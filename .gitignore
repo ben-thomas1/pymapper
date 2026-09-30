@@ -1,0 +1,24 @@
+# Publish only the project roots below; keep local working material on disk.
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/README.md
+!/CLAUDE.md
+!/SKILL.md
+!/.pymapper.toml.template
+!/src/
+!/tests/
+!/benches/
+!/docs/
+!/.github/
+
+/gitbackup/
+/target/
+/tests/fixtures/db.py
+**/__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+*.log

@@ -1,0 +1,51 @@
+# Legacy pymapper-v1 configuration only. The v2 CLI uses command-line flags.
+[report]
+# Fail if any function exceeds these metric thresholds. Comma-separated key=value pairs.
+# Keys: cc, cognitive, nesting, loc, params
+# Example: "cc=10,cognitive=15"
+# fail_above = ""
+
+# Only show functions with McCabe complexity >= this value.
+# min_cc = 1
+
+# Show only the top N functions (by McCabe complexity).
+# top = 10
+
+# Output format for the report.
+# Options: "table", "json", "csv", "markdown"
+# format = "table"
+
+# Column to sort by (descending by default; use --asc flag to reverse).
+# Options: "name", "cc", "cognitive", "nesting", "loc", "params",
+#          "fi", "fo", "rfc", "depth", "tloc", "tcc", "mi", "ret", "bool"
+# sort = "cc"
+
+[dead_code]
+# Decorator patterns to exclude from dead code results (repeatable — list of strings).
+# Functions annotated with any of these decorators are not reported as dead.
+# Example: ["app.route", "click.command"]
+# exclude_decorated = []
+
+# Exclude methods that override a base class method.
+# Options: true, false
+# exclude_overrides = false
+
+# Built-in exclusion profiles to apply. Each profile suppresses framework entry-points.
+# Options: "cli" (click/argparse), "web" (Flask/Django/FastAPI routes), "pydantic"
+# profile = []
+
+[graph]
+# Omit external/unresolved call targets and their edges from the DOT output.
+# Options: true, false
+# no_externals = false
+
+# Edge routing style for the generated Graphviz DOT graph.
+# Options: "ortho", "polyline", "curved", "spline", "line"
+# splines = "ortho"
+
+[threads]
+# Number of threads for directory walking (0 = auto).
+# walk = 0
+
+# Number of threads for file parsing (0 = auto).
+# parse = 0
