@@ -12,6 +12,7 @@ See [`docs/design.md`](docs/design.md) for the design.
 ```
 crates/pymapper-core   library (all analysis)
 crates/pymapper-cli    the `pymapper` binary
+crates/pymapper-gui    the `pymapper-gui` binary (native GUI; see docs/gui.md)
 xtask                  dev tooling: cargo xtask bench | diff-ruff | fuzz
 tests/corpus           Python inputs used by tests and benchmarks
 docs/design.md         design document (source of truth)
@@ -27,6 +28,9 @@ cargo build --profile profiling   # release + line tables, for sampling profiler
 
 Benchmarks (time per phase and peak RSS): `cargo xtask bench`, see
 [`docs/benchmarks.md`](docs/benchmarks.md).
+
+GUI (not a default member): `cargo build --release -p pymapper-gui`, see
+[`docs/gui.md`](docs/gui.md).
 
 The toolchain is pinned in `rust-toolchain.toml`.
 
