@@ -3,6 +3,7 @@
 //! Exit codes: 0 ok, 1 findings (e.g. benchmark regressions), 2 usage or fatal error.
 
 mod bench;
+mod diff_ruff;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -27,7 +28,7 @@ enum Command {
     #[command(hide = true)]
     BenchRun(bench::RunArgs),
     /// Compare extracted facts/metrics against ruff's parser.
-    DiffRuff,
+    DiffRuff(diff_ruff::Args),
     /// Fuzz the lexer/parser.
     Fuzz,
 }
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Bench(args) => bench::run(args),
         Command::BenchRun(args) => bench::run_child(args),
-        Command::DiffRuff => not_implemented("diff-ruff"),
+        Command::DiffRuff(args) => diff_ruff::run(args),
         Command::Fuzz => not_implemented("fuzz"),
     };
     match result {
