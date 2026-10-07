@@ -7,9 +7,8 @@ mod corpus;
 mod report;
 mod rusage;
 mod targets;
-mod walk;
+pub(crate) mod walk;
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use pymapper_core::timing;
+
+use crate::build::{self, repo_root};
 
 use report::{ResultsFile, Summary, Thresholds};
 use targets::{RunRecord, Target};
@@ -78,10 +79,6 @@ pub struct RunArgs {
     target: Target,
     #[arg(long)]
     root: PathBuf,
-}
-
-fn repo_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the repository root")
 }
 
 /// Default directory for results files (ignored by git via the root allowlist in .gitignore).
@@ -217,36 +214,8 @@ fn run_once(exe: &Path, target: Target, root: &Path, threads: Option<u32>) -> an
 /// The binary whose children do the measuring: this one if it already is the requested profile
 /// (or `--use-current-exe`), otherwise a freshly built `--profile` xtask in the same target dir.
 fn measuring_exe(args: &Args) -> anyhow::Result<PathBuf> {
-    let current = std::env::current_exe().context("locating the xtask executable")?;
-    if args.use_current_exe {
-        return Ok(current);
-    }
-    let profile_dir = match args.profile.as_str() {
-        "dev" | "test" => "debug",
-        "bench" => "release",
-        p => p,
-    };
-    let exe_dir = current.parent().context("xtask executable has no parent directory")?;
-    if exe_dir.file_name() == Some(OsStr::new(profile_dir)) {
-        return Ok(current);
-    }
-    let target_dir = exe_dir.parent().context("xtask executable is not inside a cargo target directory")?;
-    eprintln!("bench: building xtask with --profile {} (measurements need an optimised build)", args.profile);
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
-        .args(["build", "--quiet", "--package", "xtask", "--profile", &args.profile, "--target-dir"])
-        .arg(target_dir)
-        .current_dir(repo_root())
-        .status()
-        .context("running cargo build")?;
-    if !status.success() {
-        bail!("cargo build --profile {} failed ({status})", args.profile);
-    }
-    let exe = target_dir.join(profile_dir).join(current.file_name().context("xtask executable has no file name")?);
-    if !exe.is_file() {
-        bail!("built xtask not found at {}", exe.display());
-    }
-    Ok(exe)
+    let why = format!("bench: building xtask with --profile {} (measurements need an optimised build)", args.profile);
+    build::profile_exe(&args.profile, args.use_current_exe, &why)
 }
 
 fn git_rev() -> Option<String> {

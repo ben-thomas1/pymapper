@@ -35,3 +35,13 @@ panic = "abort"
 inherits = "release"
 debug = "line-tables-only"
 strip = "none"
+
+# `cargo xtask fuzz` builds xtask with this: optimised, but panics unwind (so catch_unwind can
+# see them) and debug assertions / overflow checks stay on to surface more bugs.
+[profile.fuzz]
+inherits = "release"
+panic = "unwind"
+lto = false
+codegen-units = 16
+debug-assertions = true
+overflow-checks = true
