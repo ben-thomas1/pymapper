@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/pymapper-core", "crates/pymapper-cli", "xtask"]
+default-members = ["crates/pymapper-core", "crates/pymapper-cli"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# Only crates permitted by the dependency policy in docs/design.md.
+[workspace.dependencies]
+pymapper-core = { path = "crates/pymapper-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Release codegen plus line tables, for sampling profilers (samply, Instruments, perf).
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
