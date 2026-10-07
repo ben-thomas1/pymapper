@@ -3,17 +3,17 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::args::Options;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
-use crate::measure::{FrameTimes, Measure};
+use crate::measure::{FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
@@ -66,7 +66,7 @@ impl App {
         egui_ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint { delay: info.delay, pass_nr: info.current_cumulative_pass_nr });
         });
-        let measure = opts.measure.clone().map(Measure::new);
+        let measure = opts.measure.clone().map(|m| Measure::new(m, launched));
         let name = opts.path.file_name().map_or_else(|| project.clone(), |n| n.to_string_lossy().into_owned());
         Self {
             opts,
@@ -102,7 +102,7 @@ impl App {
     }
 
     fn create_window(&self, event_loop: &ActiveEventLoop) -> Result<WindowState> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.title.as_str())
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(480.0, 320.0))
@@ -110,6 +110,12 @@ impl App {
             // platform can present to a hidden window; see the `Occluded` arm in `redraw`.
             // (Ignored on Wayland, where a window maps on its first commit anyway.)
             .with_visible(false);
+        if self.measure.is_some() {
+            // Measuring needs a visible window: wgpu skips acquisition while it is occluded,
+            // and a window opened from a background process may land behind the frontmost
+            // app (macOS cooperative activation). Float it above other windows.
+            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+        }
         let window = Arc::new(event_loop.create_window(attrs).context("creating window")?);
         let instance = gpu::instance();
         let surface = instance.create_surface(Arc::clone(&window)).context("creating GPU surface")?;
@@ -179,9 +185,14 @@ impl App {
                 }
                 return;
             }
-            wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                // wgpu has already reported the error through its handler; drop the frame.
+                return;
+            }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                w.surface.configure(&w.device, &w.config);
+                // The window may have changed size before `Resized` arrived: reconfigure
+                // from its current size, or the stale extent stays outdated forever.
+                w.reconfigure();
                 w.window.request_redraw();
                 return;
             }
@@ -217,7 +228,7 @@ impl App {
         let t3 = Instant::now();
 
         if suboptimal {
-            w.surface.configure(&w.device, &w.config);
+            w.reconfigure();
         }
         if !w.shown {
             w.show();
@@ -253,15 +264,20 @@ impl WindowState {
         }
     }
 
+    /// Configures the surface for the window's current size, even if unchanged.
+    fn reconfigure(&mut self) {
+        let size = self.window.inner_size();
+        self.configured = false;
+        self.resize(size.width, size.height);
+    }
+
     fn recreate_surface(&mut self) -> Result<()> {
         self.surface = self.instance.create_surface(Arc::clone(&self.window)).context("recreating GPU surface")?;
         self.config = gpu::surface_config(&self.surface, &self.adapter, self.config.width, self.config.height)?;
         if self.config.format != self.renderer.format() {
             self.renderer = Renderer::new(&self.device, self.config.format);
         }
-        if self.configured {
-            self.surface.configure(&self.device, &self.config);
-        }
+        self.reconfigure();
         Ok(())
     }
 }
@@ -336,6 +352,11 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if self.measure.as_ref().is_some_and(|m| m.stalled(now)) {
+            let err = anyhow!("--measure: no frame presented for {} s (window hidden or occluded?)", STALL.as_secs());
+            self.fail(event_loop, err);
+            return;
+        }
         if let Some(m) = self.measure.as_mut()
             && m.poll(now)
         {

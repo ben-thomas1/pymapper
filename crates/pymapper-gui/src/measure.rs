@@ -12,6 +12,10 @@ use crate::stats::{Samples, Summary, process_usage};
 
 const WARMUP_FRAMES: u32 = 30;
 const SETTLE: Duration = Duration::from_millis(500);
+/// Frames are forced back to back during warm-up and timing, so a gap this long means none
+/// can be presented (window hidden, occluded or on another Space): give up instead of
+/// waiting forever.
+pub const STALL: Duration = Duration::from_secs(10);
 
 /// CPU-side timings of one frame.
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,6 +55,8 @@ impl IdleResult {
 pub struct Measure {
     opts: MeasureOpts,
     phase: Phase,
+    /// When the last frame was rendered (or measurement started).
+    last_frame: Instant,
     ui: Samples,
     acquire: Samples,
     submit: Samples,
@@ -64,11 +70,13 @@ pub struct Measure {
 }
 
 impl Measure {
-    pub fn new(opts: MeasureOpts) -> Self {
+    /// `now` starts the stall clock (see [`STALL`]).
+    pub fn new(opts: MeasureOpts, now: Instant) -> Self {
         let cap = opts.frames as usize;
         Self {
             opts,
             phase: Phase::Warmup { left: WARMUP_FRAMES },
+            last_frame: now,
             ui: Samples::with_capacity(cap),
             acquire: Samples::with_capacity(cap),
             submit: Samples::with_capacity(cap),
@@ -86,6 +94,7 @@ impl Measure {
     /// this frame. Returns `true` if the next frame should be forced immediately.
     pub fn on_frame(&mut self, now: Instant, t: FrameTimes, since_launch: Duration) -> bool {
         self.frames += 1;
+        self.last_frame = now;
         self.first_frame.get_or_insert(since_launch);
         match self.phase {
             Phase::Warmup { left } => {
@@ -116,12 +125,20 @@ impl Measure {
         self.wakeups += 1;
     }
 
-    /// The next instant the loop must wake for the measurement, if any.
+    /// The next instant the loop must wake for the measurement, if any. While frames are
+    /// being forced this is the stall deadline.
     pub fn deadline(&self) -> Option<Instant> {
         match self.phase {
             Phase::Settle { until } | Phase::Idle { until, .. } => Some(until),
-            _ => None,
+            Phase::Warmup { .. } | Phase::Frames { .. } => self.last_frame.checked_add(STALL),
+            Phase::Done => None,
         }
+    }
+
+    /// True if frames are being forced but none has been rendered for [`STALL`].
+    pub fn stalled(&self, now: Instant) -> bool {
+        matches!(self.phase, Phase::Warmup { .. } | Phase::Frames { .. })
+            && now.saturating_duration_since(self.last_frame) >= STALL
     }
 
     /// Advances timer-driven phases. Returns `true` once the measurement is complete.
@@ -228,8 +245,8 @@ mod tests {
 
     #[test]
     fn phases_progress_to_done() {
-        let mut m = Measure::new(MeasureOpts { frames: 3, idle_secs: 1 });
         let t0 = Instant::now();
+        let mut m = Measure::new(MeasureOpts { frames: 3, idle_secs: 1 }, t0);
         let mut t = t0;
         // Warm-up frames force redraws and are not recorded.
         for _ in 0..WARMUP_FRAMES {
@@ -237,7 +254,9 @@ mod tests {
             t += Duration::from_millis(16);
         }
         assert_eq!(m.ui.len(), 0);
-        assert_eq!(m.deadline(), None);
+        // While frames are forced, the only deadline is the stall watchdog.
+        assert_eq!(m.deadline(), Some(t - Duration::from_millis(16) + STALL));
+        assert!(!m.stalled(t));
         // Timed frames: the last one stops forcing.
         assert!(m.on_frame(t, times(1), Duration::ZERO));
         assert!(m.on_frame(t, times(2), Duration::ZERO));
@@ -260,6 +279,7 @@ mod tests {
         assert_eq!((idle.frames, idle.wakeups), (1, 1));
         assert_eq!(idle.wall, Duration::from_secs(1));
         assert!(m.poll(idle_end), "done stays done");
+        assert!(!m.stalled(idle_end + 2 * STALL), "no stall once frames are done");
         assert_eq!(m.deadline(), None);
 
         let report = m.report("TestGPU\ndriver x", [100, 50], 2.0);
@@ -267,6 +287,33 @@ mod tests {
         assert!(report.contains("timed frames: 3"), "{report}");
         assert!(report.contains("idle: 1.0 s"), "{report}");
         assert!(report.contains("peak RSS"), "{report}");
+    }
+
+    #[test]
+    fn stall_while_forcing_frames() {
+        let t0 = Instant::now();
+        let mut m = Measure::new(MeasureOpts { frames: 2, idle_secs: 1 }, t0);
+        // No frame at all (window never presentable).
+        assert_eq!(m.deadline(), Some(t0 + STALL));
+        assert!(!m.stalled(t0 + STALL - Duration::from_millis(1)));
+        assert!(m.stalled(t0 + STALL));
+        // A frame resets the clock; so does reaching the timed phase.
+        let t1 = t0 + Duration::from_secs(9);
+        assert!(m.on_frame(t1, times(1), Duration::ZERO));
+        assert!(!m.stalled(t0 + STALL));
+        assert!(m.stalled(t1 + STALL));
+        for _ in 1..WARMUP_FRAMES {
+            m.on_frame(t1, times(1), Duration::ZERO);
+        }
+        assert!(matches!(m.phase, Phase::Frames { .. }));
+        assert!(m.stalled(t1 + STALL));
+        // Settle and idle are timer-driven: never stalled.
+        m.on_frame(t1, times(1), Duration::ZERO);
+        assert!(!m.on_frame(t1, times(1), Duration::ZERO));
+        assert!(matches!(m.phase, Phase::Settle { .. }));
+        assert!(!m.stalled(t1 + 3 * STALL));
+        // A clock earlier than the last frame never underflows.
+        assert!(!m.stalled(t0));
     }
 
     #[test]
