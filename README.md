@@ -25,6 +25,9 @@ cargo test --workspace
 cargo build --profile profiling   # release + line tables, for sampling profilers
 ```
 
+Benchmarks (time per phase and peak RSS): `cargo xtask bench`, see
+[`docs/benchmarks.md`](docs/benchmarks.md).
+
 The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Licence
