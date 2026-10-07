@@ -444,6 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn generated_inputs_are_pinned() {
+        // Artifacts record (seed, iteration); changing the generator silently would make old
+        // `--replay` hints regenerate different inputs. Update the constant deliberately.
+        let s = seeds(&[PY, b"x = 1\n", b""]);
+        let m = Mutator::new(&s, 42, 4096);
+        let (mut out, mut scratch) = (Vec::new(), Scratch::default());
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for iter in 0..500 {
+            m.generate(iter, &mut out, &mut scratch);
+            for &b in out.iter().chain(&(out.len() as u64).to_le_bytes()) {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(h, 7_711_520_757_789_751_470);
+    }
+
+    #[test]
     fn insert_from_within_places_copy() {
         let mut v = b"abcdef".to_vec();
         insert_from_within(&mut v, 1..3, 0);

@@ -28,6 +28,9 @@ cargo build --profile profiling   # release + line tables, for sampling profiler
 Benchmarks (time per phase and peak RSS): `cargo xtask bench`, see
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
+Fuzzing (stable-Rust mutation fuzzer for the lexer/parser): `cargo xtask fuzz`, see
+[`docs/fuzz.md`](docs/fuzz.md).
+
 The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Licence
