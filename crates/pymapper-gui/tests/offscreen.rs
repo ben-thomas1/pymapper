@@ -8,8 +8,6 @@ use pymapper_gui::gpu;
 use pymapper_gui::panels::{self, UiState};
 use pymapper_gui::render::{FrameInput, Renderer};
 
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
 struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -30,7 +28,13 @@ fn gpu() -> Option<Gpu> {
 
 /// Renders `frames` frames of the UI at `points` size and `ppp`, returns RGBA8 pixels, the
 /// pixel size and the canvas rect in pixels.
-fn render_ui(g: &Gpu, points: [f32; 2], ppp: f32, frames: usize) -> (Vec<u8>, [u32; 2], PhysicalRect) {
+fn render_ui(
+    g: &Gpu,
+    format: wgpu::TextureFormat,
+    points: [f32; 2],
+    ppp: f32,
+    frames: usize,
+) -> (Vec<u8>, [u32; 2], PhysicalRect) {
     let size = [(points[0] * ppp) as u32, (points[1] * ppp) as u32];
     let texture = g.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen"),
@@ -38,12 +42,12 @@ fn render_ui(g: &Gpu, points: [f32; 2], ppp: f32, frames: usize) -> (Vec<u8>, [u
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut renderer = Renderer::new(&g.device, FORMAT);
+    let mut renderer = Renderer::new(&g.device, format);
     let ctx = egui::Context::default();
     let mut state = UiState::new("proj".to_owned(), "offscreen".to_owned());
     let mut canvas = None;
@@ -116,9 +120,11 @@ fn close(a: [u8; 3], b: [u8; 3]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2)
 }
 
-fn check_layout(ppp: f32) {
+/// Checks the rendered layout. Both RGBA8 formats store gamma-space bytes (the sRGB one is
+/// encoded by the hardware), so the expected bytes are the style's gamma colours either way.
+fn check_layout(format: wgpu::TextureFormat, ppp: f32) {
     let Some(g) = gpu() else { return };
-    let (pixels, size, c) = render_ui(&g, [960.0, 640.0], ppp, 3);
+    let (pixels, size, c) = render_ui(&g, format, [960.0, 640.0], ppp, 3);
     let style = CanvasStyle::DEFAULT;
     let spacing = (style.spacing_points * ppp).round() as u32;
     let bg = to_u8(style.background);
@@ -145,10 +151,20 @@ fn check_layout(ppp: f32) {
 
 #[test]
 fn offscreen_layout_1x() {
-    check_layout(1.0);
+    check_layout(wgpu::TextureFormat::Rgba8Unorm, 1.0);
 }
 
 #[test]
 fn offscreen_layout_2x() {
-    check_layout(2.0);
+    check_layout(wgpu::TextureFormat::Rgba8Unorm, 2.0);
+}
+
+#[test]
+fn offscreen_layout_fractional_scale() {
+    check_layout(wgpu::TextureFormat::Rgba8Unorm, 1.5);
+}
+
+#[test]
+fn offscreen_layout_srgb_target() {
+    check_layout(wgpu::TextureFormat::Rgba8UnormSrgb, 2.0);
 }
