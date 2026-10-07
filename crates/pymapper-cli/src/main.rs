@@ -37,19 +37,22 @@ enum Command {
     Cycles(cmd::cycles::Args),
     /// Summarise the codebase.
     Summary(cmd::summary::Args),
+    /// Show the effective configuration, or print the commented template.
+    Config(Box<cmd::config::Args>),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match &cli.command {
-        Command::Check(args) => cmd::check::run(args),
-        Command::Callers(args) => cmd::callers::run(args),
-        Command::Callees(args) => cmd::callees::run(args),
-        Command::Impact(args) => cmd::impact::run(args),
-        Command::Path(args) => cmd::path::run(args),
-        Command::Deps(args) => cmd::deps::run(args),
-        Command::Cycles(args) => cmd::cycles::run(args),
-        Command::Summary(args) => cmd::summary::run(args),
+    let result = match cli.command {
+        Command::Check(args) => cmd::check::run(&args),
+        Command::Callers(args) => cmd::callers::run(&args),
+        Command::Callees(args) => cmd::callees::run(&args),
+        Command::Impact(args) => cmd::impact::run(&args),
+        Command::Path(args) => cmd::path::run(&args),
+        Command::Deps(args) => cmd::deps::run(&args),
+        Command::Cycles(args) => cmd::cycles::run(&args),
+        Command::Summary(args) => cmd::summary::run(&args),
+        Command::Config(args) => cmd::config::run(*args),
     };
     match result {
         Ok(code) => code,

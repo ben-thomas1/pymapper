@@ -3,6 +3,7 @@
 pub mod callees;
 pub mod callers;
 pub mod check;
+pub mod config;
 pub mod cycles;
 pub mod deps;
 pub mod impact;
