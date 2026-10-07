@@ -230,6 +230,13 @@ fn unknown_key_with_suggestion_and_position() {
 }
 
 #[test]
+fn tool_pymapper_header_in_standalone_file_has_hint() {
+    let d = one_err("[tool.pymapper]\nthreads = 2\n");
+    assert_eq!(d.message, "unknown option `tool`");
+    assert!(d.help.as_deref().is_some_and(|h| h.contains("remove the `[tool.pymapper]` header")), "{d}");
+}
+
+#[test]
 fn key_in_wrong_table_hint() {
     let d = one_err("select = [\"PM1\"]\n");
     assert_eq!(d.help.as_deref(), Some("`select` belongs in `[rules]`"));
@@ -349,7 +356,8 @@ fn contract_errors() {
         ("[[contracts]]\nname = \"c\"\nlayers = [\"a\", \"b\"]", "contract `c` is missing `kind`", Some("add `kind = ` one of: layers, forbidden, independence")),
         ("[[contracts]]\nname = \"c\"\nkind = \"layer\"\nlayers = [\"a\", \"b\"]", "`contracts.kind`: unknown contract kind `layer` (expected one of: layers, forbidden, independence)", Some("did you mean `layers`?")),
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"", "contract `c` (kind `layers`) is missing `layers`", None),
-        ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\"]", "contract `c`: `layers` needs at least two layers", None),
+        ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\"]", "contract `c`: `layers` needs at least 2 layers (found 1)", Some("with fewer than 2 layers there is nothing to check")),
+        ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = []", "contract `c`: `layers` needs at least 2 layers (found 0)", Some("with fewer than 2 layers there is nothing to check")),
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\", []]", "`contracts.layers`: a layer must name at least one module", None),
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\", 1]", "`contracts.layers`: expected a module name or an array of sibling module names, found an integer", None),
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\", \"b\"]\nmodules = [\"x\"]", "`contracts.modules` is not valid for contracts of kind `layers`", Some("`modules` belongs to kind `independence`")),
@@ -358,7 +366,10 @@ fn contract_errors() {
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\", \"b-c\"]", "`contracts.layers`: invalid module name `b-c`", Some("use dotted names like `pkg.sub` (wildcards are only allowed in `ignore-imports`)")),
         ("[[contracts]]\nname = \"c\"\nkind = \"layers\"\nlayers = [\"a\", \"b.*\"]", "`contracts.layers`: invalid module name `b.*`", Some("use dotted names like `pkg.sub` (wildcards are only allowed in `ignore-imports`)")),
         ("[[contracts]]\nname = \"c\"\nkind = \"forbidden\"\nsource = [\"a\"]", "contract `c` (kind `forbidden`) is missing `forbidden`", None),
-        ("[[contracts]]\nname = \"c\"\nkind = \"independence\"\nmodules = [\"a\"]", "contract `c`: `modules` needs at least two modules", None),
+        ("[[contracts]]\nname = \"c\"\nkind = \"independence\"\nmodules = [\"a\"]", "contract `c`: `modules` needs at least 2 modules (found 1)", Some("with fewer than 2 modules there is nothing to check")),
+        ("[[contracts]]\nname = \"c\"\nkind = \"independence\"\nmodules = []", "contract `c`: `modules` needs at least 2 modules (found 0)", Some("with fewer than 2 modules there is nothing to check")),
+        ("[[contracts]]\nname = \"c\"\nkind = \"forbidden\"\nsource = []\nforbidden = [\"b\"]", "contract `c`: `source` must not be empty", Some("an empty list matches no imports, so the contract could never fail")),
+        ("[[contracts]]\nname = \"c\"\nkind = \"forbidden\"\nsource = [\"a\"]\nforbidden = []", "contract `c`: `forbidden` must not be empty", Some("an empty list matches no imports, so the contract could never fail")),
         ("[[contracts]]\nname = \"c\"\nkind = \"independence\"\nmodules = [\"a\", \"b\"]\nignore-imports = [\"a b\"]", "`contracts.ignore-imports`: expected `importer -> imported`, found `a b`", Some("write `importer -> imported`, e.g. `pkg.api -> pkg.db.*`")),
         ("[[contracts]]\nname = \"c\"\nkind = \"independence\"\nmodules = [\"a\", \"b\"]\nignore-imports = [\"a -> \"]", "`contracts.ignore-imports`: invalid module pattern `` in `a -> `", Some("use dotted names like `pkg.sub`; `*` matches one segment, `**` any number")),
         ("[[contracts]]\nname = \"  \"\nkind = \"independence\"\nmodules = [\"a\", \"b\"]", "`contracts.name`: must not be empty", None),
@@ -463,6 +474,34 @@ fn entrypoint_matcher_merges_presets() {
 
     cfg.presets.clear();
     assert!(cfg.entrypoint_matcher().is_empty());
+}
+
+/// Entrypoint patterns are `Glob`s, so code that edits a `Config` directly cannot smuggle in
+/// an invalid pattern, and building the matcher never panics.
+#[test]
+fn entrypoint_globs_are_validated_by_type() {
+    assert_eq!("a b".parse::<Glob>(), Err(GlobError::BadChar(' ')));
+    assert_eq!(Glob::new("x[y]"), Err(GlobError::BadChar('[')));
+    assert_eq!(Glob::new(""), Err(GlobError::Empty));
+
+    let mut cfg = Config::new(&base());
+    cfg.entrypoints.names.push(Glob::new("handle_*").unwrap());
+    let m = cfg.entrypoint_matcher();
+    assert!(!m.has_qualified_names());
+    assert!(m.simple_name(b"handle_x") && !m.simple_name(b"other"));
+
+    cfg.presets = Preset::ALL.to_vec();
+    cfg.entrypoints.names.push("pkg.mod:run_*".parse().unwrap());
+    cfg.entrypoints.decorators.push("*.task".parse().unwrap());
+    cfg.entrypoints.bases.push("my.Base".parse().unwrap());
+    let m = cfg.entrypoint_matcher();
+    assert!(m.has_qualified_names());
+    assert!(m.qualified_name(b"pkg.mod:run_x") && !m.qualified_name(b"pkg.mod:walk"));
+    assert!(m.name(b"handle_x", b"a:handle_x") && m.decorator(b"celery.task") && m.base(b"my.Base"));
+
+    // Edited configs serialise and re-parse to the same value.
+    let text = cfg.to_toml();
+    assert_eq!(ok(&text), cfg, "{text}");
 }
 
 #[test]
@@ -654,6 +693,18 @@ fn invalid_pyproject_reports_file_positions() {
     t.write("pyproject.toml", "[tool.pymapper\nthreads = 3\n");
     let err = load(&t.0, &Overrides::default()).unwrap_err();
     assert!(err.to_string().contains("invalid TOML"), "{err}");
+}
+
+#[test]
+fn out_of_range_typed_overrides_are_rejected() {
+    let t = TempDir::new();
+    let err = load(&t.0, &Overrides { min_confidence: Some(101), ..Overrides::default() }).unwrap_err();
+    assert!(matches!(err, ConfigError::Override { field: "min_confidence", .. }), "{err}");
+    assert_eq!(err.to_string(), "invalid override `min_confidence`: 101 is out of range (0..=100)");
+    let err = load(&t.0, &Overrides { threads: Some(MAX_THREADS + 1), ..Overrides::default() }).unwrap_err();
+    assert!(matches!(err, ConfigError::Override { field: "threads", .. }), "{err}");
+    let l = load_in(&t.0, &Overrides { min_confidence: Some(100), threads: Some(MAX_THREADS), ..Overrides::default() });
+    assert_eq!((l.config.min_confidence, l.config.threads), (100, MAX_THREADS));
 }
 
 #[test]

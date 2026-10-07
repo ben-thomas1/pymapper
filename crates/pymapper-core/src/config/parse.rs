@@ -91,7 +91,7 @@ pub(super) struct Source<'a> {
 
 /// Applies a standalone document (top-level keys).
 pub(super) fn apply_document(src: &Source<'_>, cfg: &mut Config, diags: &mut Vec<Diagnostic>) {
-    let mut cx = Ctx { src, diags };
+    let mut cx = Ctx { src, diags, standalone: true };
     if let Some(doc) = cx.parse() {
         apply_root(&mut cx, doc.get_ref(), cfg);
     }
@@ -101,7 +101,7 @@ pub(super) fn apply_document(src: &Source<'_>, cfg: &mut Config, diags: &mut Vec
 /// Applies `[tool.pymapper]` of a `pyproject.toml`. Returns false if the table is absent (or the
 /// file failed to parse, in which case a diagnostic was recorded).
 pub(super) fn apply_pyproject(src: &Source<'_>, cfg: &mut Config, diags: &mut Vec<Diagnostic>) -> bool {
-    let mut cx = Ctx { src, diags };
+    let mut cx = Ctx { src, diags, standalone: false };
     let Some(doc) = cx.parse() else {
         cx.finish();
         return true;
@@ -153,6 +153,8 @@ fn join(prefix: &str, key: &str) -> String {
 struct Ctx<'s, 'd> {
     src: &'s Source<'s>,
     diags: &'d mut Vec<Diagnostic>,
+    /// Top-level keys (`pymapper.toml`, `--set`) rather than `[tool.pymapper]` of a pyproject.
+    standalone: bool,
 }
 
 impl<'s> Ctx<'s, '_> {
@@ -320,11 +322,11 @@ impl<'s> Ctx<'s, '_> {
         self.list(path, v, "an array of paths", |cx, p, item| cx.path(p, item))
     }
 
-    fn glob_list(&mut self, path: &str, v: &Value<'_>) -> Option<Vec<String>> {
+    fn glob_list(&mut self, path: &str, v: &Value<'_>) -> Option<Vec<Glob>> {
         self.list(path, v, "an array of glob patterns", |cx, p, item| {
             let s = cx.str(p, item)?;
             match Glob::new(s) {
-                Ok(_) => Some(s.to_owned()),
+                Ok(g) => Some(g),
                 Err(e) => {
                     cx.error(item.span(), format!("`{p}`: invalid pattern `{s}`: {e}"), None);
                     None
@@ -437,7 +439,7 @@ fn apply_root(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, cfg: &mut Config) {
             }
             "cache" => set(&mut cfg.cache, cx.bool(key, v)),
             "cache-dir" => set(&mut cfg.cache_dir, cx.path(key, v)),
-            "threads" => set(&mut cfg.threads, cx.u32(key, v, 0, 4096)),
+            "threads" => set(&mut cfg.threads, cx.u32(key, v, 0, super::MAX_THREADS)),
             "mode" => set(&mut cfg.mode, cx.name::<Mode>(key, v)),
             "output-format" => set(&mut cfg.output_format, cx.name::<OutputFormat>(key, v)),
             "min-confidence" => set(&mut cfg.min_confidence, cx.u32(key, v, 0, 100).map(|n| n as u8)),
@@ -474,6 +476,12 @@ fn apply_root(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, cfg: &mut Config) {
                 }
             }
             "contracts" => set(&mut cfg.contracts, contracts(cx, v)),
+            "tool" if cx.standalone => {
+                // Common mistake: pasting a pyproject `[tool.pymapper]` section into pymapper.toml.
+                let help = "pymapper.toml uses top-level keys; remove the `[tool.pymapper]` header (or the \
+                            `tool.pymapper.` prefix), which is only for pyproject.toml";
+                cx.error(k.span(), "unknown option `tool`".to_owned(), Some(help.to_owned()));
+            }
             _ => cx.unknown_key("", k, ROOT_KEYS),
         }
     }
@@ -703,29 +711,44 @@ fn contract(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, span: Range<usize>) -> Option
             ok = false;
         }
     };
+    // A contract with too few modules can never be violated, so it would pass CI while
+    // enforcing nothing: reject it. Only parsed lists are checked; a missing or invalid key has
+    // already been reported.
+    let min_len = |cx: &mut Ctx<'_, '_>, field: &str, len: Option<usize>, min: usize, what: &str| {
+        if let Some(len) = len
+            && len < min
+        {
+            let (message, help) = if min == 1 {
+                (format!("contract `{label}`: `{field}` must not be empty"), "an empty list matches no imports, so the contract could never fail".to_owned())
+            } else {
+                (
+                    format!("contract `{label}`: `{field}` needs at least {min} {what} (found {len})"),
+                    format!("with fewer than {min} {what} there is nothing to check"),
+                )
+            };
+            cx.error(span.clone(), message, Some(help));
+            false
+        } else {
+            true
+        }
+    };
     let built = match kind {
         ContractKindName::Layers => {
             need(cx, "layers", layers.is_some());
-            let layers = layers.unwrap_or_default();
-            if layers.len() == 1 && ok {
-                cx.error(span.clone(), format!("contract `{label}`: `layers` needs at least two layers"), None);
-                ok = false;
-            }
-            ContractKind::Layers { layers, containers, independent_siblings }
+            ok &= min_len(cx, "layers", layers.as_ref().map(Vec::len), 2, "layers");
+            ContractKind::Layers { layers: layers.unwrap_or_default(), containers, independent_siblings }
         }
         ContractKindName::Forbidden => {
             need(cx, "source", source.is_some());
             need(cx, "forbidden", forbidden.is_some());
+            ok &= min_len(cx, "source", source.as_ref().map(Vec::len), 1, "modules");
+            ok &= min_len(cx, "forbidden", forbidden.as_ref().map(Vec::len), 1, "modules");
             ContractKind::Forbidden { source: source.unwrap_or_default(), forbidden: forbidden.unwrap_or_default() }
         }
         ContractKindName::Independence => {
             need(cx, "modules", modules.is_some());
-            let modules = modules.unwrap_or_default();
-            if modules.len() == 1 && ok {
-                cx.error(span.clone(), format!("contract `{label}`: `modules` needs at least two modules"), None);
-                ok = false;
-            }
-            ContractKind::Independence { modules }
+            ok &= min_len(cx, "modules", modules.as_ref().map(Vec::len), 2, "modules");
+            ContractKind::Independence { modules: modules.unwrap_or_default() }
         }
     };
     if ok && let Some(dup) = duplicate_module(&built) {

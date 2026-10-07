@@ -3,7 +3,7 @@
 //! matched as written, bases as fully qualified names, names without `.`/`:` against the bare
 //! symbol name.
 
-use super::name_enum;
+use super::{Glob, name_enum};
 
 name_enum!(
     /// A framework preset; enabling one adds its [`PresetRules`] to the entrypoint rules.
@@ -228,6 +228,12 @@ impl Preset {
             Preset::Pydantic => &PYDANTIC,
         }
     }
+}
+
+/// Compiles one preset pattern.
+pub(super) fn glob(pattern: &'static str) -> Glob {
+    // Preset tables are static data; `every_preset_pattern_is_a_valid_glob` checks each entry.
+    Glob::new(pattern).expect("preset patterns are valid globs (checked by tests)")
 }
 
 #[cfg(test)]

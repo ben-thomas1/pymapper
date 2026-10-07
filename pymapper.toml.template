@@ -3,7 +3,8 @@
 #
 # Copy this file to `pymapper.toml` at your project root, or put the same options in
 # `pyproject.toml` under `[tool.pymapper]` (sections become `[tool.pymapper.rules]`,
-# `[tool.pymapper.thresholds]`, `[[tool.pymapper.contracts]]`, ...).
+# `[tool.pymapper.thresholds]`, `[[tool.pymapper.contracts]]`, ...). A standalone
+# `pymapper.toml` uses top-level keys only: do not add a `[tool.pymapper]` header to it.
 #
 # Discovery: pymapper walks up from the first path given on the command line (or the working
 # directory). In each directory `pymapper.toml` wins over a `pyproject.toml` that has a
@@ -293,7 +294,8 @@
 #
 # kind = "layers": highest layer first; a layer may import any lower layer, never a higher
 # one. A layer is a module or a list of sibling modules.
-#   layers               - the ordered layers (required, at least two).
+#   layers               - the ordered layers (required, at least two; a layer may not be
+#                          an empty list).
 #   containers           - when set, the layers are relative to each container
 #                          (`container.layer`), e.g. one layering per app (default []).
 #   independent-siblings - siblings in one layer may not import each other (default false).
@@ -309,8 +311,8 @@
 #   ignore-imports = ["myapp.db.migrations -> myapp.api.**"]
 #
 # kind = "forbidden": `source` modules may not import `forbidden` modules.
-#   source    - importing modules (required).
-#   forbidden - modules they may not import (required).
+#   source    - importing modules (required, not empty).
+#   forbidden - modules they may not import (required, not empty).
 #
 #   [[contracts]]
 #   name = "core stays pure"

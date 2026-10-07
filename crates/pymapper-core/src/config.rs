@@ -68,6 +68,8 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 ];
 /// Default minimum confidence (0-100) a finding needs to be reported by `check`.
 pub const DEFAULT_MIN_CONFIDENCE: u8 = 80;
+/// Largest accepted `threads` value.
+pub const MAX_THREADS: u32 = 4096;
 
 /// Generates a closed string-valued enum: `ALL`, `as_str`, `Display` and a `FromStr` whose
 /// error suggests the closest valid name.
@@ -367,6 +369,11 @@ impl RuleConfig {
 
 /// Per-rule numeric thresholds, named after the metric (design: Metric definitions). Each rule
 /// documents which threshold it reads; a finding is raised when a value is strictly beyond it.
+///
+/// Decision (for the rules steps): thresholds are keyed by metric name with a fixed key set, not
+/// by rule code (ruff-like, and stable when rule codes are renumbered). Adding a threshold means
+/// updating this struct, `parse::THRESHOLD_KEYS` / `apply_thresholds`, `write.rs`, the template
+/// and the template tests together; the template tests fail if one is missed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Thresholds {
     /// McCabe cyclomatic complexity per function (ruff C901 semantics).
@@ -410,17 +417,20 @@ impl Default for Thresholds {
 
 /// User-declared entrypoint rules (design: dead code (d)). Presets add to these; use
 /// [`Config::entrypoint_matcher`] for the merged, compiled form.
+///
+/// Patterns are stored as [`Glob`]s, which can only be built from valid patterns, so code that
+/// builds or edits a `Config` directly cannot make [`Config::entrypoint_matcher`] fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntrypointConfig {
     /// Globs over a decorator's dotted name as written, without call arguments
     /// (`@app.route("/")` -> `app.route`).
-    pub decorators: Vec<String>,
+    pub decorators: Vec<Glob>,
     /// Globs over fully qualified base classes (`django.db.models.Model`); subclasses (and their
     /// methods) are roots.
-    pub bases: Vec<String>,
+    pub bases: Vec<Glob>,
     /// Globs over symbol names: patterns without `.`/`:` match the simple name, others match the
     /// qualified id (`pkg.mod:Class.method`).
-    pub names: Vec<String>,
+    pub names: Vec<Glob>,
     /// Treat `[project.scripts]`, `[project.gui-scripts]`, `[project.entry-points]` and
     /// `entry_points.txt` targets as roots.
     pub project_scripts: bool,
@@ -535,7 +545,9 @@ pub struct Config {
     pub paths: Vec<PathBuf>,
     /// Extra first-party import roots; empty = auto-detect (project root, `src/` layout).
     pub src: Vec<PathBuf>,
-    /// Gitignore-style globs to skip; replaces [`DEFAULT_EXCLUDES`].
+    /// Gitignore-style globs to skip; replaces [`DEFAULT_EXCLUDES`]. Only checked to be
+    /// non-empty here: the walker's gitignore matcher owns the syntax and must report invalid
+    /// patterns (as must the rules step for `per-file-ignores`).
     pub exclude: Vec<String>,
     /// Globs added to `exclude`.
     pub extend_exclude: Vec<String>,
@@ -611,32 +623,33 @@ impl Config {
         self.exclude.iter().chain(&self.extend_exclude).map(String::as_str)
     }
 
-    /// User entrypoint rules merged with the enabled presets, compiled for matching.
+    /// User entrypoint rules merged with the enabled presets, compiled for matching. Infallible:
+    /// user patterns are [`Glob`]s and preset patterns are static and tested.
     pub fn entrypoint_matcher(&self) -> EntrypointMatcher {
         let ep = &self.entrypoints;
-        let mut decorators: Vec<&str> = ep.decorators.iter().map(String::as_str).collect();
-        let mut bases: Vec<&str> = ep.bases.iter().map(String::as_str).collect();
-        let mut names: Vec<&str> = Vec::new();
-        let mut qualnames: Vec<&str> = Vec::new();
-        let mut push_name = |n: &'static str| split_name(n, &mut names, &mut qualnames);
+        let mut decorators: Vec<Glob> = Vec::new();
+        let mut bases: Vec<Glob> = Vec::new();
+        let mut names: Vec<Glob> = Vec::new();
         for preset in &self.presets {
             let rules = preset.rules();
-            decorators.extend_from_slice(rules.decorators);
-            bases.extend_from_slice(rules.bases);
-            for n in rules.names {
-                push_name(n);
+            decorators.extend(rules.decorators.iter().map(|p| presets::glob(p)));
+            bases.extend(rules.bases.iter().map(|p| presets::glob(p)));
+            names.extend(rules.names.iter().map(|p| presets::glob(p)));
+        }
+        let mut simple: Vec<&Glob> = Vec::new();
+        let mut qualified: Vec<&Glob> = Vec::new();
+        for g in names.iter().chain(&ep.names) {
+            if is_qualified_pattern(g) {
+                qualified.push(g);
+            } else {
+                simple.push(g);
             }
         }
-        for n in &ep.names {
-            split_name(n, &mut names, &mut qualnames);
-        }
-        // Every pattern was validated when the config was parsed (presets are tested).
-        let compile = |pats: &[&str]| GlobSet::new(pats).expect("entrypoint globs are validated at parse time");
         EntrypointMatcher {
-            decorators: compile(&decorators),
-            bases: compile(&bases),
-            names: compile(&names),
-            qualnames: compile(&qualnames),
+            decorators: GlobSet::from_globs(decorators.iter().chain(&ep.decorators)),
+            bases: GlobSet::from_globs(bases.iter().chain(&ep.bases)),
+            names: GlobSet::from_globs(simple),
+            qualnames: GlobSet::from_globs(qualified),
         }
     }
 
@@ -646,12 +659,9 @@ impl Config {
     }
 }
 
-fn split_name<'a>(pat: &'a str, names: &mut Vec<&'a str>, qualnames: &mut Vec<&'a str>) {
-    if pat.contains(['.', ':']) {
-        qualnames.push(pat);
-    } else {
-        names.push(pat);
-    }
+/// Name patterns containing `.` or `:` match the qualified id, others the bare name.
+fn is_qualified_pattern(g: &Glob) -> bool {
+    g.as_str().contains(['.', ':'])
 }
 
 /// Compiled entrypoint rules: user rules plus presets. All lookups are allocation-free.
@@ -677,10 +687,30 @@ impl EntrypointMatcher {
     }
 
     /// Whether a symbol is a root by name: `simple` is its bare name, `qualified` its stable id
-    /// (`pkg.mod:Class.method`).
+    /// (`pkg.mod:Class.method`). When [`has_qualified_names`](Self::has_qualified_names) is
+    /// false, prefer [`simple_name`](Self::simple_name) and skip building the qualified id.
     #[inline]
     pub fn name(&self, simple: &[u8], qualified: &[u8]) -> bool {
-        self.names.is_match(simple) || self.qualnames.is_match(qualified)
+        self.simple_name(simple) || self.qualified_name(qualified)
+    }
+
+    /// Whether a bare symbol name matches a name pattern without `.`/`:`.
+    #[inline]
+    pub fn simple_name(&self, simple: &[u8]) -> bool {
+        self.names.is_match(simple)
+    }
+
+    /// Whether a qualified id (`pkg.mod:Class.method`) matches a name pattern with `.`/`:`.
+    #[inline]
+    pub fn qualified_name(&self, qualified: &[u8]) -> bool {
+        self.qualnames.is_match(qualified)
+    }
+
+    /// Whether any name pattern matches qualified ids. When false, callers need not build
+    /// per-symbol qualified ids for name matching.
+    #[inline]
+    pub fn has_qualified_names(&self) -> bool {
+        !self.qualnames.is_empty()
     }
 
     /// Whether no rule is configured at all (callers can skip matching).
@@ -748,7 +778,7 @@ pub struct Overrides {
     pub presets: Vec<Preset>,
     /// Replaces `output-format`.
     pub output_format: Option<OutputFormat>,
-    /// Replaces `min-confidence` (0-100).
+    /// Replaces `min-confidence` (0-100; larger values are rejected by [`load`]).
     pub min_confidence: Option<u8>,
     /// Replaces `cache-dir`.
     pub cache_dir: Option<PathBuf>,
@@ -762,7 +792,7 @@ pub struct Overrides {
     pub venv: Option<PathBuf>,
     /// Replaces `mode`.
     pub mode: Option<Mode>,
-    /// Replaces `threads`.
+    /// Replaces `threads` (0-4096; larger values are rejected by [`load`]).
     pub threads: Option<u32>,
 }
 
@@ -809,6 +839,15 @@ pub enum ConfigError {
         /// Every problem found.
         diagnostics: Vec<Diagnostic>,
     },
+    /// A typed [`Overrides`] field is out of range (the CLI validates its flags itself; this
+    /// guards library callers).
+    #[error("invalid override `{field}`: {message}")]
+    Override {
+        /// The [`Overrides`] field.
+        field: &'static str,
+        /// What is wrong.
+        message: String,
+    },
 }
 
 struct DiagList<'a>(&'a [Diagnostic]);
@@ -832,6 +871,7 @@ impl fmt::Display for DiagList<'_> {
 /// directory `pymapper.toml` wins over a `pyproject.toml` with a `[tool.pymapper]` table, and a
 /// `pyproject.toml` without one is skipped.
 pub fn load(cwd: &Path, overrides: &Overrides) -> Result<Loaded, ConfigError> {
+    check_overrides(overrides)?;
     let mut warnings = Vec::new();
     let start = match overrides.paths.first() {
         Some(p) => normalize(&cwd.join(p)),
@@ -900,6 +940,21 @@ pub fn parse_standalone(text: &str, origin: &str, base: &Path) -> Result<Config,
     if diagnostics.is_empty() { Ok(config) } else { Err(ConfigError::Invalid { diagnostics }) }
 }
 
+/// Range checks for typed overrides, matching the config-file limits.
+fn check_overrides(o: &Overrides) -> Result<(), ConfigError> {
+    if let Some(v) = o.min_confidence
+        && v > 100
+    {
+        return Err(ConfigError::Override { field: "min_confidence", message: format!("{v} is out of range (0..=100)") });
+    }
+    if let Some(v) = o.threads
+        && v > MAX_THREADS
+    {
+        return Err(ConfigError::Override { field: "threads", message: format!("{v} is out of range (0..={MAX_THREADS})") });
+    }
+    Ok(())
+}
+
 fn apply_typed(config: &mut Config, cwd: &Path, o: &Overrides) {
     if !o.paths.is_empty() {
         config.paths = o.paths.iter().map(|p| normalize(&cwd.join(p))).collect();
@@ -919,7 +974,7 @@ fn apply_typed(config: &mut Config, cwd: &Path, o: &Overrides) {
         config.output_format = v;
     }
     if let Some(v) = o.min_confidence {
-        config.min_confidence = v.min(100);
+        config.min_confidence = v;
     }
     if let Some(v) = &o.cache_dir {
         config.cache_dir = normalize(&cwd.join(v));

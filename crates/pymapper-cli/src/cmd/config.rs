@@ -69,7 +69,7 @@ pub struct ConfigArgs {
     #[arg(long, help_heading = "Configuration")]
     pub mode: Option<Mode>,
     /// Worker threads (0 = one per logical CPU).
-    #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(0..=4096), help_heading = "Configuration")]
+    #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(0..=config::MAX_THREADS as i64), help_heading = "Configuration")]
     pub threads: Option<u32>,
 }
 
@@ -85,34 +85,35 @@ fn tristate(yes: bool, no: bool) -> Option<bool> {
 }
 
 impl ConfigArgs {
-    /// Builds the core overrides. `paths` are the subcommand's positional paths.
-    pub fn overrides(&self, paths: &[PathBuf]) -> Overrides {
+    /// Builds the core overrides, moving the parsed values. `paths` are the subcommand's
+    /// positional paths.
+    pub fn into_overrides(self, paths: Vec<PathBuf>) -> Overrides {
         Overrides {
-            config_file: self.config.clone(),
+            config_file: self.config,
             isolated: self.isolated,
-            paths: paths.to_vec(),
-            set: self.set.clone(),
-            select: self.select.clone(),
-            extend_select: self.extend_select.clone(),
-            ignore: self.ignore.clone(),
-            extend_exclude: self.exclude.clone(),
-            presets: self.preset.clone(),
+            paths,
+            set: self.set,
+            select: self.select,
+            extend_select: self.extend_select,
+            ignore: self.ignore,
+            extend_exclude: self.exclude,
+            presets: self.preset,
             output_format: self.output_format,
             min_confidence: self.min_confidence,
-            cache_dir: self.cache_dir.clone(),
+            cache_dir: self.cache_dir,
             cache: self.no_cache.then_some(false),
             include_deps: tristate(self.deps, self.no_deps),
             include_stdlib: tristate(self.stdlib, self.no_stdlib),
-            venv: self.venv.clone(),
+            venv: self.venv,
             mode: self.mode,
             threads: self.threads,
         }
     }
 
     /// Discovers, applies and validates the configuration; prints warnings to stderr.
-    pub fn load(&self, paths: &[PathBuf]) -> anyhow::Result<Loaded> {
+    pub fn load(self, paths: Vec<PathBuf>) -> anyhow::Result<Loaded> {
         let cwd = std::env::current_dir().context("cannot determine the working directory")?;
-        let loaded = config::load(&cwd, &self.overrides(paths))?;
+        let loaded = config::load(&cwd, &self.into_overrides(paths))?;
         let mut err = io::stderr().lock();
         for w in &loaded.warnings {
             // Ignore write failures: stderr may be closed and there is nowhere else to report.
@@ -134,11 +135,11 @@ pub struct Args {
 }
 
 /// Prints the effective configuration (pymapper.toml syntax) or the template.
-pub fn run(args: &Args) -> anyhow::Result<ExitCode> {
+pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let text = if args.template {
         config::TEMPLATE.to_owned()
     } else {
-        let loaded = args.config.load(&args.paths)?;
+        let loaded = args.config.load(args.paths)?;
         let source = match &loaded.project.config_file {
             Some((path, _)) => path.display().to_string(),
             None => "none (defaults)".to_owned(),

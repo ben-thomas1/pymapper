@@ -6,6 +6,7 @@
 //! and a small general remainder.
 
 use std::fmt;
+use std::str::FromStr;
 
 /// Error for a pattern that is not a valid name glob.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -18,15 +19,36 @@ pub enum GlobError {
     BadChar(char),
 }
 
-/// One validated name glob.
+/// One validated name glob. The only constructor is [`Glob::new`] (or `str::parse`), so holding
+/// a `Glob` guarantees the pattern is valid.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Glob {
-    pat: Box<[u8]>,
+    pat: Box<str>,
 }
 
 impl fmt::Debug for Glob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Glob({:?})", String::from_utf8_lossy(&self.pat))
+        write!(f, "Glob({:?})", &*self.pat)
+    }
+}
+
+impl fmt::Display for Glob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.pat)
+    }
+}
+
+impl FromStr for Glob {
+    type Err = GlobError;
+
+    fn from_str(s: &str) -> Result<Glob, GlobError> {
+        Glob::new(s)
+    }
+}
+
+impl AsRef<str> for Glob {
+    fn as_ref(&self) -> &str {
+        &self.pat
     }
 }
 
@@ -43,17 +65,22 @@ impl Glob {
         if let Some(c) = pattern.chars().find(|&c| c.is_whitespace() || matches!(c, '[' | ']' | '{' | '}' | '\\')) {
             return Err(GlobError::BadChar(c));
         }
-        Ok(Glob { pat: pattern.as_bytes().into() })
+        Ok(Glob { pat: pattern.into() })
     }
 
     /// The pattern text.
-    pub fn as_bytes(&self) -> &[u8] {
+    pub fn as_str(&self) -> &str {
         &self.pat
+    }
+
+    /// The pattern text as bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.pat.as_bytes()
     }
 
     /// Whether `text` matches the whole pattern.
     pub fn is_match(&self, text: &[u8]) -> bool {
-        wildcard_match(&self.pat, text)
+        wildcard_match(self.pat.as_bytes(), text)
     }
 }
 
@@ -99,26 +126,40 @@ pub struct GlobSet {
 }
 
 impl GlobSet {
-    /// Compiles `patterns`; fails on the first invalid one.
+    /// Compiles `patterns`; fails on the first invalid one, returning its index.
     pub fn new<S: AsRef<str>>(patterns: &[S]) -> Result<GlobSet, (usize, GlobError)> {
         let mut set = GlobSet::default();
         for (i, p) in patterns.iter().enumerate() {
             let glob = Glob::new(p.as_ref()).map_err(|e| (i, e))?;
-            set.add(glob);
+            set.add(&glob);
         }
-        for v in [&mut set.exact, &mut set.last_segment, &mut set.prefix, &mut set.suffix] {
-            v.sort_unstable();
-            v.dedup();
-        }
-        set.general.dedup();
+        set.finish();
         Ok(set)
     }
 
-    fn add(&mut self, glob: Glob) {
-        let p = &glob.pat;
+    /// Compiles already validated globs; cannot fail.
+    pub fn from_globs<'a>(globs: impl IntoIterator<Item = &'a Glob>) -> GlobSet {
+        let mut set = GlobSet::default();
+        for glob in globs {
+            set.add(glob);
+        }
+        set.finish();
+        set
+    }
+
+    fn finish(&mut self) {
+        for v in [&mut self.exact, &mut self.last_segment, &mut self.prefix, &mut self.suffix] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        self.general.dedup();
+    }
+
+    fn add(&mut self, glob: &Glob) {
+        let p = glob.as_bytes();
         let first_wild = p.iter().position(|&b| is_wild(b));
         let Some(first) = first_wild else {
-            self.exact.push(glob.pat);
+            self.exact.push(p.into());
             return;
         };
         let wild_count = p.iter().filter(|&&b| is_wild(b)).count();
@@ -136,7 +177,7 @@ impl GlobSet {
                 return;
             }
         }
-        self.general.push(glob);
+        self.general.push(glob.clone());
     }
 
     /// Whether no pattern was added.
