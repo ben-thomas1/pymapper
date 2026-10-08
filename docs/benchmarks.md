@@ -55,6 +55,7 @@ entered, and symlinks are not followed.
 | `metrics-mem` | `walk`, `load`, `parse` | like `parse-mem`, with `pymapper_core::extract::metrics` teed into the same pass; every metrics row is kept to the end (extra counters `metric_rows`, `metrics_kb` = heap of the kept tables) |
 | `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
+| `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -398,3 +399,52 @@ rows (-0.34). Interner bytes are per thread here (each worker interns its own fi
 global merge (S2.3) deduplicates them. Peak RSS of `parse-only` above the retained rows is the
 per-thread tables' doubling slack and the interners; `extract-mem` also holds the whole
 corpus in memory.
+
+### Load / index (S2.3)
+
+End-to-end `pymapper_core::index::load` (`load` target): walk, then parallel read -> extract
+-> intern -> drop source, merge into the global tables, hierarchy. Module names come from the
+corpus root (`Inputs::from_root_dir`). 14-core M4 Pro, release, warm cache, best of 3 (RSS
+worst of 3). Load average was about 5-7 from other worktrees, so times are upper bounds. The
+`read` and `parse-only` rows come from the same session.
+
+| corpus | target       | threads | walk    | load.extract | load.merge | load.build | total   | peak RSS MB |
+|--------|--------------|---------|---------|--------------|------------|------------|---------|-------------|
+| stdlib | `load`       | 1       | 16.1ms  | 158.5ms      | 0.04ms     | 0.58ms     | 175.4ms | 19.4        |
+| stdlib | `load`       | 14      | 5.51ms  | 34.3ms       | 1.10ms     | 0.58ms     | 41.8ms  | 27.4        |
+| stdlib | `parse-only` | 14      | 4.97ms  | 32.6ms (read+parse) | -   | -          | 37.9ms  | 23.3        |
+| stdlib | `read`       | 14      | 5.06ms  | 29.1ms (read) | -         | -          | 34.4ms  | 5.9         |
+| venv   | `load`       | 1       | 2.88s   | 8.37s        | 0.10ms     | 45.1ms     | 11.38s  | 385.7       |
+| venv   | `load`       | 14      | 869ms   | 2.12s        | 25.4ms     | 50.3ms     | 3.09s   | 497.5       |
+| venv   | `parse-only` | 14      | 929ms   | 2.09s (read+parse) | -    | -          | 3.06s   | 440.0       |
+| venv   | `read`       | 14      | 942ms   | 1.92s (read) | -          | -          | 2.86s   | 26.9        |
+
+- **Time**: the load costs the same as `parse-only` (the front end with no merge) and is
+  I/O-bound on the venv: `load.extract` (2.12s) is within 10% of reading alone (1.92s). The
+  merge (interner merge, Sym remap, shrink) is 25ms and the hierarchy 50ms for 17M LOC
+  (998k nodes), about 2.5% of the total. Only `Interner::merge_all` is parallel; the remap
+  and the hierarchy run on one thread.
+- **Retained memory** (`Index::heap_bytes`, venv): 346 MB = 20.3 B/LOC. Facts 226.7 MB
+  (13.3 B/LOC, exact size), interner 50.5 MB (870k strings, deduplicated over threads),
+  metrics 21.3 MB, nodes about 25 MB (25 B/node), plus the paths, file headers and module table.
+- **Peak RSS** (venv, 14 threads): 497.5 MB, 151 MB above the retained index. That is mostly
+  the worker interners (about 80 MB on the venv, see `intern.rs`), which are alive with the
+  merged interner during `Interner::merge_all`, plus about one pending chunk per thread.
+  `parse-only` peaks at 440 MB without building a global index (it keeps per-thread tables
+  with doubling slack).
+
+How the peak was brought down (venv, 14 threads, same session conditions):
+
+| merge strategy                                                          | peak RSS MB |
+|-------------------------------------------------------------------------|-------------|
+| keep every chunk, then concatenate into exactly-sized tables             | 733         |
+| append each chunk once all earlier ones are in (rayon range split)       | 554         |
+| ... chunks handed out in FileId order from an atomic counter             | 502         |
+| ... plus one reservation of the global tables from an early estimate     | 494-498     |
+
+With rayon's recursive range splitting, threads work on chunks far apart, so almost every
+chunk waited for the first half of the range. Handing chunks out in order bounds the wait
+to about one chunk per thread. Without the reservation the global columns grow by doubling,
+and macOS malloc keeps freed blocks up to 8 MiB resident. Reserving 1.5x the extrapolated
+size once 1/16 of the chunks are in avoids most of that. Overshoot is untouched virtual
+memory, which the final `shrink_to_fit` releases.
