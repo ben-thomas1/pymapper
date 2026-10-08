@@ -51,6 +51,7 @@ entered, and symlinks are not followed.
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
 | `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
+| `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
@@ -219,3 +220,28 @@ all of `RECORD` costs about 14 ms of CPU); like the walker it stops scaling at a
 `module-map` is single-threaded (interning plus one sort of the (name, root) entries). The
 14-thread row was re-measured after `add_record_files` switched to owned files (S2.4 review
 fixes); the other rows are from the first measurement.
+
+### Parser (S1.2)
+
+Same machine, release build, warm cache, best of 5, load average about 5-7 from other
+worktrees. `parse-mem` runs `pymapper_core::extract::parse` (lexer included) with a visitor that
+counts defs, calls and diagnostics; positions (line/col) are computed for every event. `parse
+MB/s/core` is the `parse_MBps_core` counter. The `-j 1` rows are one thread parsing from memory.
+The lexer rows were measured in the same session for comparison.
+
+| corpus | target           | threads | files | MB    | lex / parse phase | MB/s/core | defs    | calls     | diagnostics |
+|--------|------------------|---------|-------|-------|-------------------|-----------|---------|-----------|-------------|
+| stdlib | lex-mem          | 14      | 1043  | 15.8  | 2.21ms            | 596       | -       | -         | -           |
+| stdlib | parse-mem        | 14      | 1043  | 15.8  | 4.47ms            | 274       | 24,394  | 83,013    | 0           |
+| stdlib | lex-mem `-j 1`   | 1       | 1043  | 15.8  | 21.2ms            | 736       | -       | -         | -           |
+| stdlib | parse-mem `-j 1` | 1       | 1043  | 15.8  | 43.0ms            | 364       | 24,394  | 83,013    | 0           |
+| venv   | lex-mem          | 14      | 60529 | 650.1 | 67.2ms            | 700       | -       | -         | -           |
+| venv   | parse-mem        | 14      | 60529 | 650.1 | 146ms             | 317       | 927,612 | 3,496,133 | 14          |
+| venv   | lex-mem `-j 1`   | 1       | 60529 | 650.1 | 739ms             | 881       | -       | -         | -           |
+| venv   | parse-mem `-j 1` | 1       | 60529 | 650.1 | 1.55s             | 419       | 927,612 | 3,496,133 | 14          |
+
+Parsing costs about 2x lexing: 364-419 MB/s on one core, against 217 MB/s/core for ruff's
+parser in the baseline. Of the parser's own time, the line cursor is about 14% and the
+expression scanner about 24% (samply, venv, `-j 1`). All 14 venv diagnostics are in 4 files
+of genuine Python 2 code (`print >>f, x`). Peak RSS in `parse-mem` is the loaded corpus. The
+parser itself uses a handful of reused scratch vectors per file and allocates nothing per token.

@@ -5,7 +5,7 @@ cargo-fuzz and no extra crates. A target is a plain `fn(&[u8])` that must never 
 kill the process, whatever bytes it gets.
 
 ```
-cargo xtask fuzz                        # default target, 60 s, all cores, seeds from tests/corpus
+cargo xtask fuzz                        # default target (parse), 60 s, all cores, seeds from tests/corpus
 cargo xtask fuzz -t demo -T 600         # one target for 10 minutes
 cargo xtask fuzz -n 1000000 --seed 42   # exactly inputs 0..1000000 of seed 42
 cargo xtask fuzz ~/src/some-project     # extra seeds: directories (*.py, *.pyi) or files
