@@ -309,7 +309,7 @@ pub enum DiagKind {
     UnmatchedBracket,
     /// Expected a name (after `def`, `class`, `import`, `as`, ...).
     ExpectedName,
-    /// Python 2 syntax (`print x`, `exec code`, backticks, `except E, e`).
+    /// Python 2 syntax (`print x`, `print >>f, x`, `exec code`). Backticks are lexer errors.
     Python2,
 }
 

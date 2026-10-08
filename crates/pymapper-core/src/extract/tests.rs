@@ -812,3 +812,19 @@ fn deep_nesting_does_not_overflow() {
     let lambdas = "x = ".to_string() + &"lambda: ".repeat(10_000) + "1\n";
     check(lambdas.as_bytes());
 }
+
+#[test]
+fn except_without_parentheses_pep758() {
+    let src = "try:\n    pass\nexcept ValueError, mod.TypeError:\n    pass\nexcept* A, B:\n    pass\n";
+    assert_eq!(only(src, &["Except", "diag"]), "Except (ValueError,TypeError) @3:0 {\nExcept* (A,B) @5:0 {");
+}
+
+#[test]
+fn exclamation_outside_fstring_and_suppressions() {
+    assert_eq!(only("x = a ! b\ny = f'{a!r}' + t'{b!s:>3}'\n", &["diag"]), "diag UnexpectedToken 1:6 !");
+    let src = b"x = 1  # pymapper: ignore[PM101]\nmatch y:  # pymapper: ignore[PM2]\n    case _: pass\n";
+    let mut p = super::Parser::new(src, NoopVisitor);
+    p.parse_file();
+    let (_, sup) = p.finish();
+    assert_eq!(sup.len(), 2);
+}

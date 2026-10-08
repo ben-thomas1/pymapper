@@ -5,7 +5,7 @@
 
 use super::events::{DiagKind, Diagnostic, End, Param, Pos, Visitor};
 use super::expr::{Level, TargetRec};
-use crate::lex::{Lexer, Token, TokenKind};
+use crate::lex::{Lexer, Suppression, Token, TokenKind};
 
 /// Ring buffer slots (power of two). `peek(k)` supports `k < RING`.
 const RING: usize = 4;
@@ -184,6 +184,13 @@ impl<'src, V: Visitor> Parser<'src, V> {
 
     pub fn into_visitor(self) -> V {
         self.v
+    }
+
+    /// The visitor and the `# pymapper: ignore[...]` suppressions the lexer
+    /// recorded (call after [`Parser::parse_file`]).
+    pub fn finish(mut self) -> (V, Vec<Suppression>) {
+        let sup = self.lx.take_suppressions();
+        (self.v, sup)
     }
 
     /// Diagnostics reported so far.

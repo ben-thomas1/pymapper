@@ -185,6 +185,8 @@ struct Scan {
     seg: Seg,
     /// Open impure levels (calls, subscripts, braces).
     impure: u32,
+    /// Open f/t-strings (a `!` conversion is only valid inside one).
+    fstrings: u32,
 }
 
 impl<V: Visitor> Parser<'_, V> {
@@ -204,6 +206,7 @@ impl<V: Visitor> Parser<'_, V> {
             sh: Sh::Empty,
             seg: Seg::Fresh,
             impure: 0,
+            fstrings: 0,
         };
         loop {
             let t = self.peek(0);
@@ -389,11 +392,17 @@ impl<V: Visitor> Parser<'_, V> {
                 s.chain_base = ChainBase::Unknown;
                 s.post = Post::Atom;
             }
-            K::Int | K::Float | K::Imaginary | K::True | K::False | K::None | K::Ellipsis | K::FStringEnd
-            | K::TStringEnd => {
+            K::FStringStart | K::TStringStart => s.fstrings += 1,
+            K::FStringEnd | K::TStringEnd => {
+                s.fstrings = s.fstrings.saturating_sub(1);
                 s.chain_base = ChainBase::Unknown;
                 s.post = Post::Atom;
             }
+            K::Int | K::Float | K::Imaginary | K::True | K::False | K::None | K::Ellipsis => {
+                s.chain_base = ChainBase::Unknown;
+                s.post = Post::Atom;
+            }
+            K::Exclamation if s.fstrings == 0 => self.diag_at(DiagKind::UnexpectedToken, t),
             // Literal text keeps the state of the enclosing f-string.
             K::FStringMiddle | K::TStringMiddle => s.post = post,
             K::Lambda => {
@@ -671,11 +680,11 @@ impl<V: Visitor> Parser<'_, V> {
     }
 
     /// Type expression of an `except` clause; the last names of its plain dotted
-    /// names (top level or inside a tuple) go into `self.names`.
+    /// names (top level, unparenthesised list, or inside a tuple) go into `self.names`.
     pub(super) fn except_type(&mut self) {
         self.tgt.clear();
         self.tgt_recs.clear();
-        self.scan_group(S_AS | S_COLON | S_COMMA);
+        self.scan_group(S_AS | S_COLON);
         self.names.clear();
         for r in &self.tgt_recs {
             self.names.push(self.tgt[(r.start + r.len - 1) as usize]);

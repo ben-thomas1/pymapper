@@ -142,12 +142,10 @@ impl<V: Visitor> Parser<'_, V> {
             let star = self.eat(K::Star).is_some();
             self.names.clear();
             if !self.at(K::Colon) {
+                // PEP 758 (3.14): `except A, B:` is a tuple of types. (The
+                // identical Python 2 `except E, name:` is read the same way.)
                 self.except_type();
-                if self.at(K::Comma) {
-                    // `except E, e:`
-                    self.diag(DiagKind::Python2);
-                    self.skip_to_colon_or_eol();
-                } else if let Some(as_kw) = self.eat(K::As) {
+                if let Some(as_kw) = self.eat(K::As) {
                     self.targets(as_kw, S_COLON);
                 }
             }
