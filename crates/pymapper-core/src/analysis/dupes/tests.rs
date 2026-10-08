@@ -343,12 +343,15 @@ fn renamed_copy_in_another_file() {
     assert_eq!(r.members.len(), 2);
     assert_eq!(r.groups.len(), 1);
     assert_eq!(r.group(0), &[0, 1]);
-    assert_eq!(r.best[0].map(|b| b.other), Some(p.b));
-    assert_eq!(r.best[1].map(|b| b.other), Some(p.a));
+    assert_eq!((r.best[0].this, r.best[0].other), (p.a, p.b));
+    assert_eq!((r.best[1].this, r.best[1].other), (p.b, p.a));
     // Each file read once to re-lex it and once for line numbers.
     assert_eq!(r.stats.files_read, 4);
     assert_eq!(r.stats.bytes_read, 2 * (a.len() + b.len()) as u64);
     assert!(r.stats.fingerprints > 0 && r.stats.seeds > 0 && r.stats.extended > 0);
+    assert_eq!(r.stats.seeds, r.stats.extended + r.stats.covered + r.stats.unverified);
+    assert_eq!(r.stats.unverified, 0);
+    assert_eq!(r.stats.tokens_cached, (codes(&a).len() + codes(&b).len()) as u64);
 }
 
 #[test]
@@ -411,7 +414,7 @@ fn three_copies_form_one_group() {
     assert_eq!(r.members.len(), 3);
     assert_eq!(r.groups.len(), 1);
     assert_eq!(r.group(0), &[0, 1, 2]);
-    assert!(r.best.iter().all(Option::is_some));
+    assert_eq!(r.best.len(), r.members.len());
     assert_eq!(r.group, vec![0, 0, 0]);
 }
 
@@ -423,7 +426,7 @@ fn many_copies_stay_linear_and_grouped() {
     let r = run(&refs, DupesParams::default());
     assert_eq!(r.members.len(), 20);
     assert_eq!(r.groups.len(), 1);
-    assert!(r.best.iter().all(Option::is_some));
+    assert_eq!(r.best.len(), r.members.len());
     assert!(r.pairs.len() >= 19 && r.pairs.len() <= 20 * 19 / 2, "{}", r.pairs.len());
 }
 
@@ -722,4 +725,55 @@ fn dupes_stdlib_parser_and_lexer_streams_agree() {
     }
     eprintln!("{files} files, {} differ: {differ:?}", differ.len());
     assert!(differ.len() * 1000 <= files, "{differ:?}");
+}
+
+/// A function shaped unlike [`func`] (about 12 lines, 80 tokens).
+fn other_func(name: &str) -> String {
+    format!(
+        "class {name}(Base):
+    def load(self, path, *, strict=True):
+        with open(path, \"rb\") as fh:
+            data = fh.read()
+        try:
+            obj = json.loads(data)
+        except ValueError as exc:
+            if strict:
+                raise LoadError(path) from exc
+            obj = {{}}
+        self.cache[path] = obj
+        return obj.get(\"items\", []), len(data)
+"
+    )
+}
+
+#[test]
+fn overlapping_copies_do_not_merge_transitively() {
+    // File 0 = A+B+C, file 1 = A+B, file 2 = B+C, where C is a renamed copy of A and B is
+    // unrelated to both: the copies A+B and B+C of file 0 overlap by half.
+    let (fa, fb, fc) = (func("fa", "a"), other_func("B"), func("fc", "c"));
+    let f0 = format!("{fa}\n{fb}\n{fc}");
+    let f1 = format!("x = 1\n{fa}\n{fb}");
+    let f2 = format!("y = 2\n\n{fb}\n{fc}");
+    let r = run(&[&f0, &f1, &f2], DupesParams::default());
+    let (la, lc) = (line_of(&f0, "def fa"), line_of(&f0, "def fc"));
+    // A against C inside file 0 is found ...
+    let ac = r.pairs.iter().find(|p| (p.a.file, p.b.file, p.a.start_line, p.b.start_line) == (0, 0, la, lc));
+    let ac = ac.expect("A ~ C in file 0");
+    // ... and its copies are in two members of file 0: no member grew over A+B+C.
+    let member_of = |reg: &Region| r.members.iter().position(|m| m.file == reg.file && m.start_tok <= reg.start_tok && reg.end_tok <= m.end_tok);
+    assert_ne!(member_of(&ac.a), member_of(&ac.b), "{r:?}");
+    let file0: Vec<&Region> = r.members.iter().filter(|m| m.file == 0).collect();
+    assert_eq!(file0.len(), 2, "{file0:?}");
+    // Each is at most two functions (A+B, B+C), not all three.
+    assert!(file0.iter().all(|m| m.lines() < lc), "{file0:?}");
+    // One finding per member, sized by its own copy in its best pair.
+    assert_eq!(r.best.len(), r.members.len());
+    for (m, b) in r.members.iter().zip(&r.best) {
+        assert!(m.file == b.this.file && m.start_tok <= b.this.start_tok && b.this.end_tok <= m.end_tok);
+        assert!(r.pairs.iter().any(|p| (p.a, p.b) == (b.this, b.other) || (p.b, p.a) == (b.this, b.other)));
+    }
+    let mut out = Findings::new();
+    findings(&r, &mut out);
+    assert_eq!(out.len(), r.members.len());
+    assert_eq!(r.groups.len(), 1);
 }

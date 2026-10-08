@@ -65,6 +65,13 @@ pub enum Target {
     /// (`pymapper_core::analysis::dupes`, phases `dupes.*`) with the default thresholds. Peak
     /// RSS includes the whole index.
     Dupes,
+    /// `dupes` through the facts cache (`pymapper_core::cache::load_with`), after clearing it:
+    /// fingerprints are stored with the facts of the corpus' one first-party group (phase
+    /// `cache.write`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>/dupes`.
+    DupesCold,
+    /// Like `dupes-cold` but keeps the cache: after the warm-up run every file is a hit and
+    /// gets its stored fingerprints (no read, no parse before matching).
+    DupesWarm,
     /// `load`, then import resolution (`pymapper_core::resolve::resolve_imports`): module table,
     /// namespaces, per-row resolution and module edges. Unresolved imports are attributed with
     /// the built-in stdlib table only. Peak RSS includes the index.
@@ -96,6 +103,8 @@ impl Target {
             Target::ExtractMem => "extract-mem",
             Target::Load => "load",
             Target::Dupes => "dupes",
+            Target::DupesCold => "dupes-cold",
+            Target::DupesWarm => "dupes-warm",
             Target::Resolve => "resolve",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
@@ -421,7 +430,8 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         }
         Target::Roots => roots_target(root)?,
         Target::Load => load_target(root)?,
-        Target::Dupes => dupes_target(root)?,
+        Target::Dupes => dupes_target(root, None)?,
+        Target::DupesCold | Target::DupesWarm => dupes_target(root, Some(target == Target::DupesCold))?,
         Target::Resolve => resolve_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
@@ -517,9 +527,12 @@ fn load_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
 
 /// `dupes`: walk, [`pymapper_core::index::load_with`] with fingerprints (phases `load.*`),
 /// then matching and findings (phases `dupes.seeds`, `dupes.relex`, `dupes.extend`,
-/// `dupes.locate`, `dupes.group`). The corpus is one first-party group.
-fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+/// `dupes.locate`, `dupes.group`). The corpus is one first-party group. With `cold`, the load
+/// goes through the cache ([`Target::DupesCold`] / [`Target::DupesWarm`]; phase `cache.write`
+/// after `load.build`, extra counters `hits`, `misses`, `written_kb`).
+fn dupes_target(root: &Path, cold: Option<bool>) -> anyhow::Result<(ReadStats, Counters)> {
     use pymapper_core::analysis::dupes::{self, DupesParams};
+    use pymapper_core::cache::{self, Cache};
     use pymapper_core::index::{Inputs, LoadOptions, load_with};
     use pymapper_core::roots::Origin;
     use pymapper_core::rules::Findings;
@@ -527,7 +540,28 @@ fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
     drop(files);
     let params = DupesParams::default();
-    let (ix, fps) = load_with(inputs, &LoadOptions { dupes: Some(params) });
+    let opts = LoadOptions { dupes: Some(params) };
+    let mut cache_counters = Vec::new();
+    let (ix, fps) = match cold {
+        None => load_with(inputs, &opts),
+        Some(cold) => {
+            let dir = bench_cache_dir(root).join("dupes");
+            let c = Cache::new(&dir);
+            if cold {
+                c.clear().with_context(|| format!("clearing {}", dir.display()))?;
+            }
+            let (ix, cs, fps) = cache::load_with(inputs, None, &c, &opts);
+            if let Some(e) = &cs.write_error {
+                anyhow::bail!("writing the cache: {e}");
+            }
+            cache_counters = vec![
+                ("hits".to_owned(), cs.hits + cs.verified),
+                ("misses".to_owned(), cs.misses),
+                ("written_kb".to_owned(), cs.written_bytes / 1000),
+            ];
+            (ix, fps)
+        }
+    };
     let fps = fps.context("fingerprints were requested")?;
     let (nfps, fps_bytes) = (fps.len() as u64, fps.heap_bytes() as u64);
     // Peak so far: matching's own cost is the run's peak RSS minus this.
@@ -545,6 +579,9 @@ fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("fingerprints_kb".to_owned(), fps_bytes / 1000),
         ("seeds".to_owned(), r.seeds),
         ("extended".to_owned(), r.extended),
+        ("covered".to_owned(), r.covered),
+        ("unverified".to_owned(), r.unverified),
+        ("tokens_cached".to_owned(), r.tokens_cached),
         ("files_reread".to_owned(), r.files_read),
         ("bytes_reread_kb".to_owned(), r.bytes_read / 1000),
         ("pairs".to_owned(), report.pairs.len() as u64),
@@ -553,6 +590,8 @@ fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("duplicated_lines".to_owned(), dup_lines),
         ("findings".to_owned(), findings.len() as u64),
     ];
+    let mut counters = counters;
+    counters.append(&mut cache_counters);
     Ok((stats, counters))
 }
 
@@ -820,6 +859,7 @@ mod tests {
             bytes += fs::metadata(paths.get(i)).unwrap().len();
         }
         timing::enable(true);
+        let mut dupes_counts = Vec::new();
         for target in [
             Target::Read,
             Target::ParseOnly,
@@ -833,6 +873,8 @@ mod tests {
             Target::ExtractMem,
             Target::Load,
             Target::Dupes,
+            Target::DupesCold,
+            Target::DupesWarm,
             Target::Resolve,
             Target::LoadCold,
             Target::LoadWarm,
@@ -859,6 +901,18 @@ mod tests {
                     "load.extract",
                     "load.merge",
                     "load.build",
+                    "dupes.seeds",
+                    "dupes.relex",
+                    "dupes.extend",
+                    "dupes.locate",
+                    "dupes.group",
+                ],
+                Target::DupesCold | Target::DupesWarm => &[
+                    "walk",
+                    "load.extract",
+                    "load.merge",
+                    "load.build",
+                    "cache.write",
                     "dupes.seeds",
                     "dupes.relex",
                     "dupes.extend",
@@ -910,13 +964,26 @@ mod tests {
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("nodes").unwrap() > counter("defs").unwrap());
                 assert!(counter("index_B_per_kLOC").unwrap() > 1000);
-            } else if target == Target::Dupes {
+            } else if matches!(target, Target::Dupes | Target::DupesCold | Target::DupesWarm) {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
-                assert_eq!(names, [
-                    "loc", "load_peak_rss_mb", "fingerprints", "fingerprints_kb", "seeds", "extended", "files_reread", "bytes_reread_kb",
-                    "pairs", "copies", "groups", "duplicated_lines", "findings"
-                ]);
+                let cached: &[&str] = if target == Target::Dupes { &[] } else { &["hits", "misses", "written_kb"] };
+                let base = [
+                    "loc", "load_peak_rss_mb", "fingerprints", "fingerprints_kb", "seeds", "extended", "covered", "unverified",
+                    "tokens_cached", "files_reread", "bytes_reread_kb", "pairs", "copies", "groups", "duplicated_lines",
+                    "findings",
+                ];
+                assert_eq!(names, [&base[..], cached].concat());
+                // Cold and warm (all hits) find exactly what the uncached load finds.
+                dupes_counts.push(["fingerprints", "seeds", "pairs", "copies", "findings"].map(&counter));
+                assert!(dupes_counts.windows(2).all(|w| w[0] == w[1]), "{dupes_counts:?}");
+                if target == Target::DupesCold {
+                    assert_eq!(counter("misses"), Some(rec.files));
+                } else if target == Target::DupesWarm {
+                    assert_eq!((counter("hits"), counter("misses")), (Some(rec.files), Some(0)));
+                }
                 assert!(counter("fingerprints").unwrap() > 0);
+                let seeds = ["extended", "covered", "unverified"].map(|n| counter(n).unwrap());
+                assert_eq!(counter("seeds"), Some(seeds.iter().sum()));
                 assert_eq!(counter("findings"), counter("copies"));
             } else if target == Target::Resolve {
                 assert!(counter("imports").unwrap() > 0);

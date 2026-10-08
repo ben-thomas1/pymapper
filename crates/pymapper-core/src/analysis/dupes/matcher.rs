@@ -31,9 +31,12 @@ const WORD_SHARE: usize = 8;
 /// repetition filter, so it can see a period).
 const TRIM_BLOCK: u32 = 2 * MAX_PERIOD as u32;
 
-/// The most similar other copy of a [`DupesReport::members`] entry.
+/// The most similar other copy of a [`DupesReport::members`] entry: the pair `this` /
+/// `other`, where `this` is the member's own copy in that pair (inside the member, which may
+/// be the union of several overlapping copies).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Best {
+    pub this: Region,
     pub other: Region,
     pub similarity: u8,
 }
@@ -44,9 +47,17 @@ pub struct DupesStats {
     pub fingerprints: u64,
     /// Seed position pairs generated from shared fingerprints.
     pub seeds: u64,
-    /// Seeds whose tokens matched and were extended (the rest were hash collisions or
-    /// covered by an earlier extension).
+    /// Seeds whose tokens matched and were extended.
     pub extended: u64,
+    /// Seeds inside an earlier extension on the same diagonal (nothing to do).
+    pub covered: u64,
+    /// Seeds whose k tokens differ in the re-lexed files: 32-bit hash collisions, files that
+    /// changed since extraction, or files where the parser's token stream diverges from the
+    /// lexer's after a syntax error (every later position shifts, so recall drops there).
+    /// `seeds = extended + covered + unverified`.
+    pub unverified: u64,
+    /// Tokens of the files with seeds held while extending (2 bytes each).
+    pub tokens_cached: u64,
     /// File reads of the matching stage: every file with seeds, then every file with a
     /// candidate clone.
     pub files_read: u64,
@@ -58,10 +69,11 @@ pub struct DupesStats {
 pub struct DupesReport {
     /// Every clone pair, sorted by (a, b) position.
     pub pairs: Vec<ClonePair>,
-    /// Copies: overlapping regions of the pairs in one file merged, sorted by (file, position).
+    /// Copies: overlapping regions of the pairs in one file merged (see [`find_clones`]),
+    /// sorted by (file, position). Every member has a partner in another member.
     pub members: Vec<Region>,
-    /// Per member, its most similar other copy (`None` only in degenerate overlaps).
-    pub best: Vec<Option<Best>>,
+    /// Per member, its most similar other copy.
+    pub best: Vec<Best>,
     /// Per member, its group (groups are numbered in order of their first member).
     pub group: Vec<u32>,
     /// Per group, the range of its members in `group_members`.
@@ -222,18 +234,20 @@ where
     let cache = timing::time("dupes.relex", || CodeCache::build(&seeds, nfiles, &read, &mut stats));
     let cands = timing::time("dupes.extend", || {
         let groups: Vec<&[Seed]> = seeds.chunk_by(|x, y| x.a_file == y.a_file).collect();
-        let per_file: Vec<(Vec<Cand>, u64)> = groups
+        let per_file: Vec<(Vec<Cand>, SeedCounts)> = groups
             .par_iter()
             .map_init(Scratch::default, |sc, g| {
                 let mut out = Vec::new();
-                let extended = match_file(g, params, &cache, sc, &mut out);
-                (out, extended)
+                let counts = match_file(g, params, &cache, sc, &mut out);
+                (out, counts)
             })
             .collect();
         let mut cands = Vec::with_capacity(per_file.iter().map(|p| p.0.len()).sum());
-        for (mut c, extended) in per_file {
+        for (mut c, n) in per_file {
             cands.append(&mut c);
-            stats.extended += extended;
+            stats.extended += n.extended;
+            stats.covered += n.covered;
+            stats.unverified += n.unverified;
         }
         cands
     });
@@ -310,6 +324,7 @@ impl CodeCache {
         let mut cache = CodeCache { slot, codes: Vec::with_capacity(files.len()), exact: Vec::with_capacity(files.len()) };
         for (c, e, bytes) in lexed {
             stats.bytes_read += bytes;
+            stats.tokens_cached += c.len() as u64;
             cache.codes.push(c);
             cache.exact.push(e);
         }
@@ -355,12 +370,26 @@ struct Cand {
     similarity: u8,
 }
 
+/// What happened to the seeds of one file (see [`DupesStats`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct SeedCounts {
+    extended: u64,
+    covered: u64,
+    unverified: u64,
+}
+
 /// Matches every seed of file A (`seeds`, sorted by partner, diagonal, position) and appends
-/// the chains of at least `min_tokens` tokens; returns the number of seeds extended.
-fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut Scratch, out: &mut Vec<Cand>) -> u64 {
+/// the chains of at least `min_tokens` tokens.
+fn match_file(
+    seeds: &[Seed],
+    params: &DupesParams,
+    cache: &CodeCache,
+    sc: &mut Scratch,
+    out: &mut Vec<Cand>,
+) -> SeedCounts {
     let a_file = seeds[0].a_file;
     let a = cache.get(a_file);
-    let mut extended = 0;
+    let mut n = SeedCounts::default();
     let Scratch { segs, chains } = sc;
     for sub in seeds.chunk_by(|x, y| x.b_file == y.b_file) {
         let b_file = sub[0].b_file;
@@ -374,13 +403,17 @@ fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut 
                 && d == s.diag()
                 && (c0..c1).contains(&s.a_pos)
             {
+                n.covered += 1;
                 continue;
             }
-            if let Some(seg) = extend(a, b, same_file, s.a_pos, s.b_pos, params.k()) {
-                extended += 1;
-                // The cover is the untrimmed extent, so no seed re-extends a trimmed tail.
-                cover = Some((s.diag(), seg.a0, seg.a1));
-                split(seg, a, b, segs);
+            match extend(a, b, same_file, s.a_pos, s.b_pos, params.k()) {
+                Some(seg) => {
+                    n.extended += 1;
+                    // The cover is the untrimmed extent, so no seed re-extends a trimmed tail.
+                    cover = Some((s.diag(), seg.a0, seg.a1));
+                    split(seg, a, b, segs);
+                }
+                None => n.unverified += 1,
             }
         }
         chain_segments(segs, chains, same_file);
@@ -396,7 +429,7 @@ fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut 
             out.push(Cand { a_file, b_file, a0: c.a0, a1: c.a1, b0: c.b0, b1: c.b1, similarity });
         }
     }
-    extended
+    n
 }
 
 /// Verifies a seed (`k` equal codes at `pa` / `pb`) and extends it to the maximal run of equal
@@ -622,9 +655,14 @@ fn chain_segments(segs: &mut [Segment], chains: &mut Vec<Segment>, same_file: bo
 
 /// Builds members, best partners and groups from the sorted pairs.
 ///
-/// Members: the copies of all pairs sorted by (file, position); a copy that overlaps the
-/// current member of its file by at least half of the shorter of the two joins it (the member
-/// grows to the union). Groups: connected components of members linked by pairs.
+/// Members: the copies of all pairs sorted by (file, position). A member starts at a copy
+/// (its anchor); a later copy that overlaps the anchor by at least half of the shorter of the
+/// two joins it, and the member grows to the union. Comparing with the fixed anchor, not the
+/// grown union, bounds the growth: a chain of copies each overlapping the next by half (A+B,
+/// B+C, C+D in one file) makes several members, not one ever-growing one, so clones between
+/// its parts stay visible. Members whose pairs all lie within the member itself (overlapping
+/// copies of periodic code) are dropped. Groups: connected components of members linked by
+/// pairs.
 fn cluster(pairs: Vec<ClonePair>) -> DupesReport {
     // (region, pair index * 2 + side)
     let mut ends: Vec<(Region, u32)> = Vec::with_capacity(pairs.len() * 2);
@@ -634,36 +672,63 @@ fn cluster(pairs: Vec<ClonePair>) -> DupesReport {
     }
     ends.sort_unstable_by_key(|(r, i)| (r.file, r.start_tok, r.end_tok, *i));
     let mut members: Vec<Region> = Vec::new();
+    let mut anchor: Option<Region> = None;
     // Member of each pair end.
     let mut member_of = vec![0u32; pairs.len() * 2];
     for (r, i) in &ends {
+        let joins = anchor.is_some_and(|a| {
+            let overlap = a.end_tok.min(r.end_tok).saturating_sub(a.start_tok.max(r.start_tok));
+            a.file == r.file && overlap * 2 >= a.tokens().min(r.tokens())
+        });
         match members.last_mut() {
-            Some(m) if m.file == r.file && {
-                let overlap = m.end_tok.min(r.end_tok).saturating_sub(m.start_tok.max(r.start_tok));
-                overlap * 2 >= m.tokens().min(r.tokens())
-            } =>
-            {
+            Some(m) if joins => {
                 if r.end_tok > m.end_tok {
                     m.end_tok = r.end_tok;
                     m.end_line = m.end_line.max(r.end_line);
                 }
             }
-            _ => members.push(*r),
+            _ => {
+                members.push(*r);
+                anchor = Some(*r);
+            }
         }
         member_of[*i as usize] = members.len() as u32 - 1;
     }
     drop(ends);
 
-    // Best partner per member, and union-find over members.
+    // Best partner per member (the member's own end of the pair first).
     let mut best: Vec<Option<Best>> = vec![None; members.len()];
-    let mut parent: Vec<u32> = (0..members.len() as u32).collect();
     for (i, p) in pairs.iter().enumerate() {
+        let (ma, mb) = (member_of[i * 2], member_of[i * 2 + 1]);
+        if ma != mb {
+            offer(&mut best[ma as usize], p.a, p.b, p.similarity);
+            offer(&mut best[mb as usize], p.b, p.a, p.similarity);
+        }
+    }
+    // Drop members without a partner; renumber.
+    let mut new_id = vec![u32::MAX; members.len()];
+    let mut kept = 0usize;
+    for m in 0..members.len() {
+        if best[m].is_some() {
+            new_id[m] = kept as u32;
+            members[kept] = members[m];
+            best.swap(kept, m);
+            kept += 1;
+        }
+    }
+    members.truncate(kept);
+    members.shrink_to_fit();
+    let best: Vec<Best> = best.into_iter().take(kept).flatten().collect();
+    debug_assert_eq!(best.len(), kept);
+
+    // Union-find over members.
+    let mut parent: Vec<u32> = (0..members.len() as u32).collect();
+    for i in 0..pairs.len() {
         let (ma, mb) = (member_of[i * 2], member_of[i * 2 + 1]);
         if ma == mb {
             continue;
         }
-        offer(&mut best[ma as usize], p.b, p.similarity);
-        offer(&mut best[mb as usize], p.a, p.similarity);
+        let (ma, mb) = (new_id[ma as usize], new_id[mb as usize]);
         let (ra, rb) = (find(&mut parent, ma), find(&mut parent, mb));
         if ra != rb {
             // Lower index as root: roots are the first member of their group.
@@ -672,6 +737,7 @@ fn cluster(pairs: Vec<ClonePair>) -> DupesReport {
         }
     }
     drop(member_of);
+    drop(new_id);
 
     // Group ids in order of first member; counting sort of members by group.
     let n = members.len();
@@ -701,18 +767,19 @@ fn cluster(pairs: Vec<ClonePair>) -> DupesReport {
     DupesReport { pairs, members, best, group, groups, group_members, stats: DupesStats::default() }
 }
 
-/// Keeps the more similar partner (ties: the earlier one).
+/// Keeps the more similar pair (ties: the larger own copy, then the earlier partner).
 #[inline]
-fn offer(best: &mut Option<Best>, other: Region, similarity: u8) {
+fn offer(best: &mut Option<Best>, this: Region, other: Region, similarity: u8) {
     let better = match best {
         None => true,
         Some(b) => {
-            similarity > b.similarity
-                || (similarity == b.similarity && (other.file, other.start_tok) < (b.other.file, b.other.start_tok))
+            let key = |r: &Region| (u32::MAX - r.tokens(), r.start_tok);
+            (u32::MAX - u32::from(similarity), key(&this), other.file, other.start_tok)
+                < (u32::MAX - u32::from(b.similarity), key(&b.this), b.other.file, b.other.start_tok)
         }
     };
     if better {
-        *best = Some(Best { other, similarity });
+        *best = Some(Best { this, other, similarity });
     }
 }
 

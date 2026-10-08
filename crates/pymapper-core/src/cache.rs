@@ -33,6 +33,14 @@
 //! deleted. A segment that fails validation (version, schema, checksum, structure) is ignored
 //! and rewritten: the cache never makes a load fail.
 //!
+//! With duplication analysis on ([`load_with`] with `LoadOptions::dupes`), first-party
+//! segments also hold each file's fingerprints (8 bytes per fingerprint, about one per 16
+//! tokens with the default thresholds), tagged with the key they were taken with (fingerprint
+//! version, k, w). A cached first-party file gets its stored fingerprints, so a warm load finds
+//! the same clones as a cold one. A first-party segment without fingerprints of the requested
+//! key is stale for such a load: its files are extracted and it is rewritten. A load without
+//! `dupes` ignores stored fingerprints and drops them only if it rewrites the segment.
+//!
 //! The schema hash ([`schema`]) covers the format version, the fact layout and the crate
 //! version: any of them changing invalidates every segment. Bump [`FACTS_VERSION`] whenever
 //! extraction changes what it produces.

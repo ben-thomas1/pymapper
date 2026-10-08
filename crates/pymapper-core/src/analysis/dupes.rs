@@ -20,9 +20,9 @@
 //!        small gaps, measure similarity, keep runs of >= min tokens
 //!     -> re-read files with candidates once for line numbers;        dupes.locate
 //!        keep runs spanning >= min lines in both copies
-//!     -> clusters (overlapping copies in one file) -> groups          dupes.group
-//!        (union-find over pairs)
-//!     -> one PM501 finding per copy, pointing at its most similar other copy
+//!     -> clusters (copies in one file overlapping a common anchor)    dupes.group
+//!        -> groups (union-find over pairs)
+//!     -> one PM501 finding per copy, for its most similar pair
 //! ```
 //!
 //! # Cost class: expensive (gated by `analysis.dupes`)
@@ -113,7 +113,9 @@ impl Default for DupesParams {
 }
 
 impl DupesParams {
-    /// Parameters from explicit thresholds; `min_tokens` below 2 is raised to 2.
+    /// Parameters from explicit thresholds; `min_tokens` below 2 (the smallest that makes a
+    /// k-gram and a window) is raised to 2. The config accepts `dupes-min-tokens >= 10`, below
+    /// which nearly every statement would be reported; smaller values are for tests.
     pub fn new(min_tokens: u32, min_lines: u32) -> DupesParams {
         DupesParams { min_tokens: min_tokens.max(2), min_lines }
     }
@@ -202,19 +204,19 @@ pub fn analyse(index: &Index, fps: Fingerprints, params: &DupesParams, out: &mut
     report
 }
 
-/// Appends one PM501 finding per copy of `report` to `out`: at the copy's first token,
-/// `<lines> lines duplicated in <file>:<line>` pointing at its most similar other copy, with
-/// that pair's similarity as confidence.
+/// Appends one PM501 finding per copy (member) of `report` to `out`, for its most similar
+/// pair: at the first token of the member's own copy in that pair, `<lines> lines duplicated
+/// in <file>:<line>` with that copy's lines and the other copy's start, and the pair's
+/// similarity as confidence.
 pub fn findings(report: &DupesReport, out: &mut Findings) {
-    for (m, best) in report.members.iter().zip(&report.best) {
-        let Some(best) = best else { continue };
-        let other = &best.other;
+    for best in &report.best {
+        let (this, other) = (&best.this, &best.other);
         out.push(
             DUPLICATE_CODE,
-            Location::new(FileId(m.file), m.start_line, m.col),
+            Location::new(FileId(this.file), this.start_line, this.col),
             SymbolId::NONE,
             best.similarity,
-            &[Arg::U32(m.lines()), Arg::File(FileId(other.file)), Arg::U32(other.start_line)],
+            &[Arg::U32(this.lines()), Arg::File(FileId(other.file)), Arg::U32(other.start_line)],
         );
     }
 }
