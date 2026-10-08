@@ -44,17 +44,90 @@
 //!
 //! Determinism: every output depends only on the index contents and node ids, never on thread
 //! scheduling or `Sym` values.
+//!
+//! # Calls
+//!
+//! [`resolve_calls`] turns every call row, uncalled decorator and method override into
+//! [`CallEdge`]s (src node, dst node, site row, [`Confidence`], [`Reason`]) and records one
+//! packed outcome byte per call row ([`ResolvedCalls::call`]). Read-only tables, parallel per
+//! file:
+//!
+//! ```text
+//!   Index + Imports ─> Classes        per class: members sorted by name (defs, class-body
+//!                  │                  assignments, `self.x = ...` in methods), one per kind
+//!                  ├─> MethodIndex    sorted (name, method node) of every non-dunder method
+//!                  ├─> bases          per class, its base chains resolved in the enclosing
+//!                  │                  scope (parallel per file)
+//!                  ├─> C3 MRO         sequential depth-first over the base graph, each class
+//!                  │                  once; flat pool of class ids
+//!                  └─> calls          per file: a sorted table of local bindings
+//!                                     (scope, name) -> def / import / assignment / param /
+//!                                     global / nonlocal, rebuilt in a reused buffer; then per
+//!                                     call row: lookup + edges, per decorator, per override
+//! ```
+//!
+//! Every lookup is a binary search over a sorted run (a file's locals, a file's namespace, a
+//! class's members, the method index) or a `u64` hash probe in the module trie; nothing is
+//! allocated per call (scratch is per chunk of files) and no string is built.
+//!
+//! ## Semantics
+//!
+//! - Names: the scope itself, then enclosing *function* scopes (a class body is only searched
+//!   by code directly in it, so methods do not see class attributes), then the module (defs,
+//!   imports, assignments, star imports), then the builtins of Python 3.14. `global` jumps to
+//!   the module, `nonlocal` skips the own scope. A parameter or a variable without a usable
+//!   value shadows outer names (the call is unresolved). Several different bindings of the
+//!   name in one scope lower the confidence one level.
+//! - Values: an assignment `x = Foo(...)` makes `x` an instance of `Foo` (`Likely`); `x = y`
+//!   is an alias. Instances come from the caller's scopes ([`Reason::LocalHint`]), module-level
+//!   variables of any module ([`Reason::GlobalHint`]) and `self.x = Foo()` in methods
+//!   ([`Reason::AttrHint`]). Hints and aliases are followed 8 deep.
+//! - Attributes: of a module with `from m import a` semantics (submodules, re-exports, star
+//!   imports, stubs); of a class or instance through its C3 MRO (defs first, then on instances
+//!   instance attributes, then class attributes). A class with a base that is not loaded is
+//!   [`class_flags::INCOMPLETE`] (also inherited): a member found after its first MRO entry is
+//!   only `Likely`, a missing one is [`Reason::ExternalBase`]. `object`, `Generic[...]`,
+//!   `Protocol` and `ABC` bases do not make a class incomplete.
+//! - `self.m()` / `cls.m()`: the MRO of the class whose method encloses the call (through
+//!   nested functions); `super().m()`: the same MRO after the class (`super(C, self)` is
+//!   treated like `super()`). A `self.m()` that the class lacks links the `m` of its
+//!   subclasses ([`Reason::SubclassMethod`], `Likely`; only when at most 64 methods have that
+//!   name).
+//! - Calling a class: an edge to the class ([`Reason::Constructor`]) plus its `__init__` and
+//!   `__new__` found through the MRO ([`Reason::Init`]). Calling an instance: its `__call__`.
+//! - Unknown receivers (a parameter, an unhinted variable, a call result): when exactly one
+//!   loaded non-dunder method has the name, a [`Reason::UniqueMethod`] edge (`Possible`);
+//!   names of builtin-type methods (`append`, `get`, `join`, ...) never match
+//!   ([`Reason::BuiltinMethod`]); several candidates give [`Reason::Ambiguous`].
+//! - Decorators: `@deco` is a call of `deco` from the scope the decorated def is in
+//!   ([`Reason::Decorator`]); `@deco(...)` is a call row already.
+//! - Overrides: for every method, an edge from each nearest overridden base method in the MRO
+//!   ([`Reason::Override`], `Likely`, site `NONE`), so dynamic dispatch keeps overrides alive.
+//! - Calls inside a lambda are one level less sure (lambda parameters and comprehension
+//!   targets are not recorded as bindings).
+//!
+//! Edges keep per-file order (call rows, then decorators, then overrides), files in FileId
+//! order: deterministic whatever the thread count.
 
 mod attrib;
+mod builtins;
+mod calls;
+mod classes;
 mod edges;
 mod imports;
+mod lookup;
 mod modules;
 mod namespace;
 
 #[cfg(test)]
+mod calls_tests;
+#[cfg(test)]
 mod tests;
 
 pub use attrib::{Attributed, Attribution, is_builtin_stdlib};
+pub use builtins::{BUILTIN_METHODS, BUILTINS};
+pub use calls::{CallEdge, CallStats, Confidence, Reason, ResolvedCalls, resolve_calls};
+pub use classes::{ClassId, Classes, class_flags};
 pub use edges::{ExtEdge, ExtKind, ModuleEdge};
 pub use imports::{ImportStatus, res_flags};
 pub use modules::{ModId, ModKind, ModuleTable};
@@ -312,15 +385,26 @@ impl Imports {
             Some(e) if e.base() == kind::IMPORT => return Some(self.bound_by(ix, e.r as usize)),
             _ => {}
         }
+        self.star_global(ix, f, name, &mut Scratch::default())
+    }
+
+    /// `name` through the module-level star imports of file `f` only (scratch reused by the
+    /// caller: no allocation once warm).
+    pub(crate) fn star_global(&self, ix: &Index, f: FileId, name: Sym, sc: &mut Scratch) -> Option<Global> {
         let cx = self.ctx(ix);
-        self.names(&cx).through_stars(f, name).map(|r| self.to_global(r, NONE))
+        self.names(&cx).through_stars(f, name, sc).map(|r| self.to_global(r, NONE))
     }
 
     /// Attribute `name` of module `m`, with `from m import name` semantics (bindings,
     /// re-exports, submodules, star imports).
     pub fn attribute(&self, ix: &Index, m: ModId, name: Sym) -> Option<Global> {
+        self.attribute_with(ix, m, name, &mut Scratch::default())
+    }
+
+    /// [`Imports::attribute`] with a caller scratch.
+    pub(crate) fn attribute_with(&self, ix: &Index, m: ModId, name: Sym, sc: &mut Scratch) -> Option<Global> {
         let cx = self.ctx(ix);
-        self.names(&cx).attribute(m, name).map(|r| self.to_global(r, NONE))
+        self.names(&cx).attribute(m, name, sc).map(|r| self.to_global(r, NONE))
     }
 
     /// What import `row` binds its name to (`import a.b` binds the top-level package `a`).

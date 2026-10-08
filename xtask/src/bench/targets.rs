@@ -64,6 +64,10 @@ pub enum Target {
     /// namespaces, per-row resolution and module edges. Unresolved imports are attributed with
     /// the built-in stdlib table only. Peak RSS includes the index.
     Resolve,
+    /// `resolve`, then call resolution (`pymapper_core::resolve::resolve_calls`): class table,
+    /// C3 MROs, every call site, uncalled decorator and override edge. Peak RSS includes the
+    /// index and the import resolution.
+    Calls,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -91,6 +95,7 @@ impl Target {
             Target::ExtractMem => "extract-mem",
             Target::Load => "load",
             Target::Resolve => "resolve",
+            Target::Calls => "calls",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -416,6 +421,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Roots => roots_target(root)?,
         Target::Load => load_target(root)?,
         Target::Resolve => resolve_target(root)?,
+        Target::Calls => calls_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -537,6 +543,48 @@ fn resolve_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("external_pm".to_owned(), ((st.rows - found - missing - by(ImportStatus::Dynamic)) * 1000).checked_div(st.rows).unwrap_or(0)),
         ("module_edges".to_owned(), st.module_edges),
         ("ext_edges".to_owned(), st.ext_edges),
+        ("resolve_kb".to_owned(), imp.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    Ok((stats, counters))
+}
+
+/// `calls`: [`resolve_target`]'s load and import resolution, then
+/// [`pymapper_core::resolve::resolve_calls`] (phases `resolve.classes`, `resolve.mro`,
+/// `resolve.calls`). Everything stays alive until the counters are taken.
+fn calls_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, Confidence, Reason, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let s = ix.stats();
+    let st = calls.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let pm = |n: u64| (n * 1000).checked_div(st.calls).unwrap_or(0);
+    let conf = |c: Confidence| st.by_conf[c as usize];
+    let why = |r: Reason| st.by_reason[r as usize];
+    let edges = |r: Reason| st.edges_by_reason[r as usize];
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("calls".to_owned(), st.calls),
+        // Per mille of call rows.
+        ("certain_pm".to_owned(), pm(conf(Confidence::Certain))),
+        ("likely_pm".to_owned(), pm(conf(Confidence::Likely))),
+        ("possible_pm".to_owned(), pm(conf(Confidence::Possible))),
+        ("unresolved_pm".to_owned(), pm(conf(Confidence::Unresolved))),
+        ("builtin_pm".to_owned(), pm(why(Reason::Builtin) + why(Reason::BuiltinMethod))),
+        ("external_pm".to_owned(), pm(why(Reason::External) + why(Reason::ExternalBase))),
+        ("edges".to_owned(), st.edges),
+        ("override_edges".to_owned(), edges(Reason::Override)),
+        ("decorator_edges".to_owned(), edges(Reason::Decorator)),
+        ("classes".to_owned(), st.classes),
+        ("incomplete_classes".to_owned(), st.incomplete_classes),
+        ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("resolve_kb".to_owned(), imp.heap_bytes() as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ];
@@ -785,6 +833,7 @@ mod tests {
             Target::ExtractMem,
             Target::Load,
             Target::Resolve,
+            Target::Calls,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -808,6 +857,10 @@ mod tests {
                 Target::Resolve => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges",
+                ],
+                Target::Calls => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
@@ -858,6 +911,12 @@ mod tests {
                 let pm = ["found_pm", "dynamic_pm", "missing_pm", "external_pm"].map(|n| counter(n).unwrap());
                 let sum: u64 = pm.iter().sum();
                 assert!((996..=1000).contains(&sum), "{pm:?}");
+            } else if target == Target::Calls {
+                assert!(counter("calls").unwrap() > 0);
+                let pm = ["certain_pm", "likely_pm", "possible_pm", "unresolved_pm"].map(|n| counter(n).unwrap());
+                let sum: u64 = pm.iter().sum();
+                assert!((996..=1000).contains(&sum), "{pm:?}");
+                assert!(counter("edges").unwrap() > 0);
             } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
                 assert_eq!(counter("segments"), Some(1));
                 if target == Target::LoadCold {
