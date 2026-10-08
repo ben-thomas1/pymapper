@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::ValueEnum;
@@ -85,6 +85,11 @@ pub enum Target {
     /// import graph and the module call graph with their condensations. Peak RSS includes the
     /// index, the import resolution and the resolved calls.
     Graph,
+    /// `graph`'s call graph and condensation, then reachability (`pymapper_core::reach`):
+    /// application-mode roots, forward BFS from them, index weights and HLL reach sizes per
+    /// node. `XTASK_REACH_P` sets the HLL precision (default 10); `XTASK_REACH_EXACT=1` also runs
+    /// the exact sizes (expensive) and reports the estimates' error.
+    Reach,
     /// `resolve`, then the import cycle analysis (`pymapper_core::analysis::cycles`: phase
     /// `cycles`, graph + SCC + witnesses + PM301 findings) and the layering contract analysis
     /// (`pymapper_core::analysis::layers`) with synthetic contracts over the corpus' top-level
@@ -141,6 +146,7 @@ impl Target {
             Target::Resolve => "resolve",
             Target::Calls => "calls",
             Target::Graph => "graph",
+            Target::Reach => "reach",
             Target::Cycles => "cycles",
             Target::Rollup => "rollup",
             Target::Hotspot => "hotspot",
@@ -474,6 +480,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Resolve => resolve_target(root)?,
         Target::Calls => calls_target(root)?,
         Target::Graph => graph_target(root)?,
+        Target::Reach => reach_target(root)?,
         Target::Cycles => cycles_target(root)?,
         Target::Rollup => rollup_target(root)?,
         Target::Hotspot => hotspot_target(root)?,
@@ -765,6 +772,88 @@ fn graph_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ];
+    Ok((stats, counters))
+}
+
+/// `reach`: [`graph_target`]'s call graph and condensation (no module graphs), then
+/// `pymapper_core::reach` (phases `reach.roots`, `reach.forward`, `reach.weights`,
+/// `reach.sizes`, and `reach.exact` with `XTASK_REACH_EXACT=1`). The corpus is one
+/// first-party group, so roots are every module scope plus `__main__` modules and tests.
+fn reach_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::graph::{CallFilter, Condensed, call_graph};
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::reach::{self, RootOptions, SizeMode, Weights, hll};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    let p: u8 = std::env::var("XTASK_REACH_P").ok().and_then(|v| v.parse().ok()).unwrap_or(reach::DEFAULT_PRECISION);
+    let exact = std::env::var("XTASK_REACH_EXACT").is_ok_and(|v| v == "1");
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let cg = timing::time("graph.build", || call_graph(&ix, &calls, CallFilter::default()));
+    let cc = timing::time("graph.scc", || Condensed::of(&cg));
+    let set = timing::time("reach.roots", || reach::roots(&ix, Some(&imp), Some(&calls), &RootOptions::application()));
+    let live = timing::time("reach.forward", || reach::forward(&cg, set.iter()));
+    let w = timing::time("reach.weights", || Weights::of_index(&ix));
+    let sizes = timing::time("reach.sizes", || reach::reach_sizes(&cc, &w, SizeMode::Approx(p)));
+    // Tuning aid: `XTASK_REACH_REPS=N` reruns the sizes N more times and reports the best.
+    let reps: u32 = std::env::var("XTASK_REACH_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut best = Duration::MAX;
+    for _ in 0..reps {
+        let t = Instant::now();
+        std::hint::black_box(reach::reach_sizes(&cc, &w, SizeMode::Approx(p)));
+        best = best.min(t.elapsed());
+    }
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let n = cg.node_count();
+    let st = *sizes.stats();
+    let mut counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("graph_nodes".to_owned(), u64::from(n)),
+        ("sccs".to_owned(), u64::from(cc.count())),
+        ("dag_edges".to_owned(), u64::from(cc.dag().edge_count())),
+        ("precision".to_owned(), u64::from(p)),
+        ("roots".to_owned(), u64::from(set.len())),
+        ("live".to_owned(), u64::from(live.count())),
+        ("defs".to_owned(), (0..n).filter(|&v| ix.kind(v).is_def()).count() as u64),
+        ("live_defs".to_owned(), (0..n).filter(|&v| ix.kind(v).is_def() && live.contains(v)).count() as u64),
+        ("max_symbols_reached".to_owned(), (0..n).map(|v| u64::from(sizes.symbols(v))).max().unwrap_or(0)),
+        ("max_lines_reached".to_owned(), (0..n).map(|v| u64::from(sizes.lines(v))).max().unwrap_or(0)),
+        ("dense_sets".to_owned(), st.dense_sets),
+        ("peak_live_sets".to_owned(), st.peak_live),
+        ("peak_dense".to_owned(), st.peak_dense),
+        ("peak_dense_kb".to_owned(), st.peak_dense * 2 * (hll::registers(p) as u64 + 4 * hll::HIST as u64) / 1000),
+        ("peak_sparse_kb".to_owned(), st.peak_sparse_bytes / 1000),
+        (
+            "reach_kb".to_owned(),
+            (set.heap_bytes() + live.heap_bytes() + w.heap_bytes() + sizes.heap_bytes()) as u64 / 1000,
+        ),
+        ("callgraph_kb".to_owned(), (cg.heap_bytes() + cc.heap_bytes()) as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+        ("sizes_best_us".to_owned(), if reps > 0 { best.as_micros() as u64 } else { 0 }),
+    ];
+    if exact {
+        let ex = timing::time("reach.exact", || reach::reach_sizes(&cc, &w, SizeMode::Exact));
+        let big = (hll::registers(p) / 4) as u32;
+        let (mut sq, mut cnt, mut worst) = (0.0f64, 0u64, 0.0f64);
+        for v in 0..n {
+            for (a, b) in [(sizes.symbols(v), ex.symbols(v)), (sizes.lines(v), ex.lines(v))] {
+                if b > big {
+                    let rel = f64::from(a) / f64::from(b) - 1.0;
+                    sq += rel * rel;
+                    cnt += 1;
+                    worst = worst.max(rel.abs());
+                }
+            }
+        }
+        counters.push(("estimated_sets".to_owned(), cnt));
+        counters.push(("rmse_ppm".to_owned(), (1e6 * (sq / cnt.max(1) as f64).sqrt()) as u64));
+        counters.push(("worst_ppm".to_owned(), (1e6 * worst) as u64));
+    }
     Ok((stats, counters))
 }
 
@@ -1249,6 +1338,7 @@ mod tests {
             Target::Resolve,
             Target::Calls,
             Target::Graph,
+            Target::Reach,
             Target::Cycles,
             Target::Rollup,
             Target::Hotspot,
@@ -1308,6 +1398,11 @@ mod tests {
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "graph.scc",
                     "graph.modules",
+                ],
+                Target::Reach => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "graph.scc",
+                    "reach.roots", "reach.forward", "reach.weights", "reach.sizes",
                 ],
                 Target::Cycles => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
@@ -1406,6 +1501,10 @@ mod tests {
                 assert!(counter("largest_scc").unwrap() >= 1);
                 assert!(counter("dag_edges") <= counter("graph_edges"));
                 assert!(counter("modules").unwrap() > 0);
+            } else if target == Target::Reach {
+                assert!(counter("roots").unwrap() > 0);
+                assert!(counter("live").unwrap() >= counter("roots").unwrap());
+                assert!(counter("max_lines_reached").unwrap() > 0);
             } else if target == Target::Cycles {
                 assert!(counter("modules").unwrap() > 0);
                 assert_eq!(counter("cycles"), counter("cycle_findings"));
