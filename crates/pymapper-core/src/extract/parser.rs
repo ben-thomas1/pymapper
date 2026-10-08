@@ -19,34 +19,68 @@ pub fn parse<V: Visitor>(src: &[u8], visitor: V) -> V {
 }
 
 /// Forward line counter. Offsets are usually queried in increasing order, so
-/// each byte is scanned about once; backwards queries rescan from the start.
+/// each byte is scanned about once; backward queries walk back locally.
 pub(super) struct LineCursor {
     off: u32,
     line: u32,
     line_start: u32,
+    /// The source contains `\r` (old Mac or Windows line ends): use the slow
+    /// byte-wise path. Otherwise lines end only at `\n` and counting vectorises.
+    cr: bool,
 }
 
 impl LineCursor {
+    fn new(src: &[u8]) -> Self {
+        LineCursor { off: 0, line: 1, line_start: 0, cr: src.contains(&b'\r') }
+    }
+
     #[inline]
     pub(super) fn pos(&mut self, src: &[u8], off: u32) -> Pos {
-        if off < self.off {
-            self.off = 0;
-            self.line = 1;
-            self.line_start = 0;
-        }
-        let mut i = self.off as usize;
         let end = (off as usize).min(src.len());
-        while i < end {
-            let c = src[i];
-            i += 1;
-            // `\n`, `\r\n` and lone `\r` each end a line.
-            if c == b'\n' || (c == b'\r' && src.get(i) != Some(&b'\n')) {
-                self.line += 1;
-                self.line_start = i as u32;
+        let cur = self.off as usize;
+        if end >= cur {
+            if self.cr {
+                for i in cur..end {
+                    if is_line_end(src, i) {
+                        self.line += 1;
+                        self.line_start = i as u32 + 1;
+                    }
+                }
+            } else {
+                let seg = &src[cur..end];
+                let n = seg.iter().filter(|&&c| c == b'\n').count();
+                if n > 0 {
+                    self.line += n as u32;
+                    let last = seg.iter().rposition(|&c| c == b'\n').unwrap_or(0);
+                    self.line_start = (cur + last + 1) as u32;
+                }
             }
+        } else {
+            // Walk back (queries go backwards only a little: decorator starts,
+            // block ends after lookahead).
+            for i in (end..cur).rev() {
+                if is_line_end(src, i) {
+                    self.line -= 1;
+                }
+            }
+            let mut j = end;
+            while j > 0 && !is_line_end(src, j - 1) {
+                j -= 1;
+            }
+            self.line_start = j as u32;
         }
         self.off = end as u32;
         Pos { line: self.line, col: off - self.line_start.min(off) }
+    }
+}
+
+/// `src[i]` ends a line: `\n`, or a `\r` not followed by `\n` (so `\r\n` counts once).
+#[inline(always)]
+fn is_line_end(src: &[u8], i: usize) -> bool {
+    match src[i] {
+        b'\n' => true,
+        b'\r' => src.get(i + 1) != Some(&b'\n'),
+        _ => false,
     }
 }
 
@@ -97,7 +131,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
             head: 0,
             len: 0,
             last_end: 0,
-            lines: LineCursor { off: 0, line: 1, line_start: 0 },
+            lines: LineCursor::new(src),
             v,
             def_depth: 0,
             chain: Vec::new(),

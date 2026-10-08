@@ -534,3 +534,67 @@ fn parenthesized_with_items() {
          assign AsTarget y as none L5\nWith @4:0 {\nWith @8:0 {"
     );
 }
+
+/// Parses every `.py` under `$PYMAPPER_PARSE_DIR` and lists files with
+/// diagnostics. Run with `cargo test -p pymapper-core --release corpus_diagnostics -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs PYMAPPER_PARSE_DIR"]
+fn corpus_diagnostics() {
+    struct D(Vec<Diagnostic>, i64, i64);
+    impl Visitor for D {
+        fn diagnostic(&mut self, d: &Diagnostic) {
+            self.0.push(*d);
+        }
+        fn def_enter(&mut self, _: &Def<'_>) {
+            self.1 += 1;
+        }
+        fn def_exit(&mut self, _: DefKind, _: End) {
+            self.1 -= 1;
+        }
+        fn block_enter(&mut self, _: &Block<'_>) {
+            self.2 += 1;
+        }
+        fn block_exit(&mut self, _: BlockKind, _: End, _: bool) {
+            self.2 -= 1;
+        }
+    }
+    let Ok(root) = std::env::var("PYMAPPER_PARSE_DIR") else { return };
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    let (mut files, mut bad, mut bytes) = (0, 0, 0);
+    let t0 = std::time::Instant::now();
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_file() && p.extension().is_some_and(|x| x == "py" || x == "pyi") {
+                let Ok(src) = std::fs::read(&p) else { continue };
+                files += 1;
+                bytes += src.len();
+                let d = parse(&src, D(Vec::new(), 0, 0));
+                assert_eq!((d.1, d.2), (0, 0), "unbalanced events in {}", p.display());
+                if let Some(first) = d.0.first() {
+                    bad += 1;
+                    let t = String::from_utf8_lossy(first.token.text(&src));
+                    println!("{}:{}:{}: {:?} {t:?} (+{})", p.display(), first.pos.line, first.pos.col, first.kind, d.0.len() - 1);
+                }
+            }
+        }
+    }
+    println!("{files} files, {bytes} bytes, {bad} with diagnostics, {:?}", t0.elapsed());
+}
+
+#[test]
+fn line_positions_for_all_line_endings() {
+    for nl in ["\n", "\r\n", "\r"] {
+        let src = format!("x = 1{nl}@d{nl}def f():{nl}    g(){nl}    '''a{nl}b'''{nl}    h(){nl}");
+        let e = events(&src);
+        assert_eq!(e[1], "dec d", "{nl:?}");
+        assert_eq!(e[2], "def f @3:4 L2 d0 decs=1", "{nl:?} {e:?}");
+        assert_eq!(e[3], "call g None 4:4", "{nl:?}");
+        assert_eq!(e[4], "call h None 7:4", "{nl:?}");
+        assert_eq!(e[5], "end def L7", "{nl:?}");
+    }
+}
