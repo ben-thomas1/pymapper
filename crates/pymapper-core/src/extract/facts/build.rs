@@ -25,11 +25,27 @@ struct Frame {
     imp_start: u32,
 }
 
+/// An open def.
+#[derive(Clone, Copy, Debug)]
+struct ScopeFrame {
+    /// File-relative def row.
+    def: u32,
+    /// Block depth when the def started: blocks below belong to enclosing scopes.
+    blocks: usize,
+    /// Context flags at the start of the body (only `B_TC` is inherited into a def).
+    base: u8,
+    /// Context flags of the enclosing code, restored at the end of the def.
+    outer: u8,
+}
+
 /// Extractor scratch kept in the [`FactStore`] across files (never shrinks).
 #[derive(Default, Debug)]
 pub(super) struct Scratch {
-    /// Def stack, file-relative rows; `[0]` is `<module>`.
-    scopes: Vec<u32>,
+    /// Def stack; `[0]` is `<module>`.
+    scopes: Vec<ScopeFrame>,
+    /// Def flags of each decorator seen since the last def (malformed input can
+    /// leave decorators without a def: only the def's own count is used).
+    decs: Vec<u16>,
     blocks: Vec<Frame>,
     evidence: EvidenceFilter,
     exports: Vec<Sym>,
@@ -105,8 +121,6 @@ struct Builder<'a, S: StrSink> {
     cache: [ChainKey; 2],
     /// Slot of `cache` to overwrite next.
     cache_next: usize,
-    /// Def flags gathered from the decorators of the next def.
-    dec_flags: u16,
 }
 
 pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) -> FileFacts {
@@ -115,6 +129,7 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
     strs.begin_file(src);
     let mut sc = std::mem::take(&mut st.scratch);
     sc.scopes.clear();
+    sc.decs.clear();
     sc.blocks.clear();
     sc.evidence.begin_file();
     sc.exports.clear();
@@ -137,7 +152,7 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
         0,
         0,
     );
-    sc.scopes.push(module - base.defs);
+    sc.scopes.push(ScopeFrame { def: module - base.defs, blocks: 0, base: 0, outer: 0 });
     let b = Builder {
         src,
         st,
@@ -151,7 +166,6 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
         last_try: None,
         cache: [ChainKey::default(); 2],
         cache_next: 0,
-        dec_flags: 0,
     };
     let mut p = Parser::new(src, b);
     p.parse_file();
@@ -213,7 +227,7 @@ impl<S: StrSink> Builder<'_, S> {
     #[inline]
     fn scope(&self) -> Scope {
         // Never empty: `<module>` is pushed first and never popped.
-        *self.sc.scopes.last().unwrap_or(&0)
+        self.sc.scopes.last().map_or(0, |s| s.def)
     }
 
     #[inline]
@@ -270,13 +284,14 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
     fn decorator(&mut self, dec: &Decorator<'_>) {
         let chain = self.chain(dec.names);
         let mut flags = if dec.called { dec_flags::CALLED } else { 0 };
-        match dec.names.last() {
-            Some(&last) => self.dec_flags |= decorator_flags(self.text(last), dec.names.len()),
+        let def = match dec.names.last() {
+            Some(&last) => decorator_flags(self.text(last), dec.names.len()),
             None => {
                 flags |= dec_flags::COMPLEX;
-                self.dec_flags |= def_flags::OTHER_DECORATOR;
+                def_flags::OTHER_DECORATOR
             }
-        }
+        };
+        self.sc.decs.push(def);
         self.st.decorators.push(chain.c, chain.len, flags);
     }
 
@@ -290,7 +305,12 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
     fn def_enter(&mut self, def: &Def<'_>) {
         use def_flags::*;
         let parent = self.scope();
-        let mut flags = std::mem::take(&mut self.dec_flags);
+        let mut flags = 0;
+        let n = self.sc.decs.len();
+        for &f in &self.sc.decs[n - (def.decorators as usize).min(n)..] {
+            flags |= f;
+        }
+        self.sc.decs.clear();
         let kind = match def.kind {
             EvDefKind::Function => DefKind::Function,
             EvDefKind::Class => DefKind::Class,
@@ -355,17 +375,20 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             pstart,
             nparams as u16,
         );
-        self.sc.scopes.push(row - self.base.defs);
+        let base = self.cur & B_TC;
+        self.sc.scopes.push(ScopeFrame { def: row - self.base.defs, blocks: self.sc.blocks.len(), base, outer: self.cur });
+        self.cur = base;
     }
 
     fn def_exit(&mut self, _kind: EvDefKind, end: End) {
-        if self.sc.scopes.len() > 1 {
-            let d = self.sc.scopes.pop().unwrap_or(0);
-            let row = (self.base.defs + d) as usize;
+        if self.sc.scopes.len() > 1
+            && let Some(s) = self.sc.scopes.pop()
+        {
+            let row = (self.base.defs + s.def) as usize;
             self.st.defs.end[row] = end.end;
             self.st.defs.end_line[row] = end.line;
+            self.cur = s.outer;
         }
-        self.dec_flags = 0;
     }
 
     fn block_enter(&mut self, b: &Block<'_>) {
@@ -435,7 +458,12 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
                 _ => {}
             }
         }
-        self.cur = self.sc.blocks.last().map_or(0, |f| f.flags);
+        // Blocks below the current def's start belong to enclosing scopes.
+        self.cur = match (self.sc.scopes.last(), self.sc.blocks.last()) {
+            (Some(s), Some(f)) if self.sc.blocks.len() > s.blocks => f.flags,
+            (Some(s), _) => s.base,
+            (None, f) => f.map_or(0, |f| f.flags),
+        };
     }
 
     fn lambda_enter(&mut self, _tok: Token) {

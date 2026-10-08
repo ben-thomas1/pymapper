@@ -221,15 +221,17 @@ pub mod import_flags {
     /// `except ModuleNotFoundError` handler (also tuples containing them), or
     /// inside such a handler.
     pub const TRY_IMPORT_ERROR: u8 = 1 << 3;
-    /// Inside a conditional block (if/elif/else, loop, try family, match case).
+    /// Inside a conditional block (if/elif/else, loop, try family, match case) of its own
+    /// scope (blocks around an enclosing def do not count).
     pub const CONDITIONAL: u8 = 1 << 4;
 }
 
 /// Call flags.
 pub mod call_flags {
-    /// Inside the module-level `if __name__ == "__main__":` block.
+    /// Inside the module-level `if __name__ == "__main__":` block (scope `<module>`; calls in
+    /// defs nested in the block are not flagged).
     pub const MAIN_GUARD: u8 = 1 << 0;
-    /// Inside `if TYPE_CHECKING:`.
+    /// Inside `if TYPE_CHECKING:` (also through enclosing defs).
     pub const TYPE_CHECKING: u8 = 1 << 1;
     /// Inside a lambda (scope is the lambda's enclosing def).
     pub const LAMBDA: u8 = 1 << 2;

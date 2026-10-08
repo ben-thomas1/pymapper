@@ -164,6 +164,49 @@ with x:
     );
 }
 
+#[test]
+fn block_context_is_per_scope_except_type_checking() {
+    let src = "\
+if x:
+    def f():
+        import a
+        if y:
+            import c
+        g()
+if __name__ == '__main__':
+    def main():
+        run()
+    main()
+if TYPE_CHECKING:
+    def h():
+        import b
+";
+    let out = facts(src);
+    let got: Vec<&str> = out.lines().filter(|l| l.starts_with("import") || l.starts_with("call") || l.starts_with("def")).collect();
+    assert_eq!(
+        got,
+        [
+            "def 1:f in=0 L2-6 b10-82 @2:8 () [conditional]",
+            "def 2:main in=0 L8-9 b114-139 @8:8 () [conditional]",
+            "def 3:h in=0 L12-13 b173-198 @12:8 () [type_checking,conditional]",
+            "import 1:f L3:15 import a",
+            "import 1:f L5:19 import c [conditional]",
+            "import 3:h L13:15 import b [type_checking]",
+            "call 1:f L6:8 g()",
+            "call 2:main L9:8 run()",
+            "call 0:<module> L10:4 main() [main_guard]",
+        ]
+    );
+}
+
+#[test]
+fn stray_decorator_does_not_leak_into_the_next_def() {
+    // `@dec` without a def is malformed; whatever the parser reports, `f` gets no decorators.
+    let out = facts("@staticmethod\nx = 1\ndef f(): pass\n");
+    let f = out.lines().find(|l| l.starts_with("def 1:f")).unwrap_or_default();
+    assert!(!f.contains("decs=") && !f.contains("staticmethod"), "{out}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Imports
 // ---------------------------------------------------------------------------------------------
