@@ -152,8 +152,7 @@ impl App {
             window.theme(),
             Some(max_dim as usize),
         );
-        let mut ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
-        ui.map_empty = self.map.scene.bounds == crate::map::scene::WorldRect::EMPTY;
+        let ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
         Ok(WindowState {
             renderer,
             surface,
@@ -223,6 +222,7 @@ impl App {
         let t1 = Instant::now();
 
         let raw = w.egui.take_egui_input(&w.window);
+        w.ui.map_empty = !map.scene.bounds.is_positive();
         let mut full = egui_ctx.run_ui(raw, |ui| panels::show(ui, &mut w.ui));
         w.egui.handle_platform_output(&w.window, full.platform_output);
         let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);

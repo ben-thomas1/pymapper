@@ -308,3 +308,33 @@ fn style_sizes_are_points() {
     assert!(close(px(&p, size, 103, 250), [255, 255, 255]), "{:?}", px(&p, size, 103, 250));
     assert!(close(px(&p, size, 105, 250), rgb(FILL_A)), "{:?}", px(&p, size, 105, 250));
 }
+
+#[test]
+fn glyph_atlas_grows_when_full() {
+    let Some(g) = gpu() else { return };
+    let size = [1600, 600];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    // Many labels over all printable ASCII at a large size (12x DPI: ~130 px glyphs, 4
+    // subpixel bins each) do not fit a 1024^2 atlas.
+    let ascii: Vec<u8> = (33u8..127).cycle().take(400).collect();
+    let mut b = SceneBuilder::new();
+    let style = RectStyle { fill: FILL_A, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 };
+    for r in 0..6u32 {
+        for c in 0..6u32 {
+            let (x, y) = (c as f32 * 800.0, r as f32 * 300.0);
+            let at = ((r * 6 + c) * 7 % 94) as usize;
+            b.add_rect(r * 6 + c, 0, WorldRect::new(x, y, x + 790.0, y + 290.0), style, Some(&ascii[at..at + 12]));
+        }
+    }
+    let mut map = MapState::new(Arc::new(b.build()));
+    for _ in 0..4 {
+        map.camera.center = [2400.0, 900.0];
+        map.camera.zoom = 1.0;
+        render_map(&g, &mut renderer, &texture, &mut map, size, 12.0);
+    }
+    assert!(renderer.canvas().map().atlas_size() > 1024, "{}", renderer.canvas().map().atlas_size());
+    assert!(!map.text.as_ref().unwrap().atlas_full);
+    assert!(map.stats.glyphs > 0);
+}

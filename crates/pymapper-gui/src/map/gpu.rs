@@ -355,10 +355,14 @@ impl MapRenderer {
             return;
         }
         let full = state.text.as_ref().is_some_and(|t| t.atlas_full);
-        if full && self.atlas_size < self.max_atlas {
-            self.atlas_size = (self.atlas_size * 2).min(self.max_atlas);
-            self.atlas = create_atlas(device, self.atlas_size);
-            self.bind_group = create_bind_group(device, &self.layout, &self.uniform, &self.atlas);
+        if full {
+            // Grow if possible; either way start a fresh atlas holding only the glyphs the
+            // current labels use (glyphs of earlier label sets are dropped).
+            if self.atlas_size < self.max_atlas {
+                self.atlas_size = (self.atlas_size * 2).min(self.max_atlas);
+                self.atlas = create_atlas(device, self.atlas_size);
+                self.bind_group = create_bind_group(device, &self.layout, &self.uniform, &self.atlas);
+            }
             if let Some(t) = state.text.as_mut() {
                 t.reset_atlas(self.atlas_size, self.atlas_size);
             }
