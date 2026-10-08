@@ -62,6 +62,7 @@ entered, and symlinks are not followed.
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 | `calls`      | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges`, `resolve.classes`, `resolve.mro`, `resolve.calls` | `resolve`, then `pymapper_core::resolve::resolve_calls` (class table + method index, bases + C3 MROs, then every call row, uncalled decorator and override in parallel per file). Counters `calls`, shares of call rows in per mille (`certain_pm`, `likely_pm`, `possible_pm`, `unresolved_pm`; of which `builtin_pm` = builtins and builtin-type methods, `external_pm` = unloaded code and unloaded bases), `edges`, `override_edges`, `decorator_edges`, `classes`, `incomplete_classes`, `calls_kb` = `ResolvedCalls::heap_bytes`, `resolve_kb`, `index_kb` |
 | `graph`      | `calls` phases, `graph.build`, `graph.scc`, `graph.modules` | `calls`, then `pymapper_core::graph`: `graph.build` = `call_graph` over every node (all edges with a target), `graph.scc` = its `Condensed` (iterative Tarjan + DAG), `graph.modules` = `import_graph` (no flag mask) + `module_call_graph` and both condensations. Counters `graph_nodes`, `graph_edges` (distinct), `sccs`, `cyclic_sccs`, `largest_scc`, `dag_edges`, `modules`, `import_edges`, `import_cycles` and `module_call_cycles` (components with 2+ modules), `module_call_edges`, `callgraph_kb` (call graph + condensation heap), `graph_kb` (all six structures), `calls_kb`, `index_kb` |
+| `reach`      | `calls` phases, `graph.build`, `graph.scc`, `reach.roots`, `reach.forward`, `reach.weights`, `reach.sizes` (+ `reach.exact`) | `graph`'s call graph and condensation, then `pymapper_core::reach`: application-mode roots, BFS from them, index weights, HLL reach sizes per node. `XTASK_REACH_P` sets the precision (default 10), `XTASK_REACH_EXACT=1` adds the exact sizes and their comparison (counters `estimated_sets`, `rmse_ppm`, `worst_ppm`), `XTASK_REACH_REPS=N` reruns the sizes N times (`sizes_best_us`). Counters `roots`, `live`, `defs`, `live_defs`, `max_symbols_reached`, `max_lines_reached`, `dense_sets`, `peak_live_sets`, `peak_dense`, `peak_dense_kb`, `peak_sparse_kb`, `reach_kb` (roots + reached + weights + sizes), `callgraph_kb`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -564,6 +565,63 @@ MB resident):
 
 `chain` is a million-deep DFS (no recursion, 8 bytes per DFS frame). Tarjan runs at 64-280M
 nodes + edges per second; random graphs are the slow case (cache misses on `rindex`).
+
+### Reachability (S3.5)
+
+`reach` target: `graph`'s call graph and condensation, then `pymapper_core::reach`:
+application-mode roots (`reach.roots`), BFS from them (`reach.forward`), index weights
+(`reach.weights`) and HLL reach sizes per node at `p = 10` (`reach.sizes`). 14-core M4 Pro,
+release, warm cache, best of 3 (RSS worst of 3), load average about 7-9 from other worktrees.
+The corpus is one first-party group, so roots are every module scope plus `__main__` modules
+and tests.
+
+| corpus | graph nodes | DAG edges | roots | live (defs) | reach.roots | reach.forward | reach.weights | reach.sizes | dense sets | peak dense / sparse | peak RSS MB (graph / reach) |
+|--------|-------------|-----------|-------|-------------|-------------|---------------|---------------|-------------|------------|---------------------|-----------------------------|
+| stdlib | 25,441      | 29,429    | 1,043 | 5,311 (4,268 of 24,394) | 0.11ms | 0.09ms   | 0.05ms        | 7.6ms       | 734        | 118 KB / 140 KB     | 30.8 / 31.1                 |
+| venv   | 998,345     | 1,261,259 | 167,516 | 274,835 (214,306 of 927,612) | 8.8ms | 3.5ms | 2.1ms       | 249ms       | 134,877    | 3.4 MB / 0.4 MB     | 650.7 / 667.3               |
+
+- **Time**: roots, BFS and weights are O(n) passes (BFS at ~600M nodes + edges/s). The sketch
+  propagation is single-threaded and is the largest reach phase: 249ms on the venv (6% of
+  the pipeline). Most of it is unions of sparse node sets and inserting the line keys of
+  nodes when a sparse set meets a dense one. Tuning on the venv (best of 5, `XTASK_REACH_REPS`):
+  a sparse limit of `2^p / 4` nodes and `4 * 2^p` lines took 233ms, against 265ms at `2^p`
+  lines, 303ms at `2^p / 4` lines and 348ms with no line limit. An earlier version that kept
+  sparse sets as line keys took 528ms.
+- **Memory**: output 8 B per node (`ReachSizes`), weights 4.1 B per node, roots 1 B per node,
+  `Reached` 4.1 B per node: `reach_kb` = 17.2 MB on the venv. Live sets peaked at 15,920
+  (1,478 dense buffers of 2.3 KB, 0.4 MB of sparse sets). Peak RSS grows by 17 MB over
+  `graph`.
+- **Precision** (venv, sizes above `2^p / 4` against `XTASK_REACH_EXACT=1`):
+
+| p  | reach.sizes | RMSE   | worst | sizes compared | peak dense |
+|----|-------------|--------|-------|----------------|------------|
+| 8  | 186ms       | 7.8%   | 37%   | 530,975        | 1.6 MB     |
+| 10 | 262ms       | 2.9%   | 16%   | 374,876        | 3.4 MB     |
+| 12 | 511ms       | 1.0%   | 5.7%  | 286,708        | 6.2 MB     |
+
+  RMSE matches `1.04 / sqrt(2^p)` (6.5% / 3.25% / 1.63%). The worst errors are 5 standard
+  errors: a cluster of callers that share one subset whose estimate is off. A fresh sketch of
+  the worst node's reach set gives the same estimate, so propagation loses nothing.
+- **Exact mode** (`SizeMode::Exact`, gated): 47-55ms on 14 threads and 324ms on one thread for
+  the venv, whose reach sets are small (at most 13,762 symbols). It is quadratic on graphs
+  where many nodes reach a large common part (below).
+
+Synthetic graphs (`cargo bench -p pymapper-core --bench reach -- <shape> [--exact]`, 1M nodes,
+average out-degree 3, every node a symbol with 1-30 lines, BFS from every 100th node; best of
+3, `p = 10`):
+
+| shape  | SCCs    | DAG edges | forward | approx sizes | dense sets | peak dense | exact sizes (14 threads) | RMSE / worst |
+|--------|---------|-----------|---------|--------------|------------|------------|--------------------------|--------------|
+| calls  | 172,243 | 225,242   | 24.2ms  | 61.1ms       | 109,875    | 14 buffers | 2,196ms (36x)            | 2.4% / 3.8%  |
+| random | 114,964 | 140,623   | 31.4ms  | 43.9ms       | 55,754     | 5.6 MB     | 1,382ms (31x)            | 2.7% / 3.8%  |
+| chain  | 1,000,000 | 999,999 | 3.9ms   | 126ms        | 999,744    | 1 buffer   | not run (quadratic); 30k nodes: 196ms (75x) | 2.6% / 9.0% (30k) |
+| blocks | 200,000 | 399,988   | 3.3ms   | 724ms        | 198,803    | 142 MB     | 100k nodes: 3.9ms (0.05x) | 2.2% / 9.4% (100k) |
+
+`blocks` (5-node cycles with random forward edges to any later block) is the adversarial
+case for the sketches: almost every set has a predecessor far ahead in the order, so 62,593
+dense buffers are live at once (peak RSS 243 MB), while its reach sets are small enough
+(at most 11.5k nodes) for the exact mode to be faster. `chain` is the opposite: every set is
+stolen by its only predecessor (one live buffer) but exact search is quadratic.
 
 ### Cache (S2.5)
 
