@@ -92,6 +92,12 @@ pub enum Target {
     /// (sources: up to 32 top-level packages; forbidden: `os`, `sys`, `typing`), checked
     /// directly (phase `layers`) and transitively (phase `layers.transitive`).
     Cycles,
+    /// `calls`, then the rollups (`pymapper_core::rollup`): the base tables (phase
+    /// `rollup.build`), the node aggregates (`rollup.aggregates`) and the edges of every level
+    /// (each depth, then the module level) with one reused scratch (`rollup.levels`; per-level
+    /// edge counts and times are counters). Peak RSS includes the index, the import resolution
+    /// and the resolved calls.
+    Rollup,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -125,6 +131,7 @@ impl Target {
             Target::Calls => "calls",
             Target::Graph => "graph",
             Target::Cycles => "cycles",
+            Target::Rollup => "rollup",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -455,6 +462,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Calls => calls_target(root)?,
         Target::Graph => graph_target(root)?,
         Target::Cycles => cycles_target(root)?,
+        Target::Rollup => rollup_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -829,6 +837,70 @@ fn cycles_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     Ok((stats, counters))
 }
 
+/// `rollup`: [`calls_target`]'s pipeline, then `pymapper_core::rollup` (phases
+/// `rollup.build`: base tables; `rollup.aggregates`: node aggregates; `rollup.levels`: every
+/// depth level from 0, then the module level, with one reused scratch and output buffer, as
+/// the GUI re-queries on zoom). Counters per level: `d{k}_edges` / `d{k}_us` and
+/// `module_edges` / `module_us`.
+fn rollup_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::graph::CallFilter;
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::rollup::{Aggregates, Level, LevelScratch, Rollup, RollupEdge, max_depth};
+    use pymapper_core::roots::Origin;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let r = timing::time("rollup.build", || Rollup::build(&ix, &imp, &calls, CallFilter::default(), 0));
+    let agg = timing::time("rollup.aggregates", || Aggregates::build(&ix));
+    let depth = max_depth(&ix);
+    let mut levels: Vec<Level> = (0..=depth).map(Level::Depth).collect();
+    levels.push(Level::Module);
+    let mut scratch = LevelScratch::default();
+    let mut out = Vec::new();
+    let mut per_level = Vec::with_capacity(levels.len());
+    timing::time("rollup.levels", || {
+        for &level in &levels {
+            let t = Instant::now();
+            r.level_with(&ix, level, &mut scratch, &mut out);
+            per_level.push((level, out.len() as u64, t.elapsed().as_micros() as u64));
+        }
+    });
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let st = r.stats();
+    let roots_loc: u64 = (0..ix.groups().len() as u32).map(|g| u64::from(agg.get(ix.group_node(g)).loc)).sum();
+    let mut counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("total_loc".to_owned(), roots_loc),
+        ("nodes".to_owned(), u64::from(ix.node_count())),
+        ("call_edges".to_owned(), st.call_edges),
+        ("call_pairs".to_owned(), st.call_pairs),
+        ("sites".to_owned(), st.sites),
+        ("multi_sites".to_owned(), st.multi_sites),
+        ("import_edges".to_owned(), st.import_edges),
+        ("levels".to_owned(), levels.len() as u64),
+        ("rollup_kb".to_owned(), r.heap_bytes() as u64 / 1000),
+        ("agg_kb".to_owned(), agg.heap_bytes() as u64 / 1000),
+        ("scratch_kb".to_owned(), scratch.heap_bytes() as u64 / 1000),
+        ("level_max_kb".to_owned(), (out.capacity() * size_of::<RollupEdge>()) as u64 / 1000),
+        ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    for (level, edges, us) in per_level {
+        let name = match level {
+            Level::Depth(k) => format!("d{k}"),
+            Level::Module => "module".to_owned(),
+        };
+        counters.push((format!("{name}_edges"), edges));
+        counters.push((format!("{name}_us"), us));
+    }
+    Ok((stats, counters))
+}
+
 /// Cache directory of the `load-cold` / `load-warm` targets for `root`.
 fn bench_cache_dir(root: &Path) -> std::path::PathBuf {
     let h = pymapper_core::intern::hash_bytes(root.as_os_str().as_encoded_bytes());
@@ -1078,6 +1150,7 @@ mod tests {
             Target::Calls,
             Target::Graph,
             Target::Cycles,
+            Target::Rollup,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -1137,6 +1210,11 @@ mod tests {
                 Target::Cycles => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "cycles", "layers", "layers.transitive",
+                ],
+                Target::Rollup => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "rollup.build",
+                    "rollup.aggregates", "rollup.levels",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
@@ -1226,6 +1304,13 @@ mod tests {
                 assert_eq!(counter("cycles"), counter("cycle_findings"));
                 assert!(counter("largest_cycle") <= counter("modules"));
                 assert!(counter("longest_witness") <= counter("largest_cycle"));
+            } else if target == Target::Rollup {
+                let levels = counter("levels").unwrap();
+                assert!(levels >= 3);
+                assert_eq!(counter("d0_edges"), Some(0), "one distribution");
+                assert!(counter("module_edges").is_some() && counter("module_us").is_some());
+                assert!(counter("call_pairs").unwrap() > 0);
+                assert!(counter("total_loc").unwrap() > rec.files);
             } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
                 assert_eq!(counter("segments"), Some(1));
                 if target == Target::LoadCold {
