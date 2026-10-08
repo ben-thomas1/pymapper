@@ -385,15 +385,26 @@ impl Imports {
             Some(e) if e.base() == kind::IMPORT => return Some(self.bound_by(ix, e.r as usize)),
             _ => {}
         }
+        self.star_global(ix, f, name, &mut Scratch::default())
+    }
+
+    /// `name` through the module-level star imports of file `f` only (scratch reused by the
+    /// caller: no allocation once warm).
+    pub(crate) fn star_global(&self, ix: &Index, f: FileId, name: Sym, sc: &mut Scratch) -> Option<Global> {
         let cx = self.ctx(ix);
-        self.names(&cx).through_stars(f, name).map(|r| self.to_global(r, NONE))
+        self.names(&cx).through_stars(f, name, sc).map(|r| self.to_global(r, NONE))
     }
 
     /// Attribute `name` of module `m`, with `from m import name` semantics (bindings,
     /// re-exports, submodules, star imports).
     pub fn attribute(&self, ix: &Index, m: ModId, name: Sym) -> Option<Global> {
+        self.attribute_with(ix, m, name, &mut Scratch::default())
+    }
+
+    /// [`Imports::attribute`] with a caller scratch.
+    pub(crate) fn attribute_with(&self, ix: &Index, m: ModId, name: Sym, sc: &mut Scratch) -> Option<Global> {
         let cx = self.ctx(ix);
-        self.names(&cx).attribute(m, name).map(|r| self.to_global(r, NONE))
+        self.names(&cx).attribute(m, name, sc).map(|r| self.to_global(r, NONE))
     }
 
     /// What import `row` binds its name to (`import a.b` binds the top-level package `a`).

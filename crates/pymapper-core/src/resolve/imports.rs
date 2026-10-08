@@ -228,9 +228,9 @@ fn dynamic() -> NameRes {
     NameRes { target: NONE, via: NONE, status: ImportStatus::Dynamic as u8, flags: 0 }
 }
 
-/// Per-thread scratch of phase 2.
+/// Per-thread scratch of phase 2 (and of star-import lookups by the call resolver).
 #[derive(Default)]
-pub(super) struct Scratch {
+pub(crate) struct Scratch {
     /// (source module, name) pairs already searched through a star import by the current
     /// lookup. Keyed by name too: a re-export followed inside the lookup searches the same
     /// modules for another name. Bounded by [`MAX_STAR_VISITS`].
@@ -245,9 +245,9 @@ pub(super) struct Names<'a> {
 
 impl Names<'_> {
     /// Looks up `name` as an attribute of module `m` (`from m import name`).
-    pub fn attribute(&self, m: ModId, name: Sym) -> Option<NameRes> {
-        let mut sc = Scratch::default();
-        match self.find(m, name, false, NONE, 0, &mut sc) {
+    pub fn attribute(&self, m: ModId, name: Sym, sc: &mut Scratch) -> Option<NameRes> {
+        sc.visited.clear();
+        match self.find(m, name, false, NONE, 0, sc) {
             Found::Hit(h) => Some(h),
             Found::Miss => None,
             Found::Dynamic => Some(dynamic()),
@@ -255,9 +255,9 @@ impl Names<'_> {
     }
 
     /// Looks up `name` through the star imports of file `f` (its own bindings excluded).
-    pub fn through_stars(&self, f: FileId, name: Sym) -> Option<NameRes> {
-        let mut sc = Scratch::default();
-        match self.stars(&[Some(f), None], name, 0, &mut sc) {
+    pub fn through_stars(&self, f: FileId, name: Sym, sc: &mut Scratch) -> Option<NameRes> {
+        sc.visited.clear();
+        match self.stars(&[Some(f), None], name, 0, sc) {
             Found::Hit(h) => Some(h),
             Found::Miss => None,
             Found::Dynamic => Some(dynamic()),

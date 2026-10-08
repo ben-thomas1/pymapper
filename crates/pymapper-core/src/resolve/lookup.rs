@@ -5,6 +5,9 @@ use super::calls::{Confidence, Names, Reason, Tables};
 use super::classes::{ClassId, Classes, Member, class_flags, mkind};
 use super::modules::ModId;
 use super::namespace::kind as nskind;
+use std::cell::RefCell;
+
+use super::imports::Scratch;
 use super::{Global, Imports};
 use crate::extract::events::AssignKind;
 use crate::extract::facts::{DefKind, ValueKind, assign_kind, binding_flags, decl_kind, import_flags};
@@ -153,6 +156,12 @@ impl R {
         }
         self
     }
+}
+
+thread_local! {
+    /// Visited set of star-import lookups, reused by every lookup of the thread (the lookups
+    /// do not reenter the resolver, so the borrow is never nested).
+    static STARS: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
 /// Deepest chain of hints / aliases / re-exported variables followed.
@@ -306,7 +315,8 @@ impl Cx<'_> {
             _ => {}
         }
         let is_builtin = builtins && self.tables.builtins.contains(name);
-        match self.imp.global(ix, f, name) {
+        let star = if self.imp.ns.has_stars(f) { STARS.with_borrow_mut(|sc| self.imp.star_global(ix, f, name, sc)) } else { None };
+        match star {
             // A star import of unresolved code could bind anything; builtins win.
             Some(Global::Dynamic) if is_builtin => return R::unknown(Reason::Builtin),
             Some(g) => return self.global_val(g),
@@ -442,7 +452,7 @@ impl Cx<'_> {
         {
             return self.global(loc, file, seg, depth + 1, false);
         }
-        match self.imp.attribute(ix, m, seg) {
+        match STARS.with_borrow_mut(|sc| self.imp.attribute_with(ix, m, seg, sc)) {
             Some(g) => self.global_val(g),
             None => R::unknown(Reason::MissingAttr),
         }

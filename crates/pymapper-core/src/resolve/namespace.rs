@@ -136,6 +136,14 @@ impl Namespaces {
         run[i..].iter().filter(|e| e.kind == kind::STAR).map(|e| e.r)
     }
 
+    /// File `f` has module-level star imports.
+    #[inline]
+    pub fn has_stars(&self, f: FileId) -> bool {
+        let run = self.run(f);
+        let i = run.partition_point(|e| e.name != STAR_NAME);
+        run[i..].iter().any(|e| e.kind == kind::STAR)
+    }
+
     /// File `f` may bind names dynamically (`globals()`, `exec()`).
     #[inline]
     pub fn is_dynamic(&self, f: FileId) -> bool {
