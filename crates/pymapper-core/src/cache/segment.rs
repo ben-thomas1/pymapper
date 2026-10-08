@@ -512,9 +512,11 @@ pub(crate) struct Segment {
     r: Reader,
     files: u32,
     strings: u32,
-    /// Path hash -> file. A path whose hash collides with an earlier one is not found (it is
-    /// re-extracted), so lookups compare the bytes.
+    /// Path hash -> first file with that hash; lookups compare the bytes.
     by_path: FxHashMap<u64, u32>,
+    /// Later files whose path hash collides with an earlier one (rare, but real: the Fx hash
+    /// maps `.../im_csch/im_csch_request_builder.py` and `.../im_sech/im_sech_...` alike).
+    collided: Vec<u32>,
     /// Key of the stored fingerprints, if any.
     fp: Option<FingerprintKey>,
 }
@@ -572,7 +574,7 @@ impl Segment {
     pub fn from_reader(r: Reader) -> Result<Segment, CacheError> {
         let strings = offsets(r.get::<u32>(STR_OFFS)?, r.bytes(STR_BYTES).len())?;
         let files = offsets(r.get::<u32>(PATH_OFFS)?, r.bytes(PATH_BYTES).len())?;
-        let mut seg = Segment { r, files, strings, by_path: FxHashMap::default(), fp: None };
+        let mut seg = Segment { r, files, strings, by_path: FxHashMap::default(), collided: Vec::new(), fp: None };
         if seg.r.get::<u32>(FILE_HDR)?.len() != files as usize * HDR
             || seg.r.get::<u64>(FILE_STAMP)?.len() != files as usize * 3
         {
@@ -582,7 +584,13 @@ impl Segment {
         seg.fp = seg.validate_fingerprints()?;
         seg.by_path.reserve(files as usize);
         for i in 0..files {
-            seg.by_path.entry(hash_bytes(seg.path(i))).or_insert(i);
+            let h = hash_bytes(seg.path(i));
+            match seg.by_path.entry(h) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(i);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => seg.collided.push(i),
+            }
         }
         Ok(seg)
     }
@@ -627,7 +635,10 @@ impl Segment {
     #[inline]
     pub fn find(&self, path: &[u8]) -> Option<u32> {
         let i = *self.by_path.get(&hash_bytes(path))?;
-        (self.path(i) == path).then_some(i)
+        if self.path(i) == path {
+            return Some(i);
+        }
+        self.collided.iter().copied().find(|&j| self.path(j) == path)
     }
 
     /// String `i` of the local table.

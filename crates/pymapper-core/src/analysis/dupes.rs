@@ -33,6 +33,10 @@
 //!   hashes (reused across files), and 12 bytes per fingerprint retained. The density of
 //!   winnowing is `2 / (w + 1)`: with the defaults (`k = 20`, `w = 31`) about one fingerprint
 //!   per 16 tokens, i.e. under 1 byte per token retained.
+//! - Cache: with `cache::load_with`, first-party segments store each file's fingerprints (8
+//!   bytes per fingerprint, keyed by [`DupesParams::fingerprint_key`]); cached files get them
+//!   without a read or parse. A segment without fingerprints of the key is extracted again
+//!   once and rewritten.
 //! - Matching: O(n log n) in fingerprints for the sorts (20 bytes per fingerprint while
 //!   seeding), linear seeds (at most `(ALL_PAIRS_MAX - 1) / 2` per fingerprint in small
 //!   buckets, two in large ones), 2 bytes per token of the files with seeds while extending,

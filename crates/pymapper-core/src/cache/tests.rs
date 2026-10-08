@@ -334,6 +334,38 @@ fn segment_fingerprints_roundtrip_and_are_validated() {
 }
 
 #[test]
+fn colliding_path_hashes_are_both_found() {
+    // Two real paths (of the msgraph SDK) with the same `hash_bytes`.
+    let dir = "/Users/bt386671/Code/gsk/aiml-lectio/.venv/lib/python3.12/site-packages/msgraph/generated/drives/item/items/item/workbook/functions";
+    let p1 = format!("{dir}/im_csch/im_csch_request_builder.py");
+    let p2 = format!("{dir}/im_sech/im_sech_request_builder.py");
+    assert_eq!(crate::intern::hash_bytes(p1.as_bytes()), crate::intern::hash_bytes(p2.as_bytes()));
+    let t = sample_project("collide");
+    let ix = plain_load(inputs(t.path()));
+    let files: Vec<segment::EncFile<'_>> = (0..ix.file_count())
+        .map(|f| {
+            let ff = *ix.file_facts(f);
+            let path = match f {
+                0 => p1.as_bytes(),
+                1 => p2.as_bytes(),
+                _ => ix.file_path(f).as_os_str().as_bytes(),
+            };
+            segment::EncFile { path, ff, metrics: ff.defs.start - f, stamp: Stamp::default(), fps: &[] }
+        })
+        .collect();
+    let mut map = segment::SymMap::default();
+    let (out, _) = segment::encode(ix.strings(), ix.facts(), ix.metrics(), &files, None, &mut map, KIND_FACTS, 1, 2, Cursor::new(Vec::new()))
+        .expect("encode");
+    let seg = open_bytes(&out.into_inner()).expect("segment");
+    assert_eq!(seg.find(p1.as_bytes()), Some(0));
+    assert_eq!(seg.find(p2.as_bytes()), Some(1));
+    assert_eq!(seg.find(format!("{dir}/im_sech/other.py").as_bytes()), None);
+    for f in 2..ix.file_count() {
+        assert_eq!(seg.find(ix.file_path(f).as_os_str().as_bytes()), Some(f));
+    }
+}
+
+#[test]
 fn segment_roundtrip_through_the_loader() {
     let t = sample_project("seg");
     let ix = plain_load(inputs(t.path()));

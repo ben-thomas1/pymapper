@@ -56,7 +56,9 @@ entered, and symlinks are not followed.
 | `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
-| `dupes`      | `walk`, `load.*`, `dupes.seeds`, `dupes.relex`, `dupes.extend`, `dupes.locate`, `dupes.group` | `load` with duplication fingerprints taken in the extraction pass (`index::load_with`, every file first-party), then `analysis::dupes::analyse` with the default thresholds. Counters: `load_peak_rss_mb` (peak RSS before matching: matching's own cost is the run's peak minus this), `fingerprints`, `fingerprints_kb`, `seeds`, `extended`, `files_reread`, `bytes_reread_kb`, `pairs`, `copies`, `groups`, `duplicated_lines`, `findings` |
+| `dupes`      | `walk`, `load.*`, `dupes.seeds`, `dupes.relex`, `dupes.extend`, `dupes.locate`, `dupes.group` | `load` with duplication fingerprints taken in the extraction pass (`index::load_with`, every file first-party), then `analysis::dupes::analyse` with the default thresholds. Counters: `load_peak_rss_mb` (peak RSS before matching: matching's own cost is the run's peak minus this), `fingerprints`, `fingerprints_kb`, `seeds` (= `extended` + `covered` + `unverified`: seeds that failed verification, e.g. after a parse error shifted the token stream), `tokens_cached` (tokens held while extending, 2 B each), `files_reread`, `bytes_reread_kb`, `pairs`, `copies`, `groups`, `duplicated_lines`, `findings` |
+| `dupes-cold` | `walk`, `load.*`, `cache.write`, `dupes.*` | `dupes` through `cache::load_with` after clearing the cache (in `$TMPDIR/pymapper-bench-cache/<corpus hash>/dupes`): fingerprints are stored with the facts of the one first-party segment. Extra counters `hits`, `misses`, `written_kb` |
+| `dupes-warm` | same as `dupes-cold`   | like `dupes-cold` but keeps the cache: after the warm-up run every file is a hit and gets its stored fingerprints; finds the same clones as `dupes` |
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
@@ -536,39 +538,72 @@ table and paths).
   changed but whose size did not is read and hashed, and is reused if the content is the same
   (counter `verified`). A file written within 2s of caching is stored with an unknown mtime,
   so the next load checks its content.
+- **Path lookup**: a segment's path index is keyed by `hash_bytes`, which does collide on real
+  paths (`msgraph/.../im_csch/im_csch_request_builder.py` and `.../im_sech/...`). Colliding
+  paths are kept in a side list and compared by bytes; before S4.3d they were not found, so
+  those files were extracted again and their (first-party) segment rewritten on every load.
 
 ### Duplication (S4.3d)
 
 `dupes` target vs `load` (same session): fingerprints are taken in the loader's extraction
 pass, then `analysis::dupes` matches them with the default thresholds (`dupes-min-tokens = 50`,
-`dupes-min-lines = 6`). Every corpus file counts as first-party, so the venv row is a stress
-test (17M LOC, 7.3M of them in reported copies: vendored packages). 14-core M4 Pro, release,
-warm cache, best of 3 (RSS worst of 3); load average about 3-5 from other worktrees.
+`dupes-min-lines = 6`). `dupes-cold` / `dupes-warm` go through the facts cache, which stores the
+fingerprints with the facts. Every corpus file counts as first-party (one group, one cache
+segment), so the venv row is a stress test (17M LOC, much of it vendored or generated
+code). 14-core M4 Pro, release, warm OS file cache, best of 3 (RSS worst of 3);
+load average about 7-8 from other worktrees, so times are upper bounds. Measured after
+merging S2.5 (cache).
 
-| corpus | target  | threads | load.extract | seeds  | relex  | extend | locate | group  | total   | peak RSS MB |
-|--------|---------|---------|--------------|--------|--------|--------|--------|--------|---------|-------------|
-| stdlib | `load`  | 14      | 33.5ms       | -      | -      | -      | -      | -      | 41.1ms  | 28.3        |
-| stdlib | `dupes` | 14      | 35.1ms       | 2.26ms | 20.8ms | 0.66ms | 12.2ms | 0.16ms | 79.1ms  | 40.6        |
-| stdlib | `load`  | 1       | 158.8ms      | -      | -      | -      | -      | -      | 175.8ms | 19.6        |
-| stdlib | `dupes` | 1       | 172.9ms      | 7.10ms | 92.3ms | 1.70ms | 60.8ms | 0.15ms | 352.8ms | 30.3        |
-| venv   | `load`  | 14      | 2.10s        | -      | -      | -      | -      | -      | 3.08s   | 492.5       |
-| venv   | `dupes` | 14      | 2.11s        | 95.5ms | 1.59s  | 51.6ms | 1.22s  | 42.5ms | 6.19s   | 870.3       |
+| corpus | target       | threads | load.extract | cache.write | seeds  | relex  | extend | locate | group  | total   | peak RSS MB |
+|--------|--------------|---------|--------------|-------------|--------|--------|--------|--------|--------|---------|-------------|
+| stdlib | `load`       | 14      | 32.2ms       | -           | -      | -      | -      | -      | -      | 38.8ms  | 26.5        |
+| stdlib | `dupes`      | 14      | 35.1ms       | -           | 2.23ms | 20.4ms | 0.55ms | 10.2ms | 0.17ms | 78.3ms  | 40.1        |
+| stdlib | `dupes-cold` | 14      | 35.7ms       | 4.29ms      | 2.26ms | 20.5ms | 0.51ms | 12.2ms | 0.18ms | 83.7ms  | 41.6        |
+| stdlib | `dupes-warm` | 14      | 3.69ms       | -           | 2.29ms | 23.0ms | 0.49ms | 11.1ms | 0.18ms | 47.8ms  | 41.4        |
+| stdlib | `load`       | 1       | 245.3ms      | -           | -      | -      | -      | -      | -      | 298.1ms | 19.7        |
+| stdlib | `dupes`      | 1       | 291.7ms      | -           | 7.53ms | 143ms  | 2.18ms | 135ms  | 0.19ms | 604.7ms | 29.5        |
+| venv   | `load`       | 14      | 2.07s        | -           | -      | -      | -      | -      | -      | 3.05s   | 493.8       |
+| venv   | `dupes`      | 14      | 2.15s        | -           | 95.5ms | 1.60s  | 46.7ms | 1.26s  | 48.3ms | 6.25s   | 870.0       |
+| venv   | `dupes-cold` | 14      | 2.15s        | 164ms       | 96.9ms | 1.58s  | 46.3ms | 1.25s  | 48.2ms | 6.37s   | 929.9       |
+| venv   | `dupes-warm` | 14      | 126ms        | -           | 94.3ms | 1.55s  | 48.8ms | 1.30s  | 47.9ms | 4.12s   | 879.6       |
 
-Counters: stdlib 137,776 fingerprints (1.65 MB), 19,570 seeds, 1,290 file re-reads (26.5 MB),
-1,649 pairs, 1,945 copies in 761 groups (51k lines). Venv 4.71M fingerprints (56.5 MB), 2.52M
-seeds, 85,769 re-reads (1.22 GB), 373k pairs, 158k copies in 41k groups.
+Counters: stdlib 137,776 fingerprints (1.65 MB), 19,570 seeds (12,359 extended, 7,210
+covered, 1 unverified), 1.63M tokens cached while extending, 1,290 file re-reads (26.5 MB),
+1,649 pairs, 2,056 copies in 777 groups. Venv 4.71M fingerprints (56.5 MB), 2.52M seeds (792
+unverified), 68.3M tokens cached, 85,769 re-reads (1.22 GB), 373k pairs, 228k copies in 43.5k
+groups. `findings` = `copies` on every corpus: members without a partner outside themselves
+are dropped. Members are bounded by their anchor copy (see `cluster`), so copies of one file
+may overlap and `duplicated_lines` (54,410 on stdlib, 10.7M on the venv) counts such lines
+more than once. Warm and cold find exactly what the uncached load finds (same counters).
 
 - **Off**: zero cost (the loader's extraction loop is monomorphised without the visitor).
-- **Extraction** (on): +1.6 ms on stdlib with 14 threads (+5%), +14 ms on one thread (+9%),
-  within noise on the venv. 12 B per fingerprint retained, about one fingerprint per 16
-  normalised tokens (3.2 LOC on stdlib): 3.8 B/LOC, 3.3 B/LOC on the venv.
+- **Extraction** (on): +2.9 ms on stdlib with 14 threads, within noise on the venv. 12 B per
+  fingerprint retained, about one fingerprint per 16 normalised tokens (3.2 LOC on stdlib):
+  3.8 B/LOC, 3.3 B/LOC on the venv.
+- **Cache**: fingerprints add 8 B each to the first-party segment (stdlib 1.1 MB of 8.0 MB,
+  venv 37.7 MB of 320 MB). A warm load copies them with the facts: the load part of `dupes`
+  drops from 35 ms to 3.7 ms on stdlib and from 2.15 s to 126 ms on the venv (total 6.25 s to
+  4.12 s). Writing the segment costs 4.3 ms / 164 ms on a cold run. A first-party segment
+  without fingerprints of the requested key (written by a run with `analysis.dupes` off, or
+  other thresholds) is extracted and rewritten once, i.e. costs one cold load. Peak RSS of a
+  warm run includes the mapped segment of the group being copied (`load_peak_rss_mb` 836 vs
+  551 MB uncached on the venv, whose single group maps all 320 MB at once); the run's peak is
+  in matching either way.
 - **Matching time** is dominated by the two re-reads (`relex`, `locate`), which are I/O-bound
   like `read`; seeding, extension and grouping together are 7 us/kLOC (stdlib) to 11 us/kLOC
-  (venv). stdlib: +38 ms (+92% over `load`); venv: +3.1 s (+101%).
-- **Matching memory**: the peak is in extension, `load_peak_rss_mb` + 2 B per token of the
-  files with seeds (normalised code + exact hash) + 16 B per seed. Seeding transiently holds
-  12 + 20 B per fingerprint. Venv: load peak 555 MB, 704 MB after seeding, 829 MB after
-  re-lexing, 870 MB at the end (+315 MB). stdlib: 32 -> 41 MB.
+  (venv). stdlib: +40 ms over `load`; venv: +3.2 s. Recording line numbers while re-lexing
+  would skip `locate` (1.3 s on the venv) but needs about 4 more bytes per cached token (start
+  line delta, lines spanned, start column) for every seeded file: +270 MB on the venv's 68M
+  cached tokens, on top of the 870 MB peak, to save a re-read of the 30-50% of files that hold
+  candidates. Not done: the re-read is cheap with a warm OS cache and memory is the scarcer
+  resource at this size.
+- **Matching memory**: the peak is in extension, `load_peak_rss_mb` + 2 B per cached token
+  (normalised code + exact hash) + 16 B per seed. Seeding transiently holds 12 + 20 B per
+  fingerprint. Venv: load peak 551 MB, 870 MB at the end (+319 MB). stdlib: 31 -> 40 MB.
+- **Seeds that fail verification** (`unverified`) are hash collisions, files changed since
+  extraction, or files where the parser's token stream diverges from the lexer's after a
+  syntax error (every later position shifts, so their clones are missed): 1 on stdlib, 792 on
+  the venv.
 
 Design choices measured on stdlib (counters `copies`, `duplicated_lines`, `seeds`):
 
@@ -579,10 +614,11 @@ Design choices measured on stdlib (counters `copies`, `duplicated_lines`, `seeds
 | ... plus runs of close hits in one file seed once                 | 1829   | 53,200 | 17,842      |
 | paths by next-fingerprint context                                  | 1851   | 53,574 | 17,670      |
 | paths by next and previous context                                 | 1857   | 53,765 | 19,570      |
-| ... plus splitting differing data out of matches (shipped)         | 1945   | 51,165 | 19,570      |
+| ... plus splitting differing data out of matches                   | 1945   | 51,165 | 19,570      |
+| ... plus members bounded by their anchor copy (shipped)            | 2056   | 54,410 | 19,570      |
 
-Every-pair seeding takes 3.1 s and 3.3 GB on stdlib. With splitting on in both, it finds 2022
-copies to our 1945; the lines only it covers are almost all data tables (`encodings/*`,
+Every-pair seeding takes 3.1 s and 3.3 GB on stdlib. With splitting on in both (and the earlier
+clustering), it finds 2022 copies to our 1945; the lines only it covers are almost all data tables (`encodings/*`,
 `idna/uts46data.py`) and runs of like entries shorter than `min_tokens` (`pickletools` opcode
 table, `Decimal` context methods). Without the run compression, a
 synthetic pair of 30k-token periodic tables took 1.5 s (quadratic: one diagonal per hit);
