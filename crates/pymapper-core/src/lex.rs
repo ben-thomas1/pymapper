@@ -239,18 +239,25 @@ impl<'src> Lexer<'src> {
 
     /// Parser error recovery for an unclosed bracket: forgets all open brackets
     /// and resumes scanning at `pos`, which must be the start of a token already
-    /// returned on the current logical line. Indentation of the line containing
-    /// `pos` is not reprocessed. Returns false (and changes nothing) inside an
-    /// f/t-string or when `pos` is past the current position.
+    /// returned on the current logical line. When `pos` is the first token of
+    /// its physical line, scanning resumes at the start of that line so its
+    /// indentation is processed (INDENT/DEDENT, no NEWLINE before them);
+    /// otherwise indentation is not reprocessed. Returns false (and changes
+    /// nothing) inside an f/t-string or when `pos` is past the current position.
     pub fn recover_at(&mut self, pos: u32) -> bool {
         if self.st.modes_len != 0 || pos > self.st.pos {
             return false;
         }
-        self.st.pos = pos;
+        let mut bol = pos as usize;
+        while bol > 0 && matches!(self.src[bol - 1], b' ' | b'\t' | b'\x0c') {
+            bol -= 1;
+        }
+        let first = bol == 0 || matches!(self.src[bol - 1], b'\n' | b'\r');
+        self.st.pos = if first { bol as u32 } else { pos };
         self.st.depth = 0;
         self.st.kinds = 0;
         self.st.pending_error = None;
-        self.st.at_bol = false;
+        self.st.at_bol = first;
         self.st.blank = false;
         // Comments after `pos` are lexed (and their suppressions recorded) again.
         let keep = self.suppressions.partition_point(|s| s.start < pos);

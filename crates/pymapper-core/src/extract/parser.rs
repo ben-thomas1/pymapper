@@ -11,11 +11,21 @@ use crate::lex::{Lexer, Suppression, Token, TokenKind};
 const RING: usize = 4;
 const RING_MASK: usize = RING - 1;
 
-/// Parses `src` and drives `visitor`; returns the visitor.
+/// Parses `src` and drives `visitor`; returns the visitor. Suppressions are
+/// dropped: see [`parse_with_suppressions`].
 pub fn parse<V: Visitor>(src: &[u8], visitor: V) -> V {
     let mut p = Parser::new(src, visitor);
     p.parse_file();
     p.v
+}
+
+/// Like [`parse`], but also returns the `# pymapper: ignore[...]`
+/// suppressions the lexer recorded (in source order). Use this for facts
+/// extraction; [`parse`] drops them.
+pub fn parse_with_suppressions<V: Visitor>(src: &[u8], visitor: V) -> (V, Vec<Suppression>) {
+    let mut p = Parser::new(src, visitor);
+    p.parse_file();
+    p.finish()
 }
 
 /// Forward line counter. Offsets are usually queried in increasing order, so
@@ -81,16 +91,23 @@ impl LineCursor {
         } else {
             // Walk back (queries go backwards only a little: decorator starts,
             // block ends after lookahead).
+            let mut crossed = false;
             for i in (end..cur).rev() {
                 if is_line_end(src, i) {
                     self.line -= 1;
+                    crossed = true;
                 }
             }
-            let mut j = end;
-            while j > 0 && !is_line_end(src, j - 1) {
-                j -= 1;
+            // No line end in `[end, cur)`: `end` is on the same line and the
+            // cached `line_start` (<= end) is still right. Rescanning it here
+            // would cost O(line length) per query on long one-line inputs.
+            if crossed {
+                let mut j = end;
+                while j > 0 && !is_line_end(src, j - 1) {
+                    j -= 1;
+                }
+                self.line_start = j as u32;
             }
-            self.line_start = j as u32;
         }
         self.off = end as u32;
         Pos { line: self.line, col: off - self.line_start.min(off) }
@@ -202,8 +219,15 @@ impl<'src, V: Visitor> Parser<'src, V> {
     #[inline]
     fn lex(&mut self) -> Token {
         loop {
+            let open = self.lx.bracket_depth();
             let t = self.lx.next_token();
             if !t.kind.is_error() {
+                // Inside brackets the lexer joins lines, so a NEWLINE with a
+                // bracket open means the input ended first (the lexer closes
+                // them all there). Reported once, at end of input.
+                if open > 0 && t.kind == TokenKind::Newline {
+                    self.diag_at(DiagKind::UnclosedBracket, t);
+                }
                 return t;
             }
             self.diag_at(DiagKind::Lex, t);

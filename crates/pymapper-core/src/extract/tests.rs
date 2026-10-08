@@ -379,6 +379,12 @@ fn assignments() {
          assign Plain __all__ = strs ['a',\"b\"] L10\nassign Augmented __all__ += strs ['c'] L11\n\
          assign Plain t = strs ['a','b'] L12\nassign Plain s = other L13"
     );
+    let src = "__all__ = ('a')\n__all__ = ('a',)\n__all__ = ()\n__all__ = {'a'}\n";
+    assert_eq!(
+        only(src, &["assign"]),
+        "assign Plain __all__ = other L1\nassign Plain __all__ = strs ['a'] L2\n\
+         assign Plain __all__ = strs [] L3\nassign Plain __all__ = strs ['a'] L4"
+    );
 }
 
 #[test]
@@ -827,6 +833,7 @@ fn exclamation_outside_fstring_and_suppressions() {
     p.parse_file();
     let (_, sup) = p.finish();
     assert_eq!(sup.len(), 2);
+    assert_eq!(super::parse_with_suppressions(src, NoopVisitor).1, sup);
 }
 
 #[test]
@@ -837,4 +844,90 @@ fn recovery_does_not_duplicate_suppressions() {
     assert_eq!(p.diagnostics(), 1);
     let (_, sup) = p.finish();
     assert_eq!(sup.len(), 1);
+}
+
+#[test]
+fn long_single_line_scales_linearly() {
+    // Call positions move the line cursor past assign targets (`a=f()`), so
+    // queries go backwards on the same line; that must not rescan the line.
+    let n = 100_000;
+    let one = "a=f();".repeat(n) + "\n";
+    let many = "a=f()\n".repeat(n);
+    let time = |s: &str| {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut p = super::Parser::new(s.as_bytes(), NoopVisitor);
+            p.parse_file();
+            assert_eq!(p.diagnostics(), 0);
+            best = best.min(t.elapsed());
+        }
+        best
+    };
+    let (t1, tn) = (time(&one), time(&many));
+    // Quadratic behaviour is ~1000x slower at this size; allow generous noise.
+    assert!(t1 < tn * 5 + std::time::Duration::from_millis(50), "one line {t1:?} vs separate lines {tn:?}");
+}
+
+#[test]
+fn more_than_u16_nested_lambdas_balance() {
+    struct Count(u32, u32);
+    impl Visitor for Count {
+        fn lambda_enter(&mut self, _: Token) {
+            self.0 += 1;
+        }
+        fn lambda_exit(&mut self, _: u32) {
+            self.1 += 1;
+        }
+    }
+    let n = 70_000;
+    let src = "x = ".to_string() + &"lambda: ".repeat(n) + "1\n";
+    let c = parse(src.as_bytes(), Count(0, 0));
+    assert_eq!((c.0, c.1), (n as u32, n as u32));
+    // Without the `:` (pending lambdas) as well.
+    let src = "x = ".to_string() + &"lambda ".repeat(n) + "\n";
+    let c = parse(src.as_bytes(), Count(0, 0));
+    assert_eq!(c.0, c.1);
+    check(src.as_bytes());
+}
+
+#[test]
+fn recovery_unclosed_bracket_at_eof() {
+    let e = only("x = 1\nfoo(a,\n  b\n", &["diag"]);
+    assert_eq!(e.lines().count(), 1, "{e}");
+    assert!(e.starts_with("diag UnclosedBracket"), "{e}");
+    let e = only("x = f(\nif a:\n    b = g()", &["diag"]);
+    assert_eq!(e.lines().count(), 1, "{e}");
+    assert!(e.starts_with("diag UnclosedBracket"), "{e}");
+    let e = only("for x in [1,\n  2:\n    pass\n", &["diag"]);
+    assert!(e.starts_with("diag UnclosedBracket"), "{e}");
+    // Inside a def header.
+    let e = only("def f(a, b=(1,\n", &["diag"]);
+    assert_eq!(e.lines().filter(|l| l.starts_with("diag UnclosedBracket")).count(), 1, "{e}");
+    // Recovered at a statement keyword: reported once, not again at EOF.
+    let mut p = super::Parser::new(b"x = f(a,\ndef g(): pass\n", NoopVisitor);
+    p.parse_file();
+    assert_eq!(p.diagnostics(), 1);
+    // Closed brackets report nothing.
+    assert_eq!(only("x = (1,\n 2)\n", &["diag"]), "");
+}
+
+#[test]
+fn recovery_reprocesses_indentation_of_keyword_line() {
+    // `def g` at column 0 closes `f` (DEDENT) instead of nesting into it.
+    let src = "def f():\n    x = foo(\ndef g():\n    pass\n";
+    let e = events(src);
+    assert!(e.contains(&"def g @3:4 L3 d0".to_string()), "{e:?}");
+    assert_eq!(e.iter().filter(|l| l.starts_with("diag")).count(), 1, "{e:?}");
+    // Deeper keyword line: an unexpected indent, then the statement.
+    let e = events("x = foo(\n    return 1\ny = 2\n");
+    assert!(e.iter().any(|l| l.starts_with("diag UnclosedBracket 2:4")), "{e:?}");
+    assert!(e.contains(&"assign Plain y = other L3".to_string()), "{e:?}");
+    // Keyword mid-line: indentation is not reprocessed.
+    let e = events("def f():\n    x = foo(a, b); return 1\n    y = 2\n");
+    assert!(e.contains(&"assign Plain y = other L3".to_string()), "{e:?}");
+    let e = events("def f():\n    x = foo(\ny = 1\ndef g():\n    pass");
+    assert!(e.contains(&"def g @4:4 L4 d0".to_string()), "{e:?}");
+    check(b"def f():\n    if a:\n        x = foo(\ndef g():\n    pass\n");
+    check(b"class C:\n    x = [\n        def m(self): pass\n  return\n");
 }

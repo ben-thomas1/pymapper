@@ -16,7 +16,14 @@
 //!   names, ...) and the [`Visitor::decorator`] / [`Visitor::base`] events are
 //!   emitted before [`Visitor::def_enter`].
 //! - Assignment targets are reported by [`Visitor::assign`] *after* the value's
-//!   expression events, so the value shape is known.
+//!   expression events, so the value shape is known. Exception: walrus targets
+//!   (`(x := v)`) are reported at the `:=`, before the events of `v`, with
+//!   [`Value::Other`].
+//! - Imports inside a `try` block are reported before the following `except`
+//!   handlers are seen. To flag try/`ImportError` imports, a consumer records
+//!   the indices of imports emitted inside a `Try` block and patches them when
+//!   a following `Except` [`Visitor::block_enter`] names `ImportError` /
+//!   `ModuleNotFoundError`.
 //! - `def_enter`/`def_exit`, `block_enter`/`block_exit` and
 //!   `lambda_enter`/`lambda_exit` are always balanced, even on malformed input.
 
@@ -247,7 +254,8 @@ pub enum AssignKind {
     Annotated,
     /// `(x := v)`.
     Walrus,
-    /// `for x in ...` loop / comprehension target.
+    /// `for x in ...` loop target (statement `for` only; comprehension
+    /// targets produce no `assign`, only `BranchKind::CompFor`).
     ForTarget,
     /// `with ... as x` / `except ... as x`.
     AsTarget,
@@ -303,7 +311,11 @@ pub enum DiagKind {
     ExpectedIndent,
     /// Indentation where none is allowed.
     UnexpectedIndent,
-    /// Bracket left open when a statement keyword appeared.
+    /// Bracket left open when a statement keyword appeared, or at end of
+    /// input. Recovery only happens at hard statement keywords (`def`, `class`,
+    /// `return`, `import`, ...): lines in between, including `if`/`for` headers
+    /// whose keywords are also expression keywords, are folded into the open
+    /// expression. At end of input the diagnostic sits at the final NEWLINE.
     UnclosedBracket,
     /// Closing bracket without an opener.
     UnmatchedBracket,

@@ -93,10 +93,11 @@ pub(super) struct Level {
     impure: bool,
     /// A comprehension `for` was seen at this level (a later `if` is a filter).
     comp: bool,
-    /// Lambdas whose `:` has not been seen yet.
-    lambdas: u16,
+    /// Lambdas whose `:` has not been seen yet. u32 cannot overflow: each
+    /// lambda takes at least 7 source bytes and sources are below 4 GiB.
+    lambdas: u32,
     /// Lambda bodies open at this level.
-    active: u16,
+    active: u32,
     /// Operator of the current boolean run (0 none, 1 and, 2 or).
     bool_last: u8,
 }
@@ -134,8 +135,9 @@ enum Sh {
     Call,
     SubOpen,
     Subscript,
-    /// Inside a top-level display; `expect` = next must be a string (else a comma).
-    StrOpen { expect: bool },
+    /// Inside a top-level display; `expect` = next must be a string (else a
+    /// comma); `paren` = opened by `(` with no comma yet (`("a")` is a str).
+    StrOpen { expect: bool, paren: bool },
     StrDone,
     /// Bare top-level tuple of strings.
     StrBare { expect: bool },
@@ -266,7 +268,7 @@ impl<V: Visitor> Parser<'_, V> {
     }
 
     #[inline]
-    fn exit_lambdas(&mut self, n: u16) {
+    fn exit_lambdas(&mut self, n: u32) {
         for _ in 0..n {
             self.v.lambda_exit(self.last_end);
         }
@@ -480,7 +482,7 @@ impl<V: Visitor> Parser<'_, V> {
                     self.strings.push(t);
                     Sh::StrBare { expect: false }
                 }
-                K::LPar | K::LSqb | K::LBrace => Sh::StrOpen { expect: true },
+                K::LPar | K::LSqb | K::LBrace => Sh::StrOpen { expect: true, paren: k == K::LPar },
                 _ => Sh::Other,
             },
             Sh::Name => match k {
@@ -496,12 +498,14 @@ impl<V: Visitor> Parser<'_, V> {
             Sh::CallOpen if depth == 1 && is_close(k) => Sh::Call,
             Sh::SubOpen if depth == 1 && is_close(k) => Sh::Subscript,
             st @ (Sh::CallOpen | Sh::SubOpen) => st,
-            Sh::StrOpen { expect } => match k {
+            Sh::StrOpen { expect, paren } => match k {
                 K::String if expect => {
                     self.strings.push(t);
-                    Sh::StrOpen { expect: false }
+                    Sh::StrOpen { expect: false, paren }
                 }
-                K::Comma if !expect => Sh::StrOpen { expect: true },
+                K::Comma if !expect => Sh::StrOpen { expect: true, paren: false },
+                // A parenthesised single string is not a tuple; `()` is.
+                _ if is_close(k) && paren && !self.strings.is_empty() => Sh::Other,
                 _ if is_close(k) => Sh::StrDone,
                 _ => Sh::Other,
             },

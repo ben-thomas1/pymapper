@@ -16,4 +16,4 @@ mod stmt;
 mod tests;
 
 pub use events::{NoopVisitor, Visitor};
-pub use parser::{Parser, parse};
+pub use parser::{Parser, parse, parse_with_suppressions};
