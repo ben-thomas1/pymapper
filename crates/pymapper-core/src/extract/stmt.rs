@@ -1,7 +1,6 @@
 //! Statements, blocks and definitions.
 
 use super::events::{DeclKind, DiagKind, Import, Visitor};
-use super::expr::{S_ASSIGN, S_COLON};
 use super::parser::Parser;
 use crate::lex::{Token, TokenKind as K};
 
@@ -149,31 +148,8 @@ impl<V: Visitor> Parser<'_, V> {
             }
             K::Global | K::Nonlocal => self.decl_stmt(),
             K::Import => self.import_stmt(),
-            K::From => self.from_import_stmt(),
+            K::From => self.import_from_stmt(),
             _ => self.expr_stmt(),
-        }
-    }
-
-    /// Expression statement or assignment.
-    pub(super) fn expr_stmt(&mut self) {
-        let start = self.peek(0);
-        self.expr(S_ASSIGN | S_COLON);
-        loop {
-            let k = self.kind(0);
-            if k == K::Equal || k == K::Colon || super::expr::is_augassign(k) {
-                self.bump();
-                self.expr(S_ASSIGN);
-            } else {
-                break;
-            }
-        }
-        if self.last_end <= start.start && !matches!(self.kind(0), K::Newline | K::EndOfFile | K::Semi) {
-            // Nothing consumed: a token that cannot start a statement here.
-            let t = self.peek(0);
-            if !matches!(t.kind, K::Indent | K::Dedent) {
-                self.diag_at(DiagKind::UnexpectedToken, t);
-                self.bump();
-            }
         }
     }
 
@@ -245,7 +221,7 @@ impl<V: Visitor> Parser<'_, V> {
         }
     }
 
-    fn from_import_stmt(&mut self) {
+    fn import_from_stmt(&mut self) {
         let keyword = self.bump();
         let mut level = 0u32;
         loop {

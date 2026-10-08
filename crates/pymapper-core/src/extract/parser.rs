@@ -4,6 +4,7 @@
 //! `expr.rs` (expression token scanner); both extend [`Parser`].
 
 use super::events::{DiagKind, Diagnostic, End, Param, Pos, Visitor};
+use super::expr::{Level, TargetRec};
 use crate::lex::{Lexer, Token, TokenKind};
 
 /// Ring buffer slots (power of two). `peek(k)` supports `k < RING`.
@@ -19,7 +20,7 @@ pub fn parse<V: Visitor>(src: &[u8], visitor: V) -> V {
 
 /// Forward line counter. Offsets are usually queried in increasing order, so
 /// each byte is scanned about once; backwards queries rescan from the start.
-struct LineCursor {
+pub(super) struct LineCursor {
     off: u32,
     line: u32,
     line_start: u32,
@@ -27,7 +28,7 @@ struct LineCursor {
 
 impl LineCursor {
     #[inline]
-    fn pos(&mut self, src: &[u8], off: u32) -> Pos {
+    pub(super) fn pos(&mut self, src: &[u8], off: u32) -> Pos {
         if off < self.off {
             self.off = 0;
             self.line = 1;
@@ -59,7 +60,7 @@ pub struct Parser<'src, V: Visitor> {
     len: usize,
     /// End offset of the last consumed significant token.
     pub(super) last_end: u32,
-    lines: LineCursor,
+    pub(super) lines: LineCursor,
     pub(super) v: V,
     /// Enclosing definitions (0 = module level).
     pub(super) def_depth: u32,
@@ -72,6 +73,13 @@ pub struct Parser<'src, V: Visitor> {
     pub(super) shape: Vec<Token>,
     /// Strings of the last [`super::expr::Shape::Strings`].
     pub(super) strings: Vec<Token>,
+    /// Bracket/context stack of the expression scanner.
+    pub(super) levels: Vec<Level>,
+    /// Record assignment targets while scanning (see `expr.rs`).
+    pub(super) collect: bool,
+    pub(super) tgt: Vec<Token>,
+    pub(super) tgt_recs: Vec<TargetRec>,
+    pub(super) tgt_unpack: bool,
     pub(super) diag_count: u32,
 }
 
@@ -96,6 +104,11 @@ impl<'src, V: Visitor> Parser<'src, V> {
             type_params: Vec::new(),
             shape: Vec::new(),
             strings: Vec::new(),
+            levels: Vec::new(),
+            collect: false,
+            tgt: Vec::new(),
+            tgt_recs: Vec::new(),
+            tgt_unpack: false,
             diag_count: 0,
         }
     }
@@ -197,7 +210,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
     pub(super) fn end_here(&mut self) -> End {
         let end = self.last_end;
         // The last token may span lines (triple-quoted string): use its end.
-        let line = self.pos(end.saturating_sub(1).max(0)).line;
+        let line = self.pos(end.saturating_sub(1)).line;
         End { end, line }
     }
 

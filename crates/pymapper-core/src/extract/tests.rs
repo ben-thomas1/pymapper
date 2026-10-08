@@ -123,6 +123,44 @@ impl Visitor for Rec<'_> {
         let last = if last_case { " last" } else { "" };
         self.out.push(format!("}} {kind:?} L{}{last}", end.line));
     }
+    fn call(&mut self, c: &Call<'_>) {
+        let c2 = self.chain(c.names);
+        self.out.push(format!("call {c2} {:?} {}:{}", c.receiver, c.pos.line, c.pos.col));
+    }
+    fn keyword_arg(&mut self, name: Token) {
+        let n = self.t(name);
+        self.out.push(format!("kw {n}"));
+    }
+    fn assign(&mut self, a: &Assign<'_>) {
+        let tgt = self.chain(a.target);
+        let mut s = format!("assign {:?} {}{tgt}", a.kind, if a.starred { "*" } else { "" });
+        if a.unpacked {
+            s += " unpacked";
+        }
+        let op = self.t(a.op);
+        s += &format!(" {op} ");
+        s += &match a.value {
+            Value::None => "none".to_string(),
+            Value::Call { names } => format!("call {}", self.chain(names)),
+            Value::Name(n) => format!("name {}", self.chain(n)),
+            Value::Strings(st) => format!("strs [{}]", st.iter().map(|&t| self.t(t)).collect::<Vec<_>>().join(",")),
+            Value::Other => "other".to_string(),
+        };
+        s += &format!(" L{}", a.pos.line);
+        self.out.push(s);
+    }
+    fn branch(&mut self, kind: BranchKind, _tok: Token) {
+        self.out.push(format!("branch {kind:?}"));
+    }
+    fn bool_op(&mut self, op: BoolOp, _tok: Token) {
+        self.out.push(format!("bool {op:?}"));
+    }
+    fn lambda_enter(&mut self, _tok: Token) {
+        self.out.push("lambda {".to_string());
+    }
+    fn lambda_exit(&mut self, end: u32) {
+        self.out.push(format!("}} lambda {end}"));
+    }
     fn diagnostic(&mut self, d: &Diagnostic) {
         let t = self.t(d.token);
         self.out.push(format!("diag {:?} {}:{} {t}", d.kind, d.pos.line, d.pos.col));
@@ -151,16 +189,17 @@ fn noop_visitor_and_empty_inputs() {
     }
 }
 
-fn ev(src: &str) -> String {
-    events(src).join("\n")
+/// Definition-structure events only.
+fn defs(src: &str) -> String {
+    const KEEP: [&str; 12] = ["def ", "end ", "class ", "async def", "dec ", "base ", "Global", "Nonlocal", "import ", "from ", "diag", "If @"];
+    events(src).into_iter().filter(|e| KEEP.iter().any(|k| e.starts_with(k)) || e.starts_with("} If") || e.starts_with("For @") || e.starts_with("} For")).collect::<Vec<_>>().join("\n")
 }
 
 #[test]
-#[ignore = "needs expression shapes"]
 fn defs_and_nesting() {
     let src = "def f(a, b=1, *args, c, d: int = 2, **kw) -> int:\n    def g():\n        pass\n    return 1\nclass C(Base, m.Mixin, metaclass=M):\n    x = 1\n    async def h(self, /, x): ...\n";
     assert_eq!(
-        ev(src),
+        defs(src),
         "def f @1:4 L1 d0 (a,b=,*args,kw:c,kw:d:=,**kw) ->\n\
          def g @2:8 L2 d1\n\
          end def L3\n\
@@ -174,11 +213,10 @@ fn defs_and_nesting() {
 }
 
 #[test]
-#[ignore = "needs expression shapes"]
 fn decorators_and_type_params() {
     let src = "@property\n@app.route('/x', methods=['GET'])\n@(lambda f: f)\ndef f[T: int, *Ts, **P = int](x: T) -> T: return x\n\n@dataclass\nclass P[T](Generic[T]): pass\n";
     assert_eq!(
-        ev(src),
+        defs(src),
         "dec property\ndec app.route()\ndec \n\
          def f @4:4 L1 d0 decs=3 [T,Ts,P] (x:) ->\n\
          end def L4\n\
@@ -190,15 +228,15 @@ fn decorators_and_type_params() {
 
 #[test]
 fn star_params_and_bare_star() {
-    assert_eq!(ev("def f(a, /, b, *, c=1):\n  pass\n"), "def f @1:4 L1 d0 (/a,b,kw:c=)\nend def L2");
-    assert_eq!(ev("lambda_ = 1\ndef f(\n  a,\n  b,\n):\n  pass\n"), "def f @2:4 L2 d0 (a,b)\nend def L6");
+    assert_eq!(defs("def f(a, /, b, *, c=1):\n  pass\n"), "def f @1:4 L1 d0 (/a,b,kw:c=)\nend def L2");
+    assert_eq!(defs("lambda_ = 1\ndef f(\n  a,\n  b,\n):\n  pass\n"), "def f @2:4 L2 d0 (a,b)\nend def L6");
 }
 
 #[test]
 fn imports() {
     let src = "import os, a.b.c as d\nfrom . import x\nfrom ..pkg.mod import (y as z,\n   w,)\nfrom ... import *\nfrom m import *\n";
     assert_eq!(
-        ev(src),
+        defs(src),
         "import os L1\nimport a.b.c as d L1\nfrom . : x L2\nfrom ..pkg.mod : y as z L3\nfrom ..pkg.mod : w L4\nfrom ... : * L5\nfrom m : * L6"
     );
 }
@@ -206,14 +244,14 @@ fn imports() {
 #[test]
 fn decls_and_simple_statements() {
     let src = "def f():\n    global a, b\n    nonlocal c\n    del x; return; pass\n    raise E from e\n    assert x, 'm'\n    break\n    continue\n";
-    assert_eq!(ev(src), "def f @1:4 L1 d0\nGlobal a,b\nNonlocal c\nend def L8");
+    assert_eq!(defs(src), "def f @1:4 L1 d0\nGlobal a,b\nNonlocal c\nend def L8");
 }
 
 #[test]
 fn async_def_and_single_line_bodies() {
     let src = "async def f(): await x\nclass E: pass\ndef g(): x = 1; y = 2\n";
     assert_eq!(
-        ev(src),
+        defs(src),
         "async def f @1:10 L1 d0\nend def L1\nclass E @2:6 L2 d0\nend class L2\ndef g @3:4 L3 d0\nend def L3"
     );
 }
@@ -221,7 +259,7 @@ fn async_def_and_single_line_bodies() {
 #[test]
 fn def_end_line_with_trailing_comments_and_blank_lines() {
     let src = "def f():\n    x = '''a\nb'''\n\n    # c\n\nz = 1\n";
-    assert_eq!(ev(src), "def f @1:4 L1 d0\nend def L3");
+    assert_eq!(defs(src), "def f @1:4 L1 d0\nend def L3");
 }
 
 /// Only block events, compactly: `If{ ... }` on one line.
@@ -264,7 +302,7 @@ fn try_forms() {
     let src = "try:\n    a\nexcept:\n    b\ntry:\n    a\nexcept* E:\n    b\nexcept (F, G) as e:\n    c\nelse:\n    d\nfinally:\n    e\ntry: x\nfinally: y\n";
     assert_eq!(
         blocks(src),
-        "Try{ }Try Except{ }Except Try{ }Try Except*{ }Except Except{ }Except TryElse{ }TryElse Finally{ }Finally Try{ }Try Finally{ }Finally"
+        "Try{ }Try Except{ }Except Try{ }Try Except* (E){ }Except Except (F,G){ }Except TryElse{ }TryElse Finally{ }Finally Try{ }Try Finally{ }Finally"
     );
 }
 
@@ -275,7 +313,6 @@ fn with_forms() {
 }
 
 #[test]
-#[ignore = "needs expression shapes"]
 fn if_conditions() {
     let src = "if TYPE_CHECKING:\n    pass\nelif typing.TYPE_CHECKING: pass\nif not TYPE_CHECKING: pass\nif __name__ == '__main__': main()\nif \"__main__\" == __name__: main()\nif TYPE_CHECKING or x: pass\nif __name__ == '__main__' and x: pass\n";
     assert_eq!(
@@ -287,7 +324,7 @@ fn if_conditions() {
 #[test]
 fn blocks_nested_in_defs_close_before_def_exit() {
     let src = "def f():\n    if a:\n        for b in c:\n            pass\nx = 1\n";
-    assert_eq!(ev(src), "def f @1:4 L1 d0\nIf @2:4 {\nFor @3:8 {\n} For L4\n} If L4\nend def L4");
+    assert_eq!(defs(src), "def f @1:4 L1 d0\nIf @2:4 {\nFor @3:8 {\n} For L4\n} If L4\nend def L4");
 }
 
 #[test]
@@ -297,5 +334,127 @@ fn stray_clauses_are_reported_and_body_parsed() {
     assert_eq!(e[0], "diag UnexpectedToken 1:0 else");
     assert_eq!(e[1], "def f @2:8 L2 d0");
     assert_eq!(e[3], "diag UnexpectedToken 3:0 except");
+    assert_eq!(e[4], "assign Plain x = other L5");
+    assert_eq!(e.len(), 5);
+}
+
+/// Events whose text starts with one of `prefixes`.
+fn only(src: &str, prefixes: &[&str]) -> String {
+    events(src).into_iter().filter(|e| prefixes.iter().any(|p| e.starts_with(p))).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn call_chains_and_receivers() {
+    let src = "f(x)\na.b.c(1)\nself.x.m()\ncls.make()\nsuper().run()\nsuper(C, self).a.b()\nf().g()\nd[0].h()\n''.join(xs)\nf()()\n(a).b()\nself()\n";
+    assert_eq!(
+        only(src, &["call"]),
+        "call f None 1:0\ncall a.b.c Dotted 2:0\ncall self.x.m SelfAttr 3:0\ncall cls.make ClsAttr 4:0\n\
+         call super None 5:0\ncall run Super 5:8\ncall super None 6:0\ncall a.b Super 6:15\ncall f None 7:0\ncall g Unknown 7:4\n\
+         call h Unknown 8:5\ncall join Unknown 9:3\ncall f None 10:0\ncall  Unknown 10:3\ncall b Unknown 11:4\ncall self None 12:0"
+    );
+}
+
+#[test]
+fn nested_calls_and_keyword_args() {
+    let src = "f(g(a.b(c)), key=h(1), *args, **kw)\nx = dict(a=1, b=lambda q=2: q)\n";
+    assert_eq!(
+        only(src, &["call", "kw"]),
+        "call f None 1:0\ncall g None 1:2\ncall a.b Dotted 1:4\nkw key\ncall h None 1:17\ncall dict None 2:4\nkw a\nkw b"
+    );
+}
+
+#[test]
+fn assignments() {
+    let src = "x = Foo(1)\nself.y = m.Bar()\na = b = c\nx, *rest = t\n(p, q), r = z\nd[k] = v\nn += 1\nann: int = make()\nbare: str\n__all__ = ['a', \"b\"]\n__all__ += ('c',)\nt = 'a', 'b'\ns = 'abc'\nf(x)[0].attr = 1\n";
+    assert_eq!(
+        only(src, &["assign"]),
+        "assign Plain x = call Foo L1\nassign Plain self.y = call m.Bar L2\nassign Plain a = name c L3\nassign Plain b = name c L3\n\
+         assign Plain x unpacked = name t L4\nassign Plain *rest unpacked = name t L4\n\
+         assign Plain p unpacked = name z L5\nassign Plain q unpacked = name z L5\nassign Plain r unpacked = name z L5\n\
+         assign Augmented n += other L7\nassign Annotated ann = call make L8\nassign Annotated bare : none L9\n\
+         assign Plain __all__ = strs ['a',\"b\"] L10\nassign Augmented __all__ += strs ['c'] L11\n\
+         assign Plain t = strs ['a','b'] L12\nassign Plain s = other L13"
+    );
+}
+
+#[test]
+fn for_with_except_targets() {
+    let src = "for k, v in d.items(): pass\nfor i in range(3): pass\nwith open(p) as f, g() as (a, b): pass\ntry: pass\nexcept (a.Error, OSError) as e: pass\n";
+    assert_eq!(
+        only(src, &["assign", "Except"]),
+        "assign ForTarget k unpacked for none L1\nassign ForTarget v unpacked for none L1\nassign ForTarget i for none L2\n\
+         assign AsTarget f as none L3\nassign AsTarget a unpacked as none L3\nassign AsTarget b unpacked as none L3\n\
+         assign AsTarget e as none L5\nExcept (Error,OSError) @5:0 {"
+    );
+}
+
+#[test]
+fn walrus() {
+    let src = "if (n := len(a)) > 10: pass\n[y for x in z if (y := f(x))]\n";
+    assert_eq!(only(src, &["assign"]), "assign Walrus n := other L1\nassign Walrus y := other L2");
+}
+
+#[test]
+fn bool_op_runs() {
+    assert_eq!(only("x = a and b and c\n", &["bool"]), "bool And");
+    assert_eq!(only("x = a and b or c\n", &["bool"]), "bool And\nbool Or");
+    assert_eq!(only("x = a and (b or c) and d\n", &["bool"]), "bool And\nbool Or");
+    assert_eq!(only("x = a or not b or c\n", &["bool"]), "bool Or");
+    assert_eq!(only("f(a and b, c and d)\n", &["bool"]), "bool And\nbool And");
+    assert_eq!(only("x = a and b if c and d else e and f\n", &["bool"]), "bool And\nbool And\nbool And");
+    assert_eq!(only("if a and b:\n    pass\nelif c or d: pass\n", &["bool"]), "bool And\nbool Or");
+}
+
+#[test]
+fn ternary_and_comprehensions() {
+    assert_eq!(only("x = a if b else c\n", &["branch"]), "branch Ternary");
+    assert_eq!(only("x = [a for b in c if d]\n", &["branch"]), "branch CompFor\nbranch CompIf");
+    assert_eq!(
+        only("x = [a if b else c for d in e if f for g in h]\n", &["branch"]),
+        "branch Ternary\nbranch CompFor\nbranch CompIf\nbranch CompFor"
+    );
+    assert_eq!(only("x = {k: (v if v else 0) for k, v in d}\n", &["branch"]), "branch Ternary\nbranch CompFor");
+    assert_eq!(only("f(x async for x in y)\n", &["branch"]), "branch CompFor");
+    assert_eq!(only("x = [(a if b else c) for d in e]\n", &["branch"]), "branch Ternary\nbranch CompFor");
+}
+
+#[test]
+fn lambdas_balance_and_colons() {
+    let e = only("f = lambda x, y=1: x if y else lambda: y\nd = {1: lambda: 2, 3: 4}\nif lambda: 1:\n    pass\n", &["lambda", "}", "If", "assign"]);
+    assert_eq!(
+        e,
+        "lambda {\nlambda {\n} lambda 40\n} lambda 40\nassign Plain f = other L1\nlambda {\n} lambda 58\nassign Plain d = other L2\nlambda {\n} lambda 78\nIf @3:0 {\n} If L4"
+    );
+    // A lambda in a header does not end the header early; slices and dicts are not headers.
+    assert_eq!(defs("def f(k=lambda a, b: 0, j=1): pass\n"), "def f @1:4 L1 d0 (k=,j=)\nend def L1");
+    assert_eq!(blocks("for x in a[1:2]:\n    pass\nwhile {1: 2}[k]: pass\n"), "For{ }For While{ }While");
+}
+
+#[test]
+fn names_attributes_strings() {
+    struct V(Vec<String>, &'static [u8]);
+    impl Visitor for V {
+        fn name(&mut self, t: Token) {
+            self.0.push(format!("n:{}", String::from_utf8_lossy(t.text(self.1))));
+        }
+        fn attribute(&mut self, t: Token) {
+            self.0.push(format!("a:{}", String::from_utf8_lossy(t.text(self.1))));
+        }
+        fn string(&mut self, t: Token) {
+            self.0.push(format!("s:{}", String::from_utf8_lossy(t.text(self.1))));
+        }
+    }
+    let src: &'static [u8] = b"x = a.b(c, 'k').d\ny = lambda p, *q: p\nz = f\"{w.v!r:>{n}}\"\n";
+    let v = parse(src, V(Vec::new(), src));
+    assert_eq!(v.0.join(" "), "n:x n:a a:b n:c s:'k' a:d n:y n:p n:z n:w a:v n:n");
+}
+
+#[test]
+fn python2_statements() {
+    let e = events("print 'hello'\nprint >>f, x\nexec code\nprint('ok')\nprint\n");
+    assert_eq!(e[0], "diag Python2 1:0 print");
+    assert_eq!(e[1], "diag Python2 2:0 print");
+    assert_eq!(e[2], "diag Python2 3:0 exec");
+    assert_eq!(e[3], "call print None 4:0");
     assert_eq!(e.len(), 4);
 }
