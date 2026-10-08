@@ -35,34 +35,62 @@
 //!
 //! # Layout
 //!
+//! A chain is a `Sym` column plus a `u8` length column ([`ChainCol`]): one name is
+//! stored inline, longer chains point into `names`. Row sizes (asserted in tests):
+//!
 //! ```text
 //!   FactStore (one per thread)
 //!   ├── defs        kind u8 | flags u16 | name Option<Sym> | parent u32 | start,end u32 |
 //!   │               start_line,end_line u32 | name_line,name_col u32 |
-//!   │               decorators Run | bases Run | params Run                    59 B/row
-//!   ├── decorators  chain Run | flags u8                                        9 B/row
-//!   ├── bases       chain Run | keyword Option<Sym> | flags u8                 13 B/row
+//!   │               decorators u32+u8 | bases u32+u8 | params u32+u16          51 B/row
+//!   ├── decorators  chain Sym+u8 | flags u8                                     6 B/row
+//!   ├── bases       chain Sym+u8 | keyword Option<Sym> | flags u8              10 B/row
 //!   ├── params      name Sym | kind+flags u8                                    5 B/row
-//!   ├── imports     scope u32 | module Run | name,alias Option<Sym> | level u8 |
-//!   │               flags u8 | line,col u32                                    30 B/row
-//!   ├── calls       scope u32 | chain Run | receiver u8 | flags u8 | line,col u32  22 B/row
-//!   ├── bindings    scope u32 | target Run | kind u8 | flags u8 | value u8 |
-//!   │               value_chain Run | line u32                                 27 B/row
+//!   ├── imports     scope u32 | module Sym+u8 | name,alias Option<Sym> |
+//!   │               level u8 | flags u8 | line,col u32                         27 B/row
+//!   ├── calls       scope u32 | chain Sym+u8 | receiver u8 | flags u8 |
+//!   │               line,col u32                                               19 B/row
+//!   ├── bindings    scope u32 | target Sym+u8 | kind u8 | flags u8 | value u8 |
+//!   │               value_chain Sym+u8 | line u32                              21 B/row
 //!   ├── decls       scope u32 | kind u8 | name Sym                              9 B/row
-//!   ├── names       Sym           chains of 2+ names, shared by the tables above  4 B/row
+//!   ├── names       Sym           chains of 2+ names                            4 B/row
 //!   ├── exports     Sym           `__all__` contents                            4 B/row
 //!   ├── evidence    u32           sorted unique name hashes per file            4 B/row
 //!   ├── diags       kind u8 | line,col u32                                      9 B/row
 //!   └── suppressions line u32 | codes Run | all u8                             13 B/row
-//!   FileFacts (one per file): a Run per table + line count + flags            ~120 B
+//!   FileFacts (one per file): a Run per table + line count + flags            112 B
 //! ```
 //!
-//! Name chains are deduplicated by token position: `from m import a, b` stores
-//! `m` once, and `x = Foo()` / `@app.route(...)` reuse the chain of the call
-//! event that preceded them.
+//! Chains are also deduplicated by token position: `from m.n import a, b` stores
+//! `m.n` once, and `x = Foo()` / `@app.route(...)` reuse the chain of the call
+//! event just before them.
 //!
-//! Measured retained size (interned mode, `Sym` = 4 B, row bytes as above, no
-//! spare capacity): see "Memory per LOC" in `docs/benchmarks.md`.
+//! Measured on the stdlib (437k LOC): 13.4 B/LOC of rows (calls 3.6, bindings
+//! 3.2, defs 3.0, names 1.3, evidence 1.1, the rest 1.2) plus 0.27 B/LOC of
+//! headers; see "Facts (S1.3)" in `docs/benchmarks.md` (also the venv).
+//!
+//! # What is recorded
+//!
+//! - Every `def`/`class`, with decorators, bases/keywords, parameters and the
+//!   flags in [`def_flags`]. Metrics are a separate table keyed by def row (S1.4).
+//! - Every imported name, with [`import_flags`]. Positions are those of the
+//!   imported name (the module for plain `import`).
+//! - Every call whose callee is a name chain, possibly after `self`/`cls`/`super()`
+//!   or an unknown receiver (see [`Receiver`]); `scope` is the enclosing def
+//!   (lambdas and comprehensions belong to it).
+//! - Every assignment target that is a name or dotted chain, with the value
+//!   shape: `Call`/`Name` keep the value chain (construction / alias hints).
+//!   Unpacked targets get [`ValueKind::Other`]. Context flags of header targets
+//!   (`for` targets, walrus in a condition, `except ... as e`) are those of the
+//!   statement header.
+//! - Module-level `__all__` contents ([`file_flags`] says whether it is complete).
+//! - `global`/`nonlocal` names.
+//! - Evidence: hashes of identifiers used in expressions, attribute names and the
+//!   identifier-like segments of plain string literals (`"pkg.mod.func"` gives
+//!   `pkg`, `mod`, `func`). Bare names are included (in addition to the design's
+//!   attributes and strings) so that a function passed as a value
+//!   (`register(handler)`) has evidence too.
+//! - Diagnostics and `# pymapper: ignore[...]` suppressions with their lines.
 
 mod build;
 mod render;
@@ -428,6 +456,10 @@ macro_rules! soa {
             }
 
             /// Moves all rows of `other` to the end; returns the base to shift by.
+            fn shrink_to_fit(&mut self) {
+                $(self.$f.shrink_to_fit();)+
+            }
+
             fn append(&mut self, other: &mut Self) -> u32 {
                 let base = self.len();
                 $(self.$f.append(&mut other.$f);)+
@@ -790,6 +822,23 @@ impl FactStore {
         // Validates the merged lengths.
         let _ = self.bases();
         b
+    }
+
+    /// Releases spare capacity of every table (e.g. once a worker is done).
+    pub fn shrink_to_fit(&mut self) {
+        self.defs.shrink_to_fit();
+        self.decorators.shrink_to_fit();
+        self.bases.shrink_to_fit();
+        self.params.shrink_to_fit();
+        self.imports.shrink_to_fit();
+        self.calls.shrink_to_fit();
+        self.bindings.shrink_to_fit();
+        self.decls.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.exports.shrink_to_fit();
+        self.evidence.shrink_to_fit();
+        self.diags.shrink_to_fit();
+        self.suppressions.shrink_to_fit();
     }
 
     /// Bytes of the stored facts (rows only, no spare capacity or scratch).

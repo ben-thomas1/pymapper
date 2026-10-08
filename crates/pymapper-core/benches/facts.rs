@@ -103,21 +103,27 @@ fn main() {
     let w = walk(&dirs, &WalkOptions::everything());
     println!("files: {}, threads: {}, sink: {}", w.files.len(), rayon::current_num_threads(), if spans { "spans" } else { "interner" });
 
-    let mut best: Option<Rep> = None;
-    for _ in 0..reps {
+    // Best time of `reps` runs. Only the last run's stores stay alive (the previous ones are
+    // dropped before the next run starts), so peak RSS is that of one run retaining all facts.
+    let (mut wall, mut extract_ns, mut bytes) = (f64::INFINITY, u64::MAX, 0);
+    let mut last: Option<Vec<Worker>> = None;
+    for _ in 0..reps.max(1) {
+        drop(last.take());
         let r = run(&w.files, spans, parse_only);
-        if best.as_ref().is_none_or(|b| r.wall < b.wall) {
-            best = Some(r);
-        }
+        wall = wall.min(r.wall);
+        extract_ns = extract_ns.min(r.extract_ns);
+        bytes = r.bytes;
+        last = Some(r.workers);
     }
-    let Some(r) = best else { return };
-    let mb = r.bytes as f64 / 1e6;
-    let cpu = r.extract_ns as f64 / 1e9;
+    let rss_run = peak_rss();
+    let Some(mut workers) = last else { return };
+    let mb = bytes as f64 / 1e6;
+    let cpu = extract_ns as f64 / 1e9;
     println!(
         "read+extract wall {:.1} ms, {:.1} MB, {:.0} MB/s all cores, {:.0} MB/s/core (extract only, {:.1} ms cpu)",
-        r.wall * 1e3,
+        wall * 1e3,
         mb,
-        mb / r.wall,
+        mb / wall,
         mb / cpu,
         cpu * 1e3
     );
@@ -129,7 +135,7 @@ fn main() {
     let mut heap = 0usize;
     let mut intern_heap = 0usize;
     let mut headers = 0usize;
-    for wk in &r.workers {
+    for wk in &workers {
         let st = &wk.store;
         for ff in &wk.files {
             loc += ff.lines as u64;
@@ -196,5 +202,11 @@ fn main() {
         heap as f64 / loc_f,
         intern_heap as f64 / 1e6
     );
-    println!("peak RSS {:.1} MB", peak_rss() as f64 / 1e6);
+    let mut shrunk = 0usize;
+    for wk in &mut workers {
+        wk.store.shrink_to_fit();
+        shrunk += wk.store.heap_bytes();
+    }
+    println!("table heap after shrink_to_fit {:.2} B/LOC", shrunk as f64 / loc_f);
+    println!("peak RSS {:.1} MB (one run retaining all facts and interners)", rss_run as f64 / 1e6);
 }

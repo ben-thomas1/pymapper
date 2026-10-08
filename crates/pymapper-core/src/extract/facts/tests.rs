@@ -40,6 +40,22 @@ fn header(src: &str) -> String {
     facts(src).lines().next().unwrap_or_default().to_owned()
 }
 
+#[test]
+fn row_sizes_match_the_documented_layout() {
+    assert_eq!(Defs::ROW_BYTES, 51);
+    assert_eq!(Decorators::ROW_BYTES, 6);
+    assert_eq!(Bases::ROW_BYTES, 10);
+    assert_eq!(Params::ROW_BYTES, 5);
+    assert_eq!(Imports::ROW_BYTES, 27);
+    assert_eq!(Calls::ROW_BYTES, 19);
+    assert_eq!(Bindings::ROW_BYTES, 21);
+    assert_eq!(Decls::ROW_BYTES, 9);
+    assert_eq!(Diags::ROW_BYTES, 9);
+    assert_eq!(Suppressions::ROW_BYTES, 13);
+    assert_eq!(std::mem::size_of::<FileFacts>(), 112);
+    assert_eq!(std::mem::size_of::<Option<Sym>>(), 4);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Defs
 // ---------------------------------------------------------------------------------------------
