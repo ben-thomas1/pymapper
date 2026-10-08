@@ -51,7 +51,7 @@ impl GridGeom {
     pub fn new(bounds: WorldRect, items: usize) -> Self {
         let finite = bounds.min.iter().chain(&bounds.max).all(|v| v.is_finite());
         if !finite || bounds.width() < 0.0 || bounds.height() < 0.0 {
-            return Self::single([0.0, 0.0], [1.0, 1.0]);
+            return Self::single([0.0, 0.0]);
         }
         // Zero-extent axes get a tiny positive extent so cell sizes stay positive.
         let w = bounds.width().max(f32::MIN_POSITIVE.sqrt());
@@ -83,7 +83,7 @@ impl GridGeom {
         Self { origin: bounds.min, levels, bins: base }
     }
 
-    fn single(origin: [f32; 2], _cell: [f32; 2]) -> Self {
+    fn single(origin: [f32; 2]) -> Self {
         let levels = vec![Level { cols: 1, rows: 1, cell: [f32::INFINITY; 2], base: 0 }];
         Self { origin, levels, bins: 1 }
     }
