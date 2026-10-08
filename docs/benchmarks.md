@@ -62,6 +62,7 @@ entered, and symlinks are not followed.
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 | `calls`      | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges`, `resolve.classes`, `resolve.mro`, `resolve.calls` | `resolve`, then `pymapper_core::resolve::resolve_calls` (class table + method index, bases + C3 MROs, then every call row, uncalled decorator and override in parallel per file). Counters `calls`, shares of call rows in per mille (`certain_pm`, `likely_pm`, `possible_pm`, `unresolved_pm`; of which `builtin_pm` = builtins and builtin-type methods, `external_pm` = unloaded code and unloaded bases), `edges`, `override_edges`, `decorator_edges`, `classes`, `incomplete_classes`, `calls_kb` = `ResolvedCalls::heap_bytes`, `resolve_kb`, `index_kb` |
 | `graph`      | `calls` phases, `graph.build`, `graph.scc`, `graph.modules` | `calls`, then `pymapper_core::graph`: `graph.build` = `call_graph` over every node (all edges with a target), `graph.scc` = its `Condensed` (iterative Tarjan + DAG), `graph.modules` = `import_graph` (no flag mask) + `module_call_graph` and both condensations. Counters `graph_nodes`, `graph_edges` (distinct), `sccs`, `cyclic_sccs`, `largest_scc`, `dag_edges`, `modules`, `import_edges`, `import_cycles` and `module_call_cycles` (components with 2+ modules), `module_call_edges`, `callgraph_kb` (call graph + condensation heap), `graph_kb` (all six structures), `calls_kb`, `index_kb` |
+| `rollup`     | `calls` phases, `rollup.build`, `rollup.aggregates`, `rollup.levels` | `calls`, then `pymapper_core::rollup`: `rollup.build` = `Rollup::build` (all call edges with a target, all import edges), `rollup.aggregates` = `Aggregates::build`, `rollup.levels` = `Rollup::level_with` for every `Level::Depth(k)` from 0 to the deepest node, then `Level::Module`, with one reused scratch and output buffer. Counters `total_loc` (aggregated LOC of the distributions), `nodes`, `call_edges`, `call_pairs`, `sites`, `multi_sites`, `import_edges`, `levels`, `rollup_kb` (base tables), `agg_kb`, `scratch_kb`, `level_max_kb` (output buffer at its largest), `calls_kb`, `index_kb`, and per level `d{k}_edges` / `d{k}_us`, `module_edges` / `module_us` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -564,6 +565,45 @@ MB resident):
 
 `chain` is a million-deep DFS (no recursion, 8 bytes per DFS frame). Tarjan runs at 64-280M
 nodes + edges per second; random graphs are the slow case (cache misses on `rindex`).
+
+### Rollup (S3.4)
+
+`rollup` target: `calls`, then the rollup base tables, the node aggregates and every level.
+14-core M4 Pro, release, warm cache, best of 3 (RSS worst of 3), load average about 5-6 from
+other worktrees. Everything in `pymapper_core::rollup` is sequential. The corpus is loaded as
+one group, so depth 0 (the one distribution) has no edges and depth 1 is the top-level
+packages and modules.
+
+| corpus | nodes   | call edges | call pairs | multi-target sites | import edges | rollup.build | rollup.aggregates | rollup.levels (levels) | `rollup_kb` | `agg_kb` | `scratch_kb` | peak RSS MB (calls / rollup) |
+|--------|---------|------------|------------|--------------------|--------------|--------------|-------------------|------------------------|-------------|----------|--------------|------------------------------|
+| stdlib | 25,441  | 40,172     | 31,873     | 4,329 of 32,906    | 3,974        | 0.77ms       | 0.18ms            | 2.47ms (12)            | 517         | 508      | 203          | 30.6 (`graph`) / 31.6        |
+| venv   | 998,345 | 2,232,016  | 1,382,184  | 430,631 of 1,679,242 | 329,342    | 43.1ms       | 7.55ms            | 278.9ms (26)           | 29,194      | 19,966   | 7,987        | 592.5 / 686.8                |
+
+Per level on the venv (edges, time with a warm scratch):
+
+| level       | d0    | d1     | d2     | d3      | d4      | d5        | d6        | d8        | d12       | d24 (deepest) | module  |
+|-------------|-------|--------|--------|---------|---------|-----------|-----------|-----------|-----------|---------------|---------|
+| edges       | 0     | 3,200  | 46,048 | 230,984 | 619,880 | 1,071,291 | 1,340,124 | 1,506,819 | 1,661,523 | 1,707,326     | 437,739 |
+| time        | 2.9ms | 4.5ms  | 7.2ms  | 10.1ms  | 12.6ms  | 12.7ms    | 12.3ms    | 11.6ms    | 11.4ms    | 11.3ms        | 10.5ms  |
+
+- **Time**: a level costs 3-13 ms on the venv (17M LOC), so the GUI can re-query on every
+  zoom step without caching levels. It is O(n + m): the node map (one forward pass over 1M
+  nodes, the whole 2.9 ms of depth 0), then one pass over 1.71M base rows with a slot-array
+  merge per source and a small sort per source. There is no global sort because the level maps
+  are monotone in pre-order. Building the base costs 43 ms: two passes over the 2.2M call
+  edges plus per-source bucket sorts (a counting sort by source, no comparison sort of the
+  edge list). The aggregates are two passes over the nodes.
+- **Memory**: the base is 29 MB on the venv (12 B per call pair, 12 B per import edge, 12 B per
+  multi-target site plus 4 B per target). The aggregates are 20 B per node (20 MB), the level
+  scratch 8 B per node (8 MB). A level is 24 B per edge: the deepest venv level is 41 MB (the
+  output buffer, grown by doubling, peaked at 50 MB). Peak RSS grows 94 MB over `calls`, which
+  is all of the above kept alive to the end. The transient build buffers (4 B per node plus 8 B
+  per kept edge, 22 MB) are freed before the import pairs are built.
+- **Sites**: 26% of the venv's call sites have several targets (mostly `Foo()` linking the
+  class and its `__init__`). The level subtracts the extra counts per destination, so `sites`
+  counts distinct call sites and not edges.
+- Correctness: `stdlib_rollup_matches_reference` (ignored test) checks every level, under three
+  call/import filters, against a hash-set brute force, and the aggregates against subtree walks.
 
 ### Cache (S2.5)
 
