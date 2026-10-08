@@ -60,6 +60,15 @@ pub enum Target {
     /// the hierarchy. The corpus root is the import root of one first-party group. Peak RSS
     /// includes the whole index.
     Load,
+    /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
+    /// extraction plus encoding and writing every segment. Inputs come from import roots when
+    /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
+    /// (one trusted segment); any other corpus is one first-party group validated per file
+    /// (stat). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`.
+    LoadCold,
+    /// Like `load-cold` but keeps the cache: with the default warm-up run, every file is a
+    /// cache hit (no read, no parse).
+    LoadWarm,
 }
 
 impl Target {
@@ -77,6 +86,8 @@ impl Target {
             Target::MetricsMem => "metrics-mem",
             Target::ExtractMem => "extract-mem",
             Target::Load => "load",
+            Target::LoadCold => "load-cold",
+            Target::LoadWarm => "load-warm",
         }
     }
 }
@@ -399,6 +410,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         }
         Target::Roots => roots_target(root)?,
         Target::Load => load_target(root)?,
+        Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -486,6 +498,125 @@ fn load_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("intern_kb".to_owned(), kb(ix.strings().heap_bytes())),
         // Retained index bytes per 1000 LOC (milli-bytes per LOC).
         ("index_B_per_kLOC".to_owned(), (ix.heap_bytes() as u64 * 1000).checked_div(s.lines).unwrap_or(0)),
+    ];
+    Ok((stats, counters))
+}
+
+/// Cache directory of the `load-cold` / `load-warm` targets for `root`.
+fn bench_cache_dir(root: &Path) -> std::path::PathBuf {
+    let h = pymapper_core::intern::hash_bytes(root.as_os_str().as_encoded_bytes());
+    std::env::temp_dir().join("pymapper-bench-cache").join(format!("{h:016x}"))
+}
+
+/// Inputs of the cache targets, the import roots they came from and the number of walk errors.
+type CacheInputs = (pymapper_core::index::Inputs, Option<pymapper_core::roots::Roots>, u64);
+
+/// The inputs of the cache targets (see [`Target::LoadCold`]):
+///
+/// - a venv's site-packages: import roots (phase `discover`), then the files of every
+///   distribution from its `RECORD` plus a walk of the entries no `RECORD` claims (phase
+///   `files`): what the CLI loads, with no walk of distribution files;
+/// - a stdlib: a walk without `site-packages` (phase `walk`), then import roots;
+/// - anything else: a walk, one first-party group.
+fn cache_inputs(root: &Path) -> anyhow::Result<CacheInputs> {
+    use pymapper_core::index::Inputs;
+    use pymapper_core::roots::{self, Origin, RootOptions};
+    if let Some(v) = root.ancestors().take(5).find(|d| d.join("pyvenv.cfg").is_file()) {
+        let opts = RootOptions { venv: Some(v.to_path_buf()), include_deps: true, ..RootOptions::default() };
+        let r = timing::time("discover", || roots::discover(v.parent().unwrap_or(root), &opts));
+        let (files, errors) = timing::time("files", || record_files(&r, root))?;
+        return Ok((Inputs::from_roots(&r, &files), Some(r), errors));
+    }
+    let is_stdlib = root.join("os.py").is_file()
+        && root.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b"python3."));
+    if !is_stdlib {
+        let (files, errors, _) = walk_corpus(root, &corpus_options())?;
+        return Ok((Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus"), None, errors));
+    }
+    // The stdlib without the base interpreter's site-packages, like `Roots::sources`.
+    let opts = WalkOptions { excludes: vec!["/site-packages".to_owned()], ..corpus_options() };
+    let (files, errors, _) = walk_corpus(root, &opts)?;
+    // The interpreter that owns this stdlib, found through PATH = <prefix>/bin.
+    let prefix = root.parent().and_then(Path::parent).context("stdlib prefix")?;
+    let version = roots::parse_version_prefix(&root.file_name().unwrap_or_default().as_encoded_bytes()[6..]);
+    let project = std::env::temp_dir().join("pymapper-bench-empty-project");
+    std::fs::create_dir_all(&project)?;
+    let opts = RootOptions {
+        include_stdlib: true,
+        python_version: version,
+        path_env: Some(prefix.join("bin").into_os_string()),
+        ..RootOptions::default()
+    };
+    let r = timing::time("discover", || roots::discover(&project, &opts));
+    anyhow::ensure!(r.stdlib.as_deref() == Some(root), "stdlib not discovered for {}", root.display());
+    Ok((Inputs::from_roots(&r, &files), Some(r), errors))
+}
+
+/// The third-party files under `root` from [`Roots::sources`]: `RECORD` files of every
+/// distribution, plus a walk of what no `RECORD` claims. Returns the files and walk errors.
+fn record_files(r: &pymapper_core::roots::Roots, root: &Path) -> anyhow::Result<(PathList, u64)> {
+    use pymapper_core::roots::Source;
+    let full = |_| anyhow::anyhow!("path list full");
+    let mut files = PathList::default();
+    let mut errors = 0;
+    let mut buf = Vec::new();
+    for src in r.sources(&[], &WalkOptions::default()) {
+        match src {
+            Source::Record { dist } => {
+                let site = r.dists.site_path(dist);
+                if !site.starts_with(root) {
+                    continue;
+                }
+                for rel in r.dists.owned_files(dist) {
+                    buf.clear();
+                    buf.extend_from_slice(site.as_os_str().as_encoded_bytes());
+                    buf.push(b'/');
+                    buf.extend_from_slice(rel);
+                    files.push(&buf).map_err(full)?;
+                }
+            }
+            Source::Walk { path, opts, .. } if path.starts_with(root) => {
+                let w = core_walk::walk(&[&path], &opts);
+                errors += w.diagnostics.len() as u64;
+                for i in 0..w.files.len() {
+                    files.push(w.files.get_bytes(i)).map_err(full)?;
+                }
+            }
+            Source::Walk { .. } => {}
+        }
+    }
+    Ok((files, errors))
+}
+
+/// `load-cold` / `load-warm`: the inputs ([`cache_inputs`]), then
+/// `pymapper_core::cache::load` (the `load.*` phases, then `cache.write`; segments are opened
+/// lazily inside `load.extract`).
+fn cache_target(root: &Path, cold: bool) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::cache::{self, Cache};
+    let dir = bench_cache_dir(root);
+    let c = Cache::new(&dir);
+    if cold {
+        c.clear().with_context(|| format!("clearing {}", dir.display()))?;
+    }
+    let (inputs, roots, walk_errors) = cache_inputs(root)?;
+    let (ix, cs) = cache::load(inputs, roots.as_ref(), &c);
+    if let Some(e) = &cs.write_error {
+        anyhow::bail!("writing the cache: {e}");
+    }
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let kb = |b: u64| b / 1000;
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("segments".to_owned(), u64::from(cs.segments)),
+        ("opened".to_owned(), u64::from(cs.opened)),
+        ("hits".to_owned(), cs.hits),
+        ("verified".to_owned(), cs.verified),
+        ("misses".to_owned(), cs.misses),
+        ("written".to_owned(), u64::from(cs.written)),
+        ("opened_kb".to_owned(), kb(cs.opened_bytes)),
+        ("written_kb".to_owned(), kb(cs.written_bytes)),
+        ("index_kb".to_owned(), kb(ix.heap_bytes() as u64)),
     ];
     Ok((stats, counters))
 }
@@ -612,6 +743,8 @@ mod tests {
             Target::MetricsMem,
             Target::ExtractMem,
             Target::Load,
+            Target::LoadCold,
+            Target::LoadWarm,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -630,6 +763,9 @@ mod tests {
                 Target::ParseMem | Target::MetricsMem | Target::ExtractMem => &["walk", "load", "parse"],
                 Target::Walk | Target::WalkSeq | Target::WalkGit => &["walk"],
                 Target::Load => &["walk", "load.extract", "load.merge", "load.build"],
+                Target::LoadCold | Target::LoadWarm => {
+                    &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
+                }
                 Target::Roots => unreachable!("checked below"),
             };
             assert_eq!(names, expected, "{target:?}");
@@ -668,10 +804,21 @@ mod tests {
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("nodes").unwrap() > counter("defs").unwrap());
                 assert!(counter("index_B_per_kLOC").unwrap() > 1000);
+            } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
+                assert_eq!(counter("segments"), Some(1));
+                if target == Target::LoadCold {
+                    assert_eq!((counter("misses"), counter("written")), (Some(rec.files), Some(1)));
+                } else {
+                    // Right after `load-cold`: every file is a hit (or verified, when the
+                    // corpus was written within the last seconds).
+                    assert_eq!(counter("misses"), Some(0));
+                    assert_eq!(counter("hits").unwrap() + counter("verified").unwrap(), rec.files);
+                }
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }
         }
+        let _ = fs::remove_dir_all(bench_cache_dir(&root));
         // Same test: `run` uses the process-global phase table.
         let rec = run(Target::Roots, &root).expect("roots");
         let names: Vec<&str> = rec.phases.iter().map(|(n, _)| n.as_str()).collect();

@@ -10,9 +10,10 @@ use rayon::prelude::*;
 
 use super::{FileId, Index, Inputs, build};
 use crate::arena::PerThread;
+use crate::cache::{Lookup, Probe, SegRemap, Stamp};
 use crate::extract::facts::{FactStore, FileFacts, TableBases, extract_with};
 use crate::extract::{MetricsScratch, MetricsTable, MetricsVisitor};
-use crate::intern::Interner;
+use crate::intern::{Interner, hash_bytes};
 use crate::timing;
 
 /// A file that could not be read. It is loaded as an empty module.
@@ -26,7 +27,7 @@ pub struct ReadError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub files: u64,
-    /// Source bytes read.
+    /// Source bytes (read, or the cached size of files loaded from the cache).
     pub bytes: u64,
     /// Lines of all files.
     pub lines: u64,
@@ -47,6 +48,8 @@ struct Worker {
     interner: Interner,
     scratch: MetricsScratch,
     metrics: MetricsTable,
+    /// Local ids of the cache segment being copied -> ids of `interner`.
+    remap: SegRemap,
 }
 
 /// The facts of consecutive files `first..first + files.len()`, with `Sym`s of worker
@@ -56,6 +59,8 @@ struct Chunk {
     store: FactStore,
     metrics: MetricsTable,
     files: Vec<FileFacts>,
+    /// Per file, when loading with a cache.
+    stamps: Vec<Stamp>,
     errors: Vec<ReadError>,
     bytes: u64,
 }
@@ -77,6 +82,13 @@ fn chunk_size(files: usize) -> usize {
 /// are reserved once from an early estimate; capacity that is never written is never touched
 /// (no RSS) and is released at the end.
 pub fn load(inputs: Inputs) -> Index {
+    load_with(inputs, None).0
+}
+
+/// [`load`] with cached facts: files the cache `lookup` has are copied from it instead of
+/// read and extracted. Also returns the [`Stamp`] of every file (empty without a cache), for
+/// writing the cache back. Same result as [`load`] for the same file contents.
+pub(crate) fn load_with(inputs: Inputs, lookup: Option<&mut Lookup>) -> (Index, Vec<Stamp>) {
     let n = inputs.len();
     let t0 = Instant::now();
     let workers = PerThread::new(Worker::default);
@@ -87,6 +99,7 @@ pub fn load(inputs: Inputs) -> Index {
     // Chunks are handed out in FileId order from a counter (not split recursively the rayon
     // way), so they finish roughly in order and few wait for an earlier one.
     let next = AtomicUsize::new(0);
+    let cache = lookup.as_deref();
     timing::time("load.extract", || {
         (0..rayon::current_num_threads().min(nchunks)).into_par_iter().for_each(|_| {
             loop {
@@ -95,7 +108,7 @@ pub fn load(inputs: Inputs) -> Index {
                     break;
                 }
                 let range = c * size..((c + 1) * size).min(n);
-                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range));
+                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range, cache));
                 *lock(&slots[c]) = Some(chunk);
                 drain(&sink, &slots);
             }
@@ -125,13 +138,13 @@ pub fn load(inputs: Inputs) -> Index {
     });
     let merge = t1.elapsed();
 
-    let Sink { facts, metrics, files, errors, bytes, .. } = sink;
+    let Sink { facts, metrics, files, errors, bytes, stamps, .. } = sink;
     let lines = files.iter().map(|ff| u64::from(ff.lines)).sum();
     let stats = LoadStats { files: n as u64, bytes, lines, extract, merge, build: Duration::ZERO };
     let t2 = Instant::now();
     let mut index = timing::time("load.build", || build::build(inputs, strings, facts, metrics, files, errors, stats));
     index.stats.build = t2.elapsed();
-    index
+    (index, stamps)
 }
 
 /// Locks a mutex, ignoring poisoning (a panicking worker aborts the load anyway).
@@ -159,23 +172,60 @@ fn drain(sink: &Mutex<Sink>, slots: &[Mutex<Option<Chunk>>]) {
 }
 
 impl Worker {
-    fn chunk(&mut self, wi: usize, inputs: &Inputs, range: std::ops::Range<usize>) -> Chunk {
+    fn chunk(&mut self, wi: usize, inputs: &Inputs, range: std::ops::Range<usize>, cache: Option<&Lookup>) -> Chunk {
         debug_assert!(self.store.defs.is_empty() && self.metrics.is_empty());
         let mut files = Vec::with_capacity(range.len());
+        let mut stamps = Vec::with_capacity(if cache.is_some() { range.len() } else { 0 });
         let mut errors = Vec::new();
         let mut bytes = 0u64;
         let mut buf = std::mem::take(&mut self.buf);
         for f in range {
+            let path = inputs.paths.get(f);
+            let g = inputs.group[f];
+            let probe = cache.map_or(Probe::Miss, |c| c.probe(g, path));
+            if let (Probe::Hit(i, st), Some(c)) = (probe, cache)
+                && let Some(ff) = c.copy(g, i, false, &mut self.store, &mut self.metrics, &mut self.interner, &mut self.remap)
+            {
+                files.push(ff);
+                bytes += st.size;
+                stamps.push(st);
+                c.done(g);
+                continue;
+            }
             buf.clear();
-            let res = File::open(inputs.paths.get(f)).and_then(|mut h| h.read_to_end(&mut buf));
+            let mut mtime = 0;
+            let res = File::open(path).and_then(|mut h| {
+                if cache.is_some() {
+                    mtime = crate::cache::mtime_ns(&h.metadata()?);
+                }
+                h.read_to_end(&mut buf)
+            });
+            let read_ok = res.is_ok();
             if let Err(e) = res {
                 errors.push(ReadError { file: f as FileId, kind: e.kind() });
                 buf.clear();
             }
             bytes += buf.len() as u64;
             let src = &buf[..];
+            if let Some(c) = cache {
+                let st = Stamp { size: src.len() as u64, mtime_ns: mtime, hash: hash_bytes(src) };
+                stamps.push(st);
+                if let Probe::Verify(i, old) = probe
+                    && read_ok
+                    && old.size == st.size
+                    && old.hash == st.hash
+                    && let Some(ff) = c.copy(g, i, true, &mut self.store, &mut self.metrics, &mut self.interner, &mut self.remap)
+                {
+                    files.push(ff);
+                    c.done(g);
+                    continue;
+                }
+            }
             let m = MetricsVisitor::new(src, &mut self.scratch, &mut self.metrics);
             files.push(extract_with(src, &mut self.store, &mut self.interner, m).0);
+            if let Some(c) = cache {
+                c.done(g);
+            }
         }
         // Keep the buffer for the next chunk unless one huge file grew it.
         if buf.capacity() <= 16 << 20 {
@@ -188,7 +238,7 @@ impl Worker {
         metrics.append(&self.metrics);
         self.metrics.clear();
         debug_assert_eq!(metrics.len(), store.defs.len() as usize - files.len());
-        Chunk { worker: wi, store, metrics, files, errors, bytes }
+        Chunk { worker: wi, store, metrics, files, stamps, errors, bytes }
     }
 }
 
@@ -206,6 +256,7 @@ struct Sink {
     files: Vec<FileFacts>,
     /// Worker (interner) of each file's `Sym`s, until remapped.
     worker: Vec<u32>,
+    stamps: Vec<Stamp>,
     errors: Vec<ReadError>,
     bytes: u64,
 }
@@ -267,6 +318,7 @@ impl Sink {
             self.files.push(ff);
             self.worker.push(c.worker as u32);
         }
+        self.stamps.extend_from_slice(&c.stamps);
         self.metrics.append(&c.metrics);
         self.errors.extend_from_slice(&c.errors);
         self.bytes += c.bytes;
