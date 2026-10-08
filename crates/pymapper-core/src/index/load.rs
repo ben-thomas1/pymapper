@@ -85,10 +85,10 @@ pub fn load(inputs: Inputs) -> Index {
     load_with(inputs, None).0
 }
 
-/// [`load`] with cached facts: files the cache `lookup` has are copied from it instead of
+/// [`load`] with cached facts: files the cache lookup has are copied from it instead of
 /// read and extracted. Also returns the [`Stamp`] of every file (empty without a cache), for
 /// writing the cache back. Same result as [`load`] for the same file contents.
-pub(crate) fn load_with(inputs: Inputs, lookup: Option<&mut Lookup>) -> (Index, Vec<Stamp>) {
+pub(crate) fn load_with(inputs: Inputs, cache: Option<&Lookup>) -> (Index, Vec<Stamp>) {
     let n = inputs.len();
     let t0 = Instant::now();
     let workers = PerThread::new(Worker::default);
@@ -99,7 +99,6 @@ pub(crate) fn load_with(inputs: Inputs, lookup: Option<&mut Lookup>) -> (Index, 
     // Chunks are handed out in FileId order from a counter (not split recursively the rayon
     // way), so they finish roughly in order and few wait for an earlier one.
     let next = AtomicUsize::new(0);
-    let cache = lookup.as_deref();
     timing::time("load.extract", || {
         (0..rayon::current_num_threads().min(nchunks)).into_par_iter().for_each(|_| {
             loop {

@@ -268,13 +268,11 @@ pub(crate) struct Reader {
 impl Reader {
     /// Opens and validates `path` (see the module docs).
     pub fn open(path: &Path, kind: u32, schema: u64, key: u64) -> Result<Reader, CacheError> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let len = file.metadata()?.len();
-        let bytes = if len >= MAP_THRESHOLD {
-            Bytes::Mapped(Mmap::map(&file)?)
-        } else {
-            Bytes::copy_from(&std::fs::read(path)?)
-        };
+        // Both branches use the same descriptor, so they see the same file even if it is
+        // replaced (renamed over) meanwhile.
+        let bytes = if len >= MAP_THRESHOLD { Bytes::Mapped(Mmap::map(&file)?) } else { Bytes::read_from(&mut file, len)? };
         Reader::from_bytes(bytes, kind, schema, key)
     }
 

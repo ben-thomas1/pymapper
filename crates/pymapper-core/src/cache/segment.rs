@@ -24,7 +24,7 @@ use std::path::Path;
 use super::format::{CacheError, Reader, Writer};
 use super::mmap::Pod;
 use crate::extract::MetricsTable;
-use crate::extract::facts::{FactStore, FileFacts, NO_PARENT, Run};
+use crate::extract::facts::{FactStore, FileFacts, NO_PARENT, Run, TableBases};
 use crate::intern::{FxHashMap, Interner, Sym, hash_bytes};
 
 pub(crate) const STR_OFFS: u32 = 0;
@@ -170,6 +170,95 @@ macro_rules! metric_columns {
             136: params,
         )
     };
+}
+
+/// Compile-time guard: exhaustive patterns (no `..`) over every table, so adding, removing or
+/// renaming a column of [`FactStore`] or [`MetricsTable`] fails to build here until
+/// `fact_columns!` / `metric_columns!` (and, when the extractor's output changes,
+/// [`super::FACTS_VERSION`]) are updated. A column missing from those lists would otherwise
+/// be silently dropped by the cache and leave copied tables ragged.
+#[allow(dead_code)]
+fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
+    const _: () = assert!(HDR == 13 * 2 + 4, "FILE_HDR: 13 runs, lines, flags, metrics row, reserved");
+    use crate::extract::facts::{Bases, Bindings, Calls, Decls, Decorators, Defs, Diags, Imports, Params, Suppressions};
+    let FactStore {
+        defs:
+            Defs {
+                kind: _,
+                flags: _,
+                name: _,
+                parent: _,
+                start: _,
+                end: _,
+                start_line: _,
+                end_line: _,
+                name_line: _,
+                name_col: _,
+                decorators_len: _,
+                bases_len: _,
+                params: _,
+                params_len: _,
+            },
+        decorators: Decorators { owner: _, chain: _, chain_len: _, flags: _ },
+        bases: Bases { owner: _, chain: _, chain_len: _, keyword: _, flags: _ },
+        params: Params { name: _, flags: _ },
+        imports: Imports { scope: _, module: _, module_len: _, name: _, alias: _, level: _, flags: _, line: _, col: _ },
+        calls: Calls { scope: _, chain: _, chain_len: _, flags: _, line: _, col: _ },
+        bindings:
+            Bindings { scope: _, target: _, target_len: _, kind: _, flags: _, value_chain: _, value_len: _, line: _ },
+        decls: Decls { scope: _, kind: _, name: _ },
+        names: _,
+        exports: _,
+        evidence: _,
+        diags: Diags { kind: _, line: _, col: _ },
+        suppressions: Suppressions { line: _, codes: _, all: _ },
+        // The extractor's private scratch. New tables are caught by `TableBases` below.
+        ..
+    } = s;
+    let TableBases {
+        defs: _,
+        decorators: _,
+        bases: _,
+        params: _,
+        imports: _,
+        calls: _,
+        bindings: _,
+        decls: _,
+        names: _,
+        exports: _,
+        evidence: _,
+        diags: _,
+        suppressions: _,
+    } = s.bases();
+    // `for_runs!` and the `FILE_HDR` layout (`HDR` words).
+    let FileFacts {
+        defs: _,
+        decorators: _,
+        bases: _,
+        params: _,
+        imports: _,
+        calls: _,
+        bindings: _,
+        decls: _,
+        names: _,
+        exports: _,
+        evidence: _,
+        diags: _,
+        suppressions: _,
+        lines: _,
+        flags: _,
+    } = FileFacts::default();
+    let MetricsTable {
+        cyclomatic: _,
+        cognitive: _,
+        max_nesting: _,
+        loc: _,
+        distinct_operators: _,
+        distinct_operands: _,
+        operators: _,
+        operands: _,
+        params: _,
+    } = m;
 }
 
 /// Second section of a `Run` column (`id` holds the starts, `id + 1` the lengths).
@@ -664,33 +753,38 @@ impl Segment {
         let names = u64::from(ff.names.len);
         let bad = |what| Err(CacheError::Corrupt(what));
         let d = ff.defs.range();
-        if !self.col::<u32>(19)[d.clone()].iter().all(|&p| p == NO_PARENT || p < defs) {
+        if !self.typed(19, |s| &s.defs.parent)[d.clone()].iter().all(|&p| p == NO_PARENT || p < defs) {
             return bad("parent");
         }
-        let (pstart, plen) = (&self.col::<u32>(28)[d.clone()], &self.col::<u16>(29)[d]);
+        let (pstart, plen) = (&self.typed(28, |s| &s.defs.params)[d.clone()], &self.typed(29, |s| &s.defs.params_len)[d]);
         if !pstart.iter().zip(plen).all(|(&s, &l)| u64::from(s) + u64::from(l) <= u64::from(ff.params.len)) {
             return bad("params");
         }
-        owned(self.col::<u32>(32), ff.decorators, self.col::<u8>(26), ff.defs)?;
-        owned(self.col::<u32>(40), ff.bases, self.col::<u8>(27), ff.defs)?;
-        for (id, run) in [(56, ff.imports), (72, ff.calls), (80, ff.bindings), (88, ff.decls)] {
-            if !self.col::<u32>(id)[run.range()].iter().all(|&s| s < defs) {
+        let dec_count = self.typed(26, |s| &s.defs.decorators_len);
+        owned(self.typed(32, |s| &s.decorators.owner), ff.decorators, dec_count, ff.defs)?;
+        owned(self.typed(40, |s| &s.bases.owner), ff.bases, self.typed(27, |s| &s.defs.bases_len), ff.defs)?;
+        let scopes = [
+            (self.typed(56, |s| &s.imports.scope), ff.imports),
+            (self.typed(72, |s| &s.calls.scope), ff.calls),
+            (self.typed(80, |s| &s.bindings.scope), ff.bindings),
+            (self.typed(88, |s| &s.decls.scope), ff.decls),
+        ];
+        for (col, run) in scopes {
+            if !col[run.range()].iter().all(|&s| s < defs) {
                 return bad("scope");
             }
         }
-        for (id, len_id, run) in [
-            (33, 34, ff.decorators),
-            (41, 42, ff.bases),
-            (57, 58, ff.imports),
-            (73, 74, ff.calls),
-            (81, 82, ff.bindings),
-            (85, 86, ff.bindings),
-        ] {
+        let chains = [
+            (self.typed(33, |s| &s.decorators.chain), self.typed(34, |s| &s.decorators.chain_len), ff.decorators),
+            (self.typed(41, |s| &s.bases.chain), self.typed(42, |s| &s.bases.chain_len), ff.bases),
+            (self.typed(57, |s| &s.imports.module), self.typed(58, |s| &s.imports.module_len), ff.imports),
+            (self.typed(73, |s| &s.calls.chain), self.typed(74, |s| &s.calls.chain_len), ff.calls),
+            (self.typed(81, |s| &s.bindings.target), self.typed(82, |s| &s.bindings.target_len), ff.bindings),
+            (self.typed(85, |s| &s.bindings.value_chain), self.typed(86, |s| &s.bindings.value_len), ff.bindings),
+        ];
+        for (col, lens, run) in chains {
             let r = run.range();
-            let ok = self.col::<u32>(id)[r.clone()]
-                .iter()
-                .zip(&self.col::<u8>(len_id)[r])
-                .all(|(&c, &l)| l < 2 || u64::from(c) - 1 + u64::from(l) <= names);
+            let ok = col[r.clone()].iter().zip(&lens[r]).all(|(&c, &l)| l < 2 || u64::from(c) - 1 + u64::from(l) <= names);
             if !ok {
                 return bad("chain");
             }
@@ -702,6 +796,27 @@ impl Segment {
         }
         Ok(())
     }
+
+    /// Column `id` read as the stored type of the [`FactStore`] column `_col` selects (`Sym`
+    /// columns as their raw `u32` ids), so that a column changing type cannot be read with a
+    /// stale element type here.
+    #[inline]
+    fn typed<T: Stored>(&self, id: u32, _col: fn(&FactStore) -> &Vec<T>) -> &[T::Raw] {
+        self.col::<T::Raw>(id)
+    }
+}
+
+/// How a [`FactStore`] column element is stored in a segment.
+trait Stored {
+    type Raw: Pod;
+}
+
+impl<T: Pod> Stored for T {
+    type Raw = T;
+}
+
+impl Stored for Sym {
+    type Raw = u32;
 }
 
 /// Rows owned by defs (`owner` column over `rows`, per-def counts over `defs`): owners are

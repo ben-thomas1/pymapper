@@ -2,7 +2,7 @@
 //! tests.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 
@@ -69,14 +69,19 @@ pub(crate) enum Bytes {
 
 impl Bytes {
     /// Copies `b` into an aligned buffer.
-    pub fn copy_from(b: &[u8]) -> Bytes {
-        let mut words = vec![0u64; b.len().div_ceil(8)];
-        for (w, c) in words.iter_mut().zip(b.chunks(8)) {
-            let mut a = [0u8; 8];
-            a[..c.len()].copy_from_slice(c);
-            *w = u64::from_ne_bytes(a);
-        }
-        Bytes::Owned { words, len: b.len() }
+    #[cfg(test)]
+    pub fn copy_from(mut b: &[u8]) -> Bytes {
+        let len = b.len() as u64;
+        Bytes::read_from(&mut b, len).expect("reading a slice of its own length")
+    }
+
+    /// Reads exactly `len` bytes of `r` straight into an aligned buffer (one allocation, no
+    /// intermediate copy). A short read is `UnexpectedEof`.
+    pub fn read_from(r: &mut impl Read, len: u64) -> io::Result<Bytes> {
+        let len = usize::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
+        let mut words = vec![0u64; len.div_ceil(8)];
+        r.read_exact(&mut as_bytes_mut(words.as_mut_slice())[..len])?;
+        Ok(Bytes::Owned { words, len })
     }
 
     #[inline]
@@ -103,12 +108,20 @@ unsafe impl Pod for u32 {}
 unsafe impl Pod for u64 {}
 
 /// The bytes of a scalar slice (native order; the format is little-endian and the cache is
-/// only used on little-endian hosts, see [`super::NATIVE_OK`]).
+/// only used on little-endian hosts, see [`super::load`]).
 #[inline]
 pub(crate) fn as_bytes<T: Pod>(s: &[T]) -> &[u8] {
     // SAFETY: `T: Pod` has no padding, so all `size_of_val(s)` bytes are initialised; `u8` has
     // alignment 1 and the lifetime is tied to `s`.
     unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), size_of_val(s)) }
+}
+
+/// The bytes of a scalar slice, writable.
+#[inline]
+pub(crate) fn as_bytes_mut<T: Pod>(s: &mut [T]) -> &mut [u8] {
+    // SAFETY: as `as_bytes`; writes are sound because `T: Pod` accepts every bit pattern, and
+    // the exclusive borrow of `s` is moved into the result.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), size_of_val(s)) }
 }
 
 /// Views `b` as a slice of `T`; `None` if misaligned or not a whole number of elements.

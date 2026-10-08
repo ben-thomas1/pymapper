@@ -279,8 +279,8 @@ fn open_bytes(b: &[u8]) -> Result<Segment, CacheError> {
 fn load_from_segment(inputs: Inputs, seg: Segment) -> (Index, Vec<Stamp>, u32) {
     let plan = Plan { file: String::new(), key: 2, mode: Mode::Trusted, base: PathBuf::new() };
     let n = inputs.len() as u32;
-    let mut lookup = Lookup::with_segments(vec![plan], vec![Some(seg)], &[n]);
-    let (ix, stamps) = crate::index::load_with(inputs, Some(&mut lookup));
+    let lookup = Lookup::with_segments(vec![plan], vec![Some(seg)], &[n]);
+    let (ix, stamps) = crate::index::load_with(inputs, Some(&lookup));
     let hits = lookup.hits[0].load(Ordering::Relaxed);
     (ix, stamps, hits)
 }
@@ -605,4 +605,33 @@ fn stored_paths_and_families() {
     assert_eq!(family("stdlib-3.13-abcd-0123.pmc"), Some("stdlib-3.13-abcd-"));
     assert_eq!(family("files-0123.pmc"), None);
     assert_eq!(sanitize(b"1.0+local/x y"), "1.0+local_x_y");
+}
+
+#[test]
+fn superseded_segments_are_removed_but_used_ones_kept() {
+    let t = TempDir::new("superseded");
+    let cache = Cache::new(t.path());
+    let names = [
+        "dist-foo@0.9@0001.pmc",
+        "dist-foo@1.0@0002.pmc",
+        "dist-foo@2.0@0003.pmc",
+        "dist-bar@1.0@0004.pmc",
+        "stdlib-3.13-abcd-0005.pmc",
+        "files-0006.pmc",
+    ];
+    for n in names {
+        fs::write(t.path().join(n), b"x").expect("write");
+    }
+    let plan = |file: &str| Plan { file: file.to_owned(), key: 0, mode: Mode::Trusted, base: PathBuf::new() };
+    // foo 1.0 (system site-packages, a hit) and foo 2.0 (venv, just written) in one load.
+    let plans = [plan("dist-foo@1.0@0002.pmc"), plan("dist-foo@2.0@0003.pmc"), plan("files-0007.pmc")];
+    remove_superseded(&cache, &plans, &[1, 2]);
+    let want = [
+        "dist-bar@1.0@0004.pmc",
+        "dist-foo@1.0@0002.pmc",
+        "dist-foo@2.0@0003.pmc",
+        "files-0006.pmc",
+        "stdlib-3.13-abcd-0005.pmc",
+    ];
+    assert_eq!(pmc_files(t.path()), want);
 }

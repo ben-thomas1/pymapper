@@ -61,7 +61,7 @@ use crate::config::Config;
 use crate::extract::MetricsTable;
 use crate::extract::facts::{FactStore, FileFacts};
 use crate::index::{FileId, Group, Index, Inputs};
-use crate::intern::{FxHasher, Interner, hash_bytes};
+use crate::intern::{FxHashSet, FxHasher, Interner, hash_bytes};
 use crate::roots::{Origin, Roots};
 
 /// Bump whenever the extractor changes the facts or metrics it produces for some input.
@@ -525,8 +525,8 @@ pub fn load(inputs: Inputs, roots: Option<&Roots>, cache: &Cache) -> (Index, Cac
     for f in 0..inputs.len() as FileId {
         group_files[inputs.group(f) as usize] += 1;
     }
-    let mut lookup = Lookup::new(cache.dir.clone(), schema, plans, &group_files);
-    let (index, stamps) = crate::index::load_with(inputs, Some(&mut lookup));
+    let lookup = Lookup::new(cache.dir.clone(), schema, plans, &group_files);
+    let (index, stamps) = crate::index::load_with(inputs, Some(&lookup));
     let hits: u64 = lookup.hits.iter().map(|h| u64::from(h.load(Ordering::Relaxed))).sum();
     stats.verified = lookup.verified.iter().map(|h| u64::from(h.load(Ordering::Relaxed))).sum();
     stats.hits = hits - stats.verified;
@@ -612,27 +612,26 @@ fn write_back(cache: &Cache, index: &Index, stamps: &[Stamp], lookup: &Lookup, s
             }
         }
     }
-    remove_superseded(cache, stale.iter().map(|&g| &lookup.plans[g]));
+    remove_superseded(cache, &lookup.plans, &stale);
 }
 
-/// Deletes older versions of the segments just written (same family, other file).
-fn remove_superseded<'a>(cache: &Cache, written: impl Iterator<Item = &'a Plan>) {
-    let mut keep: crate::intern::FxHashMap<&str, &str> = crate::intern::FxHashMap::default();
-    for p in written {
-        if let Some(fam) = family(&p.file) {
-            keep.insert(fam, &p.file);
-        }
-    }
-    if keep.is_empty() {
+/// Deletes older versions of the segments just written: files of the same family as one of
+/// `written` that this load does not use (`plans`). Every member of a family the load uses is
+/// kept, so the same distribution at two versions (venv and system site-packages) does not
+/// make each load delete the other's segment.
+fn remove_superseded(cache: &Cache, plans: &[Plan], written: &[usize]) {
+    let families: FxHashSet<&str> = written.iter().filter_map(|&g| family(&plans[g].file)).collect();
+    if families.is_empty() {
         return;
     }
+    let used: FxHashSet<&str> = plans.iter().map(|p| p.file.as_str()).collect();
     let Ok(rd) = std::fs::read_dir(&cache.dir) else { return };
     for ent in rd.flatten() {
         let name = ent.file_name();
         let Some(name) = name.to_str() else { continue };
         if name.ends_with(".pmc")
-            && let Some(fam) = family(name)
-            && keep.get(fam).is_some_and(|&k| k != name)
+            && !used.contains(name)
+            && family(name).is_some_and(|f| families.contains(f))
         {
             let _ = std::fs::remove_file(ent.path());
         }
