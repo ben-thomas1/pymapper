@@ -8,12 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# mmap for the zero-copy cache readers.
+libc.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-
-[dev-dependencies]
-libc.workspace = true
 
 [[bench]]
 name = "intern"
