@@ -580,7 +580,7 @@ impl<T> Pool<T> {
 /// Pads a value to its own cache line (128 bytes covers Apple M-series and x86 adjacent-line
 /// prefetch) so per-thread slots do not false-share.
 #[repr(align(128))]
-pub(crate) struct CachePadded<T>(pub(crate) T);
+struct CachePadded<T>(T);
 
 /// One `T` per rayon worker thread plus one shared overflow slot.
 ///

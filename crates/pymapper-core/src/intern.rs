@@ -23,23 +23,32 @@
 //!
 //! # Why per-thread + remap (and not a shared concurrent interner)
 //!
-//! Both were built and measured with `benches/intern.rs` (14-core Apple Silicon, release, best
-//! of N; identifiers scanned from Python sources). The shared variant was one global interner
-//! split into 64 hash-selected shards, each a `Mutex` around the same open-addressing table;
-//! it was deleted after this comparison (see git history of this file). Identifier frequencies
-//! are Zipfian (`self`, `None`, ...), so a few shards take most of the traffic and their locks
-//! and cache lines bounce between cores: on 14 threads it was slower than one thread.
+//! Both were built and measured with `benches/intern.rs` (14-core Apple Silicon, release, fat
+//! LTO, 14 rayon threads; identifiers scanned from Python sources; best of 7 runs for stdlib,
+//! best of 3 for the venv). The shared variant was one global interner split into 64
+//! hash-selected shards, each a `Mutex` around the same open-addressing table, handing out final
+//! ids at once; it was deleted after this comparison (see the history of this file).
+//! Identifier frequencies are Zipfian (`self`, `None`, ...), so a few shards take most of the
+//! traffic and their locks and cache lines bounce between cores: on 14 threads it was slower
+//! than a single thread on pre-scanned identifiers.
 //!
 //! ```text
-//!   corpus (identifiers, distinct)      phase         single    sharded   per-thread
-//!   stdlib (536k ids, 32.7k distinct)   intern        7.7 ms    16.5 ms   2.6 ms
-//!                                       scan+intern   37.4 ms   20.8 ms   5.5 ms
-//!   venv   (24.1M ids, 802k distinct)   intern        -         592 ms    82.6 ms
-//!                                       scan+intern   -         672 ms    200 ms
+//!   corpus (identifiers, distinct)       phase         single     sharded    per-thread
+//!   stdlib (536k ids, 32.7k distinct)    intern        8.8 ms     16.4 ms    2.0 ms
+//!                                        scan+intern   44.3 ms    19.5 ms    5.1 ms
+//!                                        table heap    1.2 MiB    1.2 MiB    3.1 MiB
+//!   venv   (24.1M ids, 802k distinct)    intern        410 ms     560 ms     47.5 ms
+//!                                        scan+intern   1836 ms    642 ms     162 ms
+//!                                        table heap    36.0 MiB   38.1 MiB   80.7 MiB
 //! ```
 //!
-//! The per-thread variant pays in transient memory (every worker holds the common vocabulary
-//! until the merge) and a merge step. Numbers for the final version are in `benches/intern.rs`.
+//! `intern` interns pre-scanned identifiers (pure interning, worst-case contention);
+//! `scan+intern` scans and interns each file in one pass, closer to the real extractor. The
+//! per-thread times include the merge and the remap of every id (venv `intern`: 37.4 ms parallel
+//! interning + 7.8 ms merge + 2.5 ms remap). The per-thread variant pays in transient memory:
+//! "table heap" counts every worker table, the merged table and the remaps, all alive at merge
+//! time (the worker tables are dropped right after); the merged table alone is the size of the
+//! single-threaded one.
 //!
 //! # Storage layout
 //!
@@ -683,138 +692,6 @@ impl Remap {
     /// Heap bytes held by the table.
     pub fn heap_bytes(&self) -> usize {
         self.map.as_ref().map_or(0, |m| m.capacity() * 4)
-    }
-}
-// ---------------------------------------------------------------------------------------------
-// Candidate strategy: sharded global concurrent interner (benchmark comparison only)
-// ---------------------------------------------------------------------------------------------
-
-pub mod sharded {
-    //! One global interner split into [`SHARDS`](super) mutex-protected shards selected by the
-    //! low bits of the hash tag. Workers intern directly into it and get final ids at once.
-    //!
-    //! `Sym::index = (local_id << SHARD_BITS) | shard`, so ids are final as soon as they are
-    //! handed out; the index space has small holes (shards fill evenly but not exactly).
-
-    use std::sync::{Mutex, PoisonError};
-
-    use super::{Index, SHARD_BITS, SHARDS, Sym, get_str, intern_into, interner_full, shard_of, tag_of};
-    use crate::arena::CachePadded;
-
-    const MASK: u32 = (1 << SHARD_BITS) - 1;
-
-    /// String storage + index of one shard.
-    struct Shard {
-        bytes: Vec<u8>,
-        offs: Vec<u32>,
-        ix: Index,
-    }
-
-    impl Shard {
-        fn new() -> Shard {
-            Shard { bytes: Vec::new(), offs: vec![0], ix: Index::default() }
-        }
-    }
-
-    #[inline]
-    fn make_sym(local: u32, shard: usize) -> Sym {
-        let index = (u64::from(local) << SHARD_BITS) | shard as u64;
-        if index > u64::from(Sym::MAX_INDEX) {
-            interner_full();
-        }
-        Sym::from_index(index as u32)
-    }
-
-    /// Concurrent interner: `intern(&self)` from any number of threads.
-    pub struct ShardedInterner {
-        shards: Box<[CachePadded<Mutex<Shard>>]>,
-    }
-
-    impl Default for ShardedInterner {
-        fn default() -> Self {
-            ShardedInterner::new()
-        }
-    }
-
-    impl ShardedInterner {
-        /// Creates an empty interner.
-        pub fn new() -> ShardedInterner {
-            let mut shards = Vec::with_capacity(SHARDS);
-            for _ in 0..SHARDS {
-                shards.push(CachePadded(Mutex::new(Shard::new())));
-            }
-            ShardedInterner { shards: shards.into_boxed_slice() }
-        }
-
-        /// Returns the id of `s`, inserting it if new. Thread-safe.
-        #[inline]
-        pub fn intern(&self, s: &[u8]) -> Sym {
-            let tag = tag_of(s);
-            let shard = shard_of(tag);
-            let local = {
-                let mut g = self.shards[shard].0.lock().unwrap_or_else(PoisonError::into_inner);
-                let Shard { bytes, offs, ix } = &mut *g;
-                intern_into(bytes, offs, ix, s, tag)
-            };
-            make_sym(local, shard)
-        }
-
-        /// Ends the concurrent phase: lock-free read-only view.
-        pub fn freeze(self) -> Frozen {
-            let mut shards = Vec::with_capacity(SHARDS);
-            for s in self.shards.into_vec() {
-                shards.push(s.0.into_inner().unwrap_or_else(PoisonError::into_inner));
-            }
-            Frozen { shards: shards.into_boxed_slice() }
-        }
-    }
-
-    /// Frozen interner: resolve and look up without locks.
-    pub struct Frozen {
-        shards: Box<[Shard]>,
-    }
-
-    impl Frozen {
-        /// The string of `sym`.
-        #[inline]
-        pub fn resolve(&self, sym: Sym) -> &[u8] {
-            let i = sym.index() as u32;
-            let sh = &self.shards[(i & MASK) as usize];
-            get_str(&sh.bytes, &sh.offs, i >> SHARD_BITS)
-        }
-
-        /// Id of `s` if it was interned.
-        #[inline]
-        pub fn get(&self, s: &[u8]) -> Option<Sym> {
-            let tag = tag_of(s);
-            let shard = shard_of(tag);
-            let sh = &self.shards[shard];
-            let local = sh.ix.find(&sh.bytes, &sh.offs, s, tag)?;
-            Some(make_sym(local, shard))
-        }
-
-        /// Number of distinct strings.
-        pub fn len(&self) -> usize {
-            let mut n = 0;
-            for sh in self.shards.iter() {
-                n += sh.offs.len() - 1;
-            }
-            n
-        }
-
-        /// Whether nothing was interned.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-
-        /// Heap bytes held.
-        pub fn heap_bytes(&self) -> usize {
-            let mut n = 0;
-            for sh in self.shards.iter() {
-                n += sh.bytes.capacity() + sh.offs.capacity() * 4 + sh.ix.heap_bytes();
-            }
-            n
-        }
     }
 }
 

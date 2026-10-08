@@ -1,7 +1,7 @@
 //! Interner benchmark on real Python identifier distributions.
 //!
 //! ```text
-//! cargo bench -p pymapper-core --bench intern -- <sharded|local|single> [--reps N] [DIR...]
+//! cargo bench -p pymapper-core --bench intern -- <local|single> [--reps N] [DIR...]
 //! ```
 //!
 //! Without DIRs it uses tests/corpus. Each file's identifiers are found with a simple scanner
@@ -12,13 +12,16 @@
 //! - `scan+intern`: scan and intern each file in one pass (closer to the real extractor, which
 //!   interleaves lexing with interning).
 //!
-//! Run one mode per process so peak RSS is attributable.
+//! Modes: `local` = per-thread interners under rayon + `Interner::merge_all` + remap of every
+//! id; `single` = one interner on one thread (reference). Results and the comparison with the
+//! deleted sharded concurrent interner are in the docs of `src/intern.rs`. Run one mode per
+//! process so peak RSS is attributable.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pymapper_core::arena::PerThread;
-use pymapper_core::intern::{Interner, Sym, sharded};
+use pymapper_core::intern::{Interner, Sym};
 use rayon::prelude::*;
 
 const KEYWORDS: &[&[u8]] = &[
@@ -191,29 +194,6 @@ fn run_single(files: &[File], inline: bool) -> Rep {
     Rep { parts: vec![], total, distinct: li.len(), heap: li.heap_bytes(), check }
 }
 
-fn run_sharded(files: &[File], inline: bool) -> Rep {
-    let t0 = Instant::now();
-    let si = sharded::ShardedInterner::new();
-    let out: Vec<Vec<Sym>> = files
-        .par_iter()
-        .map(|f| {
-            let mut ids = Vec::with_capacity(f.spans.len() / 2);
-            if inline {
-                scan(&f.src, |w| ids.push(si.intern(w)));
-            } else {
-                for w in idents(f) {
-                    ids.push(si.intern(w));
-                }
-            }
-            ids
-        })
-        .collect();
-    let fz = si.freeze();
-    let total = t0.elapsed();
-    let check = checksum(&out, |s| fz.resolve(s).len());
-    Rep { parts: vec![], total, distinct: fz.len(), heap: fz.heap_bytes(), check }
-}
-
 fn run_local(files: &[File], inline: bool) -> Rep {
     let t0 = Instant::now();
     let pt: PerThread<Interner> = PerThread::new(Interner::new);
@@ -274,7 +254,7 @@ fn checksum(out: &[Vec<Sym>], len: impl Fn(Sym) -> usize) -> u64 {
 
 fn main() {
     let mut args = std::env::args().skip(1).filter(|a| a != "--bench");
-    let mode = args.next().unwrap_or_else(|| "sharded".to_owned());
+    let mode = args.next().unwrap_or_else(|| "local".to_owned());
     let mut reps = 5usize;
     let mut dirs = Vec::new();
     while let Some(a) = args.next() {
@@ -288,11 +268,10 @@ fn main() {
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus"));
     }
     let run: fn(&[File], bool) -> Rep = match mode.as_str() {
-        "sharded" => run_sharded,
         "local" => run_local,
         "single" => run_single,
         other => {
-            eprintln!("unknown mode {other}: expected sharded | local | single");
+            eprintln!("unknown mode {other}: expected local | single");
             std::process::exit(2);
         }
     };
