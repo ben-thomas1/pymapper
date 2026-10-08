@@ -60,6 +60,10 @@ pub enum Target {
     /// the hierarchy. The corpus root is the import root of one first-party group. Peak RSS
     /// includes the whole index.
     Load,
+    /// `load`, then import resolution (`pymapper_core::resolve::resolve_imports`): module table,
+    /// namespaces, per-row resolution and module edges. Unresolved imports are attributed with
+    /// the built-in stdlib table only. Peak RSS includes the index.
+    Resolve,
 }
 
 impl Target {
@@ -77,6 +81,7 @@ impl Target {
             Target::MetricsMem => "metrics-mem",
             Target::ExtractMem => "extract-mem",
             Target::Load => "load",
+            Target::Resolve => "resolve",
         }
     }
 }
@@ -399,6 +404,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         }
         Target::Roots => roots_target(root)?,
         Target::Load => load_target(root)?,
+        Target::Resolve => resolve_target(root)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -486,6 +492,41 @@ fn load_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("intern_kb".to_owned(), kb(ix.strings().heap_bytes())),
         // Retained index bytes per 1000 LOC (milli-bytes per LOC).
         ("index_B_per_kLOC".to_owned(), (ix.heap_bytes() as u64 * 1000).checked_div(s.lines).unwrap_or(0)),
+    ];
+    Ok((stats, counters))
+}
+
+/// `resolve`: [`load_target`]'s load, then [`pymapper_core::resolve::resolve_imports`] (phases
+/// `resolve.modules`, `resolve.imports`, `resolve.edges`). Index and resolution stay alive until
+/// the counters are taken.
+fn resolve_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, ImportStatus, resolve_imports};
+    use pymapper_core::roots::Origin;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let s = ix.stats();
+    let st = imp.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let by = |k: ImportStatus| st.by_status[k as usize];
+    let found = by(ImportStatus::Module) + by(ImportStatus::Symbol) + by(ImportStatus::Variable);
+    let missing = by(ImportStatus::MissingName) + by(ImportStatus::MissingModule) + by(ImportStatus::BeyondTop);
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("imports".to_owned(), st.rows),
+        ("modules".to_owned(), st.modules),
+        // Per mille of import rows.
+        ("found_pm".to_owned(), (found * 1000).checked_div(st.rows).unwrap_or(0)),
+        ("dynamic_pm".to_owned(), (by(ImportStatus::Dynamic) * 1000).checked_div(st.rows).unwrap_or(0)),
+        ("missing_pm".to_owned(), (missing * 1000).checked_div(st.rows).unwrap_or(0)),
+        ("external_pm".to_owned(), ((st.rows - found - missing - by(ImportStatus::Dynamic)) * 1000).checked_div(st.rows).unwrap_or(0)),
+        ("module_edges".to_owned(), st.module_edges),
+        ("ext_edges".to_owned(), st.ext_edges),
+        ("resolve_kb".to_owned(), imp.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ];
     Ok((stats, counters))
 }
@@ -612,6 +653,7 @@ mod tests {
             Target::MetricsMem,
             Target::ExtractMem,
             Target::Load,
+            Target::Resolve,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -630,6 +672,10 @@ mod tests {
                 Target::ParseMem | Target::MetricsMem | Target::ExtractMem => &["walk", "load", "parse"],
                 Target::Walk | Target::WalkSeq | Target::WalkGit => &["walk"],
                 Target::Load => &["walk", "load.extract", "load.merge", "load.build"],
+                Target::Resolve => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges",
+                ],
                 Target::Roots => unreachable!("checked below"),
             };
             assert_eq!(names, expected, "{target:?}");
@@ -668,6 +714,14 @@ mod tests {
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("nodes").unwrap() > counter("defs").unwrap());
                 assert!(counter("index_B_per_kLOC").unwrap() > 1000);
+            } else if target == Target::Resolve {
+                assert!(counter("imports").unwrap() > 0);
+                assert!(counter("modules").unwrap() > 0);
+                // The corpus root is not the import root of its samples: most imports are
+                // external here, so only the shares are checked.
+                let pm = ["found_pm", "dynamic_pm", "missing_pm", "external_pm"].map(|n| counter(n).unwrap());
+                let sum: u64 = pm.iter().sum();
+                assert!((996..=1000).contains(&sum), "{pm:?}");
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }
