@@ -173,7 +173,8 @@ pub struct Block<'a> {
     /// Empty for a bare `except:`.
     pub except_names: &'a [Token],
     /// `Case`: the pattern is irrefutable (a bare capture/wildcard name, possibly
-    /// parenthesised or as an `|` alternative). Same notion as ruff's C901.
+    /// parenthesised, as an `|` alternative, or under `as NAME`). Same notion
+    /// as ruff's C901 (`Pattern::irrefutable_pattern`).
     pub irrefutable: bool,
     /// `Case`: has an `if` guard.
     pub guarded: bool,

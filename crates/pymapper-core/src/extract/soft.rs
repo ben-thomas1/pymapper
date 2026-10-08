@@ -181,13 +181,23 @@ impl<V: Visitor> Parser<'_, V> {
 }
 
 /// A case pattern (its tokens) is irrefutable when it is a bare capture or
-/// wildcard name, possibly parenthesised, or an `|` alternative containing one
-/// (ruff C901 / `Pattern::is_irrefutable`). `x as y` is not.
+/// wildcard name, possibly parenthesised, an `|` alternative containing one,
+/// or `<pattern> as NAME` whose sub-pattern is irrefutable (ruff C901 /
+/// `Pattern::irrefutable_pattern`).
 fn pattern_irrefutable(toks: &[Token]) -> bool {
     let mut toks = toks;
-    // Strip enclosing parentheses that match each other.
-    while toks.len() >= 2 && toks[0].kind == K::LPar && toks[toks.len() - 1].kind == K::RPar && encloses(toks) {
-        toks = &toks[1..toks.len() - 1];
+    loop {
+        // Strip enclosing parentheses that match each other.
+        if toks.len() >= 2 && toks[0].kind == K::LPar && toks[toks.len() - 1].kind == K::RPar && encloses(toks) {
+            toks = &toks[1..toks.len() - 1];
+            continue;
+        }
+        // `as` binds looser than `|`: `1 | x as y` is `(1 | x) as y`.
+        if let Some(sub) = strip_as_target(toks) {
+            toks = sub;
+            continue;
+        }
+        break;
     }
     let mut depth = 0u32;
     let mut start = 0;
@@ -215,6 +225,23 @@ fn alt_irrefutable(alt: &[Token]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `<pattern> as NAME` at depth 0 -> the sub-pattern tokens.
+fn strip_as_target(toks: &[Token]) -> Option<&[Token]> {
+    let n = toks.len();
+    if n < 3 || toks[n - 2].kind != K::As || toks[n - 1].kind != K::Name {
+        return None;
+    }
+    let mut depth = 0u32;
+    for t in &toks[..n - 2] {
+        match t.kind {
+            K::LPar | K::LSqb | K::LBrace => depth += 1,
+            K::RPar | K::RSqb | K::RBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if depth == 0 { Some(&toks[..n - 2]) } else { None }
 }
 
 /// `toks[0]` (an opener) is closed by the last token, not earlier.
