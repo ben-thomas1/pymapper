@@ -103,6 +103,14 @@ mod tests {
         guard
     }
 
+    /// The recorded phases named in `names`: tests that load an index run in parallel and
+    /// record their own phases while a test here has recording enabled.
+    fn own(names: &[&str]) -> Vec<Phase> {
+        let mut phases = take();
+        phases.retain(|p| names.contains(&p.name));
+        phases
+    }
+
     #[test]
     fn disabled_records_nothing() {
         let _l = locked();
@@ -120,7 +128,7 @@ mod tests {
         record("read", Duration::from_millis(3));
         record("walk", Duration::from_millis(4));
         enable(false);
-        let phases = take();
+        let phases = own(&["walk", "read"]);
         assert_eq!(
             phases,
             vec![
@@ -140,7 +148,7 @@ mod tests {
             time("inner", || std::thread::sleep(Duration::from_millis(10)));
         }
         enable(false);
-        let phases = take();
+        let phases = own(&["inner", "outer"]);
         assert_eq!(phases.len(), 2);
         // Inner finishes first, so it is recorded first.
         assert_eq!(phases[0].name, "inner");

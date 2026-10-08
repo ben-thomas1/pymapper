@@ -57,6 +57,8 @@ entered, and symlinks are not followed.
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
+| `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
+| `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -483,6 +485,56 @@ new; walk and load are as in the `load` rows above.
   The stdlib alone (`stdlib_imports_resolve`, ignored test, 4,483 rows) leaves 1.3%
   unresolved: `idlelib.idle_test` (not shipped), PEP 695 `type` aliases (not extracted yet),
   platform-only modules (`win32evtlog`, `java.lang`) and `test.support`.
+
+### Cache (S2.5)
+
+`pymapper_core::cache::load` cold (cache cleared, every segment written) and warm (every file
+a cache hit) against the uncached `load` target. 14-core M4 Pro, release, warm OS file cache,
+best of 3 (RSS worst of 3), load average about 7 from other worktrees, so times are upper
+bounds. The stdlib cache targets load the stdlib proper (632 files). The `load` target also
+walks the base interpreter's `site-packages` (1043 files). The venv cache targets take file
+lists from `RECORD` (phase `files`, after `discover`), so there is no walk column. The `inputs`
+column is the walk, or `discover` + `files`.
+
+| corpus | target      | threads | inputs  | load.extract | merge + build | cache.write | total   | peak RSS MB |
+|--------|-------------|---------|---------|--------------|---------------|-------------|---------|-------------|
+| stdlib | `load`      | 14      | 5.45ms  | 33.7ms       | 1.79ms        | -           | 41.3ms  | 27.6        |
+| stdlib | `load-cold` | 14      | 3.07ms  | 21.3ms       | 1.27ms        | 2.94ms      | 29.0ms  | 22.5        |
+| stdlib | `load-warm` | 14      | 1.20ms  | 2.48ms       | 1.33ms        | -           | 5.52ms  | 23.2        |
+| stdlib | `load-cold` | 1       | 10.5ms  | 133.0ms      | 0.43ms        | 3.58ms      | 147.9ms | 17.4        |
+| stdlib | `load-warm` | 1       | 1.84ms  | 3.94ms       | 0.42ms        | -           | 6.68ms  | 17.9        |
+| venv   | `load`      | 14      | 922ms   | 2.17s        | 76.3ms        | -           | 3.18s   | 492.8       |
+| venv   | `load-cold` | 14      | 51.2ms  | 2.28s        | 74.2ms        | 98.2ms      | 2.59s   | 505.8       |
+| venv   | `load-warm` | 14      | 45.9ms  | 88.1ms       | 76.3ms        | 0.25ms      | 237.4ms | 498.8       |
+| venv   | `load-cold` | 1       | 136ms   | 8.63s        | 45.0ms        | 319ms       | 9.22s   | 419.6       |
+| venv   | `load-warm` | 1       | 147ms   | 299ms        | 45.3ms        | 0.27ms      | 521.6ms | 391.7       |
+
+Cache sizes: stdlib 4.8 MB in one segment (15.7 B/LOC). Venv 284 MB in 491 segments (16.6
+B/LOC; facts plus metrics are about 14.6 B/LOC in memory, and each segment adds its own string
+table and paths).
+
+- **Warm vs cold**: with 14 threads the venv loads 13x faster than the uncached `load`
+  (3.18s to 237ms) and the stdlib 7.5x faster (41ms to 5.5ms). With one thread a warm load is
+  18x faster than a cold one on the venv (9.22s to 522ms) and 22x on the stdlib. A warm
+  `load.extract` is the checksum, validation and path index of each segment, plus a copy of
+  the rows and one intern per distinct string per worker and segment. It runs at about 3.2
+  GB/s of segment with 14 threads (0.95 GB/s with one). Most of what is left of a warm venv
+  load is outside the cache: `discover` (reads every `RECORD`, 45ms), the interner merge
+  (26ms) and the hierarchy (50ms).
+- **Cold overhead**: `load.extract` also hashes every source and records its stamp (2.28s vs
+  2.17s uncached, close to the noise at this load average). `cache.write` encodes and writes
+  every segment in 98ms with 14 threads (4% of the total) or 319ms with one (about 0.9 GB/s
+  per core). The cold venv total (2.59s) is below the uncached `load` (3.18s) only because it
+  reads `RECORD`s instead of walking the venv.
+- **Memory**: warm and cold peak RSS stay within about 3% of the uncached load (the index
+  itself is 346 MB). A segment is mapped (or read, under 64 KiB) by the first worker that
+  needs it and unmapped by the last one done with its files, so only the segments being
+  copied are resident, not the whole 284 MB cache. Segments are encoded in parallel and
+  streamed to disk one section at a time (memory: the largest section, not the file).
+- **First-party files** are checked with one `stat` each (size + mtime). A file whose mtime
+  changed but whose size did not is read and hashed, and is reused if the content is the same
+  (counter `verified`). A file written within 2s of caching is stored with an unknown mtime,
+  so the next load checks its content.
 
 ### Output (S4.4)
 
