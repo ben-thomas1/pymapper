@@ -51,6 +51,7 @@ entered, and symlinks are not followed.
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
 | `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
+| `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -195,3 +196,26 @@ summed over all threads). The `-j 1` rows are one thread lexing from memory: MB 
 
 Read + lex costs about the same as read alone (stdlib 46.2ms vs 42.3ms, venv 4.92s vs 4.83s),
 and peak RSS does not change: the lexer allocates nothing per token.
+
+### Import roots (S2.4)
+
+`cargo xtask bench -t roots -c venv -n 5`: `discover` finds the venv enclosing the corpus
+(nearest ancestor with `pyvenv.cfg`), the stdlib, parses all 504 `*.dist-info` directories
+(`METADATA` prefix, `RECORD` = 9.7 MB, `top_level.txt`, `direct_url.json`) and the `.pth` files;
+`module-map` runs `ModuleMapBuilder` over the `RECORD` `.py`/`.pyi` files each distribution owns
+(60527 files, 62522 dotted names; one file is listed by two distributions and is added once). 14-core Apple Silicon Mac, release build, warm cache, best of 5, load average
+about 2-3 from other work.
+
+| threads | discover | module-map | total   | peak RSS MB |
+|---------|----------|------------|---------|-------------|
+| 14      | 42.9ms   | 12.5ms     | 55.6ms  | 28.9        |
+| 4       | 47.9ms   | 12.3ms     | 60.5ms  | 28.3        |
+| 1       | 126.2ms  | 12.3ms     | 138.5ms | 26.7        |
+
+Heap after the run: `Distributions` 7.1 MB (per-site interned `RECORD` paths, owners, top-level
+names), `ModuleMap` 8.5 MB. `discover` is dominated by opening and reading the metadata files
+(a plain sequential `read` of every `METADATA` alone took 40-110 ms in isolation, while parsing
+all of `RECORD` costs about 14 ms of CPU); like the walker it stops scaling at about 4 threads.
+`module-map` is single-threaded (interning plus one sort of the (name, root) entries). The
+14-thread row was re-measured after `add_record_files` switched to owned files (S2.4 review
+fixes); the other rows are from the first measurement.
