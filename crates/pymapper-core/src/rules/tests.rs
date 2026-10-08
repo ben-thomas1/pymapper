@@ -141,6 +141,12 @@ const ALL_KEYS: &[ThresholdKey] = &[
     ThresholdKey::MinMaintainability,
     ThresholdKey::MaxModuleLoc,
     ThresholdKey::MaxFanOut,
+    ThresholdKey::MaxDistance,
+    ThresholdKey::DistanceMinCoupling,
+    ThresholdKey::MaxModuleSymbols,
+    ThresholdKey::MaxModuleCoupling,
+    ThresholdKey::MaxClassWmc,
+    ThresholdKey::MaxClassFanOut,
     ThresholdKey::DupesMinTokens,
     ThresholdKey::DupesMinLines,
 ];
@@ -176,10 +182,16 @@ fn threshold_values_follow_config() {
     cfg.thresholds.min_maintainability = 7.5;
     cfg.thresholds.max_module_loc = 8;
     cfg.thresholds.max_fan_out = 9;
+    cfg.thresholds.max_distance = 0.5;
+    cfg.thresholds.distance_min_coupling = 14;
+    cfg.thresholds.max_module_symbols = 15;
+    cfg.thresholds.max_module_coupling = 16;
+    cfg.thresholds.max_class_wmc = 17;
+    cfg.thresholds.max_class_fan_out = 18;
     cfg.thresholds.dupes_min_tokens = 11;
     cfg.thresholds.dupes_min_lines = 13;
     let got: Vec<f64> = ALL_KEYS.iter().map(|k| k.get(&cfg.thresholds)).collect();
-    assert_eq!(got, [12.0, 3.0, 4.0, 5.0, 6.0, 7.5, 8.0, 9.0, 11.0, 13.0]);
+    assert_eq!(got, [12.0, 3.0, 4.0, 5.0, 6.0, 7.5, 8.0, 9.0, 0.5, 14.0, 15.0, 16.0, 17.0, 18.0, 11.0, 13.0]);
 
     let e = RuleEngine::new(&cfg);
     // Strictly beyond the limit.

@@ -285,6 +285,18 @@ pub enum ThresholdKey {
     MaxModuleLoc,
     /// `max-fan-out`.
     MaxFanOut,
+    /// `max-distance`.
+    MaxDistance,
+    /// `distance-min-coupling`.
+    DistanceMinCoupling,
+    /// `max-module-symbols`.
+    MaxModuleSymbols,
+    /// `max-module-coupling`.
+    MaxModuleCoupling,
+    /// `max-class-wmc`.
+    MaxClassWmc,
+    /// `max-class-fan-out`.
+    MaxClassFanOut,
     /// `dupes-min-tokens`.
     DupesMinTokens,
     /// `dupes-min-lines`.
@@ -303,6 +315,12 @@ impl ThresholdKey {
             ThresholdKey::MinMaintainability => "min-maintainability",
             ThresholdKey::MaxModuleLoc => "max-module-loc",
             ThresholdKey::MaxFanOut => "max-fan-out",
+            ThresholdKey::MaxDistance => "max-distance",
+            ThresholdKey::DistanceMinCoupling => "distance-min-coupling",
+            ThresholdKey::MaxModuleSymbols => "max-module-symbols",
+            ThresholdKey::MaxModuleCoupling => "max-module-coupling",
+            ThresholdKey::MaxClassWmc => "max-class-wmc",
+            ThresholdKey::MaxClassFanOut => "max-class-fan-out",
             ThresholdKey::DupesMinTokens => "dupes-min-tokens",
             ThresholdKey::DupesMinLines => "dupes-min-lines",
         }
@@ -312,7 +330,9 @@ impl ThresholdKey {
     pub fn bound(self) -> Bound {
         match self {
             ThresholdKey::MinMaintainability => Bound::Min,
-            ThresholdKey::DupesMinTokens | ThresholdKey::DupesMinLines => Bound::Param,
+            ThresholdKey::DupesMinTokens | ThresholdKey::DupesMinLines | ThresholdKey::DistanceMinCoupling => {
+                Bound::Param
+            }
             _ => Bound::Max,
         }
     }
@@ -328,6 +348,12 @@ impl ThresholdKey {
             ThresholdKey::MinMaintainability => t.min_maintainability,
             ThresholdKey::MaxModuleLoc => f64::from(t.max_module_loc),
             ThresholdKey::MaxFanOut => f64::from(t.max_fan_out),
+            ThresholdKey::MaxDistance => t.max_distance,
+            ThresholdKey::DistanceMinCoupling => f64::from(t.distance_min_coupling),
+            ThresholdKey::MaxModuleSymbols => f64::from(t.max_module_symbols),
+            ThresholdKey::MaxModuleCoupling => f64::from(t.max_module_coupling),
+            ThresholdKey::MaxClassWmc => f64::from(t.max_class_wmc),
+            ThresholdKey::MaxClassFanOut => f64::from(t.max_class_fan_out),
             ThresholdKey::DupesMinTokens => f64::from(t.dupes_min_tokens),
             ThresholdKey::DupesMinLines => f64::from(t.dupes_min_lines),
         }

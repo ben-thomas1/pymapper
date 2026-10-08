@@ -41,7 +41,7 @@ diagnostics and ignored.
 | range | category | rules |
 |-------|----------|-------|
 | PM1xx | [Complexity and size](#complexity-and-size) | 7 |
-| PM2xx | [Coupling](#coupling) | 1 |
+| PM2xx | [Coupling](#coupling) | 4 |
 | PM3xx | [Import cycles and layering](#import-cycles-and-layering) | 4 |
 | PM4xx | [Dead code](#dead-code) | 5 |
 | PM5xx | [Duplication](#duplication) | 1 |
@@ -61,6 +61,9 @@ Codes PM000-PM099 and PM700-PM999 are unassigned.
 | [PM106](#pm106-low-maintainability) | `low-maintainability` | info | off | O(n) | 100 | Function with a maintainability index below `min-maintainability` |
 | [PM107](#pm107-long-module) | `long-module` | info | on | O(n) | 100 | Module longer than `max-module-loc` lines |
 | [PM201](#pm201-high-fan-out) | `high-fan-out` | warning | on | O(V+E) | 100 | Module importing more than `max-fan-out` distinct first-party modules |
+| [PM202](#pm202-main-sequence-distance) | `main-sequence-distance` | info | off | O(V+E) | 100 | Coupled module far from the main sequence (distance above `max-distance`) |
+| [PM203](#pm203-god-module) | `god-module` | warning | on | O(V+E) | 100 | Module that is both large (`max-module-symbols`) and highly coupled (`max-module-coupling`) |
+| [PM204](#pm204-god-class) | `god-class` | warning | on | O(V+E) | 100 | Class that is both complex (`max-class-wmc`) and uses many other classes (`max-class-fan-out`) |
 | [PM301](#pm301-import-cycle) | `import-cycle` | warning | on | O(V+E) | 100 | Modules that import each other, directly or indirectly |
 | [PM302](#pm302-layer-violation) | `layer-violation` | error | on | O(V+E) | 100 | Import from a lower layer into a higher one, breaking a `layers` contract |
 | [PM303](#pm303-forbidden-import) | `forbidden-import` | error | on | O(V+E) | 100 | Import breaking a `forbidden` contract |
@@ -216,6 +219,60 @@ Efferent coupling: the number of distinct first-party modules a module imports (
 Fix: move unrelated responsibilities into separate modules, or depend on a narrower facade.
 
 Suppress on a line with `# pymapper: ignore[PM201]`.
+
+### PM202 main-sequence-distance
+
+Coupled module far from the main sequence (distance above `max-distance`).
+
+- Message: `module <symbol> is far from the main sequence (D <real> > <real>; abstractness <real>, instability <real>)`
+- Severity: info
+- Enabled by default: no (enable with `select` / `extend-select`)
+- Cost: O(V+E)
+- Threshold: `thresholds.max-distance` (reported above; default 0.7)
+- Threshold: `thresholds.distance-min-coupling` (parameter; default 10)
+- Confidence: always 100
+
+Robert C. Martin's package metrics, per module. Afferent coupling Ca is the number of distinct first-party modules importing the module, efferent coupling Ce the number it imports (`if TYPE_CHECKING:` imports excluded). Instability is `I = Ce / (Ca + Ce)`; abstractness `A` is the share of its classes that are abstract (an `ABC` / `Protocol` base, an `ABCMeta` metaclass, or an `@abstractmethod`). The distance from the main sequence is `D = |A + I - 1|`. Near `A = 0, I = 0` lies the zone of pain (concrete code many modules depend on: every change ripples); near `A = 1, I = 1` the zone of uselessness (abstractions nobody uses). Only modules with `Ca + Ce` of at least `distance-min-coupling` are judged: for barely coupled modules the ratios mean little. The rule is a ranking aid, which is why it is off by default.
+
+Fix: in the zone of pain, put an abstract interface between the module and its dependants; in the zone of uselessness, remove or merge unused abstractions.
+
+Suppress on a line with `# pymapper: ignore[PM202]`.
+
+### PM203 god-module
+
+Module that is both large (`max-module-symbols`) and highly coupled (`max-module-coupling`).
+
+- Message: `module <symbol> defines <int> classes and functions (> <int>) and is coupled to <int> modules (> <int>)`
+- Severity: warning
+- Enabled by default: yes
+- Cost: O(V+E)
+- Threshold: `thresholds.max-module-symbols` (reported above; default 80)
+- Threshold: `thresholds.max-module-coupling` (reported above; default 25)
+- Confidence: always 100
+
+A module with more classes and functions (methods and nested functions included) than `max-module-symbols` whose total coupling `Ca + Ce` (distinct first-party modules importing it plus distinct first-party modules it imports, `if TYPE_CHECKING:` imports excluded) exceeds `max-module-coupling`. Such a module gathers many responsibilities and sits in the middle of the import graph, so most changes touch it and it touches most of the code base.
+
+Fix: split the module along its responsibilities so that each dependant imports only the part it needs.
+
+Suppress on a line with `# pymapper: ignore[PM203]`.
+
+### PM204 god-class
+
+Class that is both complex (`max-class-wmc`) and uses many other classes (`max-class-fan-out`).
+
+- Message: `class <symbol> is a god class (WMC <int> > <int>, uses <int> other classes > <int>)`
+- Severity: warning
+- Enabled by default: yes
+- Cost: O(V+E)
+- Threshold: `thresholds.max-class-wmc` (reported above; default 47)
+- Threshold: `thresholds.max-class-fan-out` (reported above; default 5)
+- Confidence: always 100
+
+After Lanza and Marinescu's detection strategy. WMC (weighted methods per class) is the sum of the McCabe complexities of the class's methods and class-level statements; the class fan-out is the number of distinct other classes whose constructors or methods the class's methods call (resolved calls of any confidence; calls into the class itself and to plain functions are not counted). A class above both `max-class-wmc` and `max-class-fan-out` centralises behaviour and reaches into many collaborators instead of delegating to them.
+
+Fix: move behaviour next to the data it uses (into the collaborating classes), and split the class along groups of methods that share state.
+
+Suppress on a line with `# pymapper: ignore[PM204]`.
 
 
 ## Import cycles and layering

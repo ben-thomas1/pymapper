@@ -392,6 +392,19 @@ pub struct Thresholds {
     pub max_module_loc: u32,
     /// Distinct first-party modules imported by one module (efferent coupling).
     pub max_fan_out: u32,
+    /// Distance from the main sequence `|A + I - 1|` (0-1) per module.
+    pub max_distance: f64,
+    /// Smallest total coupling `Ca + Ce` of a module judged by the main-sequence distance.
+    pub distance_min_coupling: u32,
+    /// Classes and functions per module (god module, with `max_module_coupling`).
+    pub max_module_symbols: u32,
+    /// Total coupling `Ca + Ce` per module (god module, with `max_module_symbols`).
+    pub max_module_coupling: u32,
+    /// Weighted methods per class: summed McCabe complexity (god class, with
+    /// `max_class_fan_out`).
+    pub max_class_wmc: u32,
+    /// Distinct other classes a class's methods call (god class, with `max_class_wmc`).
+    pub max_class_fan_out: u32,
     /// Minimum token run reported as a duplicate (needs `analysis.dupes`).
     pub dupes_min_tokens: u32,
     /// Minimum line count of a reported duplicate (needs `analysis.dupes`).
@@ -409,6 +422,12 @@ impl Default for Thresholds {
             min_maintainability: 10.0,
             max_module_loc: 1000,
             max_fan_out: 30,
+            max_distance: 0.7,
+            distance_min_coupling: 10,
+            max_module_symbols: 80,
+            max_module_coupling: 25,
+            max_class_wmc: 47,
+            max_class_fan_out: 5,
             dupes_min_tokens: 50,
             dupes_min_lines: 6,
         }

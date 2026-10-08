@@ -59,6 +59,12 @@ pub(super) fn to_toml(c: &Config) -> String {
     let _ = writeln!(w.out, "min-maintainability = {:?}", t.min_maintainability);
     w.raw("max-module-loc", t.max_module_loc);
     w.raw("max-fan-out", t.max_fan_out);
+    let _ = writeln!(w.out, "max-distance = {:?}", t.max_distance);
+    w.raw("distance-min-coupling", t.distance_min_coupling);
+    w.raw("max-module-symbols", t.max_module_symbols);
+    w.raw("max-module-coupling", t.max_module_coupling);
+    w.raw("max-class-wmc", t.max_class_wmc);
+    w.raw("max-class-fan-out", t.max_class_fan_out);
     w.raw("dupes-min-tokens", t.dupes_min_tokens);
     w.raw("dupes-min-lines", t.dupes_min_lines);
 
