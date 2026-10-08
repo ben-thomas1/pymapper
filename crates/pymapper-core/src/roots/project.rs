@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
+use super::is_identifier;
 use super::pyvenv::parse_version_prefix;
 use crate::config::{PYPROJECT_FILE, PythonVersion, normalize};
 
@@ -144,8 +145,10 @@ pub fn read_pyproject(root: &Path) -> Result<Option<PyprojectInfo>, String> {
 }
 
 /// `root/src` holds a src layout: it is a directory, not itself a package (no `__init__.py`),
-/// and contains at least one module or package (`__init__.py`, or PEP 420: any directory with a
-/// Python file directly inside).
+/// and contains at least one importable module or package: `name.py[i]`, or a directory `name`
+/// with a Python file directly inside (`__init__.py`, or PEP 420 namespace content), where
+/// `name` is an identifier. A monorepo `src/` of project directories (`src/my-lib/...`) is not
+/// a src layout.
 pub fn is_src_layout(src: &Path) -> bool {
     if src.join("__init__.py").exists() || src.join("__init__.pyi").exists() {
         return false;
@@ -154,14 +157,13 @@ pub fn is_src_layout(src: &Path) -> bool {
     for ent in rd.flatten() {
         let name = ent.file_name();
         let b = name.as_bytes();
-        if b.starts_with(b".") || b.ends_with(b".egg-info") || b == b"__pycache__" {
-            continue;
-        }
         let Ok(ft) = ent.file_type() else { continue };
         if ft.is_file() && crate::walk::is_python(b) {
-            return true;
-        }
-        if ft.is_dir() && dir_has_python(&ent.path()) {
+            let stem = b.strip_suffix(b".pyi").or_else(|| b.strip_suffix(b".py")).unwrap_or(b);
+            if is_identifier(stem) {
+                return true;
+            }
+        } else if ft.is_dir() && b != b"__pycache__" && is_identifier(b) && dir_has_python(&ent.path()) {
             return true;
         }
     }

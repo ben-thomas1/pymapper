@@ -912,6 +912,9 @@ fn first_party_layouts() {
     assert_eq!(discover(&t.p("c"), &opts()).roots[0].path, t.p("c/src"));
     t.file("d/pyproject.toml", "").file("d/src/README.md", "").dir("d/src/empty");
     assert_eq!(discover(&t.p("d"), &opts()).roots.len(), 1);
+    // Monorepo `src/` of project directories, and non-identifier modules: not a src layout.
+    t.file("m/pyproject.toml", "").file("m/src/my-lib/setup.py", "").file("m/src/my-lib/my_lib/__init__.py", "").file("m/src/run-me.py", "");
+    assert_eq!(discover(&t.p("m"), &opts()).roots.len(), 1);
     t.file("e/pyproject.toml", "").file("e/src/single.pyi", "");
     assert_eq!(discover(&t.p("e"), &opts()).roots.len(), 2);
 
