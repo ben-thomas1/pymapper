@@ -76,7 +76,7 @@ impl<V: Visitor> Parser<'_, V> {
     }
 
     /// Error recovery inside a header: skip to a `:` (consumed) or the end of the line.
-    fn skip_to_colon_or_eol(&mut self) {
+    pub(super) fn skip_to_colon_or_eol(&mut self) {
         loop {
             match self.kind(0) {
                 K::Colon => {
@@ -102,6 +102,14 @@ impl<V: Visitor> Parser<'_, V> {
                 _ => self.simple_stmts(),
             },
             K::If | K::While | K::For | K::Try | K::With => self.compound(),
+            K::Else | K::Elif | K::Except | K::Finally => {
+                // Clause without its statement: report, then parse the body so
+                // indentation stays balanced.
+                self.diag(DiagKind::UnexpectedToken);
+                self.bump();
+                self.skip_to_colon_or_eol();
+                self.suite();
+            }
             _ => self.simple_stmts(),
         }
     }

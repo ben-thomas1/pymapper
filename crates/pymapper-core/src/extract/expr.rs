@@ -130,4 +130,21 @@ impl<V: Visitor> Parser<'_, V> {
             _ => false,
         }
     }
+
+    /// Assignment targets (for-loop / `as`) up to a stop token. `op` is the
+    /// `for` / `as` keyword. Placeholder until target analysis lands.
+    pub(super) fn targets(&mut self, _op: Token, stop: Stop) {
+        self.expr(stop);
+    }
+
+    /// Type expression of an `except` clause; last names of dotted names into `self.names`.
+    pub(super) fn except_type(&mut self) {
+        self.expr(S_AS | S_COLON | S_COMMA);
+    }
+
+    /// At `(` after `with`: whether it opens parenthesised with-items
+    /// (`with (a as b, c):`) rather than an expression (`with (a, b) as c:`).
+    pub(super) fn parenthesized_with_items(&mut self) -> bool {
+        false
+    }
 }

@@ -96,6 +96,33 @@ impl Visitor for Rec<'_> {
         let c = names.iter().map(|&t| self.t(t)).collect::<Vec<_>>().join(",");
         self.out.push(format!("{kind:?} {c}"));
     }
+    fn block_enter(&mut self, b: &Block<'_>) {
+        let mut s = format!("{:?}", b.kind);
+        if b.is_async {
+            s = format!("async {s}");
+        }
+        if b.cond != IfCond::Other {
+            s += &format!(" {:?}", b.cond);
+        }
+        if b.star {
+            s += "*";
+        }
+        if !b.except_names.is_empty() {
+            s += &format!(" ({})", b.except_names.iter().map(|&t| self.t(t)).collect::<Vec<_>>().join(","));
+        }
+        if b.irrefutable {
+            s += " irrefutable";
+        }
+        if b.guarded {
+            s += " guarded";
+        }
+        s += &format!(" @{}:{} {{", b.pos.line, b.pos.col);
+        self.out.push(s);
+    }
+    fn block_exit(&mut self, kind: BlockKind, end: End, last_case: bool) {
+        let last = if last_case { " last" } else { "" };
+        self.out.push(format!("}} {kind:?} L{}{last}", end.line));
+    }
     fn diagnostic(&mut self, d: &Diagnostic) {
         let t = self.t(d.token);
         self.out.push(format!("diag {:?} {}:{} {t}", d.kind, d.pos.line, d.pos.col));
@@ -114,7 +141,7 @@ fn events(src: &str) -> Vec<String> {
 fn smoke_consumes_every_token() {
     let r = run("x = 1\nif x:\n    y = (1,\n 2)\n");
     assert_eq!(r.tokens, 13);
-    assert!(r.out.is_empty(), "{:?}", r.out);
+    assert!(!r.out.iter().any(|e| e.starts_with("diag")), "{:?}", r.out);
 }
 
 #[test]
@@ -195,4 +222,80 @@ fn async_def_and_single_line_bodies() {
 fn def_end_line_with_trailing_comments_and_blank_lines() {
     let src = "def f():\n    x = '''a\nb'''\n\n    # c\n\nz = 1\n";
     assert_eq!(ev(src), "def f @1:4 L1 d0\nend def L3");
+}
+
+/// Only block events, compactly: `If{ ... }` on one line.
+fn blocks(src: &str) -> String {
+    events(src)
+        .into_iter()
+        .filter_map(|e| {
+            if let Some(rest) = e.strip_prefix("} ") {
+                return Some(format!("}}{}", rest.split(' ').next().unwrap_or("")));
+            }
+            let k = e.split(" @").next().unwrap_or("").to_string();
+            if e.ends_with('{') { Some(format!("{k}{{")) } else if e.starts_with("diag") { Some(e) } else { None }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn if_elif_else() {
+    let src = "if a:\n    x\nelif b:\n    if c: y\n    else: z\nelse:\n    w\n";
+    assert_eq!(blocks(src), "If{ }If Elif{ If{ }If IfElse{ }IfElse }Elif IfElse{ }IfElse");
+    let e = events(src);
+    assert_eq!(e[0], "If @1:0 {");
+    assert_eq!(e[1], "} If L2");
+    assert_eq!(e[2], "Elif @3:0 {");
+    assert_eq!(e.last().unwrap(), "} IfElse L7");
+}
+
+#[test]
+fn loops_with_else() {
+    let src = "for x in y:\n    break\nelse:\n    pass\nwhile a:\n    continue\nelse: pass\nasync def f():\n    async for i in g(): pass\n    async with a as b, c: pass\n";
+    assert_eq!(
+        blocks(src),
+        "For{ }For LoopElse{ }LoopElse While{ }While LoopElse{ }LoopElse async For{ }For async With{ }With"
+    );
+}
+
+#[test]
+fn try_forms() {
+    let src = "try:\n    a\nexcept:\n    b\ntry:\n    a\nexcept* E:\n    b\nexcept (F, G) as e:\n    c\nelse:\n    d\nfinally:\n    e\ntry: x\nfinally: y\n";
+    assert_eq!(
+        blocks(src),
+        "Try{ }Try Except{ }Except Try{ }Try Except*{ }Except Except{ }Except TryElse{ }TryElse Finally{ }Finally Try{ }Try Finally{ }Finally"
+    );
+}
+
+#[test]
+fn with_forms() {
+    let src = "with a: pass\nwith a as b, c as d:\n    pass\nwith (a as b, c):\n    pass\nwith (a, b) as c: pass\nwith (yield x): pass\n";
+    assert_eq!(blocks(src), "With{ }With With{ }With With{ }With With{ }With With{ }With");
+}
+
+#[test]
+#[ignore = "needs expression shapes"]
+fn if_conditions() {
+    let src = "if TYPE_CHECKING:\n    pass\nelif typing.TYPE_CHECKING: pass\nif not TYPE_CHECKING: pass\nif __name__ == '__main__': main()\nif \"__main__\" == __name__: main()\nif TYPE_CHECKING or x: pass\nif __name__ == '__main__' and x: pass\n";
+    assert_eq!(
+        blocks(src),
+        "If TypeChecking{ }If Elif TypeChecking{ }Elif If NotTypeChecking{ }If If MainGuard{ }If If MainGuard{ }If If{ }If If{ }If"
+    );
+}
+
+#[test]
+fn blocks_nested_in_defs_close_before_def_exit() {
+    let src = "def f():\n    if a:\n        for b in c:\n            pass\nx = 1\n";
+    assert_eq!(ev(src), "def f @1:4 L1 d0\nIf @2:4 {\nFor @3:8 {\n} For L4\n} If L4\nend def L4");
+}
+
+#[test]
+fn stray_clauses_are_reported_and_body_parsed() {
+    let src = "else:\n    def f(): pass\nexcept E:\n    pass\nx = 1\n";
+    let e = events(src);
+    assert_eq!(e[0], "diag UnexpectedToken 1:0 else");
+    assert_eq!(e[1], "def f @2:8 L2 d0");
+    assert_eq!(e[3], "diag UnexpectedToken 3:0 except");
+    assert_eq!(e.len(), 4);
 }
