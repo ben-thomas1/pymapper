@@ -237,6 +237,24 @@ impl<'src> Lexer<'src> {
         self.suppressions.truncate(cp.suppressions as usize);
     }
 
+    /// Parser error recovery for an unclosed bracket: forgets all open brackets
+    /// and resumes scanning at `pos`, which must be the start of a token already
+    /// returned on the current logical line. Indentation of the line containing
+    /// `pos` is not reprocessed. Returns false (and changes nothing) inside an
+    /// f/t-string or when `pos` is past the current position.
+    pub fn recover_at(&mut self, pos: u32) -> bool {
+        if self.st.modes_len != 0 || pos > self.st.pos {
+            return false;
+        }
+        self.st.pos = pos;
+        self.st.depth = 0;
+        self.st.kinds = 0;
+        self.st.pending_error = None;
+        self.st.at_bol = false;
+        self.st.blank = false;
+        true
+    }
+
     #[inline(always)]
     fn tok(&self, kind: TokenKind, start: usize, end: usize) -> Token {
         Token { start: start as u32, len: (end - start) as u32, kind }
