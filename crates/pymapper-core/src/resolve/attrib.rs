@@ -124,9 +124,10 @@ pub fn is_builtin_stdlib(name: &[u8]) -> bool {
 
 /// Top-level stdlib module names: the union of `sys.stdlib_module_names` of CPython 3.12 and
 /// 3.13, plus modules removed in 3.12 (`distutils`, `imp`, `asynchat`, `asyncore`, `smtpd`) and
-/// added in 3.14 (`annotationlib`, `compression`). Sorted (byte order) for binary search.
+/// added in 3.14 (`annotationlib`, `compression`), plus `__main__` (always in `sys.modules`).
+/// Sorted (byte order) for binary search.
 pub(super) const STDLIB_NAMES: &[&str] = &[
-    "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast", "_asyncio",
+    "__future__", "__main__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast", "_asyncio",
     "_bisect", "_blake2", "_bz2", "_codecs", "_codecs_cn", "_codecs_hk", "_codecs_iso2022",
     "_codecs_jp", "_codecs_kr", "_codecs_tw", "_collections", "_collections_abc", "_colorize",
     "_compat_pickle", "_compression", "_contextvars", "_crypt", "_csv", "_ctypes", "_curses",

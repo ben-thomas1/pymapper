@@ -343,6 +343,19 @@ fn star_and_reexport_cycles_terminate() {
     );
 }
 
+/// A star-import search for one name must not hide the same module from the search for
+/// another name in the same lookup (here `b` is re-exported as `z.a`, found in `s1`).
+#[test]
+fn star_visits_are_per_name() {
+    let t = TempDir::new("starname");
+    t.file("m.py", "from s1 import *\n")
+        .file("s1.py", "from z import a as b\ndef a():\n    pass\n")
+        .file("z.py", "from s1 import *\n")
+        .file("user.py", "from m import b\n");
+    let fx = fixture(t.path());
+    assert_eq!(fx.rows("user"), s(&["1 symbol s1:a [reexport,viastar]"]));
+}
+
 #[test]
 fn dynamic_modules() {
     let t = TempDir::new("dynamic");
@@ -394,6 +407,11 @@ fn module_attribute_aliases() {
     );
     // `import myos.path` / `import myos.nothing` bind `myos` either way.
     assert_eq!(fx.global("user", "myos").as_deref(), Some("module myos"));
+    // Module-level aliases follow to what they name; other values stay variables.
+    assert_eq!(fx.global("coll", "Alias").as_deref(), Some("def coll:Real"));
+    assert_eq!(fx.global("coll", "abc").as_deref(), Some("module _coll_abc"));
+    assert_eq!(fx.global("coll", "Chained").as_deref(), Some("def _coll_abc:Mapping"));
+    assert_eq!(fx.global("coll", "Num").as_deref(), Some("var coll"));
     assert_eq!(fx.edges("user"), s(&["_coll_abc x1", "coll x4", "myos x4", "posixish x2"]));
 }
 
@@ -500,6 +518,19 @@ fn attribution_of_unresolved_imports() {
     assert_eq!(fx.edges("user"), s(&["ns.inner.x x1", "pkg x1"]));
     assert_eq!(fx.global("user", "np").as_deref(), Some("unresolved 8 third-party dist7 [reexport]"));
     assert!(is_builtin_stdlib(b"asyncio") && is_builtin_stdlib(b"_io") && !is_builtin_stdlib(b"numpy"));
+}
+
+#[test]
+fn stdlib_table_is_sorted_and_unique() {
+    for w in attrib::STDLIB_NAMES.windows(2) {
+        assert!(w[0].as_bytes() < w[1].as_bytes(), "{} >= {}", w[0], w[1]);
+    }
+    for name in ["__future__", "__main__", "os", "zoneinfo", "_abc", "tomllib"] {
+        assert!(is_builtin_stdlib(name.as_bytes()), "{name}");
+    }
+    for name in ["numpy", "requests", "", "os.path"] {
+        assert!(!is_builtin_stdlib(name.as_bytes()), "{name}");
+    }
 }
 
 #[test]
@@ -770,12 +801,20 @@ fn stdlib_imports_resolve() {
         + st.by_status[ImportStatus::BeyondTop as usize]
         + st.by_status[ImportStatus::External as usize];
     eprintln!("stdlib imports: {st:?}");
-    if std::env::var_os("PYMAPPER_DEBUG_RESOLVE").is_some() {
+    // `PYMAPPER_DEBUG_RESOLVE=1` prints the most common unresolved imports;
+    // `=missing-name` (any status name) only those of that status.
+    if let Some(only) = std::env::var_os("PYMAPPER_DEBUG_RESOLVE") {
+        let only = only.to_string_lossy().into_owned();
         let mut hist: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for f in 0..many.ix.file_count() {
             for row in many.ix.file_facts(f).imports.range() {
                 let st = many.imp.status(row);
-                if matches!(st, ImportStatus::External | ImportStatus::MissingModule | ImportStatus::MissingName) {
+                let wanted = if only == "1" {
+                    matches!(st, ImportStatus::External | ImportStatus::MissingModule | ImportStatus::MissingName)
+                } else {
+                    st.as_str() == only
+                };
+                if wanted {
                     let segs = many.ix.file_view(f).import_module(row);
                     let m: Vec<String> = segs.iter().map(|&s| String::from_utf8_lossy(many.ix.str(s)).into_owned()).collect();
                     let lvl = many.ix.facts().imports.level[row];

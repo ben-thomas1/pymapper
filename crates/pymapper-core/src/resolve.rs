@@ -20,7 +20,8 @@
 //! Lookups are hash lookups on `u64` keys (trie) and binary searches over a file's namespace
 //! run: no string is built or hashed per import, nothing is allocated per row beyond the
 //! output columns (24 bytes per import row). Re-export chains are followed up to 32 hops; star
-//! imports depth-first with a per-lookup visited set (no exponential blow-up on star cycles).
+//! imports depth-first with a per-lookup visited set of (module, name) pairs, capped at 512
+//! (no exponential blow-up on star cycles).
 //!
 //! ## Semantics
 //!
@@ -60,7 +61,7 @@ pub use modules::{ModId, ModKind, ModuleTable};
 
 use std::time::Instant;
 
-use imports::{Ctx, ModRes, NameRes, Names, Scratch};
+use imports::{Ctx, Found, ModRes, NameRes, Names, Scratch};
 use namespace::{Namespaces, kind, par_concat, par_concat_with};
 
 use crate::index::{FileId, Index, NONE, NodeId};
@@ -292,11 +293,22 @@ impl Imports {
     }
 
     /// The module-level binding of `name` in file `f`, including names bound through star
-    /// imports. `None` if the module binds no such name.
+    /// imports. Imports and `X = Y` aliases are followed to what they bind. `None` if the
+    /// module binds no such name.
     pub fn global(&self, ix: &Index, f: FileId, name: Sym) -> Option<Global> {
         match self.ns.get(f, name) {
             Some(e) if e.base() == kind::DEF => return Some(Global::Def(ix.def_node(f, e.r))),
-            Some(e) if e.base() == kind::VAR => return Some(Global::Variable(ix.file_node(f))),
+            Some(e) if e.base() == kind::VAR => {
+                // `X = Y` / `X = a.b` aliases of a class, function or module.
+                let cx = self.ctx(ix);
+                let aliased = self.modules.file_mod(f).and_then(|m| {
+                    self.names(&cx).alias(f, e.r as usize, m, 0, &mut Scratch::default())
+                });
+                return Some(match aliased {
+                    Some(Found::Hit(r)) => self.to_global(r, NONE),
+                    _ => Global::Variable(ix.file_node(f)),
+                });
+            }
             Some(e) if e.base() == kind::IMPORT => return Some(self.bound_by(ix, e.r as usize)),
             _ => {}
         }

@@ -110,8 +110,8 @@ pub(super) struct ModRes {
     pub ext: u32,
     /// `Module` when the module part resolved, else the final status.
     pub status: u8,
-    /// Segments of the module part matched by the module table.
-    pub matched: u8,
+    /// Segments of the module part matched by the module table (saturated).
+    pub matched: u16,
 }
 
 /// Phase-2 (final) result of a row.
@@ -167,7 +167,7 @@ impl Ctx<'_> {
             && let Some(m) = deep
             && self.mods.node(m).is_some()
         {
-            return ModRes { module: m, ext: NONE, status: ImportStatus::Module as u8, matched: k as u8 };
+            return ModRes { module: m, ext: NONE, status: ImportStatus::Module as u8, matched: sat16(k) };
         }
         // A regular package/module prefix makes the rest a missing submodule; otherwise (no
         // prefix, or only namespace directories) absolute names come from outside.
@@ -183,12 +183,17 @@ impl Ctx<'_> {
                 Attributed::Unknown => ModRes { module: NONE, ext: top.to_raw(), status: ImportStatus::External as u8, matched: 0 },
             };
         }
-        ModRes { module: deep.unwrap_or(NONE), ext: NONE, status: ImportStatus::MissingModule as u8, matched: k as u8 }
+        ModRes { module: deep.unwrap_or(NONE), ext: NONE, status: ImportStatus::MissingModule as u8, matched: sat16(k) }
     }
 }
 
+#[inline]
+fn sat16(k: usize) -> u16 {
+    u16::try_from(k).unwrap_or(u16::MAX)
+}
+
 /// Outcome of a name lookup.
-enum Found {
+pub(super) enum Found {
     Hit(NameRes),
     Miss,
     Dynamic,
@@ -226,7 +231,10 @@ fn dynamic() -> NameRes {
 /// Per-thread scratch of phase 2.
 #[derive(Default)]
 pub(super) struct Scratch {
-    visited: Vec<ModId>,
+    /// (source module, name) pairs already searched through a star import by the current
+    /// lookup. Keyed by name too: a re-export followed inside the lookup searches the same
+    /// modules for another name. Bounded by [`MAX_STAR_VISITS`].
+    visited: Vec<(ModId, Sym)>,
 }
 
 /// Phase 2 over phase-1 results of every row.
@@ -312,7 +320,7 @@ impl Names<'_> {
         if p.status == ImportStatus::Module as u8 {
             return Some(p.module);
         }
-        if p.status != ImportStatus::MissingModule as u8 || p.module == NONE {
+        if p.status != ImportStatus::MissingModule as u8 || p.module == NONE || p.matched == u16::MAX {
             return None;
         }
         let cx = self.cx;
@@ -441,13 +449,13 @@ impl Names<'_> {
                     dynamic = true;
                     continue;
                 }
-                if sc.visited.contains(&src.module) {
+                if sc.visited.contains(&(src.module, name)) {
                     continue;
                 }
                 if sc.visited.len() >= MAX_STAR_VISITS {
                     return Found::Dynamic;
                 }
-                sc.visited.push(src.module);
+                sc.visited.push((src.module, name));
                 match self.find(src.module, name, true, NONE, depth + 1, sc) {
                     Found::Hit(mut h) => {
                         h.flags |= res_flags::VIA_STAR;
@@ -464,7 +472,7 @@ impl Names<'_> {
     /// Follows a module-level alias `X = Y` / `X = a.b` (binding `brow` of file `f`, module
     /// `m`) to the class, function or module the value names; `None` for other values or when
     /// the value does not resolve to one (the name is then a plain variable).
-    fn alias(&self, f: FileId, brow: usize, m: ModId, depth: u32, sc: &mut Scratch) -> Option<Found> {
+    pub(super) fn alias(&self, f: FileId, brow: usize, m: ModId, depth: u32, sc: &mut Scratch) -> Option<Found> {
         let cx = self.cx;
         let b = &cx.ix.facts().bindings;
         let plain = matches!(assign_kind(b.kind[brow]), AssignKind::Plain | AssignKind::Annotated);
