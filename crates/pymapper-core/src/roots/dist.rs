@@ -1,7 +1,7 @@
 //! Installed distributions: `*.dist-info` (and legacy `*.egg-info`) parsing and the
 //! file -> distribution index.
 //!
-//! Per distribution we read the `METADATA` headers (name, version; only the first 16 KiB unless
+//! Per distribution we read the `METADATA` headers (name, version; only the first 4 KiB unless
 //! the headers are longer), `RECORD` (the installed files, so third-party code needs no walk),
 //! `top_level.txt` and `direct_url.json` (editable installs). The metadata directories of a
 //! site are parsed in parallel, then merged sequentially in sorted order, so ids are
@@ -27,7 +27,7 @@ use crate::arena::{Pool, Slice};
 use crate::intern::{Interner, Sym, hash_bytes};
 
 /// Bytes of `METADATA` / `PKG-INFO` read first; the headers almost always fit.
-const METADATA_PREFIX: usize = 16 * 1024;
+const METADATA_PREFIX: usize = 4 * 1024;
 /// Larger metadata files (`RECORD`, `METADATA`, ...) are rejected with a diagnostic.
 const MAX_METADATA_FILE: u64 = 64 * 1024 * 1024;
 

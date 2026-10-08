@@ -765,3 +765,220 @@ fn sources_follow_toggles() {
     ];
     assert_eq!(describe(&on, &on.sources(&paths, &fp)), want);
 }
+
+/// A venv at `prefix` (relative to `t`) for Python 3.`minor` with one module in site-packages.
+fn mini_venv(t: &TempDir, prefix: &str, minor: u8, cfg: &str) {
+    t.file(&format!("{prefix}/pyvenv.cfg"), cfg).file(&format!("{prefix}/lib/python3.{minor}/site-packages/m.py"), "");
+}
+
+#[test]
+fn venv_selection_order() {
+    let t = TempDir::new("venvsel");
+    t.file("proj/pyproject.toml", "");
+    mini_venv(&t, "proj/.venv", 12, "version_info = 3.12.0\n");
+    mini_venv(&t, "proj/venv", 11, "version_info = 3.11.0\n");
+    mini_venv(&t, "env", 13, "version = 3.13.1\n");
+    mini_venv(&t, "configured", 10, "");
+
+    let r = discover(&t.p("proj"), &opts());
+    let venv = r.venv.as_ref().expect("venv");
+    assert_eq!((venv.prefix.clone(), venv.source), (t.p("proj/.venv"), VenvSource::Project));
+    assert_eq!(r.python_version, Some(v(12)));
+
+    let r = discover(&t.p("proj"), &RootOptions { virtual_env: Some(t.p("env")), ..opts() });
+    let venv = r.venv.as_ref().expect("venv");
+    assert_eq!((venv.prefix.clone(), venv.source), (t.p("env"), VenvSource::Environment));
+    assert_eq!(r.python_version, Some(v(13)));
+
+    // Configured (relative to the project root) beats $VIRTUAL_ENV; the version comes from the
+    // directory name when pyvenv.cfg has none.
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some("../configured".into()), virtual_env: Some(t.p("env")), ..opts() });
+    let venv = r.venv.as_ref().expect("venv");
+    assert_eq!((venv.prefix.clone(), venv.source), (t.p("configured"), VenvSource::Configured));
+    assert_eq!(r.python_version, Some(v(10)));
+    assert_eq!(r.version_source, Some(VersionSource::Venv));
+
+    // The configured Python version picks the site-packages directory.
+    let r = discover(&t.p("proj"), &RootOptions { python_version: Some(v(12)), ..opts() });
+    assert_eq!(r.version_source, Some(VersionSource::Config));
+
+    // A broken $VIRTUAL_ENV is reported and discovery falls back to .venv.
+    let r = discover(&t.p("proj"), &RootOptions { virtual_env: Some(t.p("nope")), ..opts() });
+    assert_eq!(r.venv.as_ref().map(|v| v.source), Some(VenvSource::Project));
+    assert_eq!(r.diagnostics.len(), 1);
+    assert_eq!(r.diagnostics[0].kind, DiagnosticKind::Venv);
+    assert!(r.diagnostics[0].to_string().contains("$VIRTUAL_ENV"), "{}", r.diagnostics[0]);
+
+    // A broken configured venv is reported and nothing else is tried.
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("nope")), ..opts() });
+    assert!(r.venv.is_none());
+    assert_eq!(r.diagnostics.len(), 1);
+
+    // No venv at all, deps requested: reported.
+    let lone = TempDir::new("novenv");
+    let r = discover(lone.path(), &RootOptions { include_deps: true, ..opts() });
+    assert!(r.venv.is_none() && r.dists.is_empty());
+    assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Venv]);
+    assert_eq!(rel_roots(&lone, &r), [(String::new(), RootKind::Project, Origin::FirstParty, true)]);
+}
+
+#[test]
+fn stdlib_location() {
+    let t = TempDir::new("stdlib");
+    // Base interpreter with two versions and a free-threaded build.
+    t.file("base/lib/python3.12/os.py", "")
+        .file("base/lib/python3.13t/os.py", "")
+        .file("base/lib/python3.11/notstdlib.py", "")
+        .file("base/real/bin/python3.12", "")
+        .file("proj/pyproject.toml", "[project]\nrequires-python = \">=3.10\"\n");
+
+    // base-prefix (virtualenv).
+    let base = t.p("base").display().to_string();
+    mini_venv(&t, "v1", 12, &format!("base-prefix = {base}\nversion_info = 3.12.1\n"));
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("v1")), include_stdlib: true, ..opts() });
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/lib/python3.12")));
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+    // home pointing at the prefix itself; free-threaded lib dir.
+    mini_venv(&t, "v2", 13, &format!("home = {base}\nversion_info = 3.13.0\n"));
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("v2")), ..opts() });
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/lib/python3.13t")));
+
+    // Wanted version not installed: reported only when the stdlib is requested.
+    mini_venv(&t, "v3", 11, &format!("home = {base}/bin\nversion_info = 3.11.0\n"));
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("v3")), ..opts() });
+    assert!(r.stdlib.is_none() && r.diagnostics.is_empty());
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("v3")), include_stdlib: true, ..opts() });
+    assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Stdlib]);
+    assert!(r.diagnostics[0].message.contains("3.11"));
+
+    // No venv: interpreter on PATH through a symlink (prefix = realpath/../..). The
+    // requires-python floor (3.10) is not installed, so any version is accepted.
+    fs::create_dir_all(t.p("pathdir")).expect("mkdir");
+    std::os::unix::fs::symlink(t.p("base/real/bin/python3.12"), t.p("pathdir/python3")).expect("symlink");
+    fs::create_dir_all(t.p("base/real/lib/python3.12")).expect("mkdir");
+    fs::write(t.p("base/real/lib/python3.12/os.py"), "").expect("write");
+    let path_env = format!("/nonexistent::{}", t.p("pathdir").display());
+    let r = discover(&t.p("proj"), &RootOptions { path_env: Some(path_env.into()), include_stdlib: true, ..opts() });
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/real/lib/python3.12")));
+    assert_eq!(r.python_version, Some(v(12)));
+    assert_eq!(r.version_source, Some(VersionSource::Stdlib));
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert_eq!(r.roots.iter().map(|r| r.kind).collect::<Vec<_>>(), [RootKind::Project, RootKind::Stdlib]);
+
+    // Conda-style prefix without pyvenv.cfg: its own stdlib and site-packages.
+    t.file("conda/lib/python3.10/os.py", "").file("conda/lib/python3.10/site-packages/c.py", "");
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("conda")), ..opts() });
+    let venv = r.venv.as_ref().expect("venv");
+    assert!(venv.cfg.is_none());
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("conda/lib/python3.10")));
+    assert_eq!(r.python_version, Some(v(10)));
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("conda")), ..opts() });
+    let site = r.roots.iter().find(|x| x.kind == RootKind::SitePackages).expect("site");
+    assert_eq!(site.path, t.p("conda/lib/python3.10/site-packages"));
+    // The stdlib root does not swallow its site-packages: longest prefix wins.
+    let p = t.p("conda/lib/python3.10/site-packages/c.py");
+    assert_eq!(r.classify(&p).map(|l| r.root(l.root).kind), Some(RootKind::SitePackages));
+}
+
+#[test]
+fn system_site_packages() {
+    let t = TempDir::new("syssite");
+    let base = t.p("base").display().to_string();
+    t.file("base/lib/python3.12/os.py", "").file("base/lib/python3.12/site-packages/global_pkg.py", "").file("proj/pyproject.toml", "");
+    mini_venv(&t, "proj/.venv", 12, &format!("home = {base}/bin\nversion_info = 3.12.0\ninclude-system-site-packages = true\n"));
+    let r = discover(&t.p("proj"), &opts());
+    let sites: Vec<&Path> = r.roots.iter().filter(|x| x.kind == RootKind::SitePackages).map(|x| &*x.path).collect();
+    assert_eq!(sites, [&*t.p("proj/.venv/lib/python3.12/site-packages"), &*t.p("base/lib/python3.12/site-packages")]);
+    assert_eq!(r.dists.sites().len(), 2);
+    let p = t.p("base/lib/python3.12/site-packages/global_pkg.py");
+    let l = r.classify(&p).expect("classified");
+    assert_eq!((l.origin, l.rel), (Origin::ThirdParty, &b"global_pkg.py"[..]));
+}
+
+#[test]
+fn first_party_layouts() {
+    let t = TempDir::new("layouts");
+    // Explicit src (relative and absolute), in order; no auto-detection.
+    t.file("a/pyproject.toml", "").file("a/src/pkg/__init__.py", "").dir("a/lib");
+    let r = discover(&t.p("a"), &RootOptions { src: vec!["lib".into(), t.p("a/src")], ..opts() });
+    let kinds: Vec<_> = rel_roots(&t, &r).into_iter().map(|(p, k, ..)| (p, k)).collect();
+    assert_eq!(kinds, [("a/lib".to_owned(), RootKind::Configured), ("a/src".to_owned(), RootKind::Configured)]);
+
+    // `src/` that is itself a package is not a src layout; PEP 420 namespace dirs in src are.
+    t.file("b/pyproject.toml", "").file("b/src/__init__.py", "").file("b/src/x.py", "");
+    assert_eq!(discover(&t.p("b"), &opts()).roots.len(), 1);
+    t.file("c/pyproject.toml", "").file("c/src/nspkg/mod.py", "");
+    assert_eq!(discover(&t.p("c"), &opts()).roots[0].path, t.p("c/src"));
+    t.file("d/pyproject.toml", "").file("d/src/README.md", "").dir("d/src/empty");
+    assert_eq!(discover(&t.p("d"), &opts()).roots.len(), 1);
+    t.file("e/pyproject.toml", "").file("e/src/single.pyi", "");
+    assert_eq!(discover(&t.p("e"), &opts()).roots.len(), 2);
+
+    // Build-backend hints come first; missing dirs are skipped.
+    t.file("f/pyproject.toml", "[tool.setuptools.packages.find]\nwhere = [\"python\", \"missing\"]\n").file("f/python/p/__init__.py", "");
+    let r = discover(&t.p("f"), &opts());
+    assert_eq!(rel_roots(&t, &r).into_iter().map(|(p, ..)| p).collect::<Vec<_>>(), ["f/python", "f"]);
+
+    // Invalid pyproject: reported, defaults used.
+    t.file("g/pyproject.toml", "[project\n");
+    let r = discover(&t.p("g"), &opts());
+    assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Pyproject]);
+    assert!(r.pyproject.is_none());
+
+    // Project root detection.
+    t.file("h/pyproject.toml", "").dir("h/deep/er");
+    assert_eq!(find_project_root(&t.p("h/deep/er")), t.p("h"));
+    let lone = TempDir::new("noproj");
+    assert_eq!(find_project_root(lone.path()), lone.path());
+}
+
+#[test]
+fn distribution_metadata_edge_cases() {
+    let t = TempDir::new("dists");
+    let site = "proj/.venv/lib/python3.12/site-packages";
+    t.file("proj/pyproject.toml", "").file("proj/.venv/pyvenv.cfg", "version_info = 3.12.0\n");
+    let site_abs = t.p(site).display().to_string();
+
+    // Legacy egg-info directory: PKG-INFO, installed-files.txt relative to the egg-info dir.
+    t.file(&format!("{site}/legacy-1.2-py3.12.egg-info/PKG-INFO"), "Metadata-Version: 1.0\nName: Legacy\nVersion: 1.2\n")
+        .file(&format!("{site}/legacy-1.2-py3.12.egg-info/installed-files.txt"), "../legacy/__init__.py\n../legacy/util.py\nPKG-INFO\n../../../../bin/x\n")
+        .file(&format!("{site}/legacy-1.2-py3.12.egg-info/top_level.txt"), "legacy\n")
+        .file(&format!("{site}/legacy/__init__.py"), "");
+    // Single-file egg-info (distutils): metadata only.
+    t.file(&format!("{site}/oldie-0.1.egg-info"), "Name: oldie\nVersion: 0.1\n");
+    // Headers longer than the 16 KiB prefix: Version comes after a long folded Description.
+    let long = format!("Metadata-Version: 1.1\nName: longmeta\nDescription: {}\nVersion: 3.0\n\n", "x\n        ".repeat(4000));
+    t.file(&format!("{site}/longmeta-3.0.dist-info/METADATA"), &long).file(&format!("{site}/longmeta-3.0.dist-info/RECORD"), "");
+    // Missing METADATA: falls back to the dir name, reported.
+    t.file(&format!("{site}/nometa-0.5.dist-info/RECORD"), "nometa.py,,\n");
+    // RECORD with quoted, absolute (inside and outside the site), `./`, `..` and pycache paths;
+    // stub-only package; extension module at top level; .pth listed.
+    let record = format!(
+        "\"we,ird/__init__.py\",sha256=x,1\n{site_abs}/absmod.py,,\n/elsewhere/x.py,,\n./dot/m.py,,\nup/../escape.py,,\nwe,ird/__pycache__/a.cpython-312.pyc,,\n\
+         fancy-stubs/__init__.pyi,,\n_speedups.cpython-312-darwin.so,,\nfancy.pth,,\nREADME.md,,\nbin-dir/data.txt,,\nfancy-9.dist-info/METADATA,,\n"
+    );
+    t.file(&format!("{site}/fancy-9.dist-info/METADATA"), "Name: Fancy\nVersion: 9\n").file(&format!("{site}/fancy-9.dist-info/RECORD"), &record);
+
+    let r = discover(&t.p("proj"), &opts());
+    let d = &r.dists;
+    let names: Vec<(&str, &str)> = d.ids().map(|i| (s(d.name(i)), s(d.version(i)))).collect();
+    assert_eq!(names, [("Fancy", "9"), ("Legacy", "1.2"), ("longmeta", "3.0"), ("nometa", "0.5"), ("oldie", "0.1")]);
+    let kinds: Vec<_> = r.diagnostics.iter().map(|x| x.kind).collect();
+    assert_eq!(kinds, [DiagnosticKind::Metadata], "{:?}", r.diagnostics);
+
+    let legacy = d.by_name(b"legacy").expect("legacy");
+    assert!(d.is_egg_info(legacy) && d.has_record(legacy));
+    assert_eq!(d.files(legacy).map(s).collect::<Vec<_>>(), ["legacy/__init__.py", "legacy/util.py"]);
+    assert_eq!(d.top_level(legacy).map(s).collect::<Vec<_>>(), ["legacy"]);
+    let oldie = d.by_name(b"oldie").expect("oldie");
+    assert!(d.is_egg_info(oldie) && !d.has_record(oldie));
+
+    let fancy = d.by_name(b"fancy").expect("fancy");
+    assert_eq!(d.files(fancy).map(s).collect::<Vec<_>>(), ["we,ird/__init__.py", "absmod.py", "dot/m.py", "fancy-stubs/__init__.pyi"]);
+    assert_eq!(d.top_level(fancy).map(s).collect::<Vec<_>>(), ["_speedups", "absmod", "dot", "fancy"]);
+    assert_eq!(d.owner(0, b"fancy.pth"), Some(fancy), ".pth files are indexed for ownership");
+    assert!(d.is_claimed(0, b"bin-dir") && d.is_claimed(0, b"README.md") && !d.is_claimed(0, b"fancy-9.dist-info"));
+    assert!(!d.is_claimed(0, b"elsewhere") && !d.is_claimed(0, b"up"));
+    assert_eq!(d.record_hash(d.by_name(b"longmeta").expect("long")), crate::intern::hash_bytes(b""));
+}
