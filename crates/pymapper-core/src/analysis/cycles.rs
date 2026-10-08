@@ -234,7 +234,9 @@ pub fn runtime_file(ix: &Index, f: FileId, first_party_only: bool) -> bool {
 
 /// The module import graph searched by [`import_cycles`].
 pub fn cycle_graph(ix: &Index, imp: &Imports, opts: &CycleOptions) -> ModuleGraph {
-    import_graph_where(ix, imp, opts.exclude, |f| runtime_file(ix, f, opts.first_party_only))
+    // Once per file rather than per edge (the builder visits every edge twice).
+    let keep: Vec<bool> = (0..ix.file_count()).map(|f| runtime_file(ix, f, opts.first_party_only)).collect();
+    import_graph_where(ix, imp, opts.exclude, |f| keep[f as usize])
 }
 
 /// Import cycles of `ix` (see the module docs). O(V + E).

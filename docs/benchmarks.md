@@ -62,6 +62,7 @@ entered, and symlinks are not followed.
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 | `calls`      | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges`, `resolve.classes`, `resolve.mro`, `resolve.calls` | `resolve`, then `pymapper_core::resolve::resolve_calls` (class table + method index, bases + C3 MROs, then every call row, uncalled decorator and override in parallel per file). Counters `calls`, shares of call rows in per mille (`certain_pm`, `likely_pm`, `possible_pm`, `unresolved_pm`; of which `builtin_pm` = builtins and builtin-type methods, `external_pm` = unloaded code and unloaded bases), `edges`, `override_edges`, `decorator_edges`, `classes`, `incomplete_classes`, `calls_kb` = `ResolvedCalls::heap_bytes`, `resolve_kb`, `index_kb` |
 | `graph`      | `calls` phases, `graph.build`, `graph.scc`, `graph.modules` | `calls`, then `pymapper_core::graph`: `graph.build` = `call_graph` over every node (all edges with a target), `graph.scc` = its `Condensed` (iterative Tarjan + DAG), `graph.modules` = `import_graph` (no flag mask) + `module_call_graph` and both condensations. Counters `graph_nodes`, `graph_edges` (distinct), `sccs`, `cyclic_sccs`, `largest_scc`, `dag_edges`, `modules`, `import_edges`, `import_cycles` and `module_call_cycles` (components with 2+ modules), `module_call_edges`, `callgraph_kb` (call graph + condensation heap), `graph_kb` (all six structures), `calls_kb`, `index_kb` |
+| `cycles`     | `resolve` phases, `cycles`, `layers`, `layers.transitive` | `resolve`, then `analysis::cycles::analyse` (`cycles`: first-party runtime import graph, SCCs, witnesses, PM301 findings) and `analysis::layers::analyse` with three synthetic contracts over the corpus' top-level packages (alphabetical): 6 layers, 12 independent modules, and up to 32 sources forbidden from `os`, `sys`, `typing` (phase `layers`), then the same contracts with `transitive = true` (phase `layers.transitive`). Counters `modules`, `import_edges` (of the cycle graph), `cycles`, `modules_in_cycles`, `largest_cycle`, `longest_witness`, `cycle_findings`, `contracts`, `missing_names`, `rows_checked`, `layer_findings`, `transitive_findings`, `cycles_kb` = `Cycles::heap_bytes`, `layers_kb` / `layers_transitive_kb` = `LayersReport::heap_bytes`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -701,6 +702,30 @@ synthetic pair of 30k-token periodic tables took 1.5 s (quadratic: one diagonal 
 with it 9.5 ms. Splitting found the codec classes of the `encodings` modules, which were
 previously lost because each match ran on into the differing mapping tables and was then
 rejected as data (it reports fewer lines because those tables are no longer counted).
+
+### Cycles and layers (S4.3b)
+
+`cycles` target, 14-core M4 Pro, release, warm cache, best of 3 (RSS worst of 3), other
+worktrees running. Both analyses are O(V + E); the cycle search is sequential (graph build,
+Tarjan, one BFS per cyclic component), the contract check is parallel per chunk of 256 files.
+
+| corpus | modules | cycle edges | cycles | in cycles | largest | longest witness | `cycles` | `layers` | `layers.transitive` | rows checked | findings (direct / transitive) | `layers_kb` / transitive | peak RSS MB |
+|--------|---------|-------------|--------|-----------|---------|-----------------|----------|----------|---------------------|--------------|--------------------------------|--------------------------|-------------|
+| stdlib | 1,046   | 2,617       | 9      | 257       | 223     | 3               | 0.15ms   | 0.11ms   | 0.27ms              | 2,822        | 258 / 1,291                    | 33 / 92                  | 28.0        |
+| venv   | 70,732  | 310,295     | 492    | 11,907    | 3,415   | 10              | 14.2ms   | 2.85ms   | 17.2ms              | 30,007       | 2,619 / 5,974                  | 2,180 / 7,542            | 532.6       |
+
+- **Time**: on the venv (17M LOC) the cycle analysis is 14 ms and the three contracts 3 ms
+  (17 ms transitive, of which most is building the import graph), against 3.4 s for the whole
+  pipeline. The cycle graph has fewer edges than `graph`'s `import_edges` (329,342): stubs,
+  shadowed files and type-only edges are left out (492 cycles instead of 520).
+- **Memory**: the cycle result keeps 4 bytes per module in a cycle plus the witnesses (80 KB
+  on the venv); the graph (`8 (n + 1) + 10 m` bytes) and the BFS scratch (4 bytes per module)
+  are dropped before returning. Contracts cost 8 bytes per module for the module space plus 4
+  per module and role array; transitive contracts add the import graph (shared by contracts
+  with the same `allow-type-checking`) and 4 bytes per module and container (8 for
+  independence). Peak RSS is that of the index and the import resolution.
+- Witnesses are short even in large components (3,415 modules, witness of at most 10
+  modules): the BFS finds a shortest cycle through the component's lowest module.
 
 ### Output (S4.4)
 
