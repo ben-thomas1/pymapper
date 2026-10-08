@@ -283,7 +283,7 @@ Memory per LOC (rows only, `Sym` = 4 B; layout in `extract/facts.rs`):
 | evidence     | 278.6            | 1.11         | 244.1          | 0.98       |
 | imports      | 23.0             | 0.62         | 52.9           | 1.43       |
 | params       | 99.8             | 0.50         | 101.9          | 0.51       |
-| other        |                  | 0.14         |                | 0.21       |
+| other        |                  | 0.14         |                | 0.18       |
 | **total**    |                  | **13.41**    |                | **14.01**  |
 
 Plus per-file headers (112 B per file): 0.27 B/LOC stdlib, 0.40 B/LOC venv. LOC: stdlib
