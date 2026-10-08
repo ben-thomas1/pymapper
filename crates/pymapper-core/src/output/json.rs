@@ -23,7 +23,7 @@
 //! - Strings are UTF-8; invalid bytes in paths or names are replaced with U+FFFD.
 //!
 //! New fields may be added without a version bump; removals and meaning changes bump
-//! [`JSON_VERSION`](super::JSON_VERSION).
+//! [`JSON_VERSION`].
 
 use super::buf::{Out, push_u32};
 use super::{JSON_VERSION, Options, Report, Summary};

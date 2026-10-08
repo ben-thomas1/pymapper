@@ -24,6 +24,20 @@
 //! happen for definitions and imports (indentation is ASCII).
 //!
 //! A finding without a line prints `path: CODE message`; without a file, `CODE message`.
+//! Invalid UTF-8 in paths and qualified ids is replaced with U+FFFD everywhere (all formats and
+//! baseline keys), so the formats agree and baselines round-trip.
+//!
+//! # Use (`pymapper check`)
+//!
+//! ```ignore
+//! let stats = engine.filter(&mut findings, &suppressions, false, |file, i| ...);
+//! let ctx = IndexContext::new(&index, &root, &config.contracts);
+//! let mut report = Report::new(&findings, &ctx);
+//! if let Some(b) = &baseline { report.apply_baseline(b); }
+//! let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
+//! report.write(&opts, &Summary { files_checked, filter: stats }, &mut std::io::stdout().lock())?;
+//! std::process::ExitCode::from(report.exit_status(opts.min_confidence).code())
+//! ```
 //!
 //! # Formats
 //!
