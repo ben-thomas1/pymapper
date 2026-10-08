@@ -45,31 +45,37 @@ impl LineCursor {
     }
 
     /// Counts `\n` in `src[cur..end]` (no `\r` in the source), 8 bytes at a
-    /// time with an exact SWAR zero-byte mask, tracking the last one.
+    /// time with an exact SWAR zero-byte mask, tracking the last one. The final
+    /// partial word is read whole when the source has the bytes (masked to the
+    /// range), so short ranges between nearby queries take one or two words and
+    /// no byte loop.
     #[inline]
     fn advance_lf(&mut self, src: &[u8], cur: usize, end: usize) {
         const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
         const NL: u64 = 0x0a0a_0a0a_0a0a_0a0a;
         let mut i = cur;
-        while i + 8 <= end {
+        while i < end {
+            let take = (end - i).min(8);
             let mut w = [0u8; 8];
-            w.copy_from_slice(&src[i..i + 8]);
+            if i + 8 <= src.len() {
+                w.copy_from_slice(&src[i..i + 8]);
+            } else {
+                // End of the source: bytes past it stay 0 (not `\n`).
+                w[..src.len() - i].copy_from_slice(&src[i..]);
+            }
             let x = u64::from_le_bytes(w) ^ NL;
             // High bit set exactly in the bytes of `x` that are zero.
-            let m = !(((x & LO7).wrapping_add(LO7)) | x | LO7);
+            let mut m = !(((x & LO7).wrapping_add(LO7)) | x | LO7);
+            if take < 8 {
+                // Little endian: byte k of the word is bits 8k..8k+8.
+                m &= (1u64 << (take * 8)) - 1;
+            }
             if m != 0 {
                 self.line += m.count_ones();
                 let last = 7 - (m.leading_zeros() / 8) as usize;
                 self.line_start = (i + last + 1) as u32;
             }
-            i += 8;
-        }
-        while i < end {
-            if src[i] == b'\n' {
-                self.line += 1;
-                self.line_start = i as u32 + 1;
-            }
-            i += 1;
+            i += take;
         }
     }
 
@@ -110,7 +116,8 @@ impl LineCursor {
             }
         }
         self.off = end as u32;
-        Pos { line: self.line, col: off - self.line_start.min(off) }
+        // Offsets past the end are clamped to it (like the line).
+        Pos { line: self.line, col: end as u32 - self.line_start }
     }
 }
 
@@ -247,7 +254,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
     }
 
     /// Lexes until `k + 1` tokens are buffered.
-    #[inline(never)]
+    #[inline]
     fn fill(&mut self, k: usize) {
         while self.len <= k {
             let t = self.lex();

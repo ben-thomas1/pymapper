@@ -354,7 +354,7 @@ fn call_chains_and_receivers() {
         only(src, &["call"]),
         "call f None 1:0\ncall a.b.c Dotted 2:0\ncall self.x.m SelfAttr 3:0\ncall cls.make ClsAttr 4:0\n\
          call super None 5:0\ncall run Super 5:8\ncall super None 6:0\ncall a.b Super 6:15\ncall f None 7:0\ncall g Unknown 7:4\n\
-         call h Unknown 8:5\ncall join Unknown 9:3\ncall f None 10:0\ncall  Unknown 10:3\ncall b Unknown 11:4\ncall self None 12:0"
+         call h Unknown 8:5\ncall join Unknown 9:3\ncall f None 10:0\ncall  Unknown 10:3\ncall a.b Dotted 11:1\ncall self None 12:0"
     );
 }
 
@@ -461,12 +461,16 @@ fn names_attributes_strings() {
 
 #[test]
 fn python2_statements() {
-    let e = events("print 'hello'\nprint >>f, x\nexec code\nprint('ok')\nprint\n");
+    let e = events("print 'hello'\nprint >>f, x\nexec code\nprint('ok')\nprint\nprint >>sys.stderr, len(x), g(y)\n");
     assert_eq!(e[0], "diag Python2 1:0 print");
     assert_eq!(e[1], "diag Python2 2:0 print");
     assert_eq!(e[2], "diag Python2 3:0 exec");
     assert_eq!(e[3], "call print None 4:0");
-    assert_eq!(e.len(), 4);
+    // The rest of a Python 2 statement is still scanned for calls.
+    assert_eq!(e[4], "diag Python2 6:0 print");
+    assert_eq!(e[5], "call len None 6:20");
+    assert_eq!(e[6], "call g None 6:28");
+    assert_eq!(e.len(), 7);
 }
 
 #[test]
@@ -656,15 +660,28 @@ impl Rng {
 fn line_cursor_matches_naive_count() {
     use super::parser::LineCursor;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    for _ in 0..300 {
-        let len = rng.below(200);
-        let alphabet: &[u8] = if rng.below(2) == 0 { b"ab\n\n " } else { b"a\r\n\r" };
+    for round in 0..600 {
+        let len = rng.below(if round % 3 == 0 { 2000 } else { 200 });
+        let alphabet: &[u8] = match rng.below(3) {
+            0 => b"ab\n\n ",
+            1 => b"a\r\n\r",
+            // Mostly `\n`, a rare `\r` late in the file (switches to the byte-wise path).
+            _ => b"abcdefghij\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\r",
+        };
         let src: Vec<u8> = (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect();
         let mut lc = LineCursor::new(&src);
-        for _ in 0..20 {
-            let off = rng.below(len + 1) as u32;
+        let mut last = rng.below(len + 1) as u32;
+        for _ in 0..40 {
+            // Mix nearby forward/backward queries with long jumps.
+            let off = match rng.below(4) {
+                0 => rng.below(len + 1) as u32,
+                1 => last.saturating_sub(rng.below(5) as u32),
+                _ => (last + rng.below(30) as u32).min(len as u32 + 3),
+            };
+            last = off.min(len as u32);
             let got = lc.pos(&src, off);
             // Naive: lines end at `\n`, `\r\n` (once) and lone `\r`.
+            let off = off.min(len as u32);
             let (mut line, mut start) = (1u32, 0u32);
             for i in 0..off as usize {
                 let end = src[i] == b'\n' || (src[i] == b'\r' && src.get(i + 1) != Some(&b'\n'));
@@ -962,4 +979,22 @@ fn recovery_reprocesses_indentation_of_keyword_line() {
     assert!(e.contains(&"def g @4:4 L4 d0".to_string()), "{e:?}");
     check(b"def f():\n    if a:\n        x = foo(\ndef g():\n    pass\n");
     check(b"class C:\n    x = [\n        def m(self): pass\n  return\n");
+}
+
+#[test]
+fn parenthesised_primaries_are_transparent_in_chains() {
+    // As in the AST: parentheses around a whole primary do not change the chain.
+    let src = "((a.b)).c()\n(x)()\n(self).m()\n(super()).m()\n(f().g).h()\n(d[0]).k()\n((f)(1)).z()\n";
+    assert_eq!(
+        only(src, &["call"]),
+        "call a.b.c Dotted 1:2\ncall x None 2:1\ncall self.m SelfAttr 3:1\ncall super None 4:1\ncall m Super 4:10\n\
+         call f None 5:1\ncall g.h Unknown 5:5\ncall k Unknown 6:7\ncall f None 7:2\ncall z Unknown 7:9"
+    );
+    // Anything else in the group makes it an unknown receiver.
+    let src = "(a + b).c()\n(a, b).c()\n(f\"{a}\").x()\n(not a).y()\n(lambda: a).z()\n(a if b else c).w()\n(await a).v()\n";
+    assert_eq!(
+        only(src, &["call"]),
+        "call c Unknown 1:8\ncall c Unknown 2:7\ncall x Unknown 3:9\ncall y Unknown 4:8\ncall z Unknown 5:12\n\
+         call w Unknown 6:16\ncall v Unknown 7:10"
+    );
 }

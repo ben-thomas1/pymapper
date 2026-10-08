@@ -766,8 +766,9 @@ fn store_reuse_after_clear_is_identical() {
 fn file_b_exact() {
     check(
         FILE_B,
-        // evidence: G, h, x, k, get, 'key' (the Python 2 line is skipped after its diagnostic).
-        "file lines=5 evidence=6
+        // evidence: G, h, x, k, get, 'key', 'py2' (the rest of the Python 2 line is still scanned
+        // after its diagnostic).
+        "file lines=5 evidence=7
          module 0:<module> L1-5 b0-89
          def 1:g in=0 L1-4 b0-76 @1:4 (x, *a, **k)
          call 1:g L3:8 h()
@@ -846,4 +847,19 @@ fn corpus_files_extract_without_diagnostics() {
         let ff = extract(&src, &mut st, &mut spans);
         assert_eq!(ff.diags.len, 0, "{}", p.display());
     }
+}
+
+#[test]
+fn end_of_input_diagnostics_point_into_the_last_line() {
+    check_lines(
+        "def f(\n",
+        "diag",
+        "diag L1:6 UnclosedBracket
+         diag L1:6 UnexpectedToken
+         diag L1:6 ExpectedColon
+         diag L1:6 ExpectedIndent",
+    );
+    check_lines("x = [1,\r\n  2\r\n", "diag", "diag L2:3 UnclosedBracket");
+    check_lines("f(", "diag", "diag L1:2 UnclosedBracket");
+    check_lines("if x:\n", "diag", "diag L1:5 ExpectedIndent");
 }

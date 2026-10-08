@@ -607,7 +607,7 @@ fn tee_and_scratch_reuse() {
     expected.append(&compute(b.as_bytes()));
     assert_eq!(table, expected);
     assert_eq!(table.row(3).cognitive, 1);
-    assert!(table.heap_bytes() >= 40 * table.len());
+    assert!(table.heap_bytes() >= MetricsTable::ROW_BYTES * table.len());
     assert!(scratch.heap_bytes() > 0);
     table.clear();
     assert!(table.is_empty());
@@ -700,8 +700,10 @@ fn deep_lambda_nesting_is_linear_and_saturates() {
     }
     big.push('\n');
     let m = one(&big);
-    // Ternary k (0-based) sits at nesting k + 1: sum = n(n+3)/2 (fits in u32 here).
-    assert_eq!(u64::from(m.cognitive), (n as u64) * (n as u64 + 3) / 2);
+    // Ternary k (0-based) sits at nesting k + 1: sum = n(n+3)/2, which the table stores
+    // saturated at u16::MAX.
+    assert!((n as u64) * (n as u64 + 3) / 2 > u64::from(u16::MAX));
+    assert_eq!(m.cognitive, u32::from(u16::MAX));
     // Nested functions multiply nothing quadratically beyond that: a chain of
     // nested defs with one ternary each stays exact.
     let mut chain = String::new();

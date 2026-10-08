@@ -26,7 +26,8 @@ use super::walk::{PathStore, walk_python};
 pub enum Target {
     /// Walk + parallel read of every file: the I/O floor.
     Read,
-    /// Walk + parallel read + per-file parse hook ([`parse_file`]).
+    /// The front end in the loader's shape: walk, then per thread read -> lex + parse + facts
+    /// + metrics (interned) -> drop the source, keeping all facts ([`super::extract`]).
     ParseOnly,
     /// Parallel walk only (`pymapper_core::walk`, corpus options).
     Walk,
@@ -50,6 +51,10 @@ pub enum Target {
     /// Like `parse-mem`, plus the per-definition metrics visitor
     /// (`pymapper_core::extract::metrics`) in the same pass; metrics rows are kept.
     MetricsMem,
+    /// Like `parse-mem`, but runs the full front end of `parse-only` (facts + metrics, interned
+    /// names) from memory: the extractor micro benchmark (use `-j 1` for one core, and for
+    /// profiling: `samply record xtask bench-run --target extract-mem --root DIR`).
+    ExtractMem,
 }
 
 impl Target {
@@ -65,6 +70,7 @@ impl Target {
             Target::LexMem => "lex-mem",
             Target::ParseMem => "parse-mem",
             Target::MetricsMem => "metrics-mem",
+            Target::ExtractMem => "extract-mem",
         }
     }
 }
@@ -185,14 +191,6 @@ impl ParseAcc {
     }
 }
 
-/// The parse-only hook: called once per file with its full contents, which are dropped (the
-/// buffer is reused) as soon as this returns. Plug the lexer/extractor in here.
-#[inline]
-pub fn parse_file(src: &[u8], acc: &mut ParseAcc) {
-    // Until the lexer lands this measures walk + read only.
-    let _ = (src, acc);
-}
-
 /// The `lex` hook: lexes the whole file (parser mode, no trivia) and counts tokens.
 pub fn lex_file(src: &[u8], acc: &mut ParseAcc) {
     let t0 = Instant::now();
@@ -222,9 +220,9 @@ fn lex_count(src: &[u8]) -> (u64, u64) {
 }
 
 /// The whole corpus in memory: per-job concatenated buffers plus (buffer, start, end) per file.
-struct Loaded {
-    bufs: Vec<Vec<u8>>,
-    files: Vec<(u32, usize, usize)>,
+pub(super) struct Loaded {
+    pub(super) bufs: Vec<Vec<u8>>,
+    pub(super) files: Vec<(u32, usize, usize)>,
 }
 
 /// `lex-mem`: loads every file (phase `load`), then lexes from memory (phase `lex`).
@@ -332,7 +330,7 @@ fn metrics_mem(paths: &PathList) -> (ReadStats, ParseAcc) {
 }
 
 /// Reads every file in parallel, appending each job's files to one growing buffer.
-fn load_files(paths: &PathList) -> (ReadStats, Loaded) {
+pub(super) fn load_files(paths: &PathList) -> (ReadStats, Loaded) {
     struct Job {
         buf: Vec<u8>,
         spans: Vec<(usize, usize)>,
@@ -394,18 +392,26 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
             (ReadStats { files: files.len() as u64, bytes: 0, errors }, counters)
         }
         Target::Roots => roots_target(root)?,
-        Target::Read | Target::ParseOnly | Target::Lex | Target::LexMem | Target::ParseMem | Target::MetricsMem => {
+        Target::Read
+        | Target::ParseOnly
+        | Target::Lex
+        | Target::LexMem
+        | Target::ParseMem
+        | Target::MetricsMem
+        | Target::ExtractMem => {
             let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
-            let (mut stats, acc) = match target {
-                Target::Read => timing::time("read", || read_files(&files, no_hook)),
-                Target::ParseOnly => timing::time("read+parse", || read_files(&files, parse_file)),
-                Target::Lex => timing::time("read+lex", || read_files(&files, lex_file)),
-                Target::ParseMem => parse_mem(&files),
-                Target::MetricsMem => metrics_mem(&files),
-                _ => lex_mem(&files),
+            let with_acc = |(stats, acc): (ReadStats, ParseAcc)| (stats, acc.counters());
+            let (mut stats, counters) = match target {
+                Target::Read => with_acc(timing::time("read", || read_files(&files, no_hook))),
+                Target::ParseOnly => super::extract::parse_only(&files),
+                Target::Lex => with_acc(timing::time("read+lex", || read_files(&files, lex_file))),
+                Target::ParseMem => with_acc(parse_mem(&files)),
+                Target::MetricsMem => with_acc(metrics_mem(&files)),
+                Target::ExtractMem => super::extract::extract_mem(&files)?,
+                _ => with_acc(lex_mem(&files)),
             };
             stats.errors += walk_errors;
-            (stats, acc.counters())
+            (stats, counters)
         }
     };
     let total_s = t0.elapsed().as_secs_f64();
@@ -544,7 +550,7 @@ mod tests {
         fs::write(dir.join("c.py"), vec![b'x'; 100_000]).unwrap();
         let mut paths = core_walk::walk(&[&dir], &corpus_options()).files;
         paths.push(dir.join("vanished.py").as_os_str().as_encoded_bytes()).unwrap();
-        let (stats, _) = read_files(&paths, parse_file);
+        let (stats, _) = read_files(&paths, no_hook);
         assert_eq!(stats, ReadStats { files: 3, bytes: 100_003, errors: 1 });
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -559,11 +565,22 @@ mod tests {
             bytes += fs::metadata(paths.get(i)).unwrap().len();
         }
         timing::enable(true);
-        for target in [Target::Read, Target::ParseOnly, Target::Walk, Target::WalkSeq, Target::WalkGit, Target::Lex, Target::LexMem, Target::ParseMem, Target::MetricsMem] {
+        for target in [
+            Target::Read,
+            Target::ParseOnly,
+            Target::Walk,
+            Target::WalkSeq,
+            Target::WalkGit,
+            Target::Lex,
+            Target::LexMem,
+            Target::ParseMem,
+            Target::MetricsMem,
+            Target::ExtractMem,
+        ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
             assert_eq!(rec.files, paths.len() as u64, "{target:?}");
-            let read = matches!(target, Target::Read | Target::ParseOnly | Target::Lex | Target::LexMem | Target::ParseMem | Target::MetricsMem);
+            let read = !matches!(target, Target::Walk | Target::WalkSeq | Target::WalkGit | Target::Roots);
             assert_eq!(rec.bytes, if read { bytes } else { 0 }, "{target:?}");
             assert_eq!(rec.errors, 0);
             assert!(rec.threads >= 1);
@@ -574,7 +591,7 @@ mod tests {
                 Target::ParseOnly => &["walk", "read+parse"],
                 Target::Lex => &["walk", "read+lex"],
                 Target::LexMem => &["walk", "load", "lex"],
-                Target::ParseMem | Target::MetricsMem => &["walk", "load", "parse"],
+                Target::ParseMem | Target::MetricsMem | Target::ExtractMem => &["walk", "load", "parse"],
                 Target::Walk | Target::WalkSeq | Target::WalkGit => &["walk"],
                 Target::Roots => unreachable!("checked below"),
             };
@@ -595,6 +612,16 @@ mod tests {
                 assert!(counter("calls").unwrap() > 0);
                 assert!(counter("parse_MBps_core").is_some());
                 assert_eq!(counter("metric_rows"), if target == Target::MetricsMem { counter("defs") } else { None });
+            } else if matches!(target, Target::ParseOnly | Target::ExtractMem) {
+                let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, [
+                    "loc", "defs", "calls", "diagnostics", "parse_cpu_ms", "parse_MBps_core", "facts_B_per_kLOC",
+                    "metrics_B_per_kLOC", "facts_kb", "metrics_kb", "intern_kb"
+                ]);
+                assert!(counter("loc").unwrap() > rec.files);
+                assert!(counter("defs").unwrap() > 0 && counter("calls").unwrap() > 0);
+                assert!(counter("facts_B_per_kLOC").unwrap() > 1000);
+                assert!(counter("metrics_B_per_kLOC").unwrap() > 0);
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }

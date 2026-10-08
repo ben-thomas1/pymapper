@@ -4,15 +4,15 @@
 //! read -> [`LineIndex`] -> oracle facts ([`oracle::RuffOracle`]) -> candidate facts ->
 //! [`diff::diff_file`] -> per-worker [`Report`], merged in path order.
 //!
-//! The candidate (our extractor) is wired in by S1.5 by implementing [`FactSource`] (plus its
-//! per-thread [`Extractor`]) and passing it as `candidate` to [`compare`]; until
-//! then the command reports ruff-side totals, and `--self-check` diffs ruff against itself to
-//! exercise the whole pipeline.
+//! The candidate is our extractor ([`ours::Ours`]: `pymapper_core::extract` facts + metrics).
+//! `--self-check` diffs ruff against itself instead (exercises the whole pipeline, expects zero
+//! mismatches) and `--oracle-only` reports ruff-side totals only.
 
 pub mod diff;
 pub mod facts;
 mod hash;
 pub mod oracle;
+pub mod ours;
 pub mod report;
 mod walk;
 
@@ -41,8 +41,14 @@ pub struct Args {
     #[arg(long)]
     pub dump: bool,
     /// Diff ruff against itself to exercise the full pipeline (expects zero mismatches).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "oracle_only")]
     pub self_check: bool,
+    /// Only run ruff and report its totals (no candidate).
+    #[arg(long)]
+    pub oracle_only: bool,
+    /// With --dump: dump our facts instead of ruff's.
+    #[arg(long, requires = "dump")]
+    pub ours: bool,
 }
 
 /// Entry point: exit 0 = no mismatches (or nothing compared), 1 = mismatches; errors are
@@ -55,10 +61,16 @@ pub fn run(args: &Args) -> anyhow::Result<ExitCode> {
     }
     let root = args.dir.as_path();
     if args.dump {
-        return dump(root, &walked.files, &RuffOracle);
+        return if args.ours { dump(root, &walked.files, &ours::Ours) } else { dump(root, &walked.files, &RuffOracle) };
     }
     let walk_time = start.elapsed();
-    let candidate: Option<&dyn FactSource> = if args.self_check { Some(&RuffOracle) } else { None };
+    let candidate: Option<&dyn FactSource> = if args.self_check {
+        Some(&RuffOracle)
+    } else if args.oracle_only {
+        None
+    } else {
+        Some(&ours::Ours)
+    };
     let work_start = Instant::now();
     let report = compare(root, &walked.files, &RuffOracle, candidate, args.examples);
     let work_time = work_start.elapsed();
@@ -247,6 +259,67 @@ mod tests {
         assert_eq!(r.files_seen, w.files.len() as u64);
         assert_eq!(r.oracle, r.candidate);
         assert!(r.oracle.defs > 0 && r.oracle.imports > 0 && r.oracle.calls > 0);
+    }
+
+    #[test]
+    fn ours_matches_ruff_on_corpus() {
+        let root = corpus();
+        let w = walk::walk(&root).unwrap();
+        let r = compare(&root, &w.files, &RuffOracle, Some(&ours::Ours), 5);
+        assert_eq!(r.mismatches(), 0);
+        assert_eq!(r.oracle, r.candidate);
+    }
+
+    /// Diffs one source through both sides; returns the mismatch count and our dump.
+    fn diff_source(name: &str, src: &str) -> (u64, String) {
+        let dir = std::env::temp_dir().join(format!("pymapper-diff-ours-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), src).unwrap();
+        let w = walk::walk(&dir).unwrap();
+        let r = compare(&dir, &w.files, &RuffOracle, Some(&ours::Ours), 5);
+        let mut lines = LineIndex::default();
+        lines.reset(src.as_bytes());
+        let mut facts = FileFacts::default();
+        ours::Ours.extractor().extract(Path::new("a.py"), src.as_bytes(), &lines, &mut facts).unwrap();
+        let mut dump = Vec::new();
+        facts.dump(&mut dump).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (r.mismatches(), String::from_utf8(dump).unwrap())
+    }
+
+    #[test]
+    fn ours_rebuilds_decorators_and_bases() {
+        let src = "@a.b\n@c.d(1,\n  x=[2]) # c\n@(e or f)\n@g[0]\n@h.i(1)(2)\nasync def f(p, /, q=1, *r, s, **t): pass\n\
+                   class C(B, m.M[T], *bs, metaclass=Meta, **kw,):\n    @property\n    def p(self): return 1\n\
+                   class D[T](Generic[T], x.Y): pass\nclass E(): pass\nclass F(f(1), 'x' if a else b): pass\n";
+        let (mismatches, dump) = diff_source("decorators", src);
+        assert_eq!(mismatches, 0, "{dump}");
+        assert!(dump.contains("def async-function f line=7 params=5 mccabe=1 decorators=@a.b @c.d(1,x=[2]) @(e or f) @g[0] @h.i(1)(2) bases="), "{dump}");
+        assert!(dump.contains("def class C line=8 params=0 mccabe=0 decorators= bases=B,m.M[T],*bs,metaclass=Meta,**kw"), "{dump}");
+        assert!(dump.contains("def function C.p line=10 params=1 mccabe=1 decorators=@property"), "{dump}");
+        assert!(dump.contains("bases=Generic[T],x.Y"), "{dump}");
+        assert!(dump.contains("def class E line=12 params=0 mccabe=0 decorators= bases=\n"), "{dump}");
+        assert!(dump.contains("bases=f(1),'x'if a else b"), "{dump}");
+    }
+
+    #[test]
+    fn ours_calls_imports_and_scopes() {
+        let src = "import a.b as c, d\nfrom ..e import (f as g, h)\nfrom . import *\n\
+                   def outer(x=k()):\n    def inner(): return (y).z(super().m(), w[0].v())\n    return f\"{q(1)}\"\n\
+                   wheel.\\\n  rp(1)\nf(\n)(2)\n";
+        let (mismatches, dump) = diff_source("calls", src);
+        assert_eq!(mismatches, 0, "{dump}");
+        assert!(dump.contains("import <module> module=a.b name= alias=c level=0 line=1"), "{dump}");
+        assert!(dump.contains("import <module> module=e name=f alias=g level=2 line=2"), "{dump}");
+        assert!(dump.contains("import <module> module= name=* alias= level=1 line=3"), "{dump}");
+        assert!(dump.contains("call <module> k line=4"), "{dump}");
+        assert!(dump.contains("call outer.inner y.z line=5"), "{dump}");
+        assert!(dump.contains("call outer.inner super().m line=5"), "{dump}");
+        assert!(dump.contains("call outer.inner ?.v line=5"), "{dump}");
+        assert!(dump.contains("call outer q line=6"), "{dump}");
+        assert!(dump.contains("call <module> wheel.rp line=7"), "{dump}");
+        assert!(dump.contains("call <module> ? line=10"), "{dump}");
     }
 
     #[test]

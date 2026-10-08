@@ -5,7 +5,7 @@ use crate::extract::events::{
     Assign, Base, Block, BlockKind, Call, Decorator, Def, Diagnostic, End, IfCond, Import, Value, Visitor,
 };
 use crate::extract::events::DefKind as EvDefKind;
-use crate::extract::Parser;
+use crate::extract::{Parser, Tee};
 use crate::lex::{MAX_SOURCE_LEN, Suppression, Token};
 
 // Block-context flags (inherited by nested blocks and defs).
@@ -123,7 +123,7 @@ struct Builder<'a, S: StrSink> {
     cache_next: usize,
 }
 
-pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) -> FileFacts {
+pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, strs: &mut S, extra: V) -> (FileFacts, V) {
     let truncated = src.len() > MAX_SOURCE_LEN;
     let src = if truncated { &src[..MAX_SOURCE_LEN] } else { src };
     strs.begin_file(src);
@@ -167,13 +167,13 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
         cache: [ChainKey::default(); 2],
         cache_next: 0,
     };
-    let mut p = Parser::new(src, b);
+    let mut p = Parser::new(src, Tee(b, extra));
     p.parse_file();
     // The parser's line cursor sits near the end already: this is cheap.
     let end = p.pos(len32(src.len()));
     let lines = if end.col == 0 { end.line - 1 } else { end.line };
-    let (mut b, sups) = p.finish();
-    b.finish(&sups, lines)
+    let (Tee(mut b, extra), sups) = p.finish();
+    (b.finish(&sups, lines), extra)
 }
 
 impl<S: StrSink> Builder<'_, S> {
@@ -253,6 +253,16 @@ impl<S: StrSink> Builder<'_, S> {
         }
         let m = self.base.defs as usize;
         self.st.defs.end_line[m] = lines.max(1);
+        // Diagnostics at end of input sit on the final (zero-width) NEWLINE, which is on the
+        // line after the last one when the source ends with a line end: move them to the end
+        // of the last line so every fact points into the file.
+        let last = lines.max(1);
+        for i in self.base.diags as usize..self.st.diags.len() as usize {
+            if self.st.diags.line[i] > last {
+                self.st.diags.line[i] = last;
+                self.st.diags.col[i] = last_line_len(src);
+            }
+        }
         self.st.exports.extend_from_slice(&self.sc.exports);
         sort_dedup_tail(&mut self.st.evidence, self.base.evidence as usize);
         let now = self.st.bases();
@@ -663,6 +673,19 @@ fn is_line_end(src: &[u8], i: usize) -> bool {
 struct LineCounter {
     off: usize,
     line: u32,
+}
+
+/// Byte length of the last line of `src`, without its line end.
+fn last_line_len(src: &[u8]) -> u32 {
+    let mut end = src.len();
+    if end > 0 && src[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && src[end - 1] == b'\r' {
+        end -= 1;
+    }
+    let start = src[..end].iter().rposition(|&b| b == b'\n' || b == b'\r').map_or(0, |i| i + 1);
+    len32(end - start)
 }
 
 impl LineCounter {

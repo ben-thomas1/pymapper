@@ -1085,5 +1085,17 @@ pub fn evidence_hash(name: &[u8]) -> u32 {
 /// Never fails: malformed input yields diagnostics rows. Inputs longer than
 /// [`crate::lex::MAX_SOURCE_LEN`] are truncated (flag [`file_flags::TRUNCATED`]).
 pub fn extract<S: StrSink>(src: &[u8], store: &mut FactStore, strs: &mut S) -> FileFacts {
-    build::extract(src, store, strs)
+    build::extract(src, store, strs, super::NoopVisitor).0
+}
+
+/// [`extract`] with a second visitor driven by the same parse (e.g. a
+/// [`MetricsVisitor`](super::MetricsVisitor)); returns it with the facts. The extra visitor
+/// sees every event after the fact builder.
+pub fn extract_with<S: StrSink, V: super::Visitor>(
+    src: &[u8],
+    store: &mut FactStore,
+    strs: &mut S,
+    extra: V,
+) -> (FileFacts, V) {
+    build::extract(src, store, strs, extra)
 }

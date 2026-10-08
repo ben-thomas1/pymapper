@@ -5,7 +5,7 @@ cargo-fuzz and no extra crates. A target is a plain `fn(&[u8])` that must never 
 kill the process, whatever bytes it gets.
 
 ```
-cargo xtask fuzz                        # default target (parse), 60 s, all cores, seeds from tests/corpus
+cargo xtask fuzz                        # default target (extract), 60 s, all cores, seeds from tests/corpus
 cargo xtask fuzz -t demo -T 600         # one target for 10 minutes
 cargo xtask fuzz -n 1000000 --seed 42   # exactly inputs 0..1000000 of seed 42
 cargo xtask fuzz ~/src/some-project     # extra seeds: directories (*.py, *.pyi) or files
@@ -108,13 +108,15 @@ same run are dropped.
 
 The registry is `TARGETS` in `xtask/src/fuzz/targets.rs`. The first entry is the default. Add
 a target by appending a `FuzzTarget { name, about, selftest, run }`, where `run: fn(&[u8])`.
-The lexer and extractor steps add `lex` and `extract` there, ahead of `demo`. Use internal
-assertions (`debug_assert!` stays on in the fuzz profile) to check invariants such as tokens
-tiling the input or spans staying in bounds.
+Use internal assertions (`debug_assert!` stays on in the fuzz profile) to check invariants such
+as tokens tiling the input or spans staying in bounds.
 
 | target           | what it does                                                             |
 |------------------|--------------------------------------------------------------------------|
-| `demo`           | toy tokenizer with invariant checks (placeholder until `lex`/`extract`)  |
+| `extract`        | facts + metrics in one pass (`extract_with` + `MetricsVisitor`): one `<module>` row, parents before children and enclosing them, def spans/lines in bounds and ordered, every scope and fact line inside the file, sorted unique evidence, one metrics row per def with sane values; rendering resolves every name and chain (bounds); a second extraction into the same store with an interner is identical and renders the same |
+| `lex`            | lexer in both modes: tokens in order, in bounds, at most `3 * len + 8` of them, sticky EOF; trivia mode minus comments/NL equals parser mode, same suppressions; a checkpoint taken mid-line and restored replays the rest of the stream exactly |
+| `parse`          | parser events: def/block/lambda events balance, consumed tokens in order and in bounds |
+| `demo`           | toy tokenizer with invariant checks (tests the fuzzer itself)            |
 | `selftest-panic` | planted panics on NUL and `{{{{`, used to test the fuzzer                |
 | `selftest-hang`  | planted 1.5 s stall on a UTF-8 BOM                                       |
 | `selftest-abort` | planted unbounded recursion (stack overflow) on a backtick               |

@@ -12,9 +12,28 @@ fn xtask(args: &[&str]) -> Output {
 }
 
 #[test]
-fn oracle_only_run_reports_ruff_facts() {
+fn default_run_diffs_our_extractor_with_zero_mismatches() {
     let root = corpus();
     let out = xtask(&[root.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("facts (ruff/ours): "), "{stdout}");
+    assert!(stdout.contains("mismatches: 0\n"), "{stdout}");
+}
+
+#[test]
+fn dump_ours_prints_our_facts() {
+    let file = corpus().join("fixtures/inheritance.py");
+    let out = xtask(&[file.to_str().unwrap(), "--dump", "--ours"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.lines().any(|l| l.starts_with("def class ")), "{stdout}");
+}
+
+#[test]
+fn oracle_only_run_reports_ruff_facts() {
+    let root = corpus();
+    let out = xtask(&[root.to_str().unwrap(), "--oracle-only"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.starts_with("diff-ruff: "), "{stdout}");
