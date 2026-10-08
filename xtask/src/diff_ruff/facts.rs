@@ -33,7 +33,11 @@
 //!   by `.`, whose root is an identifier, `super()` (any call of the bare name `super`), or `?`
 //!   for an unknown receiver (call result, subscript, literal, parenthesised expression of
 //!   another kind, ...). Examples: `a.b.c(...)` -> `a.b.c`, `super().m()` -> `super().m`,
-//!   `x[0].m()` -> `?.m`, `f()()` -> `?`. `line` is the line of the opening `(`.
+//!   `x[0].m()` -> `?.m`, `f()()` -> `?`. Parentheses around a primary are transparent, as in
+//!   the AST: `(a).b()` -> `a.b`. `line` is the line of the first name of the chain: the root
+//!   name, else the first attribute after `super()` / `?` (`super().m` -> the line of `m`), and
+//!   for an empty chain (`f()()`) the line of the opening `(`. (Where the callee name is, which
+//!   is what a finding points at; the core stores that position and not the `(`.)
 
 use std::fmt;
 use std::io::{self, Write};

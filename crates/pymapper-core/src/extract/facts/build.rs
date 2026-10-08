@@ -5,7 +5,7 @@ use crate::extract::events::{
     Assign, Base, Block, BlockKind, Call, Decorator, Def, Diagnostic, End, IfCond, Import, Value, Visitor,
 };
 use crate::extract::events::DefKind as EvDefKind;
-use crate::extract::Parser;
+use crate::extract::{Parser, Tee};
 use crate::lex::{MAX_SOURCE_LEN, Suppression, Token};
 
 // Block-context flags (inherited by nested blocks and defs).
@@ -113,6 +113,8 @@ struct Builder<'a, S: StrSink> {
     /// Context flags of the innermost block (0 outside blocks).
     cur: u8,
     lambdas: u32,
+    /// Base rows pushed since the last `def_enter` (owner not yet known).
+    pending_bases: u32,
     /// Last closed `if`/`elif` at block depth `.0` and its condition.
     last_if: Option<(usize, IfCond)>,
     /// Last closed `try` at block depth `.0`: its body's import rows.
@@ -123,7 +125,7 @@ struct Builder<'a, S: StrSink> {
     cache_next: usize,
 }
 
-pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) -> FileFacts {
+pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, strs: &mut S, extra: V) -> (FileFacts, V) {
     let truncated = src.len() > MAX_SOURCE_LEN;
     let src = if truncated { &src[..MAX_SOURCE_LEN] } else { src };
     strs.begin_file(src);
@@ -149,8 +151,6 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
         0,
         0,
         0,
-        0,
-        0,
     );
     sc.scopes.push(ScopeFrame { def: module - base.defs, blocks: 0, base: 0, outer: 0 });
     let b = Builder {
@@ -162,18 +162,19 @@ pub(super) fn extract<S: StrSink>(src: &[u8], st: &mut FactStore, strs: &mut S) 
         file_flags: if truncated { file_flags::TRUNCATED } else { 0 },
         cur: 0,
         lambdas: 0,
+        pending_bases: 0,
         last_if: None,
         last_try: None,
         cache: [ChainKey::default(); 2],
         cache_next: 0,
     };
-    let mut p = Parser::new(src, b);
+    let mut p = Parser::new(src, Tee(b, extra));
     p.parse_file();
     // The parser's line cursor sits near the end already: this is cheap.
     let end = p.pos(len32(src.len()));
     let lines = if end.col == 0 { end.line - 1 } else { end.line };
-    let (mut b, sups) = p.finish();
-    b.finish(&sups, lines)
+    let (Tee(mut b, extra), sups) = p.finish();
+    (b.finish(&sups, lines), extra)
 }
 
 impl<S: StrSink> Builder<'_, S> {
@@ -237,6 +238,8 @@ impl<S: StrSink> Builder<'_, S> {
 
     /// Finalises the file: suppressions, line count, `__all__`, evidence, header.
     fn finish(&mut self, sups: &[Suppression], lines: u32) -> FileFacts {
+        // Decorators / bases never followed by their def (malformed input) are dropped.
+        self.claim_header_rows(0, 0);
         let src = self.src;
         let mut lc = LineCounter::default();
         for s in sups {
@@ -253,6 +256,16 @@ impl<S: StrSink> Builder<'_, S> {
         }
         let m = self.base.defs as usize;
         self.st.defs.end_line[m] = lines.max(1);
+        // Diagnostics at end of input sit on the final (zero-width) NEWLINE, which is on the
+        // line after the last one when the source ends with a line end: move them to the end
+        // of the last line so every fact points into the file.
+        let last = lines.max(1);
+        for i in self.base.diags as usize..self.st.diags.len() as usize {
+            if self.st.diags.line[i] > last {
+                self.st.diags.line[i] = last;
+                self.st.diags.col[i] = last_line_len(src);
+            }
+        }
         self.st.exports.extend_from_slice(&self.sc.exports);
         sort_dedup_tail(&mut self.st.evidence, self.base.evidence as usize);
         let now = self.st.bases();
@@ -292,14 +305,16 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             }
         };
         self.sc.decs.push(def);
-        self.st.decorators.push(chain.c, chain.len, flags);
+        // The owner is set when the def is entered (`claim_header_rows`).
+        self.st.decorators.push(0, chain.c, chain.len, flags);
     }
 
     fn base(&mut self, b: &Base<'_>) {
         let chain = self.chain(b.names);
         let keyword = b.keyword.map(|k| self.sym(k));
         let flags = if b.subscripted { base_flags::SUBSCRIPTED } else { 0 } | if b.starred { base_flags::STARRED } else { 0 };
-        self.st.bases.push(chain.c, chain.len, keyword, flags);
+        self.st.bases.push(0, chain.c, chain.len, keyword, flags);
+        self.pending_bases += 1;
     }
 
     fn def_enter(&mut self, def: &Def<'_>) {
@@ -310,7 +325,6 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         for &f in &self.sc.decs[n - (def.decorators as usize).min(n)..] {
             flags |= f;
         }
-        self.sc.decs.clear();
         let kind = match def.kind {
             EvDefKind::Function => DefKind::Function,
             EvDefKind::Class => DefKind::Class,
@@ -338,11 +352,7 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         if self.cur & B_COND != 0 {
             flags |= CONDITIONAL;
         }
-        let decs = self.st.decorators.len() - self.base.decorators;
-        // Counts beyond the column width keep the last rows (the decorators nearest the def).
-        let ndec = def.decorators.min(decs).min(u8::MAX as u32);
-        let nb = self.st.bases.len() - self.base.bases;
-        let nbase = def.bases.min(nb).min(u8::MAX as u32);
+        let (ndec, nbase) = self.claim_header_rows(def.decorators, def.bases);
         let pstart = self.st.params.len() - self.base.params;
         for p in def.params {
             let s = self.sym(p.name);
@@ -368,10 +378,8 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             def.start_line,
             def.name_pos.line,
             def.name_pos.col,
-            decs - ndec,
-            ndec as u8,
-            nb - nbase,
-            nbase as u8,
+            ndec,
+            nbase,
             pstart,
             nparams as u16,
         );
@@ -482,7 +490,7 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         };
         let chain = self.chain(names);
         let scope = self.scope();
-        let mut flags = 0;
+        let mut flags = receiver_u8(recv) << call_flags::RECEIVER_SHIFT;
         if self.cur & B_MAIN != 0 {
             flags |= call_flags::MAIN_GUARD;
         }
@@ -495,7 +503,7 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         if scope == 0 && c.names.len() == 2 && self.text(c.names[0]) == b"__all__" {
             self.file_flags |= file_flags::ALL_DYNAMIC;
         }
-        self.st.calls.push(scope, chain.c, chain.len, receiver_u8(recv), flags, c.pos.line, c.pos.col);
+        self.st.calls.push(scope, chain.c, chain.len, flags, c.pos.line, c.pos.col);
     }
 
     fn import(&mut self, i: &Import<'_>) {
@@ -535,7 +543,7 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             Value::Other => (ValueKind::Other, ChainCol::EMPTY),
         };
         let target = self.chain(a.target);
-        let mut flags = 0;
+        let mut flags = (value as u8) << binding_flags::VALUE_SHIFT;
         if a.unpacked {
             flags |= binding_flags::UNPACKED;
         }
@@ -558,7 +566,6 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             target.len,
             assign_kind_u8(a.kind),
             flags,
-            value as u8,
             value_chain.c,
             value_chain.len,
             a.pos.line,
@@ -601,6 +608,28 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
 }
 
 impl<S: StrSink> Builder<'_, S> {
+    /// At `def_enter`: gives the def about to be pushed the last `decorators` / `bases` rows
+    /// pushed since the previous def (at most `u8::MAX` each: the rows nearest the def) and
+    /// drops the others (left by malformed input), so each table stays grouped by def in row
+    /// order. Returns the kept counts.
+    fn claim_header_rows(&mut self, decorators: u32, bases: u32) -> (u8, u8) {
+        let owner = self.st.defs.len() - self.base.defs;
+        let pending = len32(self.sc.decs.len());
+        self.sc.decs.clear();
+        let ndec = decorators.min(pending).min(u8::MAX as u32);
+        let t = &mut self.st.decorators;
+        if let Some(r) = claim(&mut t.owner, pending, ndec, owner) {
+            t.drain_rows(r);
+        }
+        let pending = std::mem::take(&mut self.pending_bases);
+        let nbase = bases.min(pending).min(u8::MAX as u32);
+        let t = &mut self.st.bases;
+        if let Some(r) = claim(&mut t.owner, pending, nbase, owner) {
+            t.drain_rows(r);
+        }
+        (ndec as u8, nbase as u8)
+    }
+
     /// Module-level `__all__` binding.
     fn dunder_all(&mut self, a: &Assign<'_>) {
         use crate::extract::events::AssignKind as K;
@@ -663,6 +692,27 @@ fn is_line_end(src: &[u8], i: usize) -> bool {
 struct LineCounter {
     off: usize,
     line: u32,
+}
+
+/// Sets the owner of the last `keep` of the `pending` rows at the end of a table's owner
+/// column to `def`; returns the other pending rows, to be drained from every column.
+fn claim(owner: &mut [Scope], pending: u32, keep: u32, def: Scope) -> Option<std::ops::Range<usize>> {
+    let len = owner.len();
+    owner[len - keep as usize..].fill(def);
+    (pending > keep).then(|| len - pending as usize..len - keep as usize)
+}
+
+/// Byte length of the last line of `src`, without its line end.
+fn last_line_len(src: &[u8]) -> u32 {
+    let mut end = src.len();
+    if end > 0 && src[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && src[end - 1] == b'\r' {
+        end -= 1;
+    }
+    let start = src[..end].iter().rposition(|&b| b == b'\n' || b == b'\r').map_or(0, |i| i + 1);
+    len32(end - start)
 }
 
 impl LineCounter {

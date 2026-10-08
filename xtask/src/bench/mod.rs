@@ -4,6 +4,7 @@
 //! run. Usage and output are documented in docs/benchmarks.md.
 
 mod corpus;
+mod extract;
 mod report;
 mod rusage;
 mod targets;

@@ -173,7 +173,8 @@ impl Collector<'_> {
         let start = self.out.begin_str();
         push_callee(&call.func, &mut self.out.text);
         let callee = self.out.end_str(start);
-        let line = self.line(call.arguments.range);
+        let at = chain_start(&call.func).unwrap_or(call.arguments.range.start());
+        let line = self.lines.line(at.to_u32());
         self.out.calls.push(Call { scope: self.scope, callee, line });
     }
 }
@@ -181,6 +182,17 @@ impl Collector<'_> {
 #[inline]
 fn slice(src: &[u8], range: TextRange) -> &[u8] {
     &src[range.start().to_usize()..range.end().to_usize()]
+}
+
+/// Start of the first name of the callee chain (see the facts module conventions): the root
+/// name, else the first attribute after a `super()` / unknown receiver; `None` for an empty
+/// chain.
+fn chain_start(func: &Expr) -> Option<ruff_text_size::TextSize> {
+    match func {
+        Expr::Name(n) => Some(n.range.start()),
+        Expr::Attribute(a) => chain_start(&a.value).or(Some(a.attr.range.start())),
+        _ => None,
+    }
 }
 
 /// Writes the receiver chain of a call's `func` (see the facts module conventions).
@@ -459,7 +471,8 @@ mod tests {
             "f inner 10",
             "f g 11",
             "f h 12",
-            "f obj.meth 15",
+            // The chain's first name, not the `(` (line 15).
+            "f obj.meth 14",
             "f fmt 17",
         ];
         want.sort();

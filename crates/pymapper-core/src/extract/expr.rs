@@ -100,6 +100,13 @@ pub(super) struct Level {
     active: u32,
     /// Operator of the current boolean run (0 none, 1 and, 2 or).
     bool_last: u8,
+    /// A parenthesised group (`(` that is not a call).
+    group: bool,
+    /// Group: start of the first token after its `(`.
+    next_start: u32,
+    /// Start of the expression the bracket pair completes: the callee/subscripted
+    /// expression for calls and subscripts, the opening bracket otherwise.
+    expr_start: u32,
 }
 
 /// Postfix-chain state: what the last token leaves for a following `.`, `(`, `[`.
@@ -189,6 +196,11 @@ struct Scan {
     impure: u32,
     /// Open f/t-strings (a `!` conversion is only valid inside one).
     fstrings: u32,
+    /// Start of the primary expression the postfix state (`post`, `chain`,
+    /// `chain_base`) describes: its root name, literal or opening bracket. A
+    /// parenthesised group whose whole content is that expression is transparent
+    /// (`(a.b).c(...)` is the chain `a.b.c`, as in the AST).
+    chain_start: u32,
 }
 
 impl<V: Visitor> Parser<'_, V> {
@@ -209,6 +221,7 @@ impl<V: Visitor> Parser<'_, V> {
             seg: Seg::Fresh,
             impure: 0,
             fstrings: 0,
+            chain_start: u32::MAX,
         };
         loop {
             let t = self.peek(0);
@@ -330,6 +343,7 @@ impl<V: Visitor> Parser<'_, V> {
                     }
                     self.chain.clear();
                     self.chain.push(t);
+                    s.chain_start = t.start;
                     s.chain_base = match t.text(self.src) {
                         b"self" => ChainBase::SelfName,
                         b"cls" => ChainBase::ClsName,
@@ -371,34 +385,56 @@ impl<V: Visitor> Parser<'_, V> {
                     }
                 }
                 s.impure += call as u32;
-                self.levels.push(Level { call, super_call, impure: call, ..Level::default() });
+                let (next_start, expr_start) = if call { (0, s.chain_start) } else { (self.peek(1).start, t.start) };
+                self.levels.push(Level {
+                    call,
+                    super_call,
+                    impure: call,
+                    group: !call,
+                    next_start,
+                    expr_start,
+                    ..Level::default()
+                });
             }
             K::LSqb | K::LBrace => {
                 let impure = t.kind == K::LBrace || matches!(post, Post::Names | Post::Atom);
                 s.impure += impure as u32;
-                self.levels.push(Level { impure, ..Level::default() });
+                let subscript = matches!(post, Post::Names | Post::Atom) && t.kind == K::LSqb;
+                let expr_start = if subscript { s.chain_start } else { t.start };
+                self.levels.push(Level { impure, expr_start, ..Level::default() });
             }
             K::RPar | K::RSqb | K::RBrace => {
                 // depth > 0 here: the caller stops at an unmatched closer.
+                s.post = Post::Atom;
                 if let Some(l) = self.levels.pop() {
                     self.exit_lambdas(l.active + l.lambdas);
                     s.impure -= l.impure as u32;
-                    s.chain_base = if l.super_call { ChainBase::Super } else { ChainBase::Unknown };
+                    if l.group && t.kind == K::RPar && s.chain_start == l.next_start && matches!(post, Post::Names | Post::Atom) {
+                        // `(expr)`: transparent, keeps the chain state of `expr`.
+                        s.post = post;
+                    } else {
+                        s.chain_base = if l.super_call { ChainBase::Super } else { ChainBase::Unknown };
+                    }
+                    s.chain_start = l.expr_start;
                 }
-                s.post = Post::Atom;
             }
             K::String => {
                 self.v.string(t);
+                s.chain_start = t.start;
                 s.chain_base = ChainBase::Unknown;
                 s.post = Post::Atom;
             }
             K::FStringStart | K::TStringStart => s.fstrings += 1,
             K::FStringEnd | K::TStringEnd => {
                 s.fstrings = s.fstrings.saturating_sub(1);
+                // Fields may have moved `chain_start`; only the end matters for
+                // groups (`(f"...")` must not look transparent), so use it.
+                s.chain_start = t.start;
                 s.chain_base = ChainBase::Unknown;
                 s.post = Post::Atom;
             }
             K::Int | K::Float | K::Imaginary | K::True | K::False | K::None | K::Ellipsis => {
+                s.chain_start = t.start;
                 s.chain_base = ChainBase::Unknown;
                 s.post = Post::Atom;
             }
@@ -654,7 +690,9 @@ impl<V: Visitor> Parser<'_, V> {
         }
     }
 
-    /// `print x` / `print >>f, x` / `exec code`: reports Python 2 syntax and skips the statement.
+    /// `print x` / `print >>f, x` / `exec code`: reports Python 2 syntax, then scans the rest of
+    /// the statement as an expression, so its calls and names are still recorded (`print >>f, x`
+    /// is even valid Python 3: a tuple expression).
     fn python2_statement(&mut self, first: Token) -> bool {
         let next = self.kind(1);
         let py2 = match first.text(self.src) {
@@ -664,6 +702,8 @@ impl<V: Visitor> Parser<'_, V> {
         };
         if py2 {
             self.diag_at(DiagKind::Python2, first);
+            self.bump();
+            self.expr(0);
             while !matches!(self.kind(0), K::Newline | K::EndOfFile | K::Semi | K::Indent | K::Dedent) {
                 self.bump();
             }

@@ -45,7 +45,7 @@ entered, and symlinks are not followed.
 | target       | phases                 | what it does                                              |
 |--------------|------------------------|-----------------------------------------------------------|
 | `read`       | `walk`, `read`         | walk, then read every file in parallel (the I/O floor)    |
-| `parse-only` | `walk`, `read+parse`   | same, calling the parse hook on each file's bytes         |
+| `parse-only` | `walk`, `read+parse`   | the front end in the loader's shape: per thread, read each file into a reused buffer, lex + parse + facts + metrics in one pass (interned names), drop the source; all facts are kept to the end (`xtask/src/bench/extract.rs`) |
 | `walk`       | `walk`                 | parallel `pymapper_core::walk` only, corpus options       |
 | `walk-seq`   | `walk`                 | single-threaded reference walker only (same file set)     |
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
@@ -53,15 +53,17 @@ entered, and symlinks are not followed.
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 | `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
 | `metrics-mem` | `walk`, `load`, `parse` | like `parse-mem`, with `pymapper_core::extract::metrics` teed into the same pass; every metrics row is kept to the end (extra counters `metric_rows`, `metrics_kb` = heap of the kept tables) |
+| `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
 
-The parse hook is `parse_file(src: &[u8], acc: &mut ParseAcc)` in `xtask/src/bench/targets.rs`.
-Later steps plug the lexer/extractor in there. `ParseAcc` is per-thread state that gets merged
-at the end; its `counters()` (e.g. tokens, defs) show up in the table and the results file.
-Until then the hook does nothing, so `parse-only` costs the same as `read`. `read`, `parse-only`,
+`parse-only` and `extract-mem` report the counters `loc`, `defs`, `calls`, `diagnostics`,
+`parse_cpu_ms` (time inside the extractor, summed over threads), `parse_MBps_core` (corpus MB
+per second of that time: one core's throughput), `facts_B_per_kLOC` and `metrics_B_per_kLOC`
+(retained row bytes per 1000 LOC, i.e. milli-bytes per LOC; facts include the 112-byte file
+headers), `facts_kb`, `metrics_kb` and `intern_kb` (heap of the per-thread interners). `read`, `parse-only`,
 `lex`, `lex-mem` and `walk` use `pymapper_core::walk` with the corpus options: no gitignore, hidden directories
 entered, `__pycache__`/`.git` skipped, symlinks not followed. That is the same file set as the
 sequential reference walker in `xtask/src/bench/walk.rs` (`walk-seq`), so the two are directly
@@ -320,3 +322,79 @@ use a `u128` kind bitset per open definition. A row is 40 bytes (9 x u32/f32 + 2
 venv's 928k definitions need 37 MB raw; the bench's per-job tables grow by doubling, and the
 `-j 1` peak RSS (+174 MB) also includes the freed generations of one large growing table.
 Storing metrics inside per-file def records (S1.3) avoids that growth pattern.
+
+### Front end (S1.5)
+
+The whole front end (lex + parse + facts + metrics in one pass, interned names) as the loader
+will run it. 14-core M4 Pro (10 performance + 4 efficiency cores), release build, warm cache;
+load average about 3-4 from other worktrees, so times are lower bounds.
+
+Cost of each stage on one core (stdlib, `extract-mem -j 1` with `XTASK_EXTRACT_STAGES`, best of
+5; the lexer row is `lex-mem -j 1`):
+
+| stages (`XTASK_EXTRACT_STAGES`)              | parse phase | MB/s/core |
+|----------------------------------------------|-------------|-----------|
+| lexer only (`lex-mem`)                       | 19.9ms      | 794       |
+| lexer + parser, no-op visitor (`parse`)      | 35.8ms      | 441       |
+| lexer + parser + metrics (`metrics`)         | 49.0ms      | 322       |
+| lexer + parser + facts, span strings (`facts-spans`) | 46.7ms | 338   |
+| lexer + parser + facts, interned (`facts`)   | 52.1ms      | 303       |
+| everything (`all`, what `parse-only` runs)   | 63.4ms      | 249       |
+
+Throughput and memory (best of 3; `-j 1` stdlib `extract-mem` best of 10). MB/s/core is
+`parse_MBps_core` (MB per second of time inside the extractor, summed over threads); on 14
+threads it averages over performance and efficiency cores, which share caches and memory
+bandwidth.
+
+| corpus | target        | threads | walk    | load / read+parse | parse phase | total   | MB/s/core | peak RSS MB |
+|--------|---------------|---------|---------|-------------------|-------------|---------|-----------|-------------|
+| stdlib | `extract-mem` | 1       | 14.4ms  | 82.3ms            | 67.5ms      | 169.4ms | 234       | 34.8        |
+| stdlib | `extract-mem` | 14      | 5.30ms  | 29.1ms            | 8.18ms      | 43.4ms  | 150       | 39.1        |
+| stdlib | `parse-only`  | 1       | 14.2ms  | 160.4ms           | -           | 176.5ms | 205       | 17.5        |
+| stdlib | `parse-only`  | 14      | 5.70ms  | 39.2ms            | -           | 45.2ms  | 170       | 23.9        |
+| venv   | `extract-mem` | 1       | 2.97s   | 5.43s             | 2.67s       | 11.08s  | 243       | 981.9       |
+| venv   | `extract-mem` | 14      | 892ms   | 1.92s             | 251ms       | 3.08s   | 185       | 1229.9      |
+| venv   | `parse-only`  | 1       | 2.97s   | 8.40s             | -           | 11.38s  | 223       | 346.8       |
+| venv   | `parse-only`  | 14      | 937ms   | 2.12s             | -           | 3.06s   | 179       | 442.5       |
+
+- **One core**: 234-249 MB/s on the stdlib (63.4ms in a quieter run, table above), 243 MB/s
+  on the venv. The design target of 400 MB/s/core is **not met**.
+- **All cores, from memory**: 1.93 GB/s on the stdlib (15.8 MB in 8.18ms), 2.59 GB/s on the
+  venv (650 MB in 251ms).
+- **All cores, from disk** (`parse-only`): the venv's `read+parse` phase (2.12s) costs the same
+  as reading alone (`read`: 2.17s in the same session), so the front end is hidden behind I/O;
+  walk + read + extract of 16M LOC takes about 3.1s.
+
+Why 400 MB/s/core is missed (samply on the `profiling` build, venv, `-j 1`, 2.5k samples in
+the extractor): the profile is flat. The lexer is about a third (`next_token`, `lex_token`,
+`name_or_string`, identifier scan), the parser and expression scanner about a quarter (ring
+buffer `peek`/`fill`, postfix-chain state), the metrics visitor about 13%, interning about 7%
+(`fx_words` hash and probe) and fact building about 10% (evidence hashing, call/binding rows);
+no function is above 7% self time. The lexer alone already runs at 794 MB/s/core and lexer +
+parser with a no-op visitor at 441 MB/s/core, so 400 MB/s/core for the full extractor would
+need roughly halving the lexer and parser costs, not a hot-spot fix. Tried and measured in S1.5:
+precomputing line starts per file instead of the forward line cursor (no change, reverted:
+it allocated per file); removing the Halstead distinct-operand tracking entirely (about 6% of
+the metrics-only pass, within noise for the whole extractor); inlining the parser's ring fill
+(kept from the interrupted attempt, not re-measured). Ideas left for later: fusing the
+identifier hash into the lexer's name scan
+(the same identifier is hashed up to three times: evidence, Halstead operand, interner), and a
+SIMD identifier/whitespace scan in the lexer.
+
+Memory: bytes retained per LOC (rows without spare capacity; facts include the 112-byte file headers):
+
+| corpus | LOC        | facts B/LOC | metrics B/LOC | total B/LOC | facts + metrics MB | interner MB |
+|--------|------------|-------------|---------------|-------------|--------------------|-------------|
+| stdlib | 436,648    | 12.92       | 1.28          | 14.20       | 6.2                | 1.9         |
+| venv   | 17,044,697 | 13.70       | 1.25          | 14.95       | 254.8              | 48.6        |
+
+venv facts by table: calls 3.69, bindings 2.72, defs 2.49, imports 1.43, names 1.19, evidence
+0.98, params 0.51, headers 0.40, decorators 0.14, bases 0.12, the rest 0.03. At the start of
+S1.5 the venv needed 15.67 B/LOC (14.41 facts + 1.25 metrics); three layout changes brought it
+under the 15 B/LOC target: the call receiver packed into the call flags byte (-0.21), the
+binding value kind packed into the binding flags byte (-0.14), and the per-def decorator/base
+start columns (8 B on every def) replaced by an owner column on the rare decorator and base
+rows (-0.34). Interner bytes are per thread here (each worker interns its own files); the
+global merge (S2.3) deduplicates them. Peak RSS of `parse-only` above the retained rows is the
+per-thread tables' doubling slack and the interners; `extract-mem` also holds the whole
+corpus in memory.

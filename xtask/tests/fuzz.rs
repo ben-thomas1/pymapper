@@ -57,9 +57,9 @@ fn list_shows_the_default_target_first() {
     assert_eq!(o.status.code(), Some(0));
     let out = text(&o.stdout);
     let names: Vec<&str> = out.lines().map(|l| l.split_whitespace().next().unwrap()).collect();
-    assert_eq!(names[0], "parse", "{out}");
+    assert_eq!(names[0], "extract", "{out}");
     assert!(names.contains(&"demo"), "{out}");
-    for t in ["selftest-panic", "selftest-hang", "selftest-abort"] {
+    for t in ["lex", "parse", "selftest-panic", "selftest-hang", "selftest-abort"] {
         assert!(names.contains(&t), "{out}");
     }
 }
@@ -70,10 +70,10 @@ fn clean_target_runs_the_exact_iteration_count_and_exits_0() {
     let o = fuzz(&dir, &["-n", "3000", "-j", "3", "--seed", "5"]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", text(&o.stderr));
     let out = text(&o.stdout);
-    assert!(out.contains("fuzz parse: 3000 execs"), "{out}");
+    assert!(out.contains("fuzz extract: 3000 execs"), "{out}");
     assert!(out.contains("seed 5, iterations 0..3000"), "{out}");
     assert!(out.contains("crashing inputs: 0 (0 distinct), hangs: 0"), "{out}");
-    assert!(!dir.join("parse").exists(), "no artifacts for a clean run");
+    assert!(!dir.join("extract").exists(), "no artifacts for a clean run");
 }
 
 #[test]
@@ -193,5 +193,5 @@ fn usage_errors_exit_2() {
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", text(&o.stderr));
     }
     let o = fuzz(&dir, &["-t", "nope"]);
-    assert!(text(&o.stderr).contains("expected one of parse,"), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("expected one of extract,"), "{}", text(&o.stderr));
 }

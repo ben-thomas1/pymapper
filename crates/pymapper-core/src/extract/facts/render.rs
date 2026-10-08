@@ -137,7 +137,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
 
     for i in ff.calls.range() {
         let c = &st.calls;
-        let recv = match receiver(c.receiver[i]) {
+        let recv = match c.receiver(i) {
             Receiver::None => "",
             Receiver::Dotted => " dotted",
             Receiver::SelfAttr => " self",
@@ -146,7 +146,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
             Receiver::Unknown => " unknown",
         };
         let _ = write!(out, "call {} L{}:{} {}(){recv}", scope(c.scope[i]), c.line[i], c.col[i], chain(view.call_chain(i)));
-        flag_list(&mut out, c.flags[i] as u16, &[
+        flag_list(&mut out, (c.flags[i] & !call_flags::RECEIVER_MASK) as u16, &[
             (call_flags::MAIN_GUARD as u16, "main_guard"),
             (call_flags::TYPE_CHECKING as u16, "type_checking"),
             (call_flags::LAMBDA as u16, "lambda"),
@@ -164,7 +164,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
             AssignKind::ForTarget => "for",
             AssignKind::AsTarget => "as",
         };
-        let value = match ValueKind::from_u8(b.value[i]) {
+        let value = match b.value_kind(i) {
             ValueKind::None => String::new(),
             ValueKind::Call => format!(" {}()", chain(view.binding_value(i))),
             ValueKind::Name => format!(" {}", chain(view.binding_value(i))),
@@ -172,7 +172,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
             ValueKind::Other => " <expr>".to_owned(),
         };
         let _ = write!(out, "bind {} L{} {} {kind}{value}", scope(b.scope[i]), b.line[i], chain(view.binding_target(i)));
-        flag_list(&mut out, b.flags[i] as u16, &[
+        flag_list(&mut out, (b.flags[i] & !binding_flags::VALUE_MASK) as u16, &[
             (binding_flags::UNPACKED as u16, "unpacked"),
             (binding_flags::STARRED as u16, "starred"),
             (binding_flags::TYPE_CHECKING as u16, "type_checking"),

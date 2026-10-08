@@ -67,30 +67,39 @@ use crate::lex::{Token, TokenKind as K};
 
 /// Metrics of all definitions of one or more files, struct of arrays, one row
 /// per definition in `def_enter` order.
+///
+/// Stored compactly (23 bytes per row): small counts are narrowed with
+/// saturation, and the derived Halstead volume and maintainability index are
+/// not stored but computed by [`MetricsTable::row`] / [`MetricsTable::volume`] /
+/// [`MetricsTable::mi`] from the stored counts.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct MetricsTable {
-    pub cyclomatic: Vec<u32>,
-    pub cognitive: Vec<u32>,
     /// Saturates at `u16::MAX`.
-    pub max_nesting: Vec<u16>,
+    pub cyclomatic: Vec<u16>,
+    /// Saturates at `u16::MAX`.
+    pub cognitive: Vec<u16>,
+    /// Saturates at `u8::MAX`.
+    pub max_nesting: Vec<u8>,
     pub loc: Vec<u32>,
-    /// Halstead distinct operators (n1).
-    pub distinct_operators: Vec<u32>,
+    /// Halstead distinct operators (n1): operator token kinds, at most 128.
+    pub distinct_operators: Vec<u8>,
     /// Halstead distinct operands (n2).
     pub distinct_operands: Vec<u32>,
     /// Halstead total operators (N1).
     pub operators: Vec<u32>,
     /// Halstead total operands (N2).
     pub operands: Vec<u32>,
-    /// Halstead volume.
-    pub volume: Vec<f32>,
-    /// Maintainability index, 0..=100.
-    pub mi: Vec<f32>,
-    /// Saturates at `u16::MAX`.
-    pub params: Vec<u16>,
+    /// Saturates at `u8::MAX` (the facts' params run is exact).
+    pub params: Vec<u8>,
 }
 
-/// One row of a [`MetricsTable`] (a copy; for tests and reporting).
+#[inline]
+fn sat16(v: u32) -> u16 {
+    v.min(u32::from(u16::MAX)) as u16
+}
+
+/// One row of a [`MetricsTable`] (a copy, widened, with volume and MI computed;
+/// for tests and reporting).
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct DefMetrics {
     pub cyclomatic: u32,
@@ -107,6 +116,9 @@ pub struct DefMetrics {
 }
 
 impl MetricsTable {
+    /// Bytes of one row (all columns).
+    pub const ROW_BYTES: usize = 2 + 2 + 1 + 4 + 1 + 4 + 4 + 4 + 1;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -128,26 +140,41 @@ impl MetricsTable {
         self.distinct_operands.clear();
         self.operators.clear();
         self.operands.clear();
-        self.volume.clear();
-        self.mi.clear();
         self.params.clear();
     }
 
-    /// Row `i` as a struct. Panics if out of range.
+    /// Row `i` as a struct (volume and MI computed). Panics if out of range.
     pub fn row(&self, i: usize) -> DefMetrics {
         DefMetrics {
-            cyclomatic: self.cyclomatic[i],
-            cognitive: self.cognitive[i],
-            max_nesting: self.max_nesting[i],
+            cyclomatic: u32::from(self.cyclomatic[i]),
+            cognitive: u32::from(self.cognitive[i]),
+            max_nesting: u16::from(self.max_nesting[i]),
             loc: self.loc[i],
-            distinct_operators: self.distinct_operators[i],
+            distinct_operators: u32::from(self.distinct_operators[i]),
             distinct_operands: self.distinct_operands[i],
             operators: self.operators[i],
             operands: self.operands[i],
-            volume: self.volume[i],
-            mi: self.mi[i],
-            params: self.params[i],
+            volume: self.volume(i) as f32,
+            mi: self.mi(i) as f32,
+            params: u16::from(self.params[i]),
         }
+    }
+
+    /// Halstead volume of row `i`.
+    #[inline]
+    pub fn volume(&self, i: usize) -> f64 {
+        halstead_volume(
+            u32::from(self.distinct_operators[i]),
+            self.distinct_operands[i],
+            self.operators[i],
+            self.operands[i],
+        )
+    }
+
+    /// Maintainability index of row `i`, 0..=100.
+    #[inline]
+    pub fn mi(&self, i: usize) -> f64 {
+        maintainability_index(self.volume(i), u32::from(self.cyclomatic[i]), self.loc[i])
     }
 
     /// Appends all rows of `other` (lock-free merge by concatenation).
@@ -160,51 +187,45 @@ impl MetricsTable {
         self.distinct_operands.extend_from_slice(&other.distinct_operands);
         self.operators.extend_from_slice(&other.operators);
         self.operands.extend_from_slice(&other.operands);
-        self.volume.extend_from_slice(&other.volume);
-        self.mi.extend_from_slice(&other.mi);
         self.params.extend_from_slice(&other.params);
     }
 
     /// Heap bytes held (capacity).
     pub fn heap_bytes(&self) -> usize {
-        2 * (self.max_nesting.capacity() + self.params.capacity())
-            + 4 * (self.cyclomatic.capacity()
-            + self.cognitive.capacity()
-            + self.loc.capacity()
+        self.max_nesting.capacity()
             + self.distinct_operators.capacity()
-            + self.distinct_operands.capacity()
-            + self.operators.capacity()
-            + self.operands.capacity()
-            + self.volume.capacity()
-            + self.mi.capacity())
+            + self.params.capacity()
+            + 2 * (self.cyclomatic.capacity() + self.cognitive.capacity())
+            + 4 * (self.loc.capacity()
+                + self.distinct_operands.capacity()
+                + self.operators.capacity()
+                + self.operands.capacity())
     }
 
-    fn push(&mut self, m: &DefMetrics) {
-        self.cyclomatic.push(m.cyclomatic);
-        self.cognitive.push(m.cognitive);
-        self.max_nesting.push(m.max_nesting);
-        self.loc.push(m.loc);
-        self.distinct_operators.push(m.distinct_operators);
-        self.distinct_operands.push(m.distinct_operands);
-        self.operators.push(m.operators);
-        self.operands.push(m.operands);
-        self.volume.push(m.volume);
-        self.mi.push(m.mi);
-        self.params.push(m.params);
+    /// Appends a zero row (filled in by [`MetricsTable::set`] when the definition closes).
+    fn push_zero(&mut self) {
+        self.cyclomatic.push(0);
+        self.cognitive.push(0);
+        self.max_nesting.push(0);
+        self.loc.push(0);
+        self.distinct_operators.push(0);
+        self.distinct_operands.push(0);
+        self.operators.push(0);
+        self.operands.push(0);
+        self.params.push(0);
     }
 
+    /// Stores row `i`, narrowing with saturation (volume and MI are derived, not stored).
     fn set(&mut self, i: usize, m: &DefMetrics) {
-        self.cyclomatic[i] = m.cyclomatic;
-        self.cognitive[i] = m.cognitive;
-        self.max_nesting[i] = m.max_nesting;
+        self.cyclomatic[i] = sat16(m.cyclomatic);
+        self.cognitive[i] = sat16(m.cognitive);
+        self.max_nesting[i] = m.max_nesting.min(u16::from(u8::MAX)) as u8;
         self.loc[i] = m.loc;
-        self.distinct_operators[i] = m.distinct_operators;
+        self.distinct_operators[i] = m.distinct_operators.min(u32::from(u8::MAX)) as u8;
         self.distinct_operands[i] = m.distinct_operands;
         self.operators[i] = m.operators;
         self.operands[i] = m.operands;
-        self.volume[i] = m.volume;
-        self.mi[i] = m.mi;
-        self.params[i] = m.params;
+        self.params[i] = m.params.min(u16::from(u8::MAX)) as u8;
     }
 }
 
@@ -582,7 +603,7 @@ impl MetricsVisitor<'_> {
         let loc = end.line.saturating_sub(f.start_line) + 1;
         let cognitive = f.cog.saturating_add(u32::from(f.recursive));
         let n1 = f.hal.ops_seen.count_ones();
-        let volume = halstead_volume(n1, f.hal.n2, big_n1, big_n2);
+        // Volume and MI are derived from the stored counts on read (`MetricsTable::row`).
         let m = DefMetrics {
             cyclomatic: f.cc,
             cognitive,
@@ -592,8 +613,8 @@ impl MetricsVisitor<'_> {
             distinct_operands: f.hal.n2,
             operators: big_n1,
             operands: big_n2,
-            volume: volume as f32,
-            mi: maintainability_index(volume, f.cc, loc) as f32,
+            volume: 0.0,
+            mi: 0.0,
             params: f.params,
         };
         self.out.set(f.row as usize, &m);
@@ -668,7 +689,7 @@ impl Visitor for MetricsVisitor<'_> {
         };
         let is_class = def.kind == DefKind::Class;
         let row = self.out.len() as u32;
-        self.out.push(&DefMetrics::default());
+        self.out.push_zero();
         s.frames.push(Frame {
             row,
             is_class,

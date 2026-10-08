@@ -42,13 +42,13 @@ fn header(src: &str) -> String {
 
 #[test]
 fn row_sizes_match_the_documented_layout() {
-    assert_eq!(Defs::ROW_BYTES, 51);
-    assert_eq!(Decorators::ROW_BYTES, 6);
-    assert_eq!(Bases::ROW_BYTES, 10);
+    assert_eq!(Defs::ROW_BYTES, 43);
+    assert_eq!(Decorators::ROW_BYTES, 10);
+    assert_eq!(Bases::ROW_BYTES, 14);
     assert_eq!(Params::ROW_BYTES, 5);
     assert_eq!(Imports::ROW_BYTES, 27);
-    assert_eq!(Calls::ROW_BYTES, 19);
-    assert_eq!(Bindings::ROW_BYTES, 21);
+    assert_eq!(Calls::ROW_BYTES, 18);
+    assert_eq!(Bindings::ROW_BYTES, 20);
     assert_eq!(Decls::ROW_BYTES, 9);
     assert_eq!(Diags::ROW_BYTES, 9);
     assert_eq!(Suppressions::ROW_BYTES, 13);
@@ -452,7 +452,7 @@ fn long_call_chain_keeps_the_callee() {
     assert_eq!(c.len(), MAX_CHAIN);
     assert_eq!(spans.text(src.as_bytes(), c[0]), b"n45");
     assert_eq!(spans.text(src.as_bytes(), c[MAX_CHAIN - 1]), b"n299");
-    assert_eq!(receiver(st.calls.receiver[ff.calls.start as usize]), Receiver::Unknown);
+    assert_eq!(st.calls.receiver(ff.calls.start as usize), Receiver::Unknown);
     let m = v.import_module(ff.imports.start as usize);
     assert_eq!(m.len(), MAX_CHAIN);
     assert_eq!(spans.text(src.as_bytes(), m[0]), b"n0");
@@ -766,8 +766,9 @@ fn store_reuse_after_clear_is_identical() {
 fn file_b_exact() {
     check(
         FILE_B,
-        // evidence: G, h, x, k, get, 'key' (the Python 2 line is skipped after its diagnostic).
-        "file lines=5 evidence=6
+        // evidence: G, h, x, k, get, 'key', 'py2' (the rest of the Python 2 line is still scanned
+        // after its diagnostic).
+        "file lines=5 evidence=7
          module 0:<module> L1-5 b0-89
          def 1:g in=0 L1-4 b0-76 @1:4 (x, *a, **k)
          call 1:g L3:8 h()
@@ -846,4 +847,52 @@ fn corpus_files_extract_without_diagnostics() {
         let ff = extract(&src, &mut st, &mut spans);
         assert_eq!(ff.diags.len, 0, "{}", p.display());
     }
+}
+
+#[test]
+fn end_of_input_diagnostics_point_into_the_last_line() {
+    check_lines(
+        "def f(\n",
+        "diag",
+        "diag L1:6 UnclosedBracket
+         diag L1:6 UnexpectedToken
+         diag L1:6 ExpectedColon
+         diag L1:6 ExpectedIndent",
+    );
+    check_lines("x = [1,\r\n  2\r\n", "diag", "diag L2:3 UnclosedBracket");
+    check_lines("f(", "diag", "diag L1:2 UnclosedBracket");
+    check_lines("if x:\n", "diag", "diag L1:5 ExpectedIndent");
+}
+
+#[test]
+fn decorator_and_base_rows_are_grouped_by_owner() {
+    // Orphan decorators (no def follows) are dropped: before a statement, and at end of input.
+    let src = "@orphan\nx = 1\n@a\n@b.c()\nclass C(B, metaclass=M):\n    @staticmethod\n    def m(): pass\n    class D(E): pass\n    def n(self): pass\n@d\ndef f(): pass\n@tail\n";
+    check_lines(
+        src,
+        "class",
+        "class 1:C in=0 L3-9 b14-127 @5:6 decs=[a, b.c()] bases=[B, metaclass=M] [other_decorator]
+         class 3:D in=1 L8-8 b89-105 @8:10 bases=[E] [method]",
+    );
+    check_lines(
+        src,
+        "def",
+        "def 2:m in=1 L6-7 b53-84 @7:8 decs=[staticmethod] () [staticmethod,method]
+         def 4:n in=1 L9-9 b110-127 @9:8 (self) [method]
+         def 5:f in=0 L10-11 b128-144 @11:4 decs=[d] () [other_decorator]",
+    );
+    let mut st = FactStore::new();
+    let mut spans = SpanStrs::new();
+    let ff = extract(src.as_bytes(), &mut st, &mut spans);
+    assert_eq!((ff.decorators.len, ff.bases.len), (4, 3), "orphans dropped");
+    assert_eq!(st.decorators.owner, [1, 1, 2, 5]);
+    assert_eq!(st.bases.owner, [1, 1, 3]);
+
+    // A second file in the same store: owners are file-relative, lookups stay per file.
+    let ff2 = extract(b"@x\ndef g(): pass\n", &mut st, &mut spans);
+    assert_eq!(st.file(&ff2).decorators(1), 4..5);
+    let v1 = st.file(&ff);
+    assert_eq!(v1.decorators(5), 3..4);
+    assert!(v1.decorators(4).is_empty(), "no decorators");
+    assert_eq!(v1.bases(3), 2..3);
 }
