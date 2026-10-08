@@ -206,6 +206,23 @@
 # Distinct first-party modules imported by one module (efferent coupling).
 # max-fan-out = 30
 
+# Distance from the main sequence `|A + I - 1|` per module, 0-1 (PM202, off by default), and the
+# smallest total coupling (importing plus imported first-party modules) a module needs to be
+# judged at all.
+# max-distance = 0.7
+# distance-min-coupling = 10
+
+# God module (PM203): more classes and functions than `max-module-symbols` AND a total coupling
+# (importing plus imported first-party modules) above `max-module-coupling`.
+# max-module-symbols = 80
+# max-module-coupling = 25
+
+# God class (PM204): weighted methods per class (summed McCabe) above `max-class-wmc` AND calls
+# into more than `max-class-fan-out` distinct other classes. Reads the call graph; the cost is
+# O(calls of the classes above `max-class-wmc`).
+# max-class-wmc = 47
+# max-class-fan-out = 5
+
 # Duplicate detection (needs `analysis.dupes = true`): shortest reported duplicate, in tokens
 # (at least 10) and in lines (at least 2). Lower values find more, smaller duplicates and cost
 # more time and memory.
