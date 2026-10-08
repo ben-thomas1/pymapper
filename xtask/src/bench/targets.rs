@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use clap::ValueEnum;
+use pymapper_core::lex::{Lexer, TokenKind};
 use pymapper_core::timing;
 use rayon::prelude::*;
 
@@ -23,6 +24,8 @@ pub enum Target {
     Read,
     /// Walk + parallel read + per-file parse hook ([`parse_file`]).
     ParseOnly,
+    /// Walk + parallel read + lex every file to EOF ([`lex_file`]): lexer throughput.
+    Lex,
 }
 
 impl Target {
@@ -30,6 +33,7 @@ impl Target {
         match self {
             Target::Read => "read",
             Target::ParseOnly => "parse-only",
+            Target::Lex => "lex",
         }
     }
 }
@@ -53,13 +57,42 @@ pub struct RunRecord {
 
 /// Per-thread state of the parse hook. Later steps add lexer/extractor state and counters here.
 #[derive(Default)]
-pub struct ParseAcc {}
+pub struct ParseAcc {
+    lex: LexAcc,
+}
+
+/// Counters of the `lex` target.
+#[derive(Default)]
+struct LexAcc {
+    files: u64,
+    bytes: u64,
+    tokens: u64,
+    error_tokens: u64,
+    /// Time spent inside the lexer, summed over threads (excludes walk and I/O).
+    nanos: u64,
+}
 
 impl ParseAcc {
-    fn merge(&mut self, _other: ParseAcc) {}
+    fn merge(&mut self, other: ParseAcc) {
+        let (a, b) = (&mut self.lex, other.lex);
+        a.files += b.files;
+        a.bytes += b.bytes;
+        a.tokens += b.tokens;
+        a.error_tokens += b.error_tokens;
+        a.nanos += b.nanos;
+    }
 
     fn counters(&self) -> Vec<(String, u64)> {
-        Vec::new()
+        let mut out = Vec::new();
+        let lx = &self.lex;
+        if lx.files > 0 {
+            out.push(("tokens".to_owned(), lx.tokens));
+            out.push(("error_tokens".to_owned(), lx.error_tokens));
+            out.push(("lex_cpu_ms".to_owned(), lx.nanos / 1_000_000));
+            // MB (10^6 bytes) per second of lexer time: throughput of one core.
+            out.push(("lex_MBps_core".to_owned(), (lx.bytes * 1000).checked_div(lx.nanos).unwrap_or(0)));
+        }
+        out
     }
 }
 
@@ -69,6 +102,28 @@ impl ParseAcc {
 pub fn parse_file(src: &[u8], acc: &mut ParseAcc) {
     // Until the lexer lands this measures walk + read only.
     let _ = (src, acc);
+}
+
+/// The `lex` hook: lexes the whole file (parser mode, no trivia) and counts tokens.
+pub fn lex_file(src: &[u8], acc: &mut ParseAcc) {
+    let t0 = Instant::now();
+    let mut lexer = Lexer::new(src);
+    let mut tokens = 0u64;
+    let mut errors = 0u64;
+    loop {
+        let t = lexer.next_token();
+        tokens += 1;
+        errors += u64::from(t.kind.is_error());
+        if t.kind == TokenKind::EndOfFile {
+            break;
+        }
+    }
+    let lx = &mut acc.lex;
+    lx.nanos += t0.elapsed().as_nanos() as u64;
+    lx.files += 1;
+    lx.bytes += src.len() as u64;
+    lx.tokens += tokens;
+    lx.error_tokens += errors;
 }
 
 #[inline]
@@ -84,6 +139,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
     let (stats, acc) = match target {
         Target::Read => timing::time("read", || read_files(&paths, no_hook)),
         Target::ParseOnly => timing::time("read+parse", || read_files(&paths, parse_file)),
+        Target::Lex => timing::time("read+lex", || read_files(&paths, lex_file)),
     };
     drop(paths);
     let total_s = t0.elapsed().as_secs_f64();
@@ -176,7 +232,7 @@ mod tests {
             bytes += fs::metadata(paths.get(i)).unwrap().len();
         }
         timing::enable(true);
-        for target in [Target::Read, Target::ParseOnly] {
+        for target in [Target::Read, Target::ParseOnly, Target::Lex] {
             let rec = run(target, &root).expect("run");
             assert_eq!(rec.files, paths.len() as u64, "{target:?}");
             assert_eq!(rec.bytes, bytes, "{target:?}");
@@ -184,10 +240,22 @@ mod tests {
             assert!(rec.threads >= 1);
             assert!(rec.peak_rss_bytes > 0);
             let names: Vec<&str> = rec.phases.iter().map(|(n, _)| n.as_str()).collect();
-            let second = if target == Target::Read { "read" } else { "read+parse" };
+            let second = match target {
+                Target::Read => "read",
+                Target::ParseOnly => "read+parse",
+                Target::Lex => "read+lex",
+            };
             assert_eq!(names, ["walk", second], "{target:?}");
             let phase_sum: f64 = rec.phases.iter().map(|(_, s)| s).sum();
             assert!(phase_sum <= rec.total_s + 1e-6, "phases {phase_sum} > total {}", rec.total_s);
+            let counter = |name: &str| rec.counters.iter().find(|(n, _)| n == name).map(|&(_, v)| v);
+            if target == Target::Lex {
+                assert!(counter("tokens").unwrap() > rec.files);
+                assert_eq!(counter("error_tokens"), Some(0));
+                assert!(counter("lex_MBps_core").is_some());
+            } else {
+                assert!(rec.counters.is_empty(), "{target:?}");
+            }
         }
         // Same test: `run` uses the process-global phase table.
         assert!(run(Target::Read, Path::new("/no/such/xtask/root")).is_err());

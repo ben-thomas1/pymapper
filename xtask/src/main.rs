@@ -3,6 +3,7 @@
 //! Exit codes: 0 ok, 1 findings (e.g. benchmark regressions), 2 usage or fatal error.
 
 mod bench;
+mod lexdump;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -28,6 +29,9 @@ enum Command {
     BenchRun(bench::RunArgs),
     /// Compare extracted facts/metrics against ruff's parser.
     DiffRuff,
+    /// Dump lexer tokens in CPython tokenize categories (for xtask/scripts/lexdiff.py).
+    #[command(hide = true)]
+    LexDump(lexdump::Args),
     /// Fuzz the lexer/parser.
     Fuzz,
 }
@@ -38,6 +42,7 @@ fn main() -> ExitCode {
         Command::Bench(args) => bench::run(args),
         Command::BenchRun(args) => bench::run_child(args),
         Command::DiffRuff => not_implemented("diff-ruff"),
+        Command::LexDump(args) => lexdump::run(args),
         Command::Fuzz => not_implemented("fuzz"),
     };
     match result {
