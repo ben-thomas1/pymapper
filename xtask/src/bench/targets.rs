@@ -85,6 +85,15 @@ pub enum Target {
     /// import graph and the module call graph with their condensations. Peak RSS includes the
     /// index, the import resolution and the resolved calls.
     Graph,
+    /// `resolve`, then the import cycle analysis (`pymapper_core::analysis::cycles`: phase
+    /// `cycles`, graph + SCC + witnesses + PM301 findings) and the layering contract analysis
+    /// (`pymapper_core::analysis::layers`) with synthetic contracts over the corpus' top-level
+    /// packages: a 6-layer `layers`, a 12-module `independence` and a `forbidden` contract
+    /// (sources: up to 32 top-level packages; forbidden: `os`, `sys`, `typing`), plus the same
+    /// `forbidden` contract with every top-level package and module as a source (every import
+    /// row of an importable file is checked), checked directly (phase `layers`) and
+    /// transitively (phase `layers.transitive`).
+    Cycles,
     /// `calls`, then the rollups (`pymapper_core::rollup`): the base tables (phase
     /// `rollup.build`), the node aggregates (`rollup.aggregates`) and the edges of every level
     /// (each depth, then the module level) with one reused scratch (`rollup.levels`; per-level
@@ -123,6 +132,7 @@ impl Target {
             Target::Resolve => "resolve",
             Target::Calls => "calls",
             Target::Graph => "graph",
+            Target::Cycles => "cycles",
             Target::Rollup => "rollup",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
@@ -453,6 +463,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Resolve => resolve_target(root)?,
         Target::Calls => calls_target(root)?,
         Target::Graph => graph_target(root)?,
+        Target::Cycles => cycles_target(root)?,
         Target::Rollup => rollup_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
@@ -739,6 +750,104 @@ fn graph_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("callgraph_kb".to_owned(), (cg.heap_bytes() + cc.heap_bytes()) as u64 / 1000),
         ("graph_kb".to_owned(), graph_bytes as u64 / 1000),
         ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    Ok((stats, counters))
+}
+
+/// Synthetic contracts for the `cycles` target over the top-level packages of the corpus
+/// (alphabetical): see [`Target::Cycles`].
+fn bench_contracts(ix: &pymapper_core::index::Index, transitive: bool) -> Vec<pymapper_core::config::Contract> {
+    use pymapper_core::config::{Contract, ContractKind};
+    use pymapper_core::index::NodeKind;
+    // Top-level packages, and every top-level package or module (`all`).
+    let mut tops: Vec<String> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
+    for g in 0..ix.groups().len() as u32 {
+        for v in ix.children(ix.group_node(g)) {
+            let kind = ix.kind(v);
+            if kind == NodeKind::Package || kind == NodeKind::Module {
+                let name = String::from_utf8_lossy(ix.name(v)).into_owned();
+                if kind == NodeKind::Package {
+                    tops.push(name.clone());
+                }
+                all.push(name);
+            }
+        }
+    }
+    tops.sort();
+    tops.dedup();
+    all.sort();
+    all.dedup();
+    let mk = |name: &str, kind| Contract {
+        name: name.to_owned(),
+        kind,
+        allow_type_checking: true,
+        transitive,
+        ignore_imports: Vec::new(),
+    };
+    let mut out = Vec::new();
+    if tops.len() >= 2 {
+        let layers = tops.iter().take(6).map(|t| vec![t.clone()]).collect();
+        out.push(mk("bench-layers", ContractKind::Layers { layers, containers: Vec::new(), independent_siblings: false }));
+        out.push(mk("bench-independence", ContractKind::Independence { modules: tops.iter().take(12).cloned().collect() }));
+    }
+    if !tops.is_empty() {
+        let forbidden = ["os", "sys", "typing"].iter().map(|s| (*s).to_owned()).filter(|s| !tops[..tops.len().min(32)].contains(s)).collect();
+        out.push(mk("bench-forbidden", ContractKind::Forbidden { source: tops.iter().take(32).cloned().collect(), forbidden }));
+    }
+    if !all.is_empty() {
+        // Worst case per row: every importable file has a source role, so all its rows are checked.
+        let forbidden = ["os", "sys", "typing"].iter().map(|s| (*s).to_owned()).filter(|s| !all.contains(s)).collect();
+        out.push(mk("bench-forbidden-all", ContractKind::Forbidden { source: all, forbidden }));
+    }
+    out
+}
+
+/// `cycles`: [`resolve_target`]'s load and import resolution, then the cycle and layering
+/// analyses (see [`Target::Cycles`]). Everything stays alive until the counters are taken.
+fn cycles_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::analysis::{cycles, layers};
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_imports};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::rules::Findings;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let mut cycle_findings = Findings::new();
+    let opts = cycles::CycleOptions::default();
+    let cyc = timing::time("cycles", || cycles::analyse(&ix, &imp, &opts, &mut cycle_findings));
+    let direct = bench_contracts(&ix, false);
+    let mut layer_findings = Findings::new();
+    let lr = timing::time("layers", || layers::analyse(&ix, &imp, &direct, &mut layer_findings));
+    let transitive = bench_contracts(&ix, true);
+    let mut trans_findings = Findings::new();
+    let tr = timing::time("layers.transitive", || layers::analyse(&ix, &imp, &transitive, &mut trans_findings));
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let largest = (0..cyc.len()).map(|i| cyc.members(i).len()).max().unwrap_or(0) as u64;
+    let longest = (0..cyc.len()).map(|i| cyc.witness(i).len()).max().unwrap_or(0) as u64;
+    let in_cycles: u64 = (0..cyc.len()).map(|i| cyc.members(i).len() as u64).sum();
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("modules".to_owned(), u64::from(cyc.module_count())),
+        ("import_edges".to_owned(), u64::from(cyc.edge_count())),
+        ("cycles".to_owned(), cyc.len() as u64),
+        ("modules_in_cycles".to_owned(), in_cycles),
+        ("largest_cycle".to_owned(), largest),
+        ("longest_witness".to_owned(), longest),
+        ("cycle_findings".to_owned(), cycle_findings.len() as u64),
+        ("contracts".to_owned(), direct.len() as u64),
+        ("missing_names".to_owned(), lr.missing.len() as u64),
+        ("rows_checked".to_owned(), lr.rows_checked),
+        ("layer_findings".to_owned(), lr.violations),
+        ("transitive_findings".to_owned(), tr.violations),
+        ("cycles_kb".to_owned(), cyc.heap_bytes() as u64 / 1000),
+        ("layers_kb".to_owned(), lr.heap_bytes as u64 / 1000),
+        ("layers_transitive_kb".to_owned(), tr.heap_bytes as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ];
     Ok((stats, counters))
@@ -1056,6 +1165,7 @@ mod tests {
             Target::Resolve,
             Target::Calls,
             Target::Graph,
+            Target::Cycles,
             Target::Rollup,
             Target::LoadCold,
             Target::LoadWarm,
@@ -1112,6 +1222,10 @@ mod tests {
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "graph.scc",
                     "graph.modules",
+                ],
+                Target::Cycles => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "cycles", "layers", "layers.transitive",
                 ],
                 Target::Rollup => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
@@ -1201,6 +1315,11 @@ mod tests {
                 assert!(counter("largest_scc").unwrap() >= 1);
                 assert!(counter("dag_edges") <= counter("graph_edges"));
                 assert!(counter("modules").unwrap() > 0);
+            } else if target == Target::Cycles {
+                assert!(counter("modules").unwrap() > 0);
+                assert_eq!(counter("cycles"), counter("cycle_findings"));
+                assert!(counter("largest_cycle") <= counter("modules"));
+                assert!(counter("longest_witness") <= counter("largest_cycle"));
             } else if target == Target::Rollup {
                 let levels = counter("levels").unwrap();
                 assert!(levels >= 3);

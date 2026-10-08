@@ -294,6 +294,14 @@ impl Imports {
         (t != NONE).then_some(t)
     }
 
+    /// The package/module node `row` adds a module graph edge to (the rule the module edges
+    /// are built with): the submodule of `from pkg import sub`, else the named module or its
+    /// deepest resolved prefix. `NONE` for imports of code that is not loaded.
+    #[inline]
+    pub fn module_node(&self, row: usize) -> NodeId {
+        edges::row_dst(&self.modules, self.p1[row], self.p2[row])
+    }
+
     /// The distribution of a [`ImportStatus::ThirdParty`] row (also when re-exported).
     #[inline]
     pub fn dist(&self, row: usize) -> Option<DistId> {

@@ -30,7 +30,8 @@ pub(super) const RULES: &[RuleDef] = &[
 graph, reported at an import that closes a short witness cycle (the message lists it, ending at \
 the first module again). Cycles make import order matter, cause `ImportError`s on partially \
 initialised modules and prevent splitting code into independent parts. Imports under \
-`if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set.\n\n\
+`if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level \
+imports count, stub files (`.pyi`) do not.\n\n\
 Fix: move the shared code into a lower-level module both can import, or invert the dependency.",
         severity: Severity::Warning,
         default_enabled: true,
@@ -47,9 +48,11 @@ Fix: move the shared code into a lower-level module both can import, or invert t
         message: "`{0}` imports higher layer `{1}` (contract `{2}`)",
         args: CONTRACT_EDGE,
         explanation: "A `kind = \"layers\"` contract lists layers from highest to lowest: a layer may \
-import lower layers, never higher ones (and, with `independent-siblings`, not its siblings). \
-Reported at each violating import. With `transitive = true`, indirect imports through other \
-modules count too.\n\n\
+import lower layers, never higher ones. With `containers`, each container has its own layers and \
+imports between containers are not checked. Reported at each violating import (sibling imports \
+under `independent-siblings` are PM304). With `transitive = true`, an import of a module outside \
+the contract that leads to a higher layer through other such modules counts too; the message \
+names the higher-layer module reached. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the imported code down a layer, or pass it in from the higher layer (dependency \
 injection, callbacks).",
         severity: Severity::Error,
@@ -68,8 +71,10 @@ injection, callbacks).",
         // The imported module may be third-party and outside the analysed set: a dotted name.
         args: &[ArgKind::Symbol, ArgKind::Name, ArgKind::Contract],
         explanation: "A `kind = \"forbidden\"` contract forbids its `source` modules (and their \
-submodules) from importing its `forbidden` modules, which may be first- or third-party. Reported \
-at each violating import.\n\n\
+submodules) from importing its `forbidden` modules, which may be first- or third-party. Modules \
+that are not analysed match unresolved imports by dotted prefix. Reported at each violating \
+import; with `transitive = true` also at imports that lead to a forbidden module through modules \
+outside the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: remove the dependency, or move the code that needs it out of the source modules.",
         severity: Severity::Error,
         default_enabled: true,
@@ -86,7 +91,10 @@ Fix: remove the dependency, or move the code that needs it out of the source mod
         message: "`{0}` imports `{1}`, which must stay independent (contract `{2}`)",
         args: CONTRACT_EDGE,
         explanation: "A `kind = \"independence\"` contract lists modules that may not import one \
-another (submodules included). Reported at each violating import.\n\n\
+another (submodules included); the same applies to siblings within a layer of a `layers` \
+contract with `independent-siblings`. Reported at each violating import; with \
+`transitive = true` also at imports that lead to another listed module through modules outside \
+the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the shared code into a separate module that both may import.",
         severity: Severity::Error,
         default_enabled: true,
