@@ -56,6 +56,7 @@ entered, and symlinks are not followed.
 | `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
+| `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -448,6 +449,40 @@ to about one chunk per thread. Without the reservation the global columns grow b
 and macOS malloc keeps freed blocks up to 8 MiB resident. Reserving 1.5x the extrapolated
 size once 1/16 of the chunks are in avoids most of that. Overshoot is untouched virtual
 memory, which the final `shrink_to_fit` releases.
+
+### Import resolution (S3.1)
+
+`resolve` target: `load`, then `resolve_imports` (all three phases in parallel per file against
+the read-only index). 14-core M4 Pro, release, warm cache, best of 3 (1 run for the venv at
+one thread); load average about 5-7 from other worktrees. Only the `resolve.*` phases are
+new; walk and load are as in the `load` rows above.
+
+| corpus | threads | import rows | names (ModIds) | resolve.modules | resolve.imports | resolve.edges | resolve total | `Imports::heap_bytes` | peak RSS MB (load / resolve) |
+|--------|---------|-------------|----------------|-----------------|-----------------|---------------|---------------|-----------------------|------------------------------|
+| stdlib | 1       | 10,040      | 1,046          | 0.69ms          | 0.54ms          | 0.17ms        | 1.4ms         | 0.65 MB               | - / 20.6                     |
+| stdlib | 14      | 10,040      | 1,046          | 0.32ms          | 0.43ms          | 0.40ms        | 1.15ms        | 0.65 MB               | 27.3 / 28.3                  |
+| venv   | 1       | 901,141     | 70,121         | 28.6ms          | 52.7ms          | 9.92ms        | 91.2ms        | 48.3 MB               | - / 431.7                    |
+| venv   | 14      | 901,141     | 70,121         | 3.99ms          | 6.79ms          | 1.53ms        | 12.3ms        | 48.3 MB               | 493.4 / 531.4                |
+
+- **Time**: resolution is about 0.4% of the load on the venv (12ms against 3.1s at 14
+  threads, 91ms against 11.6s at one thread): 13-14 ns per import row at 14 threads. Every
+  lookup is a `u64` hash probe in the module trie or a binary search in one file's namespace
+  run; no string is built per row.
+- **Memory**: 48.3 MB on the venv = 2.8 B/LOC (index: 20.3 B/LOC). Phase results are 24 B
+  per import row (21.6 MB), namespaces 12 B per module-level name, module edges and external
+  edges 12 B each (329k and 174k), the module trie 17 B per name plus its hash map. Peak RSS
+  grows by about 40 MB over `load`, i.e. the retained tables plus the per-chunk output
+  vectors being concatenated.
+- **Outcome shares** (venv, deps loaded as one root, attribution by the built-in stdlib table
+  only): 64.2% resolved to a module/symbol/variable, 34.1% external (stdlib 291k rows,
+  unknown 16k: optional dependencies that are not installed), 1.3% missing (mostly extension
+  modules, which have no source: `MissingModule` 9.8k, `MissingName` 1.9k), 0.2% dynamic
+  (`__getattr__`, `globals()`). On the stdlib corpus `missing_pm` is 13.5% because the
+  corpus root includes `site-packages`, whose files are not importable from that root (a
+  hyphen in the path); relative imports between non-importable files are reported missing.
+  The stdlib alone (`stdlib_imports_resolve`, ignored test, 4,483 rows) leaves 1.3%
+  unresolved: `idlelib.idle_test` (not shipped), PEP 695 `type` aliases (not extracted yet),
+  platform-only modules (`win32evtlog`, `java.lang`) and `test.support`.
 
 ### Output (S4.4)
 
