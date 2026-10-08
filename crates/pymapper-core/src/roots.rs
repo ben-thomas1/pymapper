@@ -19,6 +19,8 @@
 //!
 //! - Venv: `venv` config, else `$VIRTUAL_ENV`, else `.venv` / `venv` in the project root.
 //! - Python version: config, else `pyvenv.cfg`, else `requires-python`, else the stdlib found.
+//!   It picks the stdlib (falling back to the venv's interpreter when not installed); the venv's
+//!   site-packages always follow the venv's own version (`pyvenv.cfg`, else `lib/python3.N`).
 //! - Distributions ([`Distributions`]): every `*.dist-info` / `*.egg-info` of each site is parsed
 //!   (always, the toggles only control analysis): name, version, `RECORD` files (third-party
 //!   code needs no walk), top-level import names, editable flag. File -> distribution and
@@ -179,7 +181,8 @@ pub struct RootOptions {
     pub include_stdlib: bool,
     /// Virtualenv to use (absolute, or relative to the project root).
     pub venv: Option<PathBuf>,
-    /// Target Python version.
+    /// Target Python version. Sets [`Roots::python_version`] and picks the stdlib; never the
+    /// venv's site-packages, which follow the venv's own interpreter.
     pub python_version: Option<PythonVersion>,
     /// Value of `$VIRTUAL_ENV`.
     pub virtual_env: Option<PathBuf>,
@@ -240,8 +243,9 @@ pub struct Located<'p> {
 pub enum Source {
     /// Walk `path` with `opts`.
     Walk { path: PathBuf, opts: WalkOptions, origin: Origin },
-    /// The `.py` / `.pyi` files listed in a distribution's `RECORD` (no walk needed;
-    /// [`Distributions::files`], relative to [`Distributions::site_path`]).
+    /// The `.py` / `.pyi` files a distribution's `RECORD` lists and it owns (no walk needed;
+    /// [`Distributions::owned_files`], relative to [`Distributions::site_path`]; see
+    /// [`Roots::add_record_files`]). A file listed by several distributions is loaded once.
     Record { dist: DistId },
 }
 
@@ -253,6 +257,22 @@ pub(crate) fn bytes_path(b: &[u8]) -> &Path {
 #[inline]
 fn path_bytes(p: &Path) -> &[u8] {
     p.as_os_str().as_bytes()
+}
+
+/// `hook` (an editable hook root) lies in the first-party root `fp` and maps its files to the
+/// same module names: its path relative to `fp` is its dotted prefix (`proj -> <fp>/proj`,
+/// `mod -> <fp>/mod.py`).
+fn hook_redundant(hook: &ImportRoot, fp: &ImportRoot) -> bool {
+    if hook.origin != Origin::FirstParty || !matches!(fp.kind, RootKind::Configured | RootKind::Src | RootKind::Project) {
+        return false;
+    }
+    let Ok(rel) = hook.path.strip_prefix(&fp.path) else { return false };
+    let mut rel = path_bytes(rel);
+    if hook.is_file {
+        let Some(stem) = rel.strip_suffix(b".py").or_else(|| rel.strip_suffix(b".pyi")) else { return false };
+        rel = stem;
+    }
+    rel.len() == hook.prefix.len() && rel.iter().zip(&hook.prefix).all(|(&a, &b)| a == b || (a == b'/' && b == b'.'))
 }
 
 /// `path` is `dir` or below it (component-wise).
@@ -303,7 +323,7 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
 
     let venv_cfg = opts.venv.as_deref().map(abs);
     let virtual_env = opts.virtual_env.as_deref().map(abs);
-    let venv = pyvenv::find_venv(&project_root, venv_cfg.as_deref(), virtual_env.as_deref(), opts.python_version, &mut diags);
+    let venv = pyvenv::find_venv(&project_root, venv_cfg.as_deref(), virtual_env.as_deref(), &mut diags);
 
     let mut python_version = opts.python_version;
     let mut version_source = python_version.map(|_| VersionSource::Config);
@@ -319,15 +339,26 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
         python_version = Some(v);
         version_source = Some(VersionSource::RequiresPython);
     }
-    // `requires-python` is only a floor: let any interpreter on PATH match when the floor's
-    // exact version is not installed.
-    let stdlib = pyvenv::find_stdlib(python_version, venv.as_ref(), opts.path_env.as_deref()).or_else(|| {
-        if version_source == Some(VersionSource::RequiresPython) {
-            pyvenv::find_stdlib(None, venv.as_ref(), opts.path_env.as_deref())
-        } else {
-            None
+    // The stdlib of the target version is preferred. `requires-python` is only a floor: let any
+    // interpreter match when the floor's exact version is not installed. A configured version
+    // that is not installed falls back to the venv's own interpreter (reported).
+    let venv_version = venv.as_ref().and_then(|v| v.version);
+    let path_env = opts.path_env.as_deref();
+    let mut stdlib = pyvenv::find_stdlib(python_version, venv.as_ref(), path_env);
+    if stdlib.is_none() && version_source == Some(VersionSource::RequiresPython) {
+        stdlib = pyvenv::find_stdlib(None, venv.as_ref(), path_env);
+    }
+    if stdlib.is_none()
+        && version_source == Some(VersionSource::Config)
+        && let (Some(want), Some(have)) = (python_version, venv_version)
+        && want != have
+    {
+        stdlib = pyvenv::find_stdlib(Some(have), venv.as_ref(), path_env);
+        if opts.include_stdlib && stdlib.is_some() {
+            let message = format!("standard library for Python {want} (`python-version`) not found; using the venv's Python {have} standard library");
+            diags.push(Diagnostic { kind: DiagnosticKind::Stdlib, path: project_root.clone(), message });
         }
-    });
+    }
     if let Some((_, v)) = &stdlib
         && (python_version.is_none() || version_source == Some(VersionSource::RequiresPython))
         && python_version != Some(*v)
@@ -378,12 +409,20 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
     // 3. Site-packages.
     let mut dists = Distributions::default();
     let mut sites: Vec<PathBuf> = venv.as_ref().map(|v| v.site_packages.clone()).unwrap_or_default();
-    if let (Some(v), Some((dir, _))) = (&venv, &stdlib)
+    if let Some(v) = &venv
         && v.cfg.as_ref().is_some_and(|c| c.include_system_site_packages)
     {
-        let sys_site = dir.join("site-packages");
-        if sys_site.is_dir() && !sites.contains(&sys_site) {
-            sites.push(sys_site);
+        // The base interpreter's site-packages belongs to the venv's version, which can differ
+        // from the target version the stdlib was picked for.
+        let sys_stdlib = match &stdlib {
+            Some((dir, ver)) if v.version.is_none_or(|vv| vv == *ver) => Some(dir.clone()),
+            _ => v.version.and_then(|vv| pyvenv::find_stdlib(Some(vv), Some(v), path_env)).map(|(dir, _)| dir),
+        };
+        if let Some(dir) = sys_stdlib {
+            let sys_site = dir.join("site-packages");
+            if sys_site.is_dir() && !sites.contains(&sys_site) {
+                sites.push(sys_site);
+            }
         }
     }
     let mut site_roots: Vec<(usize, PathBuf)> = Vec::new();
@@ -448,8 +487,15 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
         }
     }
 
+    // Longest prefix first, except that an editable hook root that names its files exactly as
+    // an enclosing first-party root does (setuptools' `proj -> <root>/src/proj` mapping) yields
+    // to it: the project's own files keep first-party priority whichever way it is installed.
+    let yields = |r: &ImportRoot| r.kind == RootKind::EditableHook && roots.iter().any(|o| hook_redundant(r, o));
     let mut match_order: Vec<RootId> = (0..roots.len() as RootId).collect();
-    match_order.sort_by_key(|&i| (std::cmp::Reverse(path_bytes(&roots[i as usize].path).len()), i));
+    match_order.sort_by_cached_key(|&i| {
+        let r = &roots[i as usize];
+        (yields(r), std::cmp::Reverse(path_bytes(&r.path).len()), i)
+    });
     Roots {
         project_root,
         roots,
@@ -479,7 +525,8 @@ impl Roots {
 
     /// The root, origin, relative path and distribution of an absolute file path: the longest
     /// root containing it wins (so `src/` beats the project root and site-packages beats an
-    /// enclosing project root). O(roots) prefix compares plus one hash lookup for site-packages
+    /// enclosing project root), except that an editable-hook root giving the same module names
+    /// as an enclosing first-party root yields to it. O(roots) prefix compares plus one hash lookup for site-packages
     /// files. `None` outside every root.
     pub fn classify<'p>(&self, path: &'p Path) -> Option<Located<'p>> {
         let p = path_bytes(path);
@@ -520,16 +567,32 @@ impl Roots {
         }
     }
 
-    /// Adds the `RECORD` files of `dist` (in [`Distributions::files`] order) to a module map
-    /// builder; returns the index of the first one.
+    /// Adds the files `dist` owns ([`Distributions::owned_files`], in `RECORD` order) to a
+    /// module map builder; returns the index of the first one. Files are classified like
+    /// [`Roots::add_file`], so a file under a `.pth` / hook root inside site-packages (pywin32's
+    /// `win32/lib`, `foo.egg`) gets the same module name either way. Without such roots no path
+    /// is built.
     pub fn add_record_files(&self, b: &mut ModuleMapBuilder, dist: DistId) -> u32 {
         let first = b.len() as u32;
-        let root = self.site_root(self.dists.site(dist));
-        for rel in self.dists.files(dist) {
-            match root {
-                Some(r) => b.add(r, b"", rel, false),
-                None => b.add_outside(),
-            };
+        let Some(root) = self.site_root(self.dists.site(dist)) else {
+            for _ in self.dists.owned_files(dist) {
+                b.add_outside();
+            }
+            return first;
+        };
+        let site_path = &self.roots[root as usize].path;
+        let nested = self.roots.iter().any(|r| r.site.is_none() && r.path != *site_path && is_under(&r.path, site_path));
+        let mut buf = Vec::new();
+        for rel in self.dists.owned_files(dist) {
+            if !nested {
+                b.add(root, b"", rel, false);
+                continue;
+            }
+            buf.clear();
+            buf.extend_from_slice(path_bytes(site_path));
+            buf.push(b'/');
+            buf.extend_from_slice(rel);
+            self.add_file(b, bytes_path(&buf));
         }
         first
     }
@@ -562,7 +625,7 @@ impl Roots {
                 RootKind::SitePackages => {
                     let Some(site) = r.site else { continue };
                     for d in self.dists.ids() {
-                        if self.dists.site(d) == site && !self.dists.file_ids(d).is_empty() {
+                        if self.dists.site(d) == site && self.dists.owned_files(d).next().is_some() {
                             out.push(Source::Record { dist: d });
                         }
                     }

@@ -96,23 +96,35 @@ pub struct Venv {
 }
 
 /// Opens the venv at `prefix`: it needs a `pyvenv.cfg` or a `lib/python3.N/site-packages`.
-pub fn open_venv(prefix: &Path, source: VenvSource, version: Option<PythonVersion>, diags: &mut Vec<Diagnostic>) -> Option<Venv> {
+///
+/// Site-packages is chosen by the venv's own interpreter version (`pyvenv.cfg`), never by the
+/// configured target `python-version`: targeting an older Python than the venv runs is common
+/// (like ruff's `target-version`) and must not hide the installed packages. When `pyvenv.cfg`
+/// names a version whose `lib/python3.N` has no site-packages, the highest one present is used
+/// and reported.
+pub fn open_venv(prefix: &Path, source: VenvSource, diags: &mut Vec<Diagnostic>) -> Option<Venv> {
     let cfg_path = prefix.join("pyvenv.cfg");
     let mut buf = Vec::new();
     let cfg = match read_all(&cfg_path, &mut buf) {
         Ok(()) => Some(parse_pyvenv_cfg(&buf)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            diags.push(Diagnostic { kind: DiagnosticKind::Venv, path: cfg_path, message: e.to_string() });
+            diags.push(Diagnostic { kind: DiagnosticKind::Venv, path: cfg_path.clone(), message: e.to_string() });
             None
         }
     };
-    let version = version.or_else(|| cfg.as_ref().and_then(|c| c.version));
-    let (site_packages, dir_version) = find_site_packages(prefix, version);
+    let cfg_version = cfg.as_ref().and_then(|c| c.version);
+    let (site_packages, dir_version) = find_site_packages(prefix, cfg_version);
     if cfg.is_none() && site_packages.is_empty() {
         return None;
     }
-    let version = version.or(dir_version);
+    if let (Some(want), Some(got)) = (cfg_version, dir_version)
+        && want != got
+    {
+        let message = format!("pyvenv.cfg names Python {want} but there is no lib/python{want}/site-packages; using lib/python{got}/site-packages");
+        diags.push(Diagnostic { kind: DiagnosticKind::Venv, path: cfg_path, message });
+    }
+    let version = dir_version.or(cfg_version);
     Some(Venv { prefix: prefix.to_path_buf(), source, cfg, site_packages, version })
 }
 
@@ -122,7 +134,6 @@ pub fn find_venv(
     project_root: &Path,
     explicit: Option<&Path>,
     virtual_env: Option<&Path>,
-    version: Option<PythonVersion>,
     diags: &mut Vec<Diagnostic>,
 ) -> Option<Venv> {
     let not_venv = |path: &Path, what: &str| Diagnostic {
@@ -131,14 +142,14 @@ pub fn find_venv(
         message: format!("{what} is not a virtualenv (no pyvenv.cfg or lib/python3.N/site-packages)"),
     };
     if let Some(p) = explicit {
-        let v = open_venv(p, VenvSource::Configured, version, diags);
+        let v = open_venv(p, VenvSource::Configured, diags);
         if v.is_none() {
             diags.push(not_venv(p, "configured `venv`"));
         }
         return v;
     }
     if let Some(p) = virtual_env.filter(|p| !p.as_os_str().is_empty()) {
-        match open_venv(p, VenvSource::Environment, version, diags) {
+        match open_venv(p, VenvSource::Environment, diags) {
             Some(v) => return Some(v),
             None => diags.push(not_venv(p, "$VIRTUAL_ENV")),
         }
@@ -146,7 +157,7 @@ pub fn find_venv(
     for name in [".venv", "venv"] {
         let p = project_root.join(name);
         if p.is_dir()
-            && let Some(v) = open_venv(&p, VenvSource::Project, version, diags)
+            && let Some(v) = open_venv(&p, VenvSource::Project, diags)
         {
             return Some(v);
         }
@@ -154,11 +165,13 @@ pub fn find_venv(
     None
 }
 
-/// `prefix/lib/python3.N[t]/site-packages` (for `version`, else the highest found) and
-/// `prefix/Lib/site-packages` (Windows layout), plus the version read off the directory name.
+/// `prefix/lib/python3.N[t]/site-packages` (for `version` when present, else the highest found)
+/// and `prefix/Lib/site-packages` (Windows layout), plus the version read off the directory name.
 pub fn find_site_packages(prefix: &Path, version: Option<PythonVersion>) -> (Vec<PathBuf>, Option<PythonVersion>) {
     let mut out = Vec::new();
-    let found = lib_python_dirs(&prefix.join("lib"), version, |d| d.join("site-packages").is_dir());
+    let lib = prefix.join("lib");
+    let has_site = |d: &Path| d.join("site-packages").is_dir();
+    let found = lib_python_dirs(&lib, version, has_site).or_else(|| version.and_then(|_| lib_python_dirs(&lib, None, has_site)));
     let mut ver = None;
     if let Some((dir, v)) = found {
         out.push(dir.join("site-packages"));

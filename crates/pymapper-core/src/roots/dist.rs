@@ -221,6 +221,16 @@ impl Distributions {
         self.file_ids(d).iter().map(|&s| site.files.resolve(s))
     }
 
+    /// The files of `d` that it owns ([`Distributions::owner`]): [`Distributions::files`]
+    /// minus files an earlier distribution's `RECORD` also lists (conflicting distributions
+    /// such as `opencv-python` / `opencv-python-headless`, shared legacy namespace
+    /// `__init__.py`). Every file of a site is owned exactly once, so loading the owned files
+    /// of each distribution loads each file once.
+    pub fn owned_files(&self, d: DistId) -> impl Iterator<Item = &[u8]> + '_ {
+        let site = &self.site_files[self.site(d)];
+        self.file_ids(d).iter().filter(move |&&s| site.owner[s.index()] == d).map(|&s| site.files.resolve(s))
+    }
+
     /// Path (relative to the site) of a file id of site `site`.
     pub fn site_file(&self, site: usize, file: Sym) -> &[u8] {
         self.site_files[site].files.resolve(file)

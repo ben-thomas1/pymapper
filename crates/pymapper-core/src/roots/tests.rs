@@ -766,6 +766,61 @@ fn sources_follow_toggles() {
     assert_eq!(describe(&on, &on.sources(&paths, &fp)), want);
 }
 
+#[test]
+fn overlapping_records_and_nested_roots() {
+    let t = TempDir::new("overlap");
+    let root = t.path().display().to_string();
+    t.file("proj/pyproject.toml", "[project]\nname = \"proj\"\n")
+        .file("proj/src/proj/__init__.py", "")
+        .file("proj/src/proj/core.py", "")
+        .file("proj/src/single.py", "")
+        .file("proj/.venv/pyvenv.cfg", "version_info = 3.12.0\n");
+    // Conflicting distributions installing the same files.
+    dist(&t, SITE, "opencv-python", "4.0", &["cv2/__init__.py", "cv2/data.py"], None, None);
+    dist(&t, SITE, "opencv-python-headless", "4.0", &["cv2/__init__.py", "cv2/headless.py"], None, None);
+    // pywin32-style relative `.pth` lines naming directories inside site-packages.
+    dist(&t, SITE, "pywin32", "306", &["pywin32.pth=win32\nwin32/lib\n", "win32/lib/win32con.py", "win32/winerror.py"], None, None);
+    // The project installed through a setuptools import hook mapping onto its own src/.
+    let hook_pth = "__editable__.proj-0.1.pth=import __editable___proj_0_1_finder; __editable___proj_0_1_finder.install()\n";
+    let finder = format!("__editable___proj_0_1_finder.py=MAPPING = {{'proj': '{root}/proj/src/proj', 'single': '{root}/proj/src/single.py'}}\n");
+    dist(&t, SITE, "proj", "0.1", &[hook_pth, &finder], None, None);
+
+    let r = discover(&t.p("proj"), &RootOptions { include_deps: true, ..opts() });
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    let d = &r.dists;
+    let (cv, headless) = (d.by_name(b"opencv-python").expect("cv"), d.by_name(b"opencv-python-headless").expect("hl"));
+    assert_eq!(d.files(headless).map(s).collect::<Vec<_>>(), ["cv2/__init__.py", "cv2/headless.py"]);
+    assert_eq!(d.owned_files(headless).map(s).collect::<Vec<_>>(), ["cv2/headless.py"]);
+    assert_eq!(d.owned_files(cv).map(s).collect::<Vec<_>>(), ["cv2/__init__.py", "cv2/data.py"]);
+
+    // RECORD files are classified like walked files: owned files only, `.pth` roots inside
+    // site-packages give the module names.
+    let mut b = ModuleMapBuilder::new();
+    for id in d.ids() {
+        r.add_record_files(&mut b, id);
+    }
+    let m = b.finish();
+    let names: Vec<&str> = (0..m.file_count() as u32).map(|i| m.file_module_name(i).map_or("", s)).collect();
+    assert_eq!(names, ["cv2", "cv2.data", "cv2.headless", "win32con", "winerror"]);
+    let kinds: Vec<RootKind> = (0..m.file_count() as u32).map(|i| r.root(m.file_root(i).expect("root")).kind).collect();
+    assert_eq!(kinds[..3], [RootKind::SitePackages; 3]);
+    assert_eq!(kinds[3..], [RootKind::Pth; 2]);
+    let walked = |rel: &str| {
+        let p = t.p(&format!("{SITE}/{rel}"));
+        r.classify(&p).map(|l| (r.root(l.root).kind, s(l.rel).to_owned()))
+    };
+    assert_eq!(walked("win32/lib/win32con.py"), Some((RootKind::Pth, "win32con.py".to_owned())));
+
+    // The project's hook roots exist, but its own files keep the first-party src root.
+    let hooks: Vec<&[u8]> = r.roots.iter().filter(|x| x.kind == RootKind::EditableHook).map(|x| &*x.prefix).collect();
+    assert_eq!(hooks, [&b"proj"[..], b"single"]);
+    for f in ["proj/src/proj/core.py", "proj/src/single.py"] {
+        let p = t.p(f);
+        let l = r.classify(&p).expect("classified");
+        assert_eq!((r.root(l.root).kind, l.origin), (RootKind::Src, Origin::FirstParty), "{f}");
+    }
+}
+
 /// A venv at `prefix` (relative to `t`) for Python 3.`minor` with one module in site-packages.
 fn mini_venv(t: &TempDir, prefix: &str, minor: u8, cfg: &str) {
     t.file(&format!("{prefix}/pyvenv.cfg"), cfg).file(&format!("{prefix}/lib/python3.{minor}/site-packages/m.py"), "");
@@ -798,9 +853,11 @@ fn venv_selection_order() {
     assert_eq!(r.python_version, Some(v(10)));
     assert_eq!(r.version_source, Some(VersionSource::Venv));
 
-    // The configured Python version picks the site-packages directory.
+    // A configured Python version sets the target version only (see
+    // `target_version_differs_from_venv`).
     let r = discover(&t.p("proj"), &RootOptions { python_version: Some(v(12)), ..opts() });
     assert_eq!(r.version_source, Some(VersionSource::Config));
+    assert_eq!(r.venv.as_ref().map(|v| v.site_packages.clone()), Some(vec![t.p("proj/.venv/lib/python3.12/site-packages")]));
 
     // A broken $VIRTUAL_ENV is reported and discovery falls back to .venv.
     let r = discover(&t.p("proj"), &RootOptions { virtual_env: Some(t.p("nope")), ..opts() });
@@ -894,6 +951,60 @@ fn system_site_packages() {
     let p = t.p("base/lib/python3.12/site-packages/global_pkg.py");
     let l = r.classify(&p).expect("classified");
     assert_eq!((l.origin, l.rel), (Origin::ThirdParty, &b"global_pkg.py"[..]));
+}
+
+#[test]
+fn target_version_differs_from_venv() {
+    let t = TempDir::new("targetver");
+    let base = t.p("base").display().to_string();
+    let site = "proj/.venv/lib/python3.12/site-packages";
+    t.file("proj/pyproject.toml", "")
+        .file("base/lib/python3.12/os.py", "")
+        .file(&format!("{site}/dep-1.0.dist-info/METADATA"), "Name: dep\nVersion: 1.0\n")
+        .file(&format!("{site}/dep-1.0.dist-info/RECORD"), "dep.py,,\n")
+        .file(&format!("{site}/dep.py"), "");
+    t.file("proj/.venv/pyvenv.cfg", &format!("home = {base}/bin\nversion_info = 3.12.4\n"));
+
+    // Targeting an older Python than the venv runs keeps the venv's site-packages and its
+    // distributions; only `python_version` follows the config.
+    let r = discover(&t.p("proj"), &RootOptions { python_version: Some(v(11)), include_deps: true, ..opts() });
+    assert_eq!((r.python_version, r.version_source), (Some(v(11)), Some(VersionSource::Config)));
+    let venv = r.venv.as_ref().expect("venv");
+    assert_eq!(venv.version, Some(v(12)));
+    assert_eq!(venv.site_packages, [t.p(site)]);
+    assert!(r.dists.by_name(b"dep").is_some());
+    let sp = r.roots.iter().find(|x| x.kind == RootKind::SitePackages).expect("site root");
+    assert_eq!((&*sp.path, sp.analyse), (&*t.p(site), true));
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    // The 3.11 stdlib is not installed: the venv's 3.12 stdlib is used, reported when the
+    // stdlib is analysed.
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/lib/python3.12")));
+    let r = discover(&t.p("proj"), &RootOptions { python_version: Some(v(11)), include_stdlib: true, ..opts() });
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/lib/python3.12")));
+    assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Stdlib]);
+    let msg = &r.diagnostics[0].message;
+    assert!(msg.contains("3.11") && msg.contains("3.12"), "{msg}");
+
+    // An installed target stdlib is preferred; the system site-packages still come from the
+    // venv's own interpreter version.
+    t.file("base/lib/python3.11/os.py", "").file("base/lib/python3.11/site-packages/old.py", "");
+    t.file("base/lib/python3.12/site-packages/global_pkg.py", "");
+    t.file("proj/.venv/pyvenv.cfg", &format!("home = {base}/bin\nversion_info = 3.12.4\ninclude-system-site-packages = true\n"));
+    let r = discover(&t.p("proj"), &RootOptions { python_version: Some(v(11)), include_stdlib: true, ..opts() });
+    assert_eq!(r.stdlib.as_deref(), Some(&*t.p("base/lib/python3.11")));
+    let sites: Vec<&Path> = r.roots.iter().filter(|x| x.kind == RootKind::SitePackages).map(|x| &*x.path).collect();
+    assert_eq!(sites, [&*t.p(site), &*t.p("base/lib/python3.12/site-packages")]);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+    // pyvenv.cfg names a version without site-packages: the one present is used, reported.
+    mini_venv(&t, "odd", 12, "version_info = 3.13.0\n");
+    let r = discover(&t.p("proj"), &RootOptions { venv: Some(t.p("odd")), ..opts() });
+    let venv = r.venv.as_ref().expect("venv");
+    assert_eq!((venv.version, venv.site_packages.clone()), (Some(v(12)), vec![t.p("odd/lib/python3.12/site-packages")]));
+    assert_eq!(r.python_version, Some(v(12)));
+    assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Venv]);
+    let msg = &r.diagnostics[0].message;
+    assert!(msg.contains("3.13") && msg.contains("python3.12"), "{msg}");
 }
 
 #[test]
