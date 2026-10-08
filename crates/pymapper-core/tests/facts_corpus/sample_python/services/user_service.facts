@@ -1,0 +1,24 @@
+file lines=24 evidence=12
+module 0:<module> L1-24 b0-659
+def 1:create_user in=0 L8-19 b192-578 @9:4 decs=[log_calls] (name, email) [other_decorator]
+def 2:get_user_display in=0 L22-24 b581-658 @22:4 (user)
+import 0:<module> L1:29 from utils.validation import validate_email
+import 0:<module> L2:29 from utils.formatting import format_name
+import 0:<module> L3:29 from utils.decorators import log_calls
+import 0:<module> L4:24 from models.user import User
+import 0:<module> L5:27 from repo.user_repo import save_user
+call 1:create_user L11:4 validate_email()
+call 1:create_user L12:4 validate_email()
+call 1:create_user L13:4 validate_email()
+call 1:create_user L13:19 email.lower() dotted
+call 1:create_user L14:4 validate_email()
+call 1:create_user L14:19 email.upper() dotted
+call 1:create_user L15:4 validate_email()
+call 1:create_user L15:19 email.strip() dotted
+call 1:create_user L16:16 format_name()
+call 1:create_user L17:11 User()
+call 1:create_user L18:4 save_user()
+call 2:get_user_display L23:11 format_name()
+bind 1:create_user L16 formatted = format_name()
+bind 1:create_user L17 user = User()
+bind 2:get_user_display L23 name = format_name()

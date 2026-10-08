@@ -1,0 +1,26 @@
+file lines=24 evidence=15
+module 0:<module> L1-24 b0-717
+def 1:run_pipeline in=0 L9-18 b296-580 @10:4 decs=[log_calls] (name, email, token) [other_decorator]
+def 2:format_receipt in=0 L21-24 b583-716 @21:4 (user, amount)
+import 0:<module> L1:29 from utils.validation import validate_email
+import 0:<module> L1:45 from utils.validation import validate_length
+import 0:<module> L1:62 from utils.validation import validate_not_empty
+import 0:<module> L2:29 from utils.formatting import format_name
+import 0:<module> L2:42 from utils.formatting import format_currency
+import 0:<module> L3:26 from services.auth import validate_token
+import 0:<module> L4:34 from services.user_service import create_user
+import 0:<module> L5:29 from utils.decorators import log_calls
+import 0:<module> L6:24 from models.user import User
+call 1:run_pipeline L11:4 validate_not_empty()
+call 1:run_pipeline L12:4 validate_not_empty()
+call 1:run_pipeline L13:4 validate_email()
+call 1:run_pipeline L14:4 validate_length()
+call 1:run_pipeline L15:4 validate_token()
+call 1:run_pipeline L16:16 format_name()
+call 1:run_pipeline L17:11 create_user()
+call 2:format_receipt L22:11 format_name()
+call 2:format_receipt L23:12 format_currency()
+bind 1:run_pipeline L16 formatted = format_name()
+bind 1:run_pipeline L17 user = create_user()
+bind 2:format_receipt L22 name = format_name()
+bind 2:format_receipt L23 price = format_currency()

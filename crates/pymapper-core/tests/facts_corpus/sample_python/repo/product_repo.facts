@@ -1,0 +1,9 @@
+file lines=6 evidence=7
+module 0:<module> L1-6 b0-259
+def 1:save_product in=0 L1-6 b0-258 @1:4 (product)
+call 1:save_product L2:4 product.validate() dotted
+call 1:save_product L3:4 product.is_valid() dotted
+call 1:save_product L4:11 product.to_dict() dotted
+call 1:save_product L5:11 product.serialize() dotted
+bind 1:save_product L4 data = product.to_dict()
+bind 1:save_product L5 text = product.serialize()

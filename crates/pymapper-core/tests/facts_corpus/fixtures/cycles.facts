@@ -1,0 +1,7 @@
+file lines=10 evidence=2
+module 0:<module> L1-10 b0-75
+def 1:ping in=0 L1-2 b0-22 @1:4 ()
+def 2:pong in=0 L5-6 b25-47 @5:4 ()
+def 3:no_cycle in=0 L9-10 b50-74 @9:4 ()
+call 1:ping L2:4 pong()
+call 2:pong L6:4 ping()
