@@ -215,6 +215,7 @@ dependencies = [
 name = "pymapper-core"
 version = "0.3.0"
 dependencies = [
+ "rayon",
  "thiserror",
  "toml",
 ]

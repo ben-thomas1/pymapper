@@ -1,7 +1,9 @@
-//! Interim corpus walker for the benchmarks: finds `.py`/`.pyi` files under a root.
+//! Sequential reference walker for the `walk-seq` benchmark target: finds `.py`/`.pyi` files
+//! under a root.
 //!
-//! Sequential, no gitignore, no symlink following. Replace with `pymapper_core::walk` once the
-//! walk step lands. Paths are stored compactly (one byte buffer + end offsets) rather than one
+//! Single-threaded, no gitignore, no symlink following, hidden directories entered. The other
+//! targets use `pymapper_core::walk`; this one stays as the baseline its parallel speed-up is
+//! measured against. Paths are stored compactly (one byte buffer + end offsets) rather than one
 //! `PathBuf` allocation per file.
 
 use std::ffi::OsStr;
@@ -22,6 +24,7 @@ impl PathStore {
         self.ends.len()
     }
 
+    #[cfg(test)]
     pub fn get(&self, i: usize) -> &Path {
         let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
         let end = self.ends[i] as usize;
