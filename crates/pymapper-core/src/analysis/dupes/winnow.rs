@@ -7,7 +7,7 @@ use crate::extract::Visitor;
 use crate::lex::{Lexer, Token, TokenKind};
 
 /// Base of the polynomial rolling hash (odd, so multiplication mod 2^64 is invertible).
-pub(super) const BASE: u64 =0x100_0000_01b3;
+pub(super) const BASE: u64 = 0x100_0000_01b3;
 
 /// One selected fingerprint (12 bytes): the low 32 bits of the mixed k-gram hash and where the
 /// k-gram starts (index into the file's normalised token sequence).

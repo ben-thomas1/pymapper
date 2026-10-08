@@ -124,6 +124,20 @@ fn params_derive_k_and_w_from_min_tokens() {
     assert_eq!(DupesParams::from_config(&cfg), Some(DupesParams::new(70, 3)));
 }
 
+#[test]
+fn params_from_engine_follow_gate_and_selection() {
+    use crate::config::RuleSelector;
+    use crate::rules::RuleEngine;
+    let mut cfg = Config::new(Path::new("/p"));
+    assert_eq!(DupesParams::from_engine(&RuleEngine::new(&cfg)), None);
+    cfg.analysis.dupes = true;
+    cfg.thresholds.dupes_min_tokens = 60;
+    assert_eq!(DupesParams::from_engine(&RuleEngine::new(&cfg)), Some(DupesParams::new(60, 6)));
+    // Gate open but PM501 ignored: nothing to do.
+    cfg.rules.ignore.push(RuleSelector::Prefix { value: 501, digits: 3 });
+    assert_eq!(DupesParams::from_engine(&RuleEngine::new(&cfg)), None);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Normalisation
 // ---------------------------------------------------------------------------------------------
@@ -403,7 +417,7 @@ fn three_copies_form_one_group() {
 
 #[test]
 fn many_copies_stay_linear_and_grouped() {
-    // More copies than ALL_PAIRS_MAX: buckets seed a star, everything still lands in one group.
+    // More copies than ALL_PAIRS_MAX: buckets seed paths, everything still lands in one group.
     let srcs: Vec<String> = (0..20).map(|i| format!("v{i} = {i}\n{}", func(&format!("f{i}"), &format!("n{i}")))).collect();
     let refs: Vec<&str> = srcs.iter().map(String::as_str).collect();
     let r = run(&refs, DupesParams::default());
@@ -479,6 +493,73 @@ fn data_tables_need_an_exact_copy() {
     let r = run(&[&a, &a], DupesParams::default());
     assert_eq!(r.pairs.len(), 1);
     assert_eq!(r.pairs[0].similarity, 100);
+}
+
+#[test]
+fn code_next_to_same_shaped_data_is_split_out() {
+    // A codec-like module: the class is the same in every copy, the tables after it have the
+    // same shape but other values. The extension runs through the table; the code is still
+    // reported, the differing data is not.
+    let module = |name: &str, seed: u64| -> String {
+        let mut rng = Rng(seed);
+        let rows: String = (0..60).map(|i| format!("    0x{i:04x}: 0x{:04x},\n", rng.next() % 65536)).collect();
+        format!("{}\ndecoding_map = {{\n{rows}}}\n", func(name, name))
+    };
+    let (a, b) = (module("alpha", 1), module("beta", 2));
+    assert_eq!(codes(&a), codes(&b));
+    let r = run(&[&a, &b], DupesParams::default());
+    assert_eq!(r.pairs.len(), 1, "{r:?}");
+    let p = r.pairs[0];
+    // The function (12 lines) and at most two blocks of table rows.
+    assert_eq!(p.a.start_line, 1);
+    assert!(p.a.end_line >= 12 && p.a.end_line < 12 + 2 * 48 / 4 + 2, "{p:?}");
+    assert!(p.similarity > 40, "{p:?}");
+    // Identical tables are exact copies and reported whole.
+    let c = module("gamma", 1);
+    let r = run(&[&a, &c], DupesParams::default());
+    assert_eq!(r.pairs.len(), 1, "{r:?}");
+    // 12 function lines, a blank line, `decoding_map = {`, 60 rows and `}`.
+    assert_eq!(r.pairs[0].a.end_line, 12 + 63);
+}
+
+#[test]
+fn clones_around_a_common_block_are_found() {
+    // A block shared by more than ALL_PAIRS_MAX files (large buckets, seeded by context), and
+    // a longer clone around it in two of them, after the block's first occurrences.
+    let common = func("common", "c");
+    let mut srcs: Vec<String> = (0..12).map(|i| format!("X{i} = [{i}] * {i}\n{common}\nY{i} = {i}\n")).collect();
+    srcs.push(format!("{REPO}\n{common}\n{REPO}"));
+    srcs.push(format!("{REPO}\n{common}\n{REPO}"));
+    let refs: Vec<&str> = srcs.iter().map(String::as_str).collect();
+    let r = run(&refs, DupesParams::new(40, 6));
+    // The common block's copies form one group.
+    assert!(r.groups.len() <= 2, "{r:?}");
+    let whole = r.pairs.iter().any(|p| (p.a.file, p.b.file) == (12, 13) && p.a.start_line == 1 && p.a.lines() >= 30);
+    assert!(whole, "{r:?}");
+}
+
+#[test]
+fn periodic_regions_seed_once() {
+    // A 30k-token periodic table: winnowing selects the same hash every period, so each copy
+    // has ~5000 hits in one bucket. Seeding each hit would extend ~5000 diagonals over the
+    // whole table (quadratic); runs of close hits seed once.
+    let table = |name: &str, mul: u32| -> String {
+        let rows: String = (0..5000u32).map(|i| format!("    ({i}, {}),\n", i * mul)).collect();
+        format!("{name} = [\n{rows}]\n")
+    };
+    let (a, b) = (table("X", 3), table("Y", 7));
+    assert!(codes(&a).len() > 30_000);
+    let r = run(&[&a, &b], DupesParams::default());
+    assert!(r.stats.fingerprints > 5000, "{:?}", r.stats);
+    assert!(r.stats.seeds <= 8, "{:?}", r.stats);
+    assert!(r.pairs.is_empty(), "{r:?}");
+    // An exact copy is still found, whole.
+    let r = run(&[&a, &a], DupesParams::default());
+    assert!(r.stats.seeds <= 8, "{:?}", r.stats);
+    assert_eq!(r.pairs.len(), 1, "{r:?}");
+    let p = r.pairs[0];
+    assert_eq!((p.similarity, p.a.start_line, p.a.end_line), (100, 1, 5002));
+    assert_eq!(p.b, Region { file: 1, ..p.a });
 }
 
 #[test]

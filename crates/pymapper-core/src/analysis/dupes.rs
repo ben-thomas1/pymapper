@@ -9,15 +9,15 @@
 //!     -> Fingerprint {hash u32, file u32, pos u32}            the source is then dropped
 //!
 //!   find_clones (whole program)                                       phase
-//!     sort fingerprints by hash (parallel)                            dupes.seeds
-//!     -> seeds: pairs of positions sharing a hash (all pairs in small buckets, a star from
-//!        the first occurrence in large ones: linear in n), sorted by (file A, file B,
-//!        diagonal, position)
+//!     key each fingerprint by its neighbours' hashes, sort by hash    dupes.seeds
+//!     -> seeds: pairs of positions sharing a hash (all pairs in small buckets; in large
+//!        ones, a path through the occurrences sharing the next / previous fingerprint:
+//!        linear in n), sorted by (file A, file B, diagonal, position)
 //!     -> re-read + re-lex every file with seeds once, in parallel     dupes.relex
 //!        (kept: 1 byte of code + 1 byte of exact hash per token)
 //!     -> per file A in parallel: verify each seed, extend it left and dupes.extend
-//!        right over equal codes, chain segments across small gaps, measure similarity,
-//!        keep runs of >= min tokens
+//!        right over equal codes, split out runs of differing data, chain segments across
+//!        small gaps, measure similarity, keep runs of >= min tokens
 //!     -> re-read files with candidates once for line numbers;        dupes.locate
 //!        keep runs spanning >= min lines in both copies
 //!     -> clusters (overlapping copies in one file) -> groups          dupes.group
@@ -33,10 +33,12 @@
 //!   hashes (reused across files), and 12 bytes per fingerprint retained. The density of
 //!   winnowing is `2 / (w + 1)`: with the defaults (`k = 20`, `w = 31`) about one fingerprint
 //!   per 16 tokens, i.e. under 1 byte per token retained.
-//! - Matching: O(n log n) in fingerprints for the sort, linear seeds (at most
-//!   `ALL_PAIRS_MAX - 1` per fingerprint), 2 bytes per token of the files with seeds while
-//!   extending, and at most two reads of each file (sources are never retained). Extension is
-//!   linear in the matched tokens; no step compares all pairs of files or of clones.
+//! - Matching: O(n log n) in fingerprints for the sorts (20 bytes per fingerprint while
+//!   seeding), linear seeds (at most `(ALL_PAIRS_MAX - 1) / 2` per fingerprint in small
+//!   buckets, two in large ones), 2 bytes per token of the files with seeds while extending,
+//!   and at most two reads of each file (sources are never retained). Extension is linear in
+//!   the matched tokens, also in periodic code (runs of close hits of one hash in one file
+//!   seed once); no step compares all pairs of files or of clones.
 //!
 //! See "Duplication (S4.3d)" in `docs/benchmarks.md` for measured costs.
 //!
@@ -61,7 +63,11 @@
 //! Boilerplate is only reported when the two copies are identical: highly repetitive runs (a
 //! period of at most 24 tokens covering 90% of the run, e.g. long `self.a = a` assignment
 //! lists) and data (fewer than one token in 8 is a name or keyword, e.g. tables of tuples or
-//! dict literals).
+//! dict literals). Within a match, runs of at least 96 tokens of differing boilerplate are cut
+//! out, so code next to a same-shaped table (a codec class before its mapping) is reported
+//! without the table. Code that repeats with a period shorter than `min_tokens` (a long run
+//! of like entries) is not reported as a clone of itself: each repetition is below the
+//! minimum.
 
 mod matcher;
 mod norm;
@@ -78,7 +84,7 @@ use std::io::Read;
 use crate::config::Config;
 use crate::index::Index;
 use crate::rules::codes::DUPLICATE_CODE;
-use crate::rules::{Arg, FileId, Findings, Location, SymbolId};
+use crate::rules::{Arg, FileId, Findings, Location, Pass, RuleEngine, SymbolId};
 
 /// Largest k-gram length.
 const MAX_K: u32 = 20;
@@ -109,6 +115,13 @@ impl DupesParams {
     pub fn from_config(config: &Config) -> Option<DupesParams> {
         let t = &config.thresholds;
         config.analysis.dupes.then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines))
+    }
+
+    /// The parameters for a run of `engine`: `None` when no rule of the duplication pass is
+    /// enabled (PM501 ignored, or `analysis.dupes` off).
+    pub fn from_engine(engine: &RuleEngine) -> Option<DupesParams> {
+        let t = engine.thresholds();
+        engine.should_run(Pass::Dupes).then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines))
     }
 
     /// k-gram length (noise threshold).

@@ -9,8 +9,8 @@ use super::{ClonePair, DupesParams, Region};
 use crate::lex::TokenKind;
 use crate::timing;
 
-/// Buckets up to this size seed every pair; larger ones seed a star from their first
-/// occurrence (linear, and enough: extension and grouping recover the rest).
+/// Buckets up to this size seed every pair; larger ones seed paths by context (see
+/// [`make_seeds`]): linear, and grouping recovers the transitive pairs.
 const ALL_PAIRS_MAX: usize = 8;
 
 /// Largest gap (in tokens, in each copy) bridged between two matching segments of the same
@@ -26,6 +26,10 @@ const REPEAT_PCT: usize = 90;
 
 /// Data filter: code has at least one name or keyword per this many tokens.
 const WORD_SHARE: usize = 8;
+
+/// Granularity of splitting boilerplate out of a segment (two periods of the
+/// repetition filter, so it can see a period).
+const TRIM_BLOCK: u32 = 2 * MAX_PERIOD as u32;
 
 /// The most similar other copy of a [`DupesReport::members`] entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,34 +95,104 @@ impl Seed {
     }
 }
 
-/// Seeds from the hash-sorted fingerprints: every pair of a small bucket, a star from the
-/// first occurrence of a large one. Same-file seeds closer than `min_tokens` are skipped (their
+/// A fingerprint with its contexts: the hashes of the next and previous fingerprints of the
+/// same file ([`NO_CTX`] at the ends).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Keyed {
+    hash: u32,
+    next: u32,
+    prev: u32,
+    file: u32,
+    pos: u32,
+}
+
+/// Context of the last (first) fingerprint of a file.
+const NO_CTX: u32 = u32::MAX;
+
+/// Fingerprints with contexts. Rows of one file must be contiguous and in position order, as
+/// taken (otherwise contexts are arbitrary: fewer clones are found, none is wrong).
+fn keyed(fps: &Fingerprints) -> Vec<Keyed> {
+    let rows = fps.as_slice();
+    let mut out: Vec<Keyed> = Vec::with_capacity(rows.len());
+    let ctx = |o: Option<&super::Fingerprint>, file: u32| match o {
+        Some(n) if n.file == file => n.hash,
+        _ => NO_CTX,
+    };
+    for (i, f) in rows.iter().enumerate() {
+        let prev = ctx(i.checked_sub(1).map(|j| &rows[j]), f.file);
+        out.push(Keyed { hash: f.hash, next: ctx(rows.get(i + 1), f.file), prev, file: f.file, pos: f.pos });
+    }
+    out
+}
+
+/// Seeds from the fingerprints (reordered in place). A bucket (one hash) of at most
+/// [`ALL_PAIRS_MAX`] occurrences seeds every pair. A larger one (a common k-gram) is split by
+/// context, once by next and once by previous fingerprint, and within a context each
+/// occurrence seeds its successor: occurrences of a real clone share their neighbouring
+/// fingerprints (inside the clone), so they meet in one context and end up in one group, at
+/// two seeds per occurrence. Same-file seeds closer than `min_tokens` are skipped (their
 /// copies would overlap).
-fn make_seeds(fps: &Fingerprints, params: &DupesParams) -> Vec<Seed> {
+///
+/// In a large bucket, an occurrence less than `min_tokens` after the previous occurrence of
+/// its file and context is dropped: such runs of hits come from periodic code (data tables,
+/// long lists of like statements), where every occurrence would seed its own diagonal and
+/// extending each over the whole periodic region would be quadratic in its length. The first
+/// occurrence of the run still seeds the region.
+fn make_seeds(fps: &mut [Keyed], params: &DupesParams) -> Vec<Seed> {
     let min_d = params.min_tokens;
     let mut seeds = Vec::new();
-    let push = |a: &super::Fingerprint, b: &super::Fingerprint, seeds: &mut Vec<Seed>| {
-        if a.file != b.file || b.pos - a.pos >= min_d {
-            seeds.push(Seed { a_file: a.file, b_file: b.file, a_pos: a.pos, b_pos: b.pos });
-        }
-    };
-    for bucket in fps.rows.chunk_by(|x, y| x.hash == y.hash) {
+    fps.par_sort_unstable_by_key(|f| (f.hash, f.next, f.file, f.pos));
+    for bucket in fps.chunk_by(|x, y| x.hash == y.hash) {
         if bucket.len() < 2 {
             continue;
         }
-        if bucket.len() <= ALL_PAIRS_MAX {
-            for (i, a) in bucket.iter().enumerate() {
-                for b in &bucket[i + 1..] {
-                    push(a, b, &mut seeds);
-                }
-            }
-        } else {
-            for b in &bucket[1..] {
-                push(&bucket[0], b, &mut seeds);
+        if bucket.len() > ALL_PAIRS_MAX {
+            context_paths(bucket, |f| f.next, min_d, &mut seeds);
+            continue;
+        }
+        // Every pair, in (file, pos) order whatever the contexts.
+        for (i, a) in bucket.iter().enumerate() {
+            for b in &bucket[i + 1..] {
+                let (a, b) = if (a.file, a.pos) < (b.file, b.pos) { (a, b) } else { (b, a) };
+                push_seed(a, b, min_d, &mut seeds);
             }
         }
     }
+    fps.par_sort_unstable_by_key(|f| (f.hash, f.prev, f.file, f.pos));
+    for bucket in fps.chunk_by(|x, y| x.hash == y.hash) {
+        if bucket.len() > ALL_PAIRS_MAX {
+            context_paths(bucket, |f| f.prev, min_d, &mut seeds);
+        }
+    }
     seeds
+}
+
+/// Seeds a path through each context of `bucket` (sorted by (context, file, pos)), skipping
+/// runs of close hits in one file.
+fn context_paths(bucket: &[Keyed], ctx: impl Fn(&Keyed) -> u32, min_d: u32, seeds: &mut Vec<Seed>) {
+    for group in bucket.chunk_by(|x, y| ctx(x) == ctx(y)) {
+        let (mut prev, mut kept): (Option<&Keyed>, Option<&Keyed>) = (None, None);
+        for f in group {
+            let close = matches!(prev, Some(p) if p.file == f.file && f.pos - p.pos < min_d);
+            prev = Some(f);
+            if close {
+                continue;
+            }
+            if let Some(k) = kept {
+                push_seed(k, f, min_d, seeds);
+            }
+            kept = Some(f);
+        }
+    }
+}
+
+/// Seeds `a` / `b` (`a` first in (file, pos) order) unless they are in one file closer than
+/// `min_d`.
+#[inline]
+fn push_seed(a: &Keyed, b: &Keyed, min_d: u32, seeds: &mut Vec<Seed>) {
+    if a.file != b.file || b.pos - a.pos >= min_d {
+        seeds.push(Seed { a_file: a.file, b_file: b.file, a_pos: a.pos, b_pos: b.pos });
+    }
 }
 
 /// Finds clone pairs and groups from the fingerprints of all files. `read(file, buf)` appends a
@@ -127,17 +201,21 @@ fn make_seeds(fps: &Fingerprints, params: &DupesParams) -> Vec<Seed> {
 /// (only one byte of normalised code and one byte of exact hash per token are kept until
 /// matching ends), then every file with a candidate clone once more for line numbers. Runs on
 /// the current rayon pool; deterministic.
-pub fn find_clones<R>(mut fps: Fingerprints, params: &DupesParams, read: R) -> DupesReport
+pub fn find_clones<R>(fps: Fingerprints, params: &DupesParams, read: R) -> DupesReport
 where
     R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
 {
     let mut stats = DupesStats { fingerprints: fps.len() as u64, ..DupesStats::default() };
     let nfiles = fps.iter().map(|f| f.file as usize + 1).max().unwrap_or(0);
     let seeds = timing::time("dupes.seeds", || {
-        fps.rows.par_sort_unstable();
-        let mut seeds = make_seeds(&fps, params);
+        let mut keyed = keyed(&fps);
         drop(fps);
+        let mut seeds = make_seeds(&mut keyed, params);
+        drop(keyed);
         seeds.par_sort_unstable_by_key(|s| (s.a_file, s.b_file, s.diag(), s.a_pos));
+        // Both contexts may seed the same pair.
+        seeds.dedup();
+        seeds.shrink_to_fit();
         seeds
     });
     stats.seeds = seeds.len() as u64;
@@ -300,8 +378,9 @@ fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut 
             }
             if let Some(seg) = extend(a, b, same_file, s.a_pos, s.b_pos, params.k()) {
                 extended += 1;
+                // The cover is the untrimmed extent, so no seed re-extends a trimmed tail.
                 cover = Some((s.diag(), seg.a0, seg.a1));
-                segs.push(seg);
+                split(seg, a, b, segs);
             }
         }
         chain_segments(segs, chains, same_file);
@@ -321,10 +400,10 @@ fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut 
 }
 
 /// Verifies a seed (`k` equal codes at `pa` / `pb`) and extends it to the maximal run of equal
-/// codes on its diagonal. `a` / `b` are (codes, exact hashes). In one file (`pa < pb`) the
-/// copies may not overlap.
+/// codes on its diagonal (`same` is not counted yet, see [`split`]). `a` / `b` are (codes,
+/// exact hashes). In one file (`pa < pb`) the copies may not overlap.
 fn extend(a: (&[u8], &[u8]), b: (&[u8], &[u8]), same_file: bool, pa: u32, pb: u32, k: u32) -> Option<Segment> {
-    let ((ca, ea), (cb, eb)) = (a, b);
+    let ((ca, _), (cb, _)) = (a, b);
     let (na, nb) = (ca.len() as u32, cb.len() as u32);
     // Longest allowed run: the copies of one file may not overlap.
     let max_len = if same_file { pb - pa } else { u32::MAX };
@@ -344,10 +423,62 @@ fn extend(a: (&[u8], &[u8]), b: (&[u8], &[u8]), same_file: bool, pa: u32, pb: u3
         a1 += 1;
         b1 += 1;
     }
-    let ea = &ea[a0 as usize..a1 as usize];
-    let eb = &eb[b0 as usize..b1 as usize];
-    let same = ea.iter().zip(eb).filter(|(x, y)| x == y).count() as u32;
-    Some(Segment { a0, a1, b0, b1, same })
+    Some(Segment { a0, a1, b0, b1, same: 0 })
+}
+
+/// Splits an extended segment around its noise: runs of at least two [`TRIM_BLOCK`]-token
+/// blocks that are [`boilerplate`] and not identical in both copies. Each remaining piece is
+/// pushed to `out` with its identical tokens counted. Code is often next to data of the same
+/// shape (a table after its accessor class): the extension runs through the table, and
+/// without splitting the whole run, code included, would be rejected as data. Single noisy
+/// blocks stay (a short list of like statements inside a function is code).
+fn split(seg: Segment, a: (&[u8], &[u8]), b: (&[u8], &[u8]), out: &mut Vec<Segment>) {
+    let ((ca, ea), (_, eb)) = (a, b);
+    // Position in B of position `i` in A (the segment is one diagonal).
+    let in_b = |i: u32| i - seg.a0 + seg.b0;
+    let mut piece = |lo: u32, hi: u32| {
+        let (ra, rb) = (lo as usize..hi as usize, in_b(lo) as usize..in_b(hi) as usize);
+        let same = ea[ra].iter().zip(&eb[rb]).filter(|(x, y)| x == y).count() as u32;
+        out.push(Segment { a0: lo, a1: hi, b0: in_b(lo), b1: in_b(hi), same });
+    };
+    let len = seg.a1 - seg.a0;
+    if len < 2 * TRIM_BLOCK {
+        piece(seg.a0, seg.a1);
+        return;
+    }
+    // Blocks of TRIM_BLOCK tokens from a0; the last one takes the remainder.
+    let nblocks = len / TRIM_BLOCK;
+    let block = |i: u32| {
+        let s = seg.a0 + i * TRIM_BLOCK;
+        (s, if i + 1 == nblocks { seg.a1 } else { s + TRIM_BLOCK })
+    };
+    let noisy = |i: u32| {
+        let (s, e) = block(i);
+        let (ra, rb) = (s as usize..e as usize, in_b(s) as usize..in_b(e) as usize);
+        ea[ra.clone()] != eb[rb] && boilerplate(&ca[ra])
+    };
+    // Start of the current piece, and of the current run of noisy blocks.
+    let mut start = Some(seg.a0);
+    let mut run: Option<u32> = None;
+    for i in 0..=nblocks {
+        let n = i < nblocks && noisy(i);
+        match (n, run) {
+            (true, None) => run = Some(i),
+            (false, Some(r)) => {
+                if i - r >= 2 {
+                    if let Some(st) = start.filter(|&st| st < block(r).0) {
+                        piece(st, block(r).0);
+                    }
+                    start = (i < nblocks).then(|| block(i).0);
+                }
+                run = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        piece(st, seg.a1);
+    }
 }
 
 /// Per-thread buffers of [`locate`].

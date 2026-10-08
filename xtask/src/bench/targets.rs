@@ -512,6 +512,8 @@ fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let (ix, fps) = load_with(inputs, &LoadOptions { dupes: Some(params) });
     let fps = fps.context("fingerprints were requested")?;
     let (nfps, fps_bytes) = (fps.len() as u64, fps.heap_bytes() as u64);
+    // Peak so far: matching's own cost is the run's peak RSS minus this.
+    let load_peak = rusage::peak_rss_bytes().context("getrusage")?;
     let mut findings = Findings::new();
     let report = dupes::analyse(&ix, fps, &params, &mut findings);
     let s = ix.stats();
@@ -520,6 +522,7 @@ fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let dup_lines: u64 = report.members.iter().map(|m| u64::from(m.lines())).sum();
     let counters = vec![
         ("loc".to_owned(), s.lines),
+        ("load_peak_rss_mb".to_owned(), load_peak / 1_000_000),
         ("fingerprints".to_owned(), nfps),
         ("fingerprints_kb".to_owned(), fps_bytes / 1000),
         ("seeds".to_owned(), r.seeds),
@@ -728,7 +731,7 @@ mod tests {
             } else if target == Target::Dupes {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
                 assert_eq!(names, [
-                    "loc", "fingerprints", "fingerprints_kb", "seeds", "extended", "files_reread", "bytes_reread_kb",
+                    "loc", "load_peak_rss_mb", "fingerprints", "fingerprints_kb", "seeds", "extended", "files_reread", "bytes_reread_kb",
                     "pairs", "copies", "groups", "duplicated_lines", "findings"
                 ]);
                 assert!(counter("fingerprints").unwrap() > 0);

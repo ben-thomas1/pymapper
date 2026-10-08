@@ -56,6 +56,7 @@ entered, and symlinks are not followed.
 | `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
+| `dupes`      | `walk`, `load.*`, `dupes.seeds`, `dupes.relex`, `dupes.extend`, `dupes.locate`, `dupes.group` | `load` with duplication fingerprints taken in the extraction pass (`index::load_with`, every file first-party), then `analysis::dupes::analyse` with the default thresholds. Counters: `load_peak_rss_mb` (peak RSS before matching: matching's own cost is the run's peak minus this), `fingerprints`, `fingerprints_kb`, `seeds`, `extended`, `files_reread`, `bytes_reread_kb`, `pairs`, `copies`, `groups`, `duplicated_lines`, `findings` |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -448,6 +449,59 @@ to about one chunk per thread. Without the reservation the global columns grow b
 and macOS malloc keeps freed blocks up to 8 MiB resident. Reserving 1.5x the extrapolated
 size once 1/16 of the chunks are in avoids most of that. Overshoot is untouched virtual
 memory, which the final `shrink_to_fit` releases.
+
+### Duplication (S4.3d)
+
+`dupes` target vs `load` (same session): fingerprints are taken in the loader's extraction
+pass, then `analysis::dupes` matches them with the default thresholds (`dupes-min-tokens = 50`,
+`dupes-min-lines = 6`). Every corpus file counts as first-party, so the venv row is a stress
+test (17M LOC, 7.3M of them in reported copies: vendored packages). 14-core M4 Pro, release,
+warm cache, best of 3 (RSS worst of 3); load average about 3-5 from other worktrees.
+
+| corpus | target  | threads | load.extract | seeds  | relex  | extend | locate | group  | total   | peak RSS MB |
+|--------|---------|---------|--------------|--------|--------|--------|--------|--------|---------|-------------|
+| stdlib | `load`  | 14      | 33.5ms       | -      | -      | -      | -      | -      | 41.1ms  | 28.3        |
+| stdlib | `dupes` | 14      | 35.1ms       | 2.26ms | 20.8ms | 0.66ms | 12.2ms | 0.16ms | 79.1ms  | 40.6        |
+| stdlib | `load`  | 1       | 158.8ms      | -      | -      | -      | -      | -      | 175.8ms | 19.6        |
+| stdlib | `dupes` | 1       | 172.9ms      | 7.10ms | 92.3ms | 1.70ms | 60.8ms | 0.15ms | 352.8ms | 30.3        |
+| venv   | `load`  | 14      | 2.10s        | -      | -      | -      | -      | -      | 3.08s   | 492.5       |
+| venv   | `dupes` | 14      | 2.11s        | 95.5ms | 1.59s  | 51.6ms | 1.22s  | 42.5ms | 6.19s   | 870.3       |
+
+Counters: stdlib 137,776 fingerprints (1.65 MB), 19,570 seeds, 1,290 file re-reads (26.5 MB),
+1,649 pairs, 1,945 copies in 761 groups (51k lines). Venv 4.71M fingerprints (56.5 MB), 2.52M
+seeds, 85,769 re-reads (1.22 GB), 373k pairs, 158k copies in 41k groups.
+
+- **Off**: zero cost (the loader's extraction loop is monomorphised without the visitor).
+- **Extraction** (on): +1.6 ms on stdlib with 14 threads (+5%), +14 ms on one thread (+9%),
+  within noise on the venv. 12 B per fingerprint retained, about one fingerprint per 16
+  normalised tokens (3.2 LOC on stdlib): 3.8 B/LOC, 3.3 B/LOC on the venv.
+- **Matching time** is dominated by the two re-reads (`relex`, `locate`), which are I/O-bound
+  like `read`; seeding, extension and grouping together are 7 us/kLOC (stdlib) to 11 us/kLOC
+  (venv). stdlib: +38 ms (+92% over `load`); venv: +3.1 s (+101%).
+- **Matching memory**: the peak is in extension, `load_peak_rss_mb` + 2 B per token of the
+  files with seeds (normalised code + exact hash) + 16 B per seed. Seeding transiently holds
+  12 + 20 B per fingerprint. Venv: load peak 555 MB, 704 MB after seeding, 829 MB after
+  re-lexing, 870 MB at the end (+315 MB). stdlib: 32 -> 41 MB.
+
+Design choices measured on stdlib (counters `copies`, `duplicated_lines`, `seeds`):
+
+| seeding of large buckets (> 8 occurrences of a hash)             | copies | lines  | seeds       |
+|------------------------------------------------------------------|--------|--------|-------------|
+| every pair (reference, quadratic)                                 | 1959   | 57,486 | 199,865,146 |
+| star from the first occurrence (salvaged WIP)                     | 1832   | 53,432 | 64,187      |
+| ... plus runs of close hits in one file seed once                 | 1829   | 53,200 | 17,842      |
+| paths by next-fingerprint context                                  | 1851   | 53,574 | 17,670      |
+| paths by next and previous context                                 | 1857   | 53,765 | 19,570      |
+| ... plus splitting differing data out of matches (shipped)         | 1945   | 51,165 | 19,570      |
+
+Every-pair seeding takes 3.1 s and 3.3 GB on stdlib. With splitting on in both, it finds 2022
+copies to our 1945; the lines only it covers are almost all data tables (`encodings/*`,
+`idna/uts46data.py`) and runs of like entries shorter than `min_tokens` (`pickletools` opcode
+table, `Decimal` context methods). Without the run compression, a
+synthetic pair of 30k-token periodic tables took 1.5 s (quadratic: one diagonal per hit);
+with it 9.5 ms. Splitting found the codec classes of the `encodings` modules, which were
+previously lost because each match ran on into the differing mapping tables and was then
+rejected as data (it reports fewer lines because those tables are no longer counted).
 
 ### Output (S4.4)
 
