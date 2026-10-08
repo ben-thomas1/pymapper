@@ -254,6 +254,29 @@ fn corpus_invariants_and_determinism() {
     assert!(ix.heap_bytes() > 0);
 }
 
+/// Real-world determinism and invariants: the stdlib (`PYMAPPER_STDLIB`, else the default path
+/// of docs/design.md) loaded on 1 and on many threads must give identical indexes. Slow in
+/// debug builds: `cargo test --release -p pymapper-core stdlib_ -- --ignored`.
+#[test]
+#[ignore]
+fn stdlib_deterministic_and_consistent() {
+    let root = std::env::var_os("PYMAPPER_STDLIB").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("/Users/bt386671/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13")
+    });
+    if !root.is_dir() {
+        eprintln!("skipping: {} not found", root.display());
+        return;
+    }
+    let many = load_dir_threads(&root, 14);
+    check_invariants(&many);
+    // Spot checks when the root is a stdlib (the variable may point at any tree).
+    if many.module_node(b"json.decoder", 0).is_some() {
+        assert!(many.find(b"json.decoder:JSONDecoder.decode").is_some());
+        assert!(many.find(b"collections:OrderedDict").is_some());
+    }
+    assert_eq!(dump(&load_dir_threads(&root, 1)), dump(&many));
+}
+
 #[test]
 fn module_names_from_root_dir() {
     let t = TempDir::new("names");
