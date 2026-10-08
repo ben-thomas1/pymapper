@@ -145,13 +145,14 @@
 # ---------------------------------------------------------------------------------------------
 # Rules
 # ---------------------------------------------------------------------------------------------
-# Rules are identified by codes `PMxxx`. Selectors are code prefixes: "ALL", "PM", "PM1",
-# "PM10", "PM101". When a rule matches both a select and an ignore selector, the more specific
-# selector wins; on a tie, ignore wins. Rules whose cost class is "expensive" also need their
-# analysis toggle (see [analysis]) to run.
+# Rules are identified by codes `PMxxx` (reference: docs/rules.md). Selectors are code
+# prefixes: "ALL", "PM", "PM1", "PM10", "PM101". When a rule matches both a select and an ignore
+# selector, the more specific selector wins; on a tie, ignore wins. Rules whose cost class is
+# "expensive" also need their analysis toggle (see [analysis]) to run; turning the toggle on is
+# enough to enable them unless they are ignored.
 [rules]
 
-# Rules to enable. Unset = the default rule set (every non-expensive rule).
+# Rules to enable. Unset = the default rule set (the rules marked "on" in docs/rules.md).
 # (CLI: `--select`, replaces this list.)
 #   select = ["PM1", "PM2"]
 # cost: each enabled rule declares its own cost class (O(n), O(V+E) or expensive).
