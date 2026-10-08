@@ -1,0 +1,12 @@
+::warning title=PM301 import-cycle::import cycle: pkg.alpha -> pkg.zeta -> pkg.alpha
+::warning title=PM602 unused-dependency::dependency `requests` is declared but never imported
+::warning file=odd dir/a%2Cb%3Ac%25d"e.py,line=1,col=1,title=PM401 unused-function::function `odd:f` is never used (confidence 60)
+::notice file=pkg/__init__.py,title=PM107 long-module::module `pkg` is 900 lines long (> 500)
+::error file=pkg/alpha.py,line=3,col=1,title=PM303 forbidden-import::`pkg.alpha` imports forbidden module `we"ird%0Aname` (contract `core-layers`)
+::warning file=pkg/alpha.py,line=3,col=1,title=PM405 unused-import::`os.path` is imported but never used (confidence 90)
+::warning file=pkg/alpha.py,line=3,col=1,title=PM405 unused-import::`yaml` is imported but never used (confidence 90)
+::notice file=pkg/alpha.py,line=20,col=5,title=PM106 low-maintainability::`pkg.alpha:Big.run` has a low maintainability index (12.2 < 20.0)
+::error file=pkg/café/�.py,line=2,title=PM601 undeclared-dependency::`yaml` is provided by `PyYAML`, which is not a declared dependency
+::warning file=pkg/zeta.py,line=12,col=5,title=PM101 complex-function::`pkg.zeta:handle` is too complex (McCabe 14 > 10)
+Found 10 findings in 5 files (1 below min-confidence 80; 42 files checked).
+Not shown: 1 suppressed, 3 ignored by per-file-ignores, 1 below min-confidence.

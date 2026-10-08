@@ -1,0 +1,12 @@
+PM301 import cycle: pkg.alpha -> pkg.zeta -> pkg.alpha
+PM602 dependency `requests` is declared but never imported
+odd dir/a,b:c%d"e.py:1:1: PM401 function `odd:f` is never used (confidence 60)
+pkg/__init__.py: PM107 module `pkg` is 900 lines long (> 500)
+pkg/alpha.py:3:1: PM303 `pkg.alpha` imports forbidden module `we"ird name` (contract `core-layers`)
+pkg/alpha.py:3:1: PM405 `os.path` is imported but never used (confidence 90)
+pkg/alpha.py:3:1: PM405 `yaml` is imported but never used (confidence 90)
+pkg/alpha.py:20:5: PM106 `pkg.alpha:Big.run` has a low maintainability index (12.2 < 20.0)
+pkg/café/�.py:2: PM601 `yaml` is provided by `PyYAML`, which is not a declared dependency
+pkg/zeta.py:12:5: PM101 `pkg.zeta:handle` is too complex (McCabe 14 > 10)
+Found 10 findings in 5 files (1 below min-confidence 80; 42 files checked).
+Not shown: 1 suppressed, 3 ignored by per-file-ignores, 1 below min-confidence.
