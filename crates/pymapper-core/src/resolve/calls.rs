@@ -375,6 +375,8 @@ pub(super) struct Names {
     pub new: Option<Sym>,
     pub call: Option<Sym>,
     pub getattr: Option<Sym>,
+    pub class_: Option<Sym>,
+    pub metaclass: Option<Sym>,
     pub object: Option<Sym>,
     /// Base names that add nothing callable (`Generic[T]`, `Protocol`, `ABC`).
     pub markers: [Option<Sym>; 3],
@@ -389,6 +391,8 @@ impl Names {
             new: g(b"__new__"),
             call: g(b"__call__"),
             getattr: g(b"__getattr__"),
+            class_: g(b"__class__"),
+            metaclass: g(b"metaclass"),
             object: g(b"object"),
             markers: [g(b"Generic"), g(b"Protocol"), g(b"ABC")],
         }
@@ -514,7 +518,10 @@ fn class_bases(cx: &Cx<'_>) -> (Vec<ClassId>, Vec<u32>, Vec<u8>) {
             let before = out.bases.len();
             let mut fl = 0;
             for row in fv.bases(d) {
-                if st.bases.keyword[row].is_some() {
+                if let Some(kw) = st.bases.keyword[row] {
+                    if Some(kw) == cx.names.metaclass {
+                        fl |= class_flags::METACLASS;
+                    }
                     continue;
                 }
                 let chain = fv.base_chain(row);
@@ -662,6 +669,9 @@ fn resolve_site(
                     && subclass_edges(cx, methods, c, chain[1], sink)
                 {
                     return (Confidence::Likely, Reason::SubclassMethod);
+                } else if chain.len() > 2 && first.val == Val::Unknown(Reason::MissingAttr) {
+                    // `self.x.m()` with `x` set from elsewhere (a subclass, a caller).
+                    first = R::unknown(Reason::Variable);
                 }
                 cx.attrs(loc, first, &chain[2..], 0)
             }
@@ -734,7 +744,9 @@ fn finish(
         Val::Module(_) => (Confidence::Unresolved, Reason::NotCallable),
         Val::Unknown(why) => {
             let attr_call = s.chain.len() >= 2 || (s.recv == Receiver::Unknown && !s.chain.is_empty());
-            if !attr_call || !matches!(why, Reason::Parameter | Reason::Variable | Reason::UnknownReceiver) {
+            // `NotFound` heads are mostly comprehension targets and lambda parameters.
+            let unknown = matches!(why, Reason::Parameter | Reason::Variable | Reason::UnknownReceiver | Reason::NotFound);
+            if !attr_call || !unknown {
                 return (Confidence::Unresolved, why);
             }
             let Some(&name) = s.chain.last() else { return (Confidence::Unresolved, why) };

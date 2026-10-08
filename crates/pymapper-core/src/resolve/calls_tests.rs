@@ -803,3 +803,95 @@ class B:
     }
     assert!(fx.calls.heap_bytes() > 0);
 }
+
+#[test]
+fn object_attributes_metaclasses_and_unknown_heads() {
+    let src = "\
+from abc import ABCMeta
+
+class Base:
+    def copy(self):
+        return self.__class__()
+
+class Child(Base):
+    def __init__(self):
+        super().__init__()
+        self.widget.configure()
+        self.widget.only_here()
+
+class Meta(metaclass=ABCMeta):
+    pass
+
+class Other:
+    def only_here(self):
+        pass
+
+def use(ks):
+    Meta.register(int)
+    return [k.lower() for k in ks] + [k.only_here() for k in ks]
+";
+    let fx = cfx(&[("mod.py", src), ("star.py", "from _unloaded import *\n\nlen([])\nunknown_name()\n")]);
+    assert_eq!(fx.out("mod:Base.copy"), ["mod:Base likely constructor"]);
+    assert_eq!(fx.row("mod", "__init__"), "unresolved builtin");
+    // `self.widget` is set elsewhere: the receiver is unknown, so the fallback applies.
+    assert_eq!(fx.row("mod", "self.widget.configure"), "unresolved variable");
+    assert_eq!(fx.row("mod", "self.widget.only_here"), "possible unique-method");
+    assert_eq!(fx.row("mod", "Meta.register"), "unresolved external-base");
+    // A star import of unloaded code does not hide the builtins (but may bind other names).
+    assert_eq!(fx.row("star", "len"), "unresolved builtin");
+    assert_eq!(fx.row("star", "unknown_name"), "unresolved dynamic");
+    assert_eq!(fx.row("mod", "k.lower"), "unresolved builtin-method");
+    assert_eq!(fx.row("mod", "k.only_here"), "possible unique-method");
+}
+
+/// The stdlib as one root (`PYMAPPER_STDLIB` overrides the path). Prints the outcome shares;
+/// `PYMAPPER_DEBUG_CALLS=<reason>` also prints the most common chains with that reason.
+#[test]
+#[ignore = "needs a local CPython stdlib"]
+fn stdlib_calls_resolve() {
+    let root = std::env::var_os("PYMAPPER_STDLIB").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("/Users/bt386671/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13")
+    });
+    if !root.is_dir() {
+        eprintln!("skipping: {} not found", root.display());
+        return;
+    }
+    let w = walk(&[root.as_path()], &WalkOptions::everything());
+    let ix = load(Inputs::from_root_dir(&root, &w.files, Origin::Stdlib, b"stdlib"));
+    let mut attr = Attribution::new();
+    attr.add_stdlib_dir(&root);
+    let imp = resolve_imports(&ix, &attr);
+    let calls = resolve_calls(&ix, &imp);
+    let st = calls.stats();
+    eprintln!("calls {} edges {} classes {} incomplete {} no-c3 {}", st.calls, st.edges, st.classes, st.incomplete_classes, st.no_c3);
+    for c in 0..4u8 {
+        eprintln!("  {:<10} {:>6.1}%", Confidence::from_u8(c).as_str(), st.by_conf[c as usize] as f64 * 100.0 / st.calls as f64);
+    }
+    for r in 0..Reason::COUNT as u8 {
+        let n = st.by_reason[r as usize];
+        if n > 0 {
+            eprintln!("  {:<18} {:>6.1}%  edges {}", Reason::from_u8(r).as_str(), n as f64 * 100.0 / st.calls as f64, st.edges_by_reason[r as usize]);
+        }
+    }
+    if let Some(only) = std::env::var_os("PYMAPPER_DEBUG_CALLS") {
+        let only = only.to_string_lossy().into_owned();
+        let mut hist: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for f in 0..ix.file_count() {
+            let fv = ix.file_view(f);
+            for row in ix.file_facts(f).calls.range() {
+                if calls.call(row).1.as_str() != only {
+                    continue;
+                }
+                let chain: Vec<String> = fv.call_chain(row).iter().map(|&s| String::from_utf8_lossy(ix.str(s)).into_owned()).collect();
+                let recv = format!("{:?}", ix.facts().calls.receiver(row));
+                *hist.entry(format!("{recv} {}", chain.join("."))).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(String, u32)> = hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (k, n) in v.iter().take(40) {
+            eprintln!("  {n:>6} {k}");
+        }
+    }
+    assert!(st.by_conf[Confidence::Certain as usize] > 0);
+}

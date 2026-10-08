@@ -39,6 +39,9 @@ pub mod class_flags {
     pub const NO_C3: u8 = 1 << 1;
     /// The class body or a method assigns `__getattr__` / defines it (attributes are dynamic).
     pub const GETATTR: u8 = 1 << 2;
+    /// The class or a base has a `metaclass=` keyword: class-level attributes may come from
+    /// the metaclass.
+    pub const METACLASS: u8 = 1 << 3;
 }
 
 /// Every class of an index: struct of arrays indexed by [`ClassId`].
@@ -246,7 +249,7 @@ impl Classes {
                     let off = self.mro_off[b as usize] as usize;
                     lin.add(&self.mro[off..off + self.mro_len[b as usize] as usize], b);
                     // Bases are final: inherit what makes their attributes uncertain.
-                    self.flags[ci] |= self.flags[b as usize] & (class_flags::INCOMPLETE | class_flags::GETATTR);
+                    self.flags[ci] |= self.flags[b as usize] & (class_flags::INCOMPLETE | class_flags::GETATTR | class_flags::METACLASS);
                 }
                 let ok = lin.merge();
                 if cyclic || !ok {

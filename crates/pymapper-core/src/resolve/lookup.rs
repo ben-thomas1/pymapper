@@ -210,11 +210,16 @@ impl Cx<'_> {
 
     /// Applies attribute steps `segs` to `r`.
     pub fn attrs(&self, loc: &Locals, mut r: R, segs: &[Sym], depth: u8) -> R {
-        for &seg in segs {
+        for (i, &seg) in segs.iter().enumerate() {
             if matches!(r.val, Val::Unknown(_)) {
                 break;
             }
+            let on_object = matches!(r.val, Val::Instance(_) | Val::Def(_));
             r = self.attr(loc, r, seg, depth);
+            if on_object && i + 1 < segs.len() && r.val == Val::Unknown(Reason::MissingAttr) {
+                // An attribute set from elsewhere (a subclass, a caller): its value is unknown.
+                r = R::unknown(Reason::Variable);
+            }
         }
         r
     }
@@ -300,10 +305,14 @@ impl Cx<'_> {
             Some(e) if e.base() == nskind::IMPORT => return self.import_row(loc, e.r as usize, depth),
             _ => {}
         }
-        if let Some(g) = self.imp.global(ix, f, name) {
-            return self.global_val(g);
+        let is_builtin = builtins && self.tables.builtins.contains(name);
+        match self.imp.global(ix, f, name) {
+            // A star import of unresolved code could bind anything; builtins win.
+            Some(Global::Dynamic) if is_builtin => return R::unknown(Reason::Builtin),
+            Some(g) => return self.global_val(g),
+            None => {}
         }
-        if builtins && self.tables.builtins.contains(name) {
+        if is_builtin {
             return R::unknown(Reason::Builtin);
         }
         if self.imp.ns.is_dynamic(f) {
@@ -449,11 +458,18 @@ impl Cx<'_> {
             let r = self.member(loc, k, m, depth);
             return if i > 0 && cl.flags(c) & class_flags::INCOMPLETE != 0 { r.worst(Confidence::Likely) } else { r };
         }
+        if instance && Some(seg) == self.names.class_ {
+            // `self.__class__(...)`: the class itself, or a subclass.
+            return R::new(Val::Def(cl.node(c)), Confidence::Likely, Reason::ClassAttr);
+        }
         let fl = cl.flags(c);
         if fl & class_flags::GETATTR != 0 {
             R::unknown(Reason::Dynamic)
-        } else if fl & class_flags::INCOMPLETE != 0 {
+        } else if fl & class_flags::INCOMPLETE != 0 || (!instance && fl & class_flags::METACLASS != 0) {
             R::unknown(Reason::ExternalBase)
+        } else if is_dunder(self.ix.str(seg)) {
+            // Inherited from `object` (`__init__`, `__repr__`, `__init_subclass__`, ...).
+            R::unknown(Reason::Builtin)
         } else {
             R::unknown(Reason::MissingAttr)
         }
@@ -469,6 +485,12 @@ impl Cx<'_> {
             None => R::unknown(Reason::Variable),
         }
     }
+}
+
+/// `__name__`.
+#[inline]
+fn is_dunder(s: &[u8]) -> bool {
+    s.len() > 4 && s.starts_with(b"__") && s.ends_with(b"__")
 }
 
 /// The member a lookup uses among the bindings of one name in one class: a def, else (on
