@@ -161,6 +161,10 @@ impl Visitor for Rec<'_> {
     fn lambda_exit(&mut self, end: u32) {
         self.out.push(format!("}} lambda {end}"));
     }
+    fn type_alias(&mut self, name: Token, tps: &[Token], pos: Pos) {
+        let n = self.t(name);
+        self.out.push(format!("type {n} [{}] L{}", tps.iter().map(|&t| self.t(t)).collect::<Vec<_>>().join(","), pos.line));
+    }
     fn diagnostic(&mut self, d: &Diagnostic) {
         let t = self.t(d.token);
         self.out.push(format!("diag {:?} {}:{} {t}", d.kind, d.pos.line, d.pos.col));
@@ -457,4 +461,76 @@ fn python2_statements() {
     assert_eq!(e[2], "diag Python2 3:0 exec");
     assert_eq!(e[3], "call print None 4:0");
     assert_eq!(e.len(), 4);
+}
+
+#[test]
+fn match_statement() {
+    let src = "match command.split():\n    case [action]:\n        pass\n    case Point(x=0, y=y) if y > 0:\n        go()\n    case {'k': v, **rest}:\n        pass\n    case _:\n        pass\n";
+    assert_eq!(blocks(src), "Match{ Case{ }Case Case guarded{ }Case Case{ }Case Case irrefutable{ }Case }Match");
+    let e = events(src);
+    assert!(e.contains(&"} Case L9 last".to_string()), "{e:?}");
+    assert_eq!(e.iter().filter(|x| x.ends_with(" last")).count(), 1);
+    // Class patterns are not calls; keyword patterns are not keyword args.
+    assert_eq!(only(src, &["call", "kw"]), "call command.split Dotted 1:6\ncall go None 5:8");
+}
+
+#[test]
+fn case_irrefutability() {
+    let irr = |pat: &str| {
+        let src = format!("match x:\n    case {pat}:\n        pass\n");
+        let e = events(&src);
+        assert!(!e.iter().any(|l| l.starts_with("diag")), "{pat}: {e:?}");
+        e.iter().any(|l| l.contains("irrefutable"))
+    };
+    assert!(irr("_"));
+    assert!(irr("y"));
+    assert!(irr("(y)"));
+    assert!(irr("((_))"));
+    assert!(irr("1 | _"));
+    assert!(irr("(1 | y)"));
+    assert!(!irr("_ as y"));
+    assert!(!irr("a.b"));
+    assert!(!irr("1"));
+    assert!(!irr("[_]"));
+    assert!(!irr("(a, b)"));
+    assert!(!irr("C()"));
+    assert!(irr("(a) | (b, c)"));
+}
+
+#[test]
+fn match_as_identifier() {
+    let src = "match = 1\nmatch.x = 2\nmatch(a, b)\nmatch[0]: int = 1\nprint(match)\nmatch, case = 1, 2\ncase = 3\nmatch -x:\n    case 1: pass\n";
+    let e = events(src);
+    assert_eq!(blocks(src), "Match{ Case{ }Case }Match", "{e:?}");
+    assert!(e.contains(&"call match None 3:0".to_string()));
+    assert!(e.contains(&"assign Plain match = other L1".to_string()));
+}
+
+#[test]
+fn match_subject_forms() {
+    assert_eq!(blocks("match (a, b):\n    case (1, 2): pass\n"), "Match{ Case{ }Case }Match");
+    assert_eq!(blocks("match *a, b:\n    case _: pass\n"), "Match{ Case irrefutable{ }Case }Match");
+    assert_eq!(blocks("match {1: 2}[k]:\n    case 1: pass\n"), "Match{ Case{ }Case }Match");
+    assert_eq!(blocks("match lambda: 1:\n    case 1: pass\n"), "lambda {{ }lambda Match{ Case{ }Case }Match");
+    // Long subject (beyond the 4-token ring buffer).
+    assert_eq!(blocks("match a.b.c.d(e, f, g)[h]:\n    case 1: pass\n"), "Match{ Case{ }Case }Match");
+    // Nested match inside a case body, inside a def.
+    let src = "def f():\n    match x:\n        case 1:\n            match y:\n                case 2: pass\n        case _: pass\n    return 1\n";
+    assert_eq!(blocks(src), "Match{ Case{ Match{ Case{ }Case }Match }Case Case irrefutable{ }Case }Match");
+}
+
+#[test]
+fn type_alias_statement() {
+    let src = "type X = int\ntype Pair[T] = tuple[T, T]\ntype = 1\ntype(x)\nprint(type)\n";
+    assert_eq!(only(src, &["type", "assign", "call"]), "type X [] L1\ntype Pair [T] L2\nassign Plain type = other L3\ncall type None 4:0\ncall print None 5:0");
+}
+
+#[test]
+fn parenthesized_with_items() {
+    let src = "with (open(a) as f, open(b) as g):\n    pass\nwith (a, b) as c: pass\nwith (\n    x as y,\n    z,\n): pass\nwith (a): pass\n";
+    assert_eq!(
+        only(src, &["assign", "With", "diag"]),
+        "assign AsTarget f as none L1\nassign AsTarget g as none L1\nWith @1:0 {\nassign AsTarget c as none L3\nWith @3:0 {\n\
+         assign AsTarget y as none L5\nWith @4:0 {\nWith @8:0 {"
+    );
 }

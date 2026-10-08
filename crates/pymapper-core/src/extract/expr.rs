@@ -234,6 +234,9 @@ impl<V: Visitor> Parser<'_, V> {
             if self.collect {
                 self.target_step(&mut s, t);
             }
+            if self.pattern {
+                self.tgt.push(t);
+            }
             if k == K::Name && s.post != Post::Dot && self.keyword_arg_at(&mut s, t) {
                 continue;
             }
@@ -273,7 +276,14 @@ impl<V: Visitor> Parser<'_, V> {
         if !(l.call && l.lambdas == 0 && matches!(s.prev, K::LPar | K::Comma)) || self.kind(1) != K::Equal {
             return false;
         }
-        self.v.keyword_arg(t);
+        if !self.pattern {
+            self.v.keyword_arg(t);
+        }
+        if self.pattern {
+            // `t` itself was recorded by the caller.
+            let eq = self.peek(1);
+            self.tgt.push(eq);
+        }
         self.bump();
         self.bump();
         s.prev = K::Equal;
@@ -349,9 +359,11 @@ impl<V: Visitor> Parser<'_, V> {
                         (ChainBase::SelfName, _) => Receiver::SelfAttr,
                         (ChainBase::ClsName, _) => Receiver::ClsAttr,
                     };
-                    let first = self.chain.first().copied().unwrap_or(t);
-                    let pos = self.pos(first.start);
-                    self.v.call(&Call { names: &self.chain, receiver, lpar: t, pos });
+                    if !self.pattern {
+                        let first = self.chain.first().copied().unwrap_or(t);
+                        let pos = self.pos(first.start);
+                        self.v.call(&Call { names: &self.chain, receiver, lpar: t, pos });
+                    }
                 }
                 s.impure += call as u32;
                 self.levels.push(Level { call, super_call, impure: call, ..Level::default() });
@@ -666,11 +678,5 @@ impl<V: Visitor> Parser<'_, V> {
         for r in &self.tgt_recs {
             self.names.push(self.tgt[(r.start + r.len - 1) as usize]);
         }
-    }
-
-    /// At `(` after `with`: whether it opens parenthesised with-items
-    /// (`with (a as b, c):`) rather than an expression (`with (a, b) as c:`).
-    pub(super) fn parenthesized_with_items(&mut self) -> bool {
-        false
     }
 }

@@ -80,6 +80,8 @@ pub struct Parser<'src, V: Visitor> {
     pub(super) tgt: Vec<Token>,
     pub(super) tgt_recs: Vec<TargetRec>,
     pub(super) tgt_unpack: bool,
+    /// Scanning a case pattern: no call/keyword events; tokens go to `tgt`.
+    pub(super) pattern: bool,
     pub(super) diag_count: u32,
 }
 
@@ -109,6 +111,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
             tgt: Vec::new(),
             tgt_recs: Vec::new(),
             tgt_unpack: false,
+            pattern: false,
             diag_count: 0,
         }
     }
@@ -186,6 +189,43 @@ impl<'src, V: Visitor> Parser<'src, V> {
     #[inline]
     pub(super) fn eat(&mut self, kind: TokenKind) -> Option<Token> {
         if self.at(kind) { Some(self.bump()) } else { None }
+    }
+
+    /// Unbounded lookahead within the current logical line: feeds `f` the
+    /// tokens from the current one onwards (buffered tokens first, then fresh
+    /// ones from the lexer) until it returns a decision, then rewinds the
+    /// lexer to a checkpoint so nothing is consumed. Stops with `false` at the
+    /// end of the logical line (NEWLINE is offered to `f` first) or at
+    /// INDENT/DEDENT/EOF. Error tokens are skipped silently (they are reported
+    /// when actually consumed).
+    pub(super) fn rescan(&mut self, mut f: impl FnMut(Token) -> Option<bool>) -> bool {
+        use TokenKind as K;
+        for i in 0..self.len {
+            let t = self.buf[(self.head + i) & RING_MASK];
+            if let Some(r) = f(t) {
+                return r;
+            }
+            if matches!(t.kind, K::Newline | K::EndOfFile | K::Indent | K::Dedent) {
+                return false;
+            }
+        }
+        // The checkpoint is the state right after the last buffered token. The
+        // scan never passes a NEWLINE, so the indent stack is untouched.
+        let cp = self.lx.checkpoint();
+        let r = loop {
+            let t = self.lx.next_token();
+            if t.kind.is_error() {
+                continue;
+            }
+            if let Some(r) = f(t) {
+                break r;
+            }
+            if matches!(t.kind, K::Newline | K::EndOfFile | K::Indent | K::Dedent) {
+                break false;
+            }
+        };
+        self.lx.restore(cp);
+        r
     }
 
     /// Drops the buffered lookahead and the lexer's open brackets, resuming at

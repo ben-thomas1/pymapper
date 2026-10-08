@@ -9,6 +9,7 @@ mod defs;
 pub mod events;
 mod expr;
 pub mod parser;
+mod soft;
 mod stmt;
 
 #[cfg(test)]

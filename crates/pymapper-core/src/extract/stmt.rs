@@ -20,7 +20,7 @@ impl<V: Visitor> Parser<'_, V> {
     }
 
     /// One statement, or a stray NEWLINE / unexpected INDENT block.
-    fn statement_or_stray(&mut self) {
+    pub(super) fn statement_or_stray(&mut self) {
         match self.kind(0) {
             K::Newline => {
                 self.bump();
@@ -101,6 +101,7 @@ impl<V: Visitor> Parser<'_, V> {
                 _ => self.simple_stmts(),
             },
             K::If | K::While | K::For | K::Try | K::With => self.compound(),
+            K::Name if self.soft_keyword_stmt() => {}
             K::Else | K::Elif | K::Except | K::Finally => {
                 // Clause without its statement: report, then parse the body so
                 // indentation stays balanced.
