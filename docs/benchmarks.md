@@ -138,3 +138,20 @@ best of 3. Other worktrees were building at the same time, so the machine was no
 | stdlib | parse-only | 1043   | 15.8  | 15.9ms | 28.8ms            | 45.0ms | 351  | 5.21        |
 | venv   | read       | 60529  | 650.1 | 2.93s  | 1.89s             | 4.86s  | 134  | 24.0        |
 | venv   | parse-only | 60529  | 650.1 | 2.75s  | 1.92s             | 4.71s  | 138  | 23.3        |
+
+Lexer (S1.1), same machine, release build, warm cache, best of 5. Other worktrees were
+building at the same time (load average about 10 on 14 cores), so treat these as lower bounds.
+`lex` MB/s/core is the `lex_MBps_core` counter (MB per second of time inside the lexer,
+summed over all threads). The `-j 1` rows are one thread lexing from memory: MB / `lex` phase.
+
+| corpus | target       | threads | files | MB    | lex phase | lex MB/s | tokens     | peak RSS MB |
+|--------|--------------|---------|-------|-------|-----------|----------|------------|-------------|
+| stdlib | lex          | 14      | 1043  | 15.8  | -         | 653/core | 2,044,807  | 5.72        |
+| stdlib | lex-mem      | 14      | 1043  | 15.8  | 1.82ms    | 8,700    | 2,044,807  | 22.9        |
+| stdlib | lex-mem `-j 1` | 1     | 1043  | 15.8  | 20.5ms    | 771      | 2,044,807  | 21.5        |
+| venv   | lex          | 14      | 60529 | 650.1 | -         | 745/core | 83,594,594 | 24.4        |
+| venv   | lex-mem      | 14      | 60529 | 650.1 | 62.1ms    | 10,470   | 83,594,594 | 793.7       |
+| venv   | lex-mem `-j 1` | 1     | 60529 | 650.1 | 668ms     | 973      | 83,594,594 | 666.6       |
+
+Read + lex costs about the same as read alone (stdlib 46.2ms vs 42.3ms, venv 4.92s vs 4.83s),
+and peak RSS does not change: the lexer allocates nothing per token.
