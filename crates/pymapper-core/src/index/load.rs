@@ -73,8 +73,9 @@ fn chunk_size(files: usize) -> usize {
 /// module docs). Runs on the current rayon pool.
 ///
 /// Memory: a finished chunk is appended to the global tables as soon as every earlier chunk
-/// is, so only out-of-order chunks (about one per thread) wait in memory; the global tables grow by doubling, but
-/// capacity that is never written is never touched (no RSS) and is released at the end.
+/// is, so only out-of-order chunks (about one per thread) wait in memory. The global tables
+/// are reserved once from an early estimate; capacity that is never written is never touched
+/// (no RSS) and is released at the end.
 pub fn load(inputs: Inputs) -> Index {
     let n = inputs.len();
     let t0 = Instant::now();

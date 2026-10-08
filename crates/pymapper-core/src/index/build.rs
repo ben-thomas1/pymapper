@@ -64,6 +64,8 @@ struct Builder<'a> {
     /// (stack level, file, last segment, dotted name).
     pending: Vec<(usize, u32, Sym, Sym)>,
     segs: Vec<Sym>,
+    /// Reused copy of the current dotted name.
+    name_buf: Vec<u8>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -118,6 +120,7 @@ pub(super) fn build(
         stack: Vec::new(),
         pending: Vec::new(),
         segs: Vec::new(),
+        name_buf: Vec::new(),
     };
     // Namespace packages are extra; most trees have few.
     b.nodes.reserve(group_order.len() + total_defs + total_defs / 64);
@@ -162,8 +165,16 @@ pub(super) fn build(
 impl Builder<'_> {
     /// Places file `f` (dotted name `module`) in the tree of distribution `dist`.
     fn file(&mut self, dist: NodeId, f: u32, module: Sym) {
+        let mut name = std::mem::take(&mut self.name_buf);
+        name.clear();
+        name.extend_from_slice(self.strings.resolve(module));
+        self.place(dist, f, module, &name);
+        self.name_buf = name;
+    }
+
+    /// [`Builder::file`] with the bytes of the dotted name in `name`.
+    fn place(&mut self, dist: NodeId, f: u32, module: Sym, name: &[u8]) {
         self.segs.clear();
-        let name = self.strings.resolve(module).to_vec();
         for seg in name.split(|&c| c == b'.') {
             let s = self.strings.intern(seg);
             self.segs.push(s);
@@ -216,14 +227,17 @@ impl Builder<'_> {
         while self.stack.len() > level {
             let lvl = self.stack.len() - 1;
             self.stack.pop();
-            while let Some(&(l, f, seg, module)) = self.pending.last() {
-                if l != lvl {
-                    break;
-                }
-                self.pending.pop();
-                let parent = self.top(dist);
+            // This level's duplicates are the tail of `pending`; emit them in rank order.
+            let mut start = self.pending.len();
+            while start > 0 && self.pending[start - 1].0 == lvl {
+                start -= 1;
+            }
+            let parent = self.top(dist);
+            for i in start..self.pending.len() {
+                let (_, f, seg, module) = self.pending[i];
                 self.emit_file(parent, f, seg, module);
             }
+            self.pending.truncate(start);
         }
     }
 

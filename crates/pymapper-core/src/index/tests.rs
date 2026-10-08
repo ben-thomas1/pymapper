@@ -345,6 +345,29 @@ fn duplicates_close_after_the_primary_subtree() {
 }
 
 #[test]
+fn several_duplicates_keep_rank_order() {
+    // Four files named `m`: implementation, stub, shadowed, not importable (pushed in reverse).
+    let t = TempDir::new("ranks");
+    t.file("d/m.py", "def d():\n    pass\n")
+        .file("c/m.py", "def c():\n    pass\n")
+        .file("a/m.pyi", "def b():\n    pass\n")
+        .file("a/m.py", "def a():\n    pass\n")
+        .file("a/m/sub.py", "");
+    let mut inp = Inputs::new();
+    let g = inp.add_group(b"proj", Origin::FirstParty, None);
+    let p = |rel: &str| t.path().join(rel).into_os_string().into_encoded_bytes();
+    inp.push(&p("d/m.py"), g, b"m", FileStatus::NotImportable).expect("push");
+    inp.push(&p("c/m.py"), g, b"m", FileStatus::Shadowed).expect("push");
+    inp.push(&p("a/m.pyi"), g, b"m", FileStatus::Active).expect("push");
+    inp.push(&p("a/m/sub.py"), g, b"m.sub", FileStatus::Shadowed).expect("push");
+    inp.push(&p("a/m.py"), g, b"m", FileStatus::StubShadowed).expect("push");
+    let ix = load(inp);
+    check_invariants(&ix);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    assert_eq!(all, ["@proj", "m", "m:a", "m.sub", "m#2", "m#2:b", "m#3", "m#3:c", "m#4", "m#4:d"]);
+}
+
+#[test]
 fn groups_sorted_and_namespaces_deduplicated() {
     let t = TempDir::new("groups");
     t.file("a/google/protobuf/__init__.py", "class Message:\n    pass\n")
