@@ -61,7 +61,7 @@ pub use modules::{ModId, ModKind, ModuleTable};
 use std::time::Instant;
 
 use imports::{Ctx, ModRes, NameRes, Names, Scratch};
-use namespace::{Namespaces, kind, par_concat};
+use namespace::{Namespaces, kind, par_concat, par_concat_with};
 
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::intern::Sym;
@@ -131,10 +131,9 @@ pub fn resolve_imports(ix: &Index, attr: &Attribution) -> Imports {
             }
         });
         let names = Names { cx: &cx, p1: &p1 };
-        let (p2, _) = par_concat(files, |f, out| {
-            let mut sc = Scratch::default();
+        let (p2, _) = par_concat_with(files, |sc: &mut Scratch, f, out| {
             for row in ix.file_facts(f).imports.range() {
-                out.push(names.row(f, row, &mut sc));
+                out.push(names.row(f, row, sc));
             }
         });
         (p1, p2)

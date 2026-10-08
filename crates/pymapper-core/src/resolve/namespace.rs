@@ -61,16 +61,25 @@ pub(super) fn chunk_size(files: usize) -> usize {
 /// concatenates the outputs in file order. Returns the rows and the per-file starts
 /// (`files + 1` entries).
 pub(super) fn par_concat<T: Send>(files: usize, per: impl Fn(FileId, &mut Vec<T>) + Sync) -> (Vec<T>, Vec<u32>) {
+    par_concat_with(files, |_: &mut (), f, out| per(f, out))
+}
+
+/// [`par_concat`] with per-task state `S` (scratch reused across the files of a chunk).
+pub(super) fn par_concat_with<T: Send, S: Default>(
+    files: usize,
+    per: impl Fn(&mut S, FileId, &mut Vec<T>) + Sync,
+) -> (Vec<T>, Vec<u32>) {
     let chunk = chunk_size(files);
     let parts: Vec<(Vec<T>, Vec<u32>)> = (0..files.div_ceil(chunk))
         .into_par_iter()
         .map(|c| {
             let range = c * chunk..files.min((c + 1) * chunk);
+            let mut state = S::default();
             let mut out = Vec::new();
             let mut lens = Vec::with_capacity(range.len());
             for f in range {
                 let before = out.len();
-                per(f as FileId, &mut out);
+                per(&mut state, f as FileId, &mut out);
                 lens.push((out.len() - before) as u32);
             }
             (out, lens)

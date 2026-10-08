@@ -525,6 +525,49 @@ fn stdlib_dir_and_roots_attribution() {
     assert_eq!(b.classify(b"brand_new_mod"), Attributed::Stdlib);
 }
 
+/// End to end with discovered roots: deps and stdlib not loaded, attributed from the venv's
+/// distributions and the base interpreter's stdlib directory.
+#[test]
+fn attribution_from_discovered_roots() {
+    use crate::roots::{RootOptions, discover};
+    let t = TempDir::new("roots");
+    let root = t.path().display().to_string();
+    let site = "proj/.venv/lib/python3.12/site-packages";
+    t.file("proj/pyproject.toml", "[project]\nname = \"proj\"\n")
+        .file("proj/src/proj/__init__.py", "import requests\nimport yaml\nimport json\nimport brandnew\nfrom . import core\n")
+        .file("proj/src/proj/core.py", "")
+        .file("proj/.venv/pyvenv.cfg", &format!("home = {root}/python/bin\nversion_info = 3.12.3\n"))
+        .file("python/lib/python3.12/json/__init__.py", "")
+        .file("python/lib/python3.12/os.py", "")
+        .file("python/lib/python3.12/brandnew.py", "")
+        .file(&format!("{site}/requests/__init__.py"), "")
+        .file(&format!("{site}/requests-2.0.dist-info/METADATA"), "Metadata-Version: 2.1\nName: requests\nVersion: 2.0\n")
+        .file(&format!("{site}/requests-2.0.dist-info/RECORD"), "requests/__init__.py,,\n")
+        .file(&format!("{site}/PyYAML-6.0.dist-info/METADATA"), "Metadata-Version: 2.1\nName: PyYAML\nVersion: 6.0\n")
+        .file(&format!("{site}/PyYAML-6.0.dist-info/top_level.txt"), "yaml\n");
+    fs::create_dir_all(t.path().join("python/bin")).expect("mkdir");
+    let opts = RootOptions { path_env: Some(Default::default()), ..RootOptions::default() };
+    let roots = discover(&t.path().join("proj"), &opts);
+    assert!(roots.stdlib.is_some(), "{:?}", roots.diagnostics);
+    let w = walk(&[t.path().join("proj/src")], &WalkOptions::default());
+    let ix = load(Inputs::from_roots(&roots, &w.files));
+    let attr = Attribution::from_roots(&roots);
+    let imp = resolve_imports(&ix, &attr);
+    let fx = Fx { ix, imp };
+    let requests = roots.dists.by_name(b"requests").expect("requests").0;
+    let yaml = roots.dists.by_name(b"pyyaml").expect("pyyaml").0;
+    assert_eq!(
+        fx.rows("proj"),
+        vec![
+            format!("1 third-party dist{requests} [exported]"),
+            format!("2 third-party dist{yaml} [exported]"),
+            "3 stdlib json [exported]".to_owned(),
+            "4 stdlib brandnew [exported]".to_owned(),
+            "5 module proj.core [exported]".to_owned(),
+        ]
+    );
+}
+
 #[test]
 fn stubs_and_namespace_packages() {
     let t = TempDir::new("stubs");
@@ -744,7 +787,7 @@ fn stdlib_imports_resolve() {
             }
         }
         let mut v: Vec<_> = hist.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (k, n) in v.iter().take(40) {
             eprintln!("{n:6} {k}");
         }
