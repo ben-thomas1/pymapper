@@ -2,6 +2,8 @@
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -69,47 +71,90 @@ fn chunk_size(files: usize) -> usize {
 /// after extraction), merges into global tables and builds the hierarchy. Never fails:
 /// unreadable files become [`ReadError`]s and load as empty modules. Deterministic (see the
 /// module docs). Runs on the current rayon pool.
+///
+/// Memory: a finished chunk is appended to the global tables as soon as every earlier chunk
+/// is, so only out-of-order chunks (about one per thread) wait in memory; the global tables grow by doubling, but
+/// capacity that is never written is never touched (no RSS) and is released at the end.
 pub fn load(inputs: Inputs) -> Index {
     let n = inputs.len();
     let t0 = Instant::now();
     let workers = PerThread::new(Worker::default);
     let size = chunk_size(n);
-    let mut chunks: Vec<Chunk> = timing::time("load.extract", || {
-        (0..n.div_ceil(size))
-            .into_par_iter()
-            .map(|c| {
+    let nchunks = n.div_ceil(size);
+    let slots: Vec<Mutex<Option<Chunk>>> = (0..nchunks).map(|_| Mutex::new(None)).collect();
+    let sink = Mutex::new(Sink { chunks: nchunks, ..Sink::default() });
+    // Chunks are handed out in FileId order from a counter (not split recursively the rayon
+    // way), so they finish roughly in order and few wait for an earlier one.
+    let next = AtomicUsize::new(0);
+    timing::time("load.extract", || {
+        (0..rayon::current_num_threads().min(nchunks)).into_par_iter().for_each(|_| {
+            loop {
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                if c >= nchunks {
+                    break;
+                }
                 let range = c * size..((c + 1) * size).min(n);
-                workers.with(|wi, w| w.chunk(wi, &inputs, range))
-            })
-            .collect()
+                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range));
+                *lock(&slots[c]) = Some(chunk);
+                drain(&sink, &slots);
+            }
+        });
     });
+    let mut sink = sink.into_inner().unwrap_or_else(PoisonError::into_inner);
+    // Chunks stranded by a lost try_lock race.
+    sink.drain_ready(&slots);
+    assert_eq!(sink.next, nchunks, "every chunk is merged");
     let extract = t0.elapsed();
 
     let t1 = Instant::now();
-    let (strings, facts, metrics, files, read_errors, bytes) = timing::time("load.merge", || {
+    let strings = timing::time("load.merge", || {
         let interners: Vec<Interner> = workers.into_vec().into_iter().map(|w| w.interner).collect();
         let (strings, remaps) = Interner::merge_all(interners);
-        chunks.par_iter_mut().for_each(|c| {
-            let r = &remaps[c.worker];
-            if r.is_identity() {
-                return;
+        for (f, ff) in sink.files.iter().enumerate() {
+            let r = &remaps[sink.worker[f] as usize];
+            if !r.is_identity() {
+                sink.facts.map_syms(ff, |s| r.get(s));
             }
-            for ff in &c.files {
-                c.store.map_syms(ff, |s| r.get(s));
-            }
-        });
-        drop(remaps);
-        let (facts, metrics, files, errors, bytes) = concat(chunks);
-        (strings, facts, metrics, files, errors, bytes)
+        }
+        sink.facts.shrink_to_fit();
+        shrink_metrics(&mut sink.metrics);
+        sink.files.shrink_to_fit();
+        drop(std::mem::take(&mut sink.worker));
+        strings
     });
     let merge = t1.elapsed();
 
+    let Sink { facts, metrics, files, errors, bytes, .. } = sink;
     let lines = files.iter().map(|ff| u64::from(ff.lines)).sum();
     let stats = LoadStats { files: n as u64, bytes, lines, extract, merge, build: Duration::ZERO };
     let t2 = Instant::now();
-    let mut index = timing::time("load.build", || build::build(inputs, strings, facts, metrics, files, read_errors, stats));
+    let mut index = timing::time("load.build", || build::build(inputs, strings, facts, metrics, files, errors, stats));
     index.stats.build = t2.elapsed();
     index
+}
+
+/// Locks a mutex, ignoring poisoning (a panicking worker aborts the load anyway).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Appends every ready chunk in order, unless another thread is already doing it. Loops so
+/// that a chunk published while the previous drainer was releasing the lock is not left
+/// behind (any that still are get merged after the parallel phase).
+fn drain(sink: &Mutex<Sink>, slots: &[Mutex<Option<Chunk>>]) {
+    loop {
+        let mut s = match sink.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        s.drain_ready(slots);
+        let next = s.next;
+        drop(s);
+        if next >= slots.len() || lock(&slots[next]).is_none() {
+            return;
+        }
+    }
 }
 
 impl Worker {
@@ -146,53 +191,85 @@ impl Worker {
     }
 }
 
-fn add_bases(a: &mut TableBases, b: &TableBases) {
-    a.defs += b.defs;
-    a.decorators += b.decorators;
-    a.bases += b.bases;
-    a.params += b.params;
-    a.imports += b.imports;
-    a.calls += b.calls;
-    a.bindings += b.bindings;
-    a.decls += b.decls;
-    a.names += b.names;
-    a.exports += b.exports;
-    a.evidence += b.evidence;
-    a.diags += b.diags;
-    a.suppressions += b.suppressions;
+/// The global tables being filled, in chunk order.
+#[derive(Default)]
+struct Sink {
+    /// Number of chunks.
+    chunks: usize,
+    /// Next chunk to append.
+    next: usize,
+    /// The tables were reserved for the estimated total (see [`Sink::reserve_estimate`]).
+    reserved: bool,
+    facts: FactStore,
+    metrics: MetricsTable,
+    files: Vec<FileFacts>,
+    /// Worker (interner) of each file's `Sym`s, until remapped.
+    worker: Vec<u32>,
+    errors: Vec<ReadError>,
+    bytes: u64,
 }
 
-type Merged = (FactStore, MetricsTable, Vec<FileFacts>, Vec<ReadError>, u64);
-
-/// Concatenates the chunks in order into exactly-sized global tables, freeing each chunk as
-/// soon as it is copied (peak: one copy of the facts plus one chunk).
-fn concat(chunks: Vec<Chunk>) -> Merged {
-    let mut total = TableBases::default();
-    let (mut nfiles, mut nmetrics, mut nerrors) = (0usize, 0usize, 0usize);
-    for c in &chunks {
-        add_bases(&mut total, &c.store.bases());
-        nfiles += c.files.len();
-        nmetrics += c.metrics.len();
-        nerrors += c.errors.len();
+impl Sink {
+    /// Appends chunks `next..` while they are ready.
+    fn drain_ready(&mut self, slots: &[Mutex<Option<Chunk>>]) {
+        while self.next < slots.len() {
+            let Some(c) = lock(&slots[self.next]).take() else { break };
+            self.absorb(c);
+            self.next += 1;
+            if !self.reserved && self.next * 16 >= self.chunks {
+                self.reserve_estimate();
+            }
+        }
     }
-    let mut facts = FactStore::new();
-    facts.reserve_exact(&total);
-    let mut metrics = MetricsTable::new();
-    reserve_metrics(&mut metrics, nmetrics);
-    let mut files = Vec::with_capacity(nfiles);
-    let mut errors = Vec::with_capacity(nerrors);
-    let mut bytes = 0;
-    for mut c in chunks {
-        let b = facts.append(&mut c.store);
+
+    /// Reserves every table for 1.5x its extrapolated final length, once about 1/16 of the
+    /// chunks are in. Without it the tables grow by doubling, and allocators keep the freed
+    /// smaller blocks resident (macOS keeps blocks up to 8 MiB): about one more copy of the
+    /// facts in RSS. Overshoot costs only untouched virtual memory (released by the final
+    /// `shrink_to_fit`); undershoot falls back to doubling from a large base.
+    fn reserve_estimate(&mut self) {
+        self.reserved = true;
+        let (done, all) = (self.next as u64, self.chunks as u64);
+        let more = |len: u32| -> u32 {
+            let est = u64::from(len) * all * 3 / (2 * done.max(1));
+            u32::try_from(est.saturating_sub(u64::from(len))).unwrap_or(u32::MAX - len)
+        };
+        let b = self.facts.bases();
+        let extra = TableBases {
+            defs: more(b.defs),
+            decorators: more(b.decorators),
+            bases: more(b.bases),
+            params: more(b.params),
+            imports: more(b.imports),
+            calls: more(b.calls),
+            bindings: more(b.bindings),
+            decls: more(b.decls),
+            names: more(b.names),
+            exports: more(b.exports),
+            evidence: more(b.evidence),
+            diags: more(b.diags),
+            suppressions: more(b.suppressions),
+        };
+        self.facts.reserve_exact(&extra);
+        let m = more(self.metrics.len() as u32) as usize;
+        reserve_metrics(&mut self.metrics, m);
+        let rest = self.chunks.saturating_sub(self.next);
+        let per_chunk = self.files.len() / self.next.max(1) + 1;
+        self.files.reserve_exact(rest * per_chunk);
+        self.worker.reserve_exact(rest * per_chunk);
+    }
+
+    fn absorb(&mut self, mut c: Chunk) {
+        let b = self.facts.append(&mut c.store);
         for mut ff in c.files {
             ff.shift(&b);
-            files.push(ff);
+            self.files.push(ff);
+            self.worker.push(c.worker as u32);
         }
-        metrics.append(&c.metrics);
-        errors.extend_from_slice(&c.errors);
-        bytes += c.bytes;
+        self.metrics.append(&c.metrics);
+        self.errors.extend_from_slice(&c.errors);
+        self.bytes += c.bytes;
     }
-    (facts, metrics, files, errors, bytes)
 }
 
 fn reserve_metrics(m: &mut MetricsTable, n: usize) {
@@ -205,4 +282,16 @@ fn reserve_metrics(m: &mut MetricsTable, n: usize) {
     m.operators.reserve_exact(n);
     m.operands.reserve_exact(n);
     m.params.reserve_exact(n);
+}
+
+fn shrink_metrics(m: &mut MetricsTable) {
+    m.cyclomatic.shrink_to_fit();
+    m.cognitive.shrink_to_fit();
+    m.max_nesting.shrink_to_fit();
+    m.loc.shrink_to_fit();
+    m.distinct_operators.shrink_to_fit();
+    m.distinct_operands.shrink_to_fit();
+    m.operators.shrink_to_fit();
+    m.operands.shrink_to_fit();
+    m.params.shrink_to_fit();
 }

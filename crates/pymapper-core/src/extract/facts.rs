@@ -818,8 +818,8 @@ impl FactStore {
         }
     }
 
-    /// Reserves room for exactly `n.<table>` more rows in every table (e.g. the summed
-    /// lengths of the stores about to be appended, so the merge allocates once).
+    /// Reserves room for exactly `n.<table>` more rows in every table (e.g. an estimate of
+    /// what is about to be appended, so a growing merge reallocates once).
     pub fn reserve_exact(&mut self, n: &TableBases) {
         self.defs.reserve_exact(n.defs as usize);
         self.decorators.reserve_exact(n.decorators as usize);

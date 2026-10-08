@@ -253,3 +253,232 @@ fn corpus_invariants_and_determinism() {
     assert!(s.bytes > 0 && s.lines > 0);
     assert!(ix.heap_bytes() > 0);
 }
+
+#[test]
+fn module_names_from_root_dir() {
+    let t = TempDir::new("names");
+    t.file("__init__.py", "")
+        .file("a.py", "")
+        .file("a.pyi", "")
+        .file("my-script.py", "def main():\n    pass\n")
+        .file("pkg/__init__.pyi", "")
+        .file("pkg/x.y/z.py", "")
+        .file("README.txt", "");
+    let w = walk(&[t.path()], &WalkOptions::everything());
+    let inp = Inputs::from_root_dir(t.path(), &w.files, Origin::FirstParty, b"proj");
+    let got: Vec<(String, String, FileStatus)> = (0..inp.len() as u32)
+        .map(|f| {
+            let rel = inp.path(f).strip_prefix(t.path()).expect("under root").display().to_string();
+            (rel, String::from_utf8_lossy(inp.module(f)).into_owned(), inp.status(f))
+        })
+        .collect();
+    let want = [
+        ("__init__.py", "__init__", FileStatus::NotImportable),
+        ("a.py", "a", FileStatus::StubShadowed),
+        ("a.pyi", "a", FileStatus::Active),
+        ("my-script.py", "my-script", FileStatus::NotImportable),
+        ("pkg/__init__.pyi", "pkg", FileStatus::Active),
+        ("pkg/x.y/z.py", "pkg.x.y.z", FileStatus::NotImportable),
+    ];
+    let want: Vec<(String, String, FileStatus)> = want.iter().map(|&(a, b, c)| (a.to_owned(), b.to_owned(), c)).collect();
+    assert_eq!(got, want);
+
+    let ix = load(inp);
+    check_invariants(&ix);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    // The implementation of `a` comes first, its stub is `a#2`. `x.y` is not an identifier,
+    // so `pkg.x.y.z` gets namespace nodes `pkg.x` and `pkg.x.y`.
+    assert_eq!(
+        all,
+        ["@proj", "__init__", "a", "a#2", "my-script", "my-script:main", "pkg", "pkg.x", "pkg.x.y", "pkg.x.y.z"]
+    );
+    assert_eq!(ix.kind(find(&ix, "pkg")), NodeKind::Package);
+    assert_eq!(ix.file_status(ix.file(find(&ix, "a")).expect("file")), FileStatus::StubShadowed);
+    assert!(ix.file_path(ix.file(find(&ix, "a#2")).expect("file")).ends_with("a.pyi"));
+}
+
+#[test]
+fn duplicates_close_after_the_primary_subtree() {
+    // Hand-built inputs: two files claim `pkg` (a package and a shadowed one), one claims
+    // `pkg.m`; the duplicate must not end up inside the primary's subtree.
+    let t = TempDir::new("dups");
+    t.file("one/pkg/__init__.py", "def f():\n    pass\n")
+        .file("one/pkg/m.py", "")
+        .file("two/pkg/__init__.py", "def g():\n    pass\n");
+    let mut inp = Inputs::new();
+    let g = inp.add_group(b"proj", Origin::FirstParty, None);
+    let p = |rel: &str| t.path().join(rel).into_os_string().into_encoded_bytes();
+    inp.push(&p("two/pkg/__init__.py"), g, b"pkg", FileStatus::Shadowed).expect("push");
+    inp.push(&p("one/pkg/m.py"), g, b"pkg.m", FileStatus::Active).expect("push");
+    inp.push(&p("one/pkg/__init__.py"), g, b"pkg", FileStatus::Active).expect("push");
+    let ix = load(inp);
+    check_invariants(&ix);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    assert_eq!(all, ["@proj", "pkg", "pkg:f", "pkg.m", "pkg#2", "pkg#2:g"]);
+    assert_eq!(ix.file(find(&ix, "pkg")), Some(2));
+    assert_eq!(ix.file(find(&ix, "pkg#2")), Some(0));
+    assert_eq!(ix.parent(find(&ix, "pkg#2")), Some(0));
+    assert!(!ix.is_descendant(find(&ix, "pkg"), find(&ix, "pkg#2")));
+}
+
+#[test]
+fn groups_sorted_and_namespaces_deduplicated() {
+    let t = TempDir::new("groups");
+    t.file("a/google/protobuf/__init__.py", "class Message:\n    pass\n")
+        .file("b/google/api/x.py", "")
+        .file("s/os.py", "def getcwd():\n    pass\n")
+        .file("p/app.py", "import os\n");
+    let mut inp = Inputs::new();
+    // Added out of order: groups sort by (origin, name).
+    let protobuf = inp.add_group(b"protobuf", Origin::ThirdParty, None);
+    let stdlib = inp.add_group(b"stdlib", Origin::Stdlib, None);
+    let api = inp.add_group(b"googleapis", Origin::ThirdParty, None);
+    let proj = inp.add_group(b"proj", Origin::FirstParty, None);
+    let p = |rel: &str| t.path().join(rel).into_os_string().into_encoded_bytes();
+    inp.push(&p("a/google/protobuf/__init__.py"), protobuf, b"google.protobuf", FileStatus::Active).expect("push");
+    inp.push(&p("b/google/api/x.py"), api, b"google.api.x", FileStatus::Active).expect("push");
+    inp.push(&p("s/os.py"), stdlib, b"os", FileStatus::Active).expect("push");
+    inp.push(&p("p/app.py"), proj, b"app", FileStatus::Active).expect("push");
+    let ix = load(inp);
+    check_invariants(&ix);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    assert_eq!(
+        all,
+        [
+            "@proj",
+            "app",
+            "@googleapis",
+            "google",
+            "google.api",
+            "google.api.x",
+            "@protobuf",
+            "google#2",
+            "google.protobuf",
+            "google.protobuf:Message",
+            "@stdlib",
+            "os",
+            "os:getcwd",
+        ]
+    );
+    assert_eq!(ix.group_node(stdlib), find(&ix, "@stdlib"));
+    assert_eq!(ix.file_origin(2), Origin::Stdlib);
+    assert_eq!(ix.groups()[ix.file_group(0) as usize].name.as_ref(), b"protobuf");
+}
+
+#[test]
+fn unreadable_files_load_as_empty_modules() {
+    let t = TempDir::new("unreadable");
+    t.file("ok.py", "def f():\n    pass\n");
+    let mut inp = Inputs::new();
+    let g = inp.add_group(b"proj", Origin::FirstParty, None);
+    let p = |rel: &str| t.path().join(rel).into_os_string().into_encoded_bytes();
+    inp.push(&p("missing.py"), g, b"missing", FileStatus::Active).expect("push");
+    inp.push(&p("ok.py"), g, b"ok", FileStatus::Active).expect("push");
+    let ix = load(inp);
+    check_invariants(&ix);
+    assert_eq!(ix.read_errors(), &[ReadError { file: 0, kind: std::io::ErrorKind::NotFound }]);
+    assert_eq!(ix.file_facts(0).defs.len, 1);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    assert_eq!(all, ["@proj", "missing", "ok", "ok:f"]);
+}
+
+#[test]
+fn empty_inputs() {
+    let ix = load(Inputs::new());
+    assert_eq!(ix.node_count(), 0);
+    assert_eq!(ix.file_count(), 0);
+    let mut inp = Inputs::new();
+    inp.add_group(b"proj", Origin::FirstParty, None);
+    let ix = load(inp);
+    assert_eq!(ix.node_count(), 1);
+    assert_eq!(ix.find(b"@proj"), Some(0));
+    check_invariants(&ix);
+}
+
+#[test]
+fn deep_nesting_and_many_duplicates() {
+    let t = TempDir::new("deep");
+    let mut src = String::new();
+    let mut want = String::from("deep:");
+    for d in 0..60 {
+        src.push_str(&" ".repeat(d * 4));
+        src.push_str(&format!("def f{d}():\n"));
+        if d > 0 {
+            want.push('.');
+        }
+        want.push_str(&format!("f{d}"));
+    }
+    src.push_str(&" ".repeat(60 * 4));
+    src.push_str("pass\n");
+    for _ in 0..12 {
+        src.push_str("def dup():\n    pass\n");
+    }
+    t.file("deep.py", &src);
+    let ix = load_dir(t.path());
+    check_invariants(&ix);
+    let last = find(&ix, &want);
+    assert_eq!(ix.depth(last), 2 + 59);
+    assert_eq!(ix.ancestor_at(last, 1), find(&ix, "deep"));
+    assert_eq!(qid(&ix, find(&ix, "deep:dup#12")), "deep:dup#12");
+}
+
+/// A distribution in `site` owning `files` (written empty unless `path=contents`).
+fn dist(t: &TempDir, site: &str, name: &str, files: &[&str]) {
+    let info = format!("{site}/{}-1.0.dist-info", name.replace('-', "_"));
+    t.file(&format!("{info}/METADATA"), &format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"));
+    let mut record = String::new();
+    for f in files {
+        let (path, contents) = f.split_once('=').unwrap_or((f, ""));
+        t.file(&format!("{site}/{path}"), contents);
+        record.push_str(&format!("{path},sha256=x,1\n"));
+    }
+    t.file(&format!("{info}/RECORD"), &record);
+}
+
+#[test]
+fn inputs_from_discovered_roots() {
+    use crate::roots::{RootOptions, discover};
+    const SITE: &str = "proj/.venv/lib/python3.12/site-packages";
+    let t = TempDir::new("roots");
+    let root = t.path().display().to_string();
+    t.file("proj/pyproject.toml", "[project]\nname = \"Proj\"\n")
+        .file("proj/src/proj/__init__.py", "")
+        .file("proj/src/proj/core.py", "def run():\n    pass\n")
+        .file("proj/tests/test_core.py", "")
+        .file("proj/.venv/pyvenv.cfg", &format!("home = {root}/python/bin\nversion_info = 3.12.3\n"))
+        .file(&format!("{SITE}/stray.py"), "");
+    fs::create_dir_all(t.path().join("python/bin")).expect("mkdir");
+    dist(&t, SITE, "protobuf", &["google/protobuf/__init__.py"]);
+    dist(&t, SITE, "googleapis-common-protos", &["google/api/x.py", "google/api/x.pyi"]);
+    let opts = RootOptions { include_deps: true, path_env: Some(Default::default()), ..RootOptions::default() };
+    let roots = discover(&t.path().join("proj"), &opts);
+    let w = walk(&[t.path().join("proj")], &WalkOptions::everything());
+    let ix = load(Inputs::from_roots(&roots, &w.files));
+    check_invariants(&ix);
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    assert_eq!(
+        all,
+        [
+            "@Proj",
+            "proj",
+            "proj.core",
+            "proj.core:run",
+            "tests",
+            "tests.test_core",
+            "@googleapis-common-protos",
+            "google",
+            "google.api",
+            "google.api.x",
+            "google.api.x#2",
+            "@protobuf",
+            "google#2",
+            "google.protobuf",
+            "@unknown",
+            "stray",
+        ]
+    );
+    let x = ix.file(find(&ix, "google.api.x")).expect("file");
+    assert_eq!(ix.file_status(x), FileStatus::StubShadowed);
+    assert_eq!(ix.file_origin(x), Origin::ThirdParty);
+    assert!(ix.groups()[ix.file_group(x) as usize].dist.is_some());
+}

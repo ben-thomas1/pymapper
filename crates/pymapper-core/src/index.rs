@@ -142,7 +142,7 @@ impl NodeKind {
     }
 }
 
-/// Hierarchy nodes, struct of arrays, in pre-order (21 bytes per node plus the ancestor pool).
+/// Hierarchy nodes, struct of arrays, in pre-order (25 bytes per node plus the ancestor pool).
 #[derive(Default, Debug)]
 pub(crate) struct Nodes {
     pub kind: Vec<u8>,
@@ -161,8 +161,6 @@ pub(crate) struct Nodes {
 }
 
 impl Nodes {
-    pub const ROW_BYTES: usize = 1 + 2 + 2 + 4 + 4 + 4 + 4 + 4;
-
     #[inline]
     pub fn len(&self) -> u32 {
         self.kind.len() as u32

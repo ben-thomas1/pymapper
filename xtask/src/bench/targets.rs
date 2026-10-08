@@ -55,6 +55,11 @@ pub enum Target {
     /// names) from memory: the extractor micro benchmark (use `-j 1` for one core, and for
     /// profiling: `samply record xtask bench-run --target extract-mem --root DIR`).
     ExtractMem,
+    /// End-to-end streaming load (`pymapper_core::index::load`): walk, then read -> extract ->
+    /// intern -> drop the source per file in parallel, merge into the global tables and build
+    /// the hierarchy. The corpus root is the import root of one first-party group. Peak RSS
+    /// includes the whole index.
+    Load,
 }
 
 impl Target {
@@ -71,6 +76,7 @@ impl Target {
             Target::ParseMem => "parse-mem",
             Target::MetricsMem => "metrics-mem",
             Target::ExtractMem => "extract-mem",
+            Target::Load => "load",
         }
     }
 }
@@ -392,6 +398,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
             (ReadStats { files: files.len() as u64, bytes: 0, errors }, counters)
         }
         Target::Roots => roots_target(root)?,
+        Target::Load => load_target(root)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -453,6 +460,34 @@ fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64
         ("hidden".to_owned(), s.hidden),
     ];
     Ok((w.files, w.diagnostics.len() as u64, counters))
+}
+
+/// `load`: walk (phase `walk`), then [`pymapper_core::index::load`] (phases `load.extract`,
+/// `load.merge`, `load.build`). The whole index stays alive until the counters are taken.
+fn load_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::roots::Origin;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let s = ix.stats();
+    let defs = u64::from(ix.facts().defs.len()) - u64::from(ix.file_count());
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let kb = |b: usize| b as u64 / 1000;
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("defs".to_owned(), defs),
+        ("nodes".to_owned(), u64::from(ix.node_count())),
+        ("strings".to_owned(), ix.strings().len() as u64),
+        ("index_kb".to_owned(), kb(ix.heap_bytes())),
+        ("facts_kb".to_owned(), kb(ix.facts().heap_bytes())),
+        ("metrics_kb".to_owned(), kb(ix.metrics().heap_bytes())),
+        ("intern_kb".to_owned(), kb(ix.strings().heap_bytes())),
+        // Retained index bytes per 1000 LOC (milli-bytes per LOC).
+        ("index_B_per_kLOC".to_owned(), (ix.heap_bytes() as u64 * 1000).checked_div(s.lines).unwrap_or(0)),
+    ];
+    Ok((stats, counters))
 }
 
 /// `roots`: discovery as phase `discover` (deps and stdlib on), then the module map over every
@@ -576,6 +611,7 @@ mod tests {
             Target::ParseMem,
             Target::MetricsMem,
             Target::ExtractMem,
+            Target::Load,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -593,6 +629,7 @@ mod tests {
                 Target::LexMem => &["walk", "load", "lex"],
                 Target::ParseMem | Target::MetricsMem | Target::ExtractMem => &["walk", "load", "parse"],
                 Target::Walk | Target::WalkSeq | Target::WalkGit => &["walk"],
+                Target::Load => &["walk", "load.extract", "load.merge", "load.build"],
                 Target::Roots => unreachable!("checked below"),
             };
             assert_eq!(names, expected, "{target:?}");
@@ -622,6 +659,15 @@ mod tests {
                 assert!(counter("defs").unwrap() > 0 && counter("calls").unwrap() > 0);
                 assert!(counter("facts_B_per_kLOC").unwrap() > 1000);
                 assert!(counter("metrics_B_per_kLOC").unwrap() > 0);
+            } else if target == Target::Load {
+                let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, [
+                    "loc", "defs", "nodes", "strings", "index_kb", "facts_kb", "metrics_kb", "intern_kb",
+                    "index_B_per_kLOC"
+                ]);
+                assert!(counter("loc").unwrap() > rec.files);
+                assert!(counter("nodes").unwrap() > counter("defs").unwrap());
+                assert!(counter("index_B_per_kLOC").unwrap() > 1000);
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }
