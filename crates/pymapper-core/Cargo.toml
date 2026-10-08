@@ -26,5 +26,9 @@ harness = false
 name = "output"
 harness = false
 
+[[bench]]
+name = "graph"
+harness = false
+
 [lints]
 workspace = true

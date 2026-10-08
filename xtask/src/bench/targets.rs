@@ -80,6 +80,11 @@ pub enum Target {
     /// C3 MROs, every call site, uncalled decorator and override edge. Peak RSS includes the
     /// index and the import resolution.
     Calls,
+    /// `calls`, then the graphs (`pymapper_core::graph`): the call graph over every node (all
+    /// edges with a target) and its condensation (iterative Tarjan SCC + DAG), the module
+    /// import graph and the module call graph with their condensations. Peak RSS includes the
+    /// index, the import resolution and the resolved calls.
+    Graph,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -111,6 +116,7 @@ impl Target {
             Target::DupesWarm => "dupes-warm",
             Target::Resolve => "resolve",
             Target::Calls => "calls",
+            Target::Graph => "graph",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -439,6 +445,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::DupesCold | Target::DupesWarm => dupes_target(root, Some(target == Target::DupesCold))?,
         Target::Resolve => resolve_target(root)?,
         Target::Calls => calls_target(root)?,
+        Target::Graph => graph_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -673,6 +680,57 @@ fn calls_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("incomplete_classes".to_owned(), st.incomplete_classes),
         ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("resolve_kb".to_owned(), imp.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    Ok((stats, counters))
+}
+
+/// `graph`: [`calls_target`]'s pipeline, then the graphs of `pymapper_core::graph` (phases
+/// `graph.build`: call graph; `graph.scc`: its condensation; `graph.modules`: import and module
+/// call graphs plus their condensations). Everything stays alive until the counters are taken.
+fn graph_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::graph::{CallFilter, Condensed, call_graph, import_graph, module_call_graph};
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let cg = timing::time("graph.build", || call_graph(&ix, &calls, CallFilter::default()));
+    let cc = timing::time("graph.scc", || Condensed::of(&cg));
+    let (ig, ic, mg, mc) = timing::time("graph.modules", || {
+        let ig = import_graph(&ix, &imp, 0);
+        let ic = Condensed::of(ig.graph());
+        let mg = module_call_graph(&ix, &calls, CallFilter::default());
+        let mc = Condensed::of(mg.graph());
+        (ig, ic, mg, mc)
+    });
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let scc = cc.scc();
+    let largest = (0..scc.count()).map(|c| scc.size(c)).max().unwrap_or(0);
+    let cyclic = (0..scc.count()).filter(|&c| scc.is_cyclic(&cg, c)).count() as u64;
+    let module_cycles = |c: &Condensed| c.scc().nontrivial().count() as u64;
+    let graph_bytes = cg.heap_bytes() + cc.heap_bytes() + ig.heap_bytes() + ic.heap_bytes() + mg.heap_bytes() + mc.heap_bytes();
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("graph_nodes".to_owned(), u64::from(cg.node_count())),
+        ("graph_edges".to_owned(), u64::from(cg.edge_count())),
+        ("sccs".to_owned(), u64::from(scc.count())),
+        ("cyclic_sccs".to_owned(), cyclic),
+        ("largest_scc".to_owned(), u64::from(largest)),
+        ("dag_edges".to_owned(), u64::from(cc.dag().edge_count())),
+        ("modules".to_owned(), u64::from(ig.len())),
+        ("import_edges".to_owned(), u64::from(ig.graph().edge_count())),
+        ("import_cycles".to_owned(), module_cycles(&ic)),
+        ("module_call_edges".to_owned(), u64::from(mg.graph().edge_count())),
+        ("module_call_cycles".to_owned(), module_cycles(&mc)),
+        ("callgraph_kb".to_owned(), (cg.heap_bytes() + cc.heap_bytes()) as u64 / 1000),
+        ("graph_kb".to_owned(), graph_bytes as u64 / 1000),
+        ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ];
     Ok((stats, counters))
@@ -925,6 +983,7 @@ mod tests {
             Target::DupesWarm,
             Target::Resolve,
             Target::Calls,
+            Target::Graph,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -975,6 +1034,11 @@ mod tests {
                 Target::Calls => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls",
+                ],
+                Target::Graph => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "graph.scc",
+                    "graph.modules",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
@@ -1052,6 +1116,13 @@ mod tests {
                 let sum: u64 = pm.iter().sum();
                 assert!((996..=1000).contains(&sum), "{pm:?}");
                 assert!(counter("edges").unwrap() > 0);
+            } else if target == Target::Graph {
+                assert!(counter("graph_nodes").unwrap() > 0);
+                assert!(counter("graph_edges").unwrap() > 0);
+                assert!(counter("sccs").unwrap() > 0 && counter("sccs") <= counter("graph_nodes"));
+                assert!(counter("largest_scc").unwrap() >= 1);
+                assert!(counter("dag_edges") <= counter("graph_edges"));
+                assert!(counter("modules").unwrap() > 0);
             } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
                 assert_eq!(counter("segments"), Some(1));
                 if target == Target::LoadCold {
