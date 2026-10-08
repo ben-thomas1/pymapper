@@ -245,3 +245,51 @@ parser in the baseline. Of the parser's own time, the line cursor is about 14% a
 expression scanner about 24% (samply, venv, `-j 1`). All 14 venv diagnostics are in 4 files
 of genuine Python 2 code (`print >>f, x`). Peak RSS in `parse-mem` is the loaded corpus. The
 parser itself uses a handful of reused scratch vectors per file and allocates nothing per token.
+
+### Facts (S1.3)
+
+`cargo bench -p pymapper-core --bench facts -- [--spans | --parse-only] [--reps N] DIR` (own
+harness in `crates/pymapper-core/benches/facts.rs`, not yet an xtask target; S1.5 wires the
+extractor into `xtask bench`). Each rayon worker owns a `FactStore` and an `Interner` and runs
+read -> `extract` -> drop source per file, keeping every file's facts (the loader's shape).
+`--parse-only` runs the parser with a no-op visitor instead (the extractor's baseline);
+`--spans` uses the pre-interning span sink. MB/s/core is MB per second of time inside
+`extract` (or `parse`), summed over threads. Peak RSS is of one run that retains all facts and
+interners (earlier runs are dropped first). Same machine, release build, warm cache, best of
+3-5, load average 4-10 from other worktrees, so treat times as lower bounds.
+
+| corpus | threads | sink       | wall    | MB/s/core | parse-only MB/s/core | peak RSS MB |
+|--------|---------|------------|---------|-----------|----------------------|-------------|
+| stdlib | 14      | interner   | 31.3ms  | 203       | 295                  | 22.0        |
+| stdlib | 1       | interner   | 149ms   | 246       | 330                  | -           |
+| stdlib | 1       | spans      | 136ms   | 287       | 330                  | -           |
+| venv   | 14      | interner   | 1.95s   | 220       | 303                  | 494         |
+| venv   | 1       | interner   | 8.45s   | 238       | 347                  | -           |
+
+Wall includes reading the files (the venv wall is I/O bound). Fact building costs about 17% on
+top of the parser with span strings, about 35% with interning (the interner's hash and probe
+per recorded name; S2.3 needs that anyway). Profiled hot spots were a separate line-count pass
+and a hash set for evidence; both were replaced (the parser's line cursor gives the line
+count, a direct-mapped filter plus sort/dedup gives the evidence column).
+
+Memory per LOC (rows only, `Sym` = 4 B; layout in `extract/facts.rs`):
+
+| table        | stdlib rows/kLOC | stdlib B/LOC | venv rows/kLOC | venv B/LOC |
+|--------------|------------------|--------------|----------------|------------|
+| defs         | 58.3             | 2.97         | 58.0           | 2.96       |
+| calls        | 190.1            | 3.61         | 205.1          | 3.90       |
+| bindings     | 153.0            | 3.21         | 136.1          | 2.86       |
+| names        | 311.6            | 1.25         | 298.7          | 1.19       |
+| evidence     | 278.6            | 1.11         | 244.1          | 0.98       |
+| imports      | 23.0             | 0.62         | 52.9           | 1.43       |
+| params       | 99.8             | 0.50         | 101.9          | 0.51       |
+| other        |                  | 0.14         |                | 0.18       |
+| **total**    |                  | **13.41**    |                | **14.01**  |
+
+Plus per-file headers (112 B per file): 0.27 B/LOC stdlib, 0.40 B/LOC venv. LOC: stdlib
+436,648, venv 17,044,697. The per-thread tables grow by doubling, so their heap is about
+19-21 B/LOC until `FactStore::shrink_to_fit` (or the merge into global tables) trims them to
+the row size; that slack and the interners (47.5 MB on the venv) are most of the venv's peak
+RSS above the 239 MB of rows. Two layout choices brought the stdlib from 16.5 to 13.4 B/LOC:
+chain lengths as `u8` columns instead of 8-byte runs, and single-name chains stored inline in
+the chain column (most binding targets and many callees) instead of in `names`.

@@ -1,0 +1,10 @@
+file lines=10 evidence=7
+module 0:<module> L1-10 b0-278
+def 1:save_user in=0 L1-6 b0-240 @1:4 (user)
+def 2:delete_user in=0 L9-10 b243-277 @9:4 (user_id)
+call 1:save_user L2:4 user.validate() dotted
+call 1:save_user L3:4 user.is_valid() dotted
+call 1:save_user L4:11 user.to_dict() dotted
+call 1:save_user L5:11 user.serialize() dotted
+bind 1:save_user L4 data = user.to_dict()
+bind 1:save_user L5 text = user.serialize()

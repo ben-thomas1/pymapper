@@ -1,0 +1,10 @@
+file lines=12 evidence=6
+module 0:<module> L1-12 b0-167
+def 1:greet in=0 L1-2 b0-44 @1:4 (name)
+class 2:Greeter in=0 L5-7 b47-116 @5:6
+def 3:say_hello in=2 L6-7 b66-116 @6:8 (self) [method]
+def 4:main in=0 L10-12 b119-166 @10:4 ()
+call 3:say_hello L7:15 greet()
+call 4:main L11:8 Greeter()
+call 4:main L12:4 g.say_hello() dotted
+bind 4:main L11 g = Greeter()

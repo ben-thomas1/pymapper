@@ -19,5 +19,9 @@ libc.workspace = true
 name = "intern"
 harness = false
 
+[[bench]]
+name = "facts"
+harness = false
+
 [lints]
 workspace = true

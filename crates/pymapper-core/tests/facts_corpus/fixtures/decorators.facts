@@ -1,0 +1,9 @@
+file lines=19 evidence=6
+module 0:<module> L1-19 b0-192
+def 1:sample_data in=0 L4-6 b16-71 @5:4 decs=[pytest.fixture] () [other_decorator]
+def 2:helper in=0 L9-10 b74-105 @9:4 ()
+def 3:index in=0 L13-15 b108-161 @14:4 decs=[app.route()] () [other_decorator]
+def 4:unused_func in=0 L18-19 b164-191 @18:4 ()
+import 0:<module> L1:7 import pytest
+call 0:<module> L13:1 app.route() dotted
+call 3:index L15:11 helper()

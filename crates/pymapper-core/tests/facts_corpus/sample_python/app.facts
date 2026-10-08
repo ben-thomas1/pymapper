@@ -1,0 +1,19 @@
+file lines=28 evidence=12
+module 0:<module> L1-28 b0-597
+def 1:list_users in=0 L8-11 b195-315 @9:4 decs=[app.route()] () [other_decorator]
+def 2:health_check in=0 L14-16 b318-389 @15:4 decs=[app.route()] () [other_decorator]
+def 3:main in=0 L19-24 b392-564 @20:4 decs=[log_calls] () [other_decorator]
+def 4:dead_endpoint in=0 L27-28 b567-596 @27:4 ()
+import 0:<module> L1:26 from services.auth import require_auth
+import 0:<module> L2:34 from services.user_service import create_user
+import 0:<module> L3:32 from middleware.pipeline import run_pipeline
+import 0:<module> L4:29 from utils.decorators import log_calls
+import 0:<module> L5:19 from cycles import ping
+call 0:<module> L8:1 app.route() dotted
+call 1:list_users L10:12 create_user()
+call 0:<module> L14:1 app.route() dotted
+call 3:main L21:4 require_auth()
+call 3:main L22:4 create_user()
+call 3:main L23:4 run_pipeline()
+call 3:main L24:4 ping()
+bind 1:list_users L10 users = create_user()

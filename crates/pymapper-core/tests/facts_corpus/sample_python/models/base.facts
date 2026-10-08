@@ -1,0 +1,13 @@
+file lines=21 evidence=6
+module 0:<module> L1-21 b0-441
+class 1:BaseModel in=0 L1-21 b0-440 @1:6
+def 2:validate in=1 L2-7 b21-170 @2:8 (self) [method]
+def 3:to_dict in=1 L9-10 b176-229 @9:8 (self) [method]
+def 4:save in=1 L12-15 b235-323 @12:8 (self) [method]
+def 5:serialize in=1 L17-18 b329-384 @17:8 (self) [method]
+def 6:is_valid in=1 L20-21 b390-440 @20:8 (self) [method]
+call 2:validate L5:11 len()
+call 4:save L13:11 self.validate() self
+call 5:serialize L18:15 str()
+call 5:serialize L18:19 self.to_dict() self
+call 6:is_valid L21:15 self.validate() self

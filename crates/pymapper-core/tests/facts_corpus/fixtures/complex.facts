@@ -1,0 +1,11 @@
+file lines=26 evidence=8
+module 0:<module> L1-26 b0-576
+def 1:complex_function in=0 L1-22 b0-536 @1:4 (x, y, z)
+def 2:simple_function in=0 L25-26 b539-575 @25:4 ()
+call 1:complex_function L4:21 range()
+call 1:complex_function L6:20 print()
+call 1:complex_function L8:20 print()
+bind 1:complex_function L4 i for [conditional]
+bind 1:complex_function L11 x op= <expr> [conditional]
+bind 1:complex_function L14 result = <expr> [conditional]
+bind 1:complex_function L16 result = <expr> [conditional]

@@ -1,0 +1,9 @@
+file lines=11 evidence=5
+module 0:<module> L1-11 b0-273
+class 1:Product in=0 L4-11 b36-272 @4:6 bases=[BaseModel]
+def 2:__init__ in=1 L5-8 b66-206 @5:8 (self, title, price) [dunder,method]
+def 3:display_price in=1 L10-11 b212-272 @10:8 (self) [method]
+import 0:<module> L1:24 from models.base import BaseModel
+bind 2:__init__ L6 self.title = title
+bind 2:__init__ L7 self.price = price
+bind 2:__init__ L8 self.data = <expr>

@@ -8,6 +8,7 @@ mod compound;
 mod defs;
 pub mod events;
 mod expr;
+pub mod facts;
 pub mod parser;
 mod soft;
 mod stmt;

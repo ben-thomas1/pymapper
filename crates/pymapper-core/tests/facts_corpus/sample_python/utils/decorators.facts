@@ -1,0 +1,8 @@
+file lines=8 evidence=7
+module 0:<module> L1-8 b0-276
+def 1:log_calls in=0 L1-8 b0-275 @1:4 (func)
+def 2:wrapper in=1 L3-7 b85-256 @3:8 (*args, **kwargs) [nested]
+call 2:wrapper L4:8 print()
+call 2:wrapper L5:17 func()
+call 2:wrapper L6:8 print()
+bind 2:wrapper L5 result = func()
