@@ -63,6 +63,8 @@ entered, and symlinks are not followed.
 | `calls`      | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges`, `resolve.classes`, `resolve.mro`, `resolve.calls` | `resolve`, then `pymapper_core::resolve::resolve_calls` (class table + method index, bases + C3 MROs, then every call row, uncalled decorator and override in parallel per file). Counters `calls`, shares of call rows in per mille (`certain_pm`, `likely_pm`, `possible_pm`, `unresolved_pm`; of which `builtin_pm` = builtins and builtin-type methods, `external_pm` = unloaded code and unloaded bases), `edges`, `override_edges`, `decorator_edges`, `classes`, `incomplete_classes`, `calls_kb` = `ResolvedCalls::heap_bytes`, `resolve_kb`, `index_kb` |
 | `graph`      | `calls` phases, `graph.build`, `graph.scc`, `graph.modules` | `calls`, then `pymapper_core::graph`: `graph.build` = `call_graph` over every node (all edges with a target), `graph.scc` = its `Condensed` (iterative Tarjan + DAG), `graph.modules` = `import_graph` (no flag mask) + `module_call_graph` and both condensations. Counters `graph_nodes`, `graph_edges` (distinct), `sccs`, `cyclic_sccs`, `largest_scc`, `dag_edges`, `modules`, `import_edges`, `import_cycles` and `module_call_cycles` (components with 2+ modules), `module_call_edges`, `callgraph_kb` (call graph + condensation heap), `graph_kb` (all six structures), `calls_kb`, `index_kb` |
 | `rollup`     | `calls` phases, `rollup.build`, `rollup.aggregates`, `rollup.levels` | `calls`, then `pymapper_core::rollup`: `rollup.build` = `Rollup::build` (all call edges with a target, all import edges), `rollup.aggregates` = `Aggregates::build`, `rollup.levels` = `Rollup::level_with` for every `Level::Depth(k)` from 0 to the deepest node, then `Level::Module`, with one reused scratch and output buffer. Counters `total_loc` (aggregated LOC of the distributions), `nodes`, `call_edges`, `call_pairs`, `sites`, `multi_sites`, `import_edges`, `levels`, `rollup_kb` (base tables), `agg_kb`, `scratch_kb`, `level_max_kb` (output buffer at its largest), `calls_kb`, `index_kb`, and per level `d{k}_edges` / `d{k}_us`, `module_edges` / `module_us` |
+| `hotspot`    | `load` phases, `hotspot.scan`, `hotspot.top` | `load`, then `pymapper_core::analysis::hotspot::analyse` with the default config (`hotspot.scan`: PM101-PM107 findings plus the per-module aggregates) and `top_functions` for the 100 worst functions by cognitive complexity (`hotspot.top`). Counters `loc`, `functions`, `classes`, `flagged` (functions over any function threshold), `findings`, `top_len`, `top_cognitive`, `hotspot_kb` = `ModuleHotspots::heap_bytes`, `index_kb` |
+| `coupling`   | `calls` phases, `graph.build`, `coupling.analyse` | `calls`, then the call graph over every node (all edges with a target) and `pymapper_core::analysis::coupling::analyse` with the default config (module Ca/Ce, abstractness, PM201-PM204). Counters `loc`, `modules` (files), `import_edges` (counted edges = sum of Ce), `class_candidates` (classes above `max-class-wmc`), `findings`, `coupling_kb` = `ModuleCoupling::heap_bytes`, `callgraph_kb`, `calls_kb`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -604,6 +606,35 @@ Per level on the venv (edges, time with a warm scratch):
   counts distinct call sites and not edges.
 - Correctness: `stdlib_rollup_matches_reference` (ignored test) checks every level, under three
   call/import filters, against a hash-set brute force, and the aggregates against subtree walks.
+
+### Hotspots and coupling (S4.3a)
+
+`hotspot` target: `load`, then the hotspot pass and the top 100 functions. `coupling` target:
+`calls`, then the call graph and the coupling pass. Default config (every corpus is loaded as
+one first-party group, so the stdlib and the venv are judged like project code). 14-core M4 Pro,
+release, warm cache, best of 3 (RSS worst of 3), load average about 7.5 from other worktrees.
+Both passes are sequential.
+
+| corpus | functions | classes | `hotspot.scan` | `hotspot.top` | findings (PM1xx) | `hotspot_kb` | peak RSS MB (`load` / `hotspot`) |
+|--------|-----------|---------|----------------|---------------|------------------|--------------|----------------------------------|
+| stdlib | 20,875    | 3,471   | 0.40ms         | 0.06ms        | 2,494            | 34           | 27.8 / 27.3                      |
+| venv   | 744,507   | 159,758 | 14.9ms         | 1.68ms        | 67,095           | 1,997        | 489.6 / 492.6                    |
+
+| corpus | modules | counted import edges | god-class candidates | `graph.build` | `coupling.analyse` | findings (PM2xx) | `coupling_kb` | `callgraph_kb` | peak RSS MB (`calls` / `coupling`) |
+|--------|---------|----------------------|----------------------|---------------|--------------------|------------------|---------------|----------------|------------------------------------|
+| stdlib | 1,043   | 3,958                | 200                  | 0.73ms        | 0.25ms             | 95               | 20            | 522            | 29.1 / 29.3                        |
+| venv   | 60,529  | 310,372              | 3,463                | 29.2ms        | 7.97ms             | 2,828            | 1,210         | 21,808         | 584.3 / 607.6                      |
+
+- **Hotspots**: 20 ns per function on the venv (17M LOC): a scan over the def rows and their
+  metrics rows, two logarithms per function for the maintainability index, findings pushed
+  with typed arguments (no formatting). `top_functions` is a bounded heap, O(defs log k).
+  Memory is the 33 B per file of `ModuleHotspots` (2 MB on the venv) plus the findings; the
+  peak RSS differences against `load` are within run-to-run noise.
+- **Coupling**: 8 ms on the venv: one pass over the module edges (310k counted, type-only
+  ones dropped), one over the defs and bases for abstractness, then the call-graph fan-out
+  of the 3,463 classes above `max-class-wmc` only. `ModuleCoupling` is 20 B per file (1.2 MB).
+  The 23 MB of RSS over `calls` is the call graph (`callgraph_kb`), which a full run builds
+  once and shares with the other graph analyses.
 
 ### Cache (S2.5)
 

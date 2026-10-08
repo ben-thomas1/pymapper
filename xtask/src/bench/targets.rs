@@ -91,6 +91,15 @@ pub enum Target {
     /// edge counts and times are counters). Peak RSS includes the index, the import resolution
     /// and the resolved calls.
     Rollup,
+    /// `load`, then the hotspot pass (`pymapper_core::analysis::hotspot`) with the default rules
+    /// and thresholds (phase `hotspot.scan`: findings plus per-module aggregates) and the 100
+    /// worst functions by cognitive complexity (`hotspot.top`). Peak RSS includes the index.
+    Hotspot,
+    /// `calls`, then the call graph (`graph.build`) and the coupling pass
+    /// (`pymapper_core::analysis::coupling`, phase `coupling.analyse`) with the default rules and
+    /// thresholds. Peak RSS includes the index, the import resolution, the resolved calls and
+    /// the call graph.
+    Coupling,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -124,6 +133,8 @@ impl Target {
             Target::Calls => "calls",
             Target::Graph => "graph",
             Target::Rollup => "rollup",
+            Target::Hotspot => "hotspot",
+            Target::Coupling => "coupling",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -454,6 +465,8 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Calls => calls_target(root)?,
         Target::Graph => graph_target(root)?,
         Target::Rollup => rollup_target(root)?,
+        Target::Hotspot => hotspot_target(root)?,
+        Target::Coupling => coupling_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -808,6 +821,77 @@ fn rollup_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     Ok((stats, counters))
 }
 
+/// `hotspot`: [`load_target`]'s load, then `pymapper_core::analysis::hotspot` with the default
+/// config (phase `hotspot.scan`) and the top 100 functions by cognitive complexity
+/// (`hotspot.top`).
+fn hotspot_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::analysis::hotspot::{self, Metric};
+    use pymapper_core::config::Config;
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::rules::{Findings, RuleEngine};
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let engine = RuleEngine::new(&Config::new(root));
+    let mut out = Findings::new();
+    let report = timing::time("hotspot.scan", || hotspot::analyse(&ix, &engine, &mut out));
+    let top = timing::time("hotspot.top", || hotspot::top_functions(&ix, Metric::Cognitive, 100, |_| true));
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let st = report.stats;
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("functions".to_owned(), st.functions),
+        ("classes".to_owned(), st.classes),
+        ("flagged".to_owned(), st.flagged),
+        ("findings".to_owned(), st.findings),
+        ("top_len".to_owned(), top.len() as u64),
+        ("top_cognitive".to_owned(), top.first().map_or(0, |&(_, v)| u64::from(v))),
+        ("hotspot_kb".to_owned(), report.modules.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    Ok((stats, counters))
+}
+
+/// `coupling`: [`calls_target`]'s pipeline, then the call graph (`graph.build`) and
+/// `pymapper_core::analysis::coupling` with the default config (`coupling.analyse`).
+fn coupling_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::analysis::coupling;
+    use pymapper_core::config::Config;
+    use pymapper_core::graph::{CallFilter, call_graph};
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::rules::{Findings, RuleEngine};
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let cg = timing::time("graph.build", || call_graph(&ix, &calls, CallFilter::default()));
+    let engine = RuleEngine::new(&Config::new(root));
+    let mut out = Findings::new();
+    let report = timing::time("coupling.analyse", || coupling::analyse(&ix, &imp, Some(&cg), &engine, &mut out));
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let st = report.stats;
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("modules".to_owned(), st.files),
+        ("import_edges".to_owned(), st.edges),
+        ("class_candidates".to_owned(), st.class_candidates),
+        ("findings".to_owned(), st.findings),
+        ("coupling_kb".to_owned(), report.modules.heap_bytes() as u64 / 1000),
+        ("callgraph_kb".to_owned(), cg.heap_bytes() as u64 / 1000),
+        ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ];
+    Ok((stats, counters))
+}
+
 /// Cache directory of the `load-cold` / `load-warm` targets for `root`.
 fn bench_cache_dir(root: &Path) -> std::path::PathBuf {
     let h = pymapper_core::intern::hash_bytes(root.as_os_str().as_encoded_bytes());
@@ -1057,6 +1141,8 @@ mod tests {
             Target::Calls,
             Target::Graph,
             Target::Rollup,
+            Target::Hotspot,
+            Target::Coupling,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -1117,6 +1203,11 @@ mod tests {
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "rollup.build",
                     "rollup.aggregates", "rollup.levels",
+                ],
+                Target::Hotspot => &["walk", "load.extract", "load.merge", "load.build", "hotspot.scan", "hotspot.top"],
+                Target::Coupling => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "coupling.analyse",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
@@ -1208,6 +1299,13 @@ mod tests {
                 assert!(counter("module_edges").is_some() && counter("module_us").is_some());
                 assert!(counter("call_pairs").unwrap() > 0);
                 assert!(counter("total_loc").unwrap() > rec.files);
+            } else if target == Target::Hotspot {
+                assert!(counter("functions").unwrap() > 0);
+                assert!(counter("flagged").is_some() && counter("findings").is_some());
+                assert!(counter("top_len").unwrap() > 0);
+            } else if target == Target::Coupling {
+                assert_eq!(counter("modules"), Some(rec.files));
+                assert!(counter("import_edges").is_some() && counter("findings").is_some());
             } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
                 assert_eq!(counter("segments"), Some(1));
                 if target == Target::LoadCold {
