@@ -148,8 +148,9 @@ pub(super) fn write(r: &Report<'_>, out: &mut Out<'_>) {
 
 /// `"PMxxx"`.
 fn push_code(b: &mut Vec<u8>, rule: Rule) {
-    let c = rule.code();
-    b.extend_from_slice(&[b'"', b'P', b'M', b'0' + (c / 100 % 10) as u8, b'0' + (c / 10 % 10) as u8, b'0' + (c % 10) as u8, b'"']);
+    b.push(b'"');
+    super::buf::push_code(b, rule.code());
+    b.push(b'"');
 }
 
 /// Percent-encodes a relative path as a URI reference (RFC 3986): unreserved characters and

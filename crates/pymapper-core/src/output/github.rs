@@ -5,9 +5,7 @@
 //! Escaping follows the runner: `%`, CR and LF in the message; additionally `:` and `,` in
 //! property values.
 
-use std::fmt::Write as _;
-
-use super::buf::Out;
+use super::buf::{Out, push_code};
 use super::{Options, Report, Summary, concise};
 use crate::rules::{FileId, Severity};
 
@@ -33,14 +31,18 @@ pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut
             }
             out.byte(b',');
         }
-        let _ = write!(out, "title={} ", f.rule);
+        out.str("title=");
+        push_code(out.buf(), f.rule.code());
+        out.byte(b' ');
         escape(def.name.as_bytes(), true, out);
         out.str("::");
         r.message(f, &mut msg);
-        if f.confidence < 100 {
-            let _ = write!(msg, " (confidence {})", f.confidence);
-        }
         escape(msg.as_bytes(), false, out);
+        if f.confidence < 100 {
+            out.str(" (confidence ");
+            out.u32(u32::from(f.confidence));
+            out.byte(b')');
+        }
         out.byte(b'\n');
     }
     if opts.footer {

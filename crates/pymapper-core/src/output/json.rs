@@ -32,28 +32,49 @@ use crate::rules::{FileId, SymbolId};
 /// Appends `s` as a JSON string literal (with quotes). Invalid UTF-8 becomes `�`.
 pub fn push_str(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
-    for chunk in s.utf8_chunks() {
-        push_escaped(out, chunk.valid().as_bytes());
-        if !chunk.invalid().is_empty() {
-            out.extend_from_slice(b"\\ufffd");
+    match std::str::from_utf8(s) {
+        Ok(_) => push_escaped(out, s),
+        Err(_) => {
+            for chunk in s.utf8_chunks() {
+                push_escaped(out, chunk.valid().as_bytes());
+                if !chunk.invalid().is_empty() {
+                    out.extend_from_slice(b"\\ufffd");
+                }
+            }
         }
     }
     out.push(b'"');
 }
+
+/// Bytes that need escaping in a JSON string: controls, `"`, `\` (and DEL, for readability).
+static ESCAPE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 0x20 {
+        t[b] = true;
+        b += 1;
+    }
+    t[b'"' as usize] = true;
+    t[b'\\' as usize] = true;
+    t[0x7f] = true;
+    t
+};
 
 /// Escapes valid UTF-8 (no quotes): runs of plain bytes are copied at once.
 fn push_escaped(out: &mut Vec<u8>, s: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut run = 0;
     for (i, &b) in s.iter().enumerate() {
+        if !ESCAPE[b as usize] {
+            continue;
+        }
         let esc: &[u8] = match b {
             b'"' => b"\\\"",
             b'\\' => b"\\\\",
             b'\n' => b"\\n",
             b'\r' => b"\\r",
             b'\t' => b"\\t",
-            0..=0x1f | 0x7f => b"",
-            _ => continue,
+            _ => b"",
         };
         out.extend_from_slice(&s[run..i]);
         run = i + 1;

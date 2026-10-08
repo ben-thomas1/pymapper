@@ -448,3 +448,32 @@ to about one chunk per thread. Without the reservation the global columns grow b
 and macOS malloc keeps freed blocks up to 8 MiB resident. Reserving 1.5x the extrapolated
 size once 1/16 of the chunks are in avoids most of that. Overshoot is untouched virtual
 memory, which the final `shrink_to_fit` releases.
+
+### Output (S4.4)
+
+Sorting, every format and the baseline round trip on synthetic findings (`cargo bench -p
+pymapper-core --bench output -- [N] [FILES]`): three rules (one with a symbol and two numbers,
+one with a symbol, one with a name), resolver backed by pre-rendered tables, output to a
+byte-counting sink. 14-core M4 Pro, release, one thread (output is sequential). Other
+worktrees were building at the same time, so times are upper bounds.
+
+| findings / files | push order       | sort  | concise | json  | sarif | github | baseline save / load / apply |
+|------------------|------------------|-------|---------|-------|-------|--------|------------------------------|
+| 10k / 500        | scrambled        | 54ns  | 94ns    | 213ns | 225ns | 140ns  | 170ns / 100ns / 37ns         |
+| 1M / 10k         | file-interleaved | 68ns  | 94ns    | 207ns | 225ns | 138ns  | 227ns / 119ns / 153ns        |
+| 1M / 10k         | scrambled        | 114ns | 321ns   | 455ns | 462ns | 377ns  | 344ns / 118ns / 226ns        |
+
+Times are per finding (per entry for load). Line sizes: concise 97 B, json 233 B, sarif 452 B,
+github 143 B per finding; the baseline file is 80 B per key.
+
+- **Throughput**: about 1 GB/s of concise or JSON output and 1.9 GB/s of SARIF when findings
+  arrive roughly in file order, which is how per-file analyses produce them. Fully scrambled
+  1M-finding buffers are 3x slower: the sorted walk reads findings, their arguments and the
+  name tables at random (cache misses), not formatting.
+- **Allocation**: none per finding. `Report::new` allocates its index array and one path pool
+  (each distinct path rendered once); writing allocates the 64 KiB output buffer and three
+  512-byte scratch buffers, the same count at 1k and 50k findings (`tests/output_alloc.rs`
+  checks this with a counting allocator).
+- **Memory**: 4 B per finding for the order plus the distinct paths. A loaded baseline holds
+  one byte pool with every key (rule + length-prefixed id and detail parts) plus about 32 B
+  per key for the entry, the hash index and the collision chain.

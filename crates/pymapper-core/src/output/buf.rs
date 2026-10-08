@@ -135,6 +135,12 @@ pub(crate) fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(fmt_u32(v, &mut digits));
 }
 
+/// Appends a rule code as `PMxxx` (codes are below 1000).
+#[inline]
+pub(crate) fn push_code(out: &mut Vec<u8>, code: u16) {
+    out.extend_from_slice(&[b'P', b'M', b'0' + (code / 100 % 10) as u8, b'0' + (code / 10 % 10) as u8, b'0' + (code % 10) as u8]);
+}
+
 /// Appends `v` as 16 lower-case hex digits to `out`.
 pub(crate) fn push_hex64(out: &mut Vec<u8>, v: u64) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

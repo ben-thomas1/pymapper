@@ -23,5 +23,9 @@ harness = false
 name = "facts"
 harness = false
 
+[[bench]]
+name = "output"
+harness = false
+
 [lints]
 workspace = true

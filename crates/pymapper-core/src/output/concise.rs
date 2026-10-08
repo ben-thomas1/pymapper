@@ -1,8 +1,6 @@
 //! `path:line:col: CODE message`, one finding per line, then the summary footer.
 
-use std::fmt::Write as _;
-
-use super::buf::Out;
+use super::buf::{Out, push_code};
 use super::{Options, Report, Summary};
 use crate::rules::{FileId, Finding};
 
@@ -10,11 +8,16 @@ pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut
     let mut msg = String::with_capacity(super::SCRATCH);
     for f in r.iter() {
         location(r, f, out);
-        let _ = write!(out, "{} ", f.rule);
+        push_code(out.buf(), f.rule.code());
+        out.byte(b' ');
         r.message(f, &mut msg);
         // Messages are single-line by construction; keep the format line-oriented regardless.
-        for b in msg.bytes() {
-            out.byte(if b == b'\n' || b == b'\r' { b' ' } else { b });
+        let start = out.buf().len();
+        out.buf().extend_from_slice(msg.as_bytes());
+        for b in &mut out.buf()[start..] {
+            if *b == b'\n' || *b == b'\r' {
+                *b = b' ';
+            }
         }
         if f.confidence < 100 {
             out.str(" (confidence ");
