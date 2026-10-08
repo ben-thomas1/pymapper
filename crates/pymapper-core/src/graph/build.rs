@@ -98,9 +98,10 @@ impl ModuleGraph {
     }
 }
 
-/// Package and module nodes of `ix`, ascending. Skips def subtrees (a module's subtree holds
-/// only defs), so this costs O(packages + modules + defs of `__init__` files).
-fn module_nodes(ix: &Index) -> Vec<NodeId> {
+/// Package and module nodes of `ix`, ascending: the local ids of every [`ModuleGraph`]. Skips
+/// def subtrees (a module's subtree holds only defs), so this costs O(packages + modules +
+/// defs of `__init__` files).
+pub fn module_nodes(ix: &Index) -> Vec<NodeId> {
     let mut out = Vec::new();
     let n = ix.node_count();
     let mut v = 0;
