@@ -9,8 +9,8 @@
 //!     dist-<name>@<version>@<hash>.pmc   one per third-party distribution
 //! ```
 //!
-//! Each file is a facts segment ([`segment`]): the facts and metrics of a set of files with a
-//! local string table, laid out as the in-memory columns, so loading a cached file is a copy
+//! Each file is a facts segment (`cache/segment.rs`): the facts and metrics of a set of files
+//! with a local string table, laid out as the in-memory columns, so loading a cached file is a copy
 //! of its rows (no parse). What makes an entry valid depends on the group:
 //!
 //! - First-party (and third-party files without a `RECORD`, editable installs): per file, the
@@ -24,11 +24,14 @@
 //! - The stdlib: per interpreter version and install (path, plus a `stat` of `os.py`, which a
 //!   patch upgrade rewrites); files are trusted like a distribution's.
 //!
-//! [`load`] wraps [`index::load`]: it opens the segments of every group in parallel, the loader
-//! copies hits and extracts the rest, then every group whose segment is missing or stale is
-//! re-encoded from the finished index and written atomically (temp file + `rename`). A
-//! segment that fails validation (version, schema, checksum, structure) is ignored and
-//! rewritten: the cache never makes a load fail.
+//! [`load`] wraps [`crate::index::load`]: the loader's workers open (map and validate) a
+//! group's segment when they reach its first file and the last one done with the group's
+//! files unmaps it, so only the segments being copied are resident. Hits are copied, the rest
+//! is extracted. Then every group whose segment is missing or stale is re-encoded from the
+//! finished index (in parallel) and written atomically (temp file + `rename`), and older
+//! versions of rewritten distribution / stdlib segments that the load does not use are
+//! deleted. A segment that fails validation (version, schema, checksum, structure) is ignored
+//! and rewritten: the cache never makes a load fail.
 //!
 //! The schema hash ([`schema`]) covers the format version, the fact layout and the crate
 //! version: any of them changing invalidates every segment. Bump [`FACTS_VERSION`] whenever
