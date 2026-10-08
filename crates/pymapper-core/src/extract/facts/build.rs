@@ -497,8 +497,10 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
 
     fn assign(&mut self, a: &Assign<'_>) {
         // Value first: it usually repeats the chain of the call event just seen.
+        // An unpacked target gets one element of the value: its shape is unknown.
         let (value, value_chain) = match a.value {
             Value::None => (ValueKind::None, ChainCol::EMPTY),
+            _ if a.unpacked => (ValueKind::Other, ChainCol::EMPTY),
             Value::Call { names } => (ValueKind::Call, self.chain(names)),
             Value::Name(names) => (ValueKind::Name, self.chain(names)),
             Value::Strings(_) => (ValueKind::Strings, ChainCol::EMPTY),

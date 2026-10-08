@@ -22,14 +22,14 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
         }
     };
 
-    let _ = write!(out, "file lines={}", ff.lines);
+    let _ = write!(out, "file lines={} evidence={}", ff.lines, ff.evidence.len);
     flag_list(&mut out, ff.flags as u16, &[
         (file_flags::MAIN_GUARD as u16, "main_guard"),
         (file_flags::ALL_DEFINED as u16, "all_defined"),
         (file_flags::ALL_DYNAMIC as u16, "all_dynamic"),
         (file_flags::TRUNCATED as u16, "truncated"),
     ]);
-    let _ = writeln!(out, " evidence={}", ff.evidence.len);
+    out.push('\n');
 
     for d in 0..ff.defs.len {
         let row = view.def_row(d);
