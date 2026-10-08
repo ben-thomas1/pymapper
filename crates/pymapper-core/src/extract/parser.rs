@@ -159,6 +159,7 @@ pub struct Parser<'src, V: Visitor> {
     pub(super) resync: bool,
     /// Scanning a case pattern: no call/keyword events; tokens go to `tgt`.
     pub(super) pattern: bool,
+    pub(super) pat: super::soft::PatScratch,
     pub(super) diag_count: u32,
 }
 
@@ -189,6 +190,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
             tgt_recs: Vec::new(),
             tgt_unpack: false,
             pattern: false,
+            pat: super::soft::PatScratch::default(),
             resync: false,
             diag_count: 0,
         }

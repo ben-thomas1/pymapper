@@ -512,6 +512,27 @@ fn case_irrefutability() {
     assert!(!irr("(a, b)"));
     assert!(!irr("C()"));
     assert!(irr("(a) | (b, c)"));
+    assert!(!irr("x,"));
+    assert!(!irr("x, y"));
+    assert!(!irr("(x,)"));
+    assert!(!irr("x as y as"));
+}
+
+#[test]
+fn case_pattern_deep_nesting() {
+    // Hostile nesting must neither overflow the stack nor go quadratic.
+    let n = 50_000;
+    let mut alt = String::new();
+    alt.push_str(&"(".repeat(n));
+    alt.push('x');
+    alt.push_str(&")|1".repeat(n));
+    let src = format!("match v:\n    case {alt}:\n        pass\n");
+    assert!(events(&src).iter().any(|l| l.contains("irrefutable")));
+    let mut wrap = "(".repeat(n);
+    wrap.push('1');
+    wrap.push_str(&") as y".repeat(n));
+    let src = format!("match v:\n    case {wrap}:\n        pass\n");
+    assert!(!events(&src).iter().any(|l| l.contains("irrefutable")));
 }
 
 #[test]

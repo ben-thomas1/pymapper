@@ -121,7 +121,7 @@ impl<V: Visitor> Parser<'_, V> {
         self.pattern = true;
         self.expr(S_IF | S_COLON);
         self.pattern = false;
-        let irrefutable = pattern_irrefutable(&self.tgt);
+        let irrefutable = self.pat.irrefutable(&self.tgt);
         let guarded = self.eat(K::If).is_some();
         if guarded {
             self.expr(S_COLON);
@@ -180,84 +180,95 @@ impl<V: Visitor> Parser<'_, V> {
     }
 }
 
-/// A case pattern (its tokens) is irrefutable when it is a bare capture or
-/// wildcard name, possibly parenthesised, an `|` alternative containing one,
-/// or `<pattern> as NAME` whose sub-pattern is irrefutable (ruff C901 /
-/// `Pattern::irrefutable_pattern`).
-fn pattern_irrefutable(toks: &[Token]) -> bool {
-    let mut toks = toks;
-    loop {
-        // Strip enclosing parentheses that match each other.
-        if toks.len() >= 2 && toks[0].kind == K::LPar && toks[toks.len() - 1].kind == K::RPar && encloses(toks) {
-            toks = &toks[1..toks.len() - 1];
-            continue;
+/// Reusable scratch buffers for [`PatScratch::irrefutable`].
+#[derive(Default)]
+pub(super) struct PatScratch {
+    /// Index of the matching bracket for each token (`NONE` if unpaired).
+    mate: Vec<u32>,
+    /// Open-bracket stack used while pairing.
+    open: Vec<u32>,
+    /// Top-level element positions of the range being examined.
+    top: Vec<u32>,
+    /// Pending token ranges `[lo, hi)` to examine.
+    work: Vec<(u32, u32)>,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl PatScratch {
+    /// A case pattern (its tokens) is irrefutable when it is a bare capture or
+    /// wildcard name, possibly parenthesised, an `|` alternative containing
+    /// one, or `<pattern> as NAME` whose sub-pattern is irrefutable (ruff
+    /// C901 / `Pattern::irrefutable_pattern`).
+    ///
+    /// Linear and iterative: brackets are paired once, then each token is
+    /// visited at exactly one nesting level, so hostile nesting can neither
+    /// overflow the stack nor go quadratic.
+    pub(super) fn irrefutable(&mut self, toks: &[Token]) -> bool {
+        let n = toks.len().min(NONE as usize - 1);
+        let toks = &toks[..n];
+        self.pair(toks);
+        self.work.clear();
+        self.work.push((0, n as u32));
+        while let Some((lo, hi)) = self.work.pop() {
+            if self.range_irrefutable(toks, lo, hi) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn pair(&mut self, toks: &[Token]) {
+        self.mate.clear();
+        self.mate.resize(toks.len(), NONE);
+        self.open.clear();
+        for (i, t) in toks.iter().enumerate() {
+            match t.kind {
+                K::LPar | K::LSqb | K::LBrace => self.open.push(i as u32),
+                K::RPar | K::RSqb | K::RBrace => {
+                    if let Some(o) = self.open.pop() {
+                        self.mate[o as usize] = i as u32;
+                        self.mate[i] = o;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Examines `toks[lo..hi]` at its top level. Returns true if an
+    /// alternative is a bare name; parenthesised alternatives are queued.
+    fn range_irrefutable(&mut self, toks: &[Token], lo: u32, hi: u32) -> bool {
+        // Top-level elements: a bracket group counts as its opener.
+        self.top.clear();
+        let mut i = lo;
+        while i < hi {
+            self.top.push(i);
+            let m = self.mate[i as usize];
+            let opener = matches!(toks[i as usize].kind, K::LPar | K::LSqb | K::LBrace);
+            i = if opener && m != NONE && m < hi { m + 1 } else { i + 1 };
         }
         // `as` binds looser than `|`: `1 | x as y` is `(1 | x) as y`.
-        if let Some(sub) = strip_as_target(toks) {
-            toks = sub;
-            continue;
+        while let [.., a, b] = self.top[..]
+            && self.top.len() >= 3
+            && toks[a as usize].kind == K::As
+            && toks[b as usize].kind == K::Name
+        {
+            self.top.truncate(self.top.len() - 2);
         }
-        break;
-    }
-    let mut depth = 0u32;
-    let mut start = 0;
-    for (i, t) in toks.iter().enumerate() {
-        match t.kind {
-            K::LPar | K::LSqb | K::LBrace => depth += 1,
-            K::RPar | K::RSqb | K::RBrace => depth = depth.saturating_sub(1),
-            K::VBar if depth == 0 => {
-                if alt_irrefutable(&toks[start..i]) {
-                    return true;
-                }
-                start = i + 1;
+        let mut found = false;
+        for alt in self.top.split(|&p| toks[p as usize].kind == K::VBar) {
+            let [p] = *alt else { continue };
+            let t = toks[p as usize];
+            if t.kind == K::Name {
+                found = true;
+                break;
             }
-            _ => {}
-        }
-    }
-    alt_irrefutable(&toks[start..])
-}
-
-fn alt_irrefutable(alt: &[Token]) -> bool {
-    match alt {
-        [t] => t.kind == K::Name,
-        [first, .., last] if first.kind == K::LPar && last.kind == K::RPar && encloses(alt) => {
-            pattern_irrefutable(alt)
-        }
-        _ => false,
-    }
-}
-
-/// `<pattern> as NAME` at depth 0 -> the sub-pattern tokens.
-fn strip_as_target(toks: &[Token]) -> Option<&[Token]> {
-    let n = toks.len();
-    if n < 3 || toks[n - 2].kind != K::As || toks[n - 1].kind != K::Name {
-        return None;
-    }
-    let mut depth = 0u32;
-    for t in &toks[..n - 2] {
-        match t.kind {
-            K::LPar | K::LSqb | K::LBrace => depth += 1,
-            K::RPar | K::RSqb | K::RBrace => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    if depth == 0 { Some(&toks[..n - 2]) } else { None }
-}
-
-/// `toks[0]` (an opener) is closed by the last token, not earlier.
-fn encloses(toks: &[Token]) -> bool {
-    let mut depth = 0u32;
-    for (i, t) in toks.iter().enumerate() {
-        match t.kind {
-            K::LPar | K::LSqb | K::LBrace => depth += 1,
-            K::RPar | K::RSqb | K::RBrace => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return i == toks.len() - 1;
-                }
+            let m = self.mate[p as usize];
+            if t.kind == K::LPar && m != NONE && m > p && m < hi && toks[m as usize].kind == K::RPar {
+                self.work.push((p + 1, m));
             }
-            _ => {}
         }
+        found
     }
-    false
 }
