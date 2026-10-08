@@ -352,3 +352,424 @@ fn dynamic_modules() {
     let fx = fixture(t.path());
     assert_eq!(fx.rows("user"), s(&["1 dynamic in lazy", "2 dynamic in starry"]));
 }
+
+#[test]
+fn module_attribute_aliases() {
+    let t = TempDir::new("aliases");
+    // `os.path` / `collections.abc` style: a module bound in its parent, registered in
+    // `sys.modules`, with no file of that dotted name.
+    t.file("myos.py", "import sys\nimport posixish as path\nsys.modules['myos.path'] = path\n")
+        .file("posixish.py", "def join():\n    pass\n")
+        .file("coll/__init__.py", "import _coll_abc\nabc = _coll_abc\nclass Real:\n    pass\nAlias = Real\nChained = abc.Mapping\nNum = 3\n")
+        .file("_coll_abc.py", "class Mapping:\n    pass\n")
+        .file(
+            "user.py",
+            concat!(
+                "import myos.path\n",
+                "from myos.path import join\n",
+                "from myos import path\n",
+                "import coll.abc\n",
+                "from coll.abc import Mapping\n",
+                "from coll import Alias, Chained, Num\n",
+                "import myos.nothing\n",
+                "from myos import __name__, __doc__\n",
+            ),
+        );
+    let fx = fixture(t.path());
+    assert_eq!(
+        fx.rows("user"),
+        s(&[
+            "1 module posixish",
+            "2 symbol posixish:join",
+            "3 module posixish [reexport]",
+            "4 module _coll_abc",
+            "5 symbol _coll_abc:Mapping",
+            "6 symbol coll:Real",
+            "6 symbol _coll_abc:Mapping [reexport]",
+            "6 variable coll",
+            "7 missing-module in myos",
+            "8 variable myos",
+            "8 variable myos",
+        ])
+    );
+    // `import myos.path` / `import myos.nothing` bind `myos` either way.
+    assert_eq!(fx.global("user", "myos").as_deref(), Some("module myos"));
+    assert_eq!(fx.edges("user"), s(&["_coll_abc x1", "coll x4", "myos x4", "posixish x2"]));
+}
+
+#[test]
+fn dynamic_namespaces() {
+    let t = TempDir::new("dynns");
+    t.file("g.py", "globals().update({'made': 1})\n")
+        .file("e.py", "def make():\n    exec('def made(): pass', globals())\nmake()\n")
+        .file("plain.py", "def f():\n    pass\n")
+        .file("user.py", "from g import made\nfrom e import made as m2\nfrom plain import made as m3\n");
+    let fx = fixture(t.path());
+    assert_eq!(fx.rows("user"), s(&["1 dynamic in g", "2 dynamic in e", "3 missing-name in plain"]));
+}
+
+#[test]
+fn context_flags_and_edge_aggregation() {
+    let t = TempDir::new("flags");
+    t.file("a.py", "def f():\n    pass\n")
+        .file("b.py", "def g():\n    pass\n")
+        .file("c.py", "")
+        .file("d.py", "")
+        .file(
+            "user.py",
+            concat!(
+                "from typing import TYPE_CHECKING\n",
+                "if TYPE_CHECKING:\n",
+                "    from a import f\n",
+                "    import b\n",
+                "from b import g\n",
+                "try:\n",
+                "    import c\n",
+                "except ImportError:\n",
+                "    c = None\n",
+                "if f:\n",
+                "    import d\n",
+                "def h():\n",
+                "    import d\n",
+            ),
+        );
+    let fx = fixture(t.path());
+    assert_eq!(
+        fx.rows("user"),
+        s(&[
+            "1 stdlib typing",
+            "3 symbol a:f [type,cond]",
+            "4 module b [type,cond]",
+            "5 symbol b:g",
+            "7 module c [cond,try]",
+            "11 module d [cond]",
+            "13 module d [lazy]",
+        ])
+    );
+    // An edge is type-only / conditional only if every row behind it is.
+    assert_eq!(fx.edges("user"), s(&["a x1 [type,cond]", "b x2", "c x1 [cond,try]", "d x2"]));
+    assert_eq!(fx.ext_edges("user"), s(&["Stdlib typing x1"]));
+}
+
+#[test]
+fn attribution_of_unresolved_imports() {
+    let t = TempDir::new("attr");
+    t.file("pkg/__init__.py", "import numpy as np\n")
+        .file("ns/inner/x.py", "")
+        .file(
+            "user.py",
+            concat!(
+                "import os.path\n",
+                "import json, sys\n",
+                "import numpy.linalg\n",
+                "from requests import get\n",
+                "import zzz_unknown\n",
+                "import ns.inner.x\n",
+                "import ns.other\n",
+                "from pkg import np\n",
+                "import __future__\n",
+            ),
+        );
+    let mut attr = Attribution::new();
+    attr.add_dist_name(b"numpy", DistId(7));
+    attr.add_dist_name(b"requests", DistId(3));
+    // Stdlib names win over distributions.
+    attr.add_dist_name(b"json", DistId(9));
+    let fx = fixture_with(t.path(), &attr);
+    assert_eq!(
+        fx.rows("user"),
+        s(&[
+            "1 stdlib os",
+            "2 stdlib json",
+            "2 stdlib sys",
+            "3 third-party dist7",
+            "4 third-party dist3",
+            "5 external zzz_unknown",
+            "6 module ns.inner.x",
+            // Only a namespace prefix: attributed by the top-level name.
+            "7 external ns",
+            // A re-exported third-party module keeps its attribution.
+            "8 third-party dist7 [reexport]",
+            "9 stdlib __future__",
+        ])
+    );
+    assert_eq!(
+        fx.ext_edges("user"),
+        s(&["Stdlib __future__ x1", "Stdlib json x1", "Stdlib os x1", "Stdlib sys x1", "dist3 x1", "dist7 x1", "Unknown ns x1", "Unknown zzz_unknown x1"])
+    );
+    assert_eq!(fx.edges("user"), s(&["ns.inner.x x1", "pkg x1"]));
+    assert_eq!(fx.global("user", "np").as_deref(), Some("unresolved 8 third-party dist7 [reexport]"));
+    assert!(is_builtin_stdlib(b"asyncio") && is_builtin_stdlib(b"_io") && !is_builtin_stdlib(b"numpy"));
+}
+
+#[test]
+fn stdlib_dir_and_roots_attribution() {
+    let t = TempDir::new("stdlibdir");
+    t.file("lib/python3.99/brand_new_mod.py", "")
+        .file("lib/python3.99/newpkg/__init__.py", "")
+        .file("lib/python3.99/lib-dynload/_fastthing.cpython-399-darwin.so", "")
+        .file("lib/python3.99/site-packages/notstd.py", "");
+    let mut a = Attribution::new();
+    a.add_stdlib_dir(&t.path().join("lib/python3.99"));
+    a.add_dist_name(b"newpkg", DistId(1));
+    assert_eq!(a.classify(b"brand_new_mod"), Attributed::Stdlib);
+    assert_eq!(a.classify(b"newpkg"), Attributed::Stdlib);
+    assert_eq!(a.classify(b"_fastthing"), Attributed::Stdlib);
+    assert_eq!(a.classify(b"site-packages"), Attributed::Unknown);
+    assert_eq!(a.classify(b"notstd"), Attributed::Unknown);
+    assert_eq!(a.classify(b"os"), Attributed::Stdlib);
+    // A distribution name added before the stdlib directory still loses to it.
+    let mut b = Attribution::new();
+    b.add_dist_name(b"brand_new_mod", DistId(2));
+    b.add_stdlib_dir(&t.path().join("lib/python3.99"));
+    assert_eq!(b.classify(b"brand_new_mod"), Attributed::Stdlib);
+}
+
+#[test]
+fn stubs_and_namespace_packages() {
+    let t = TempDir::new("stubs");
+    t.file("m.py", "def impl_only():\n    pass\ndef both():\n    pass\n")
+        .file("m.pyi", "def both() -> None: ...\ndef stub_only() -> None: ...\n")
+        .file("lone.pyi", "def s() -> None: ...\n")
+        .file("nsp/a.py", "def fa():\n    pass\n")
+        .file("nsp/deep/b.py", "")
+        .file("user.py", "from m import impl_only, both, stub_only\nfrom lone import s\nimport nsp.a\nfrom nsp import a, deep\nfrom nsp.deep import b\nimport nsp\n");
+    let fx = fixture(t.path());
+    assert_eq!(
+        fx.rows("user"),
+        s(&[
+            "1 symbol m:impl_only",
+            // The implementation's binding comes first; the stub fills in.
+            "1 symbol m:both",
+            "1 symbol m#2:stub_only",
+            "2 symbol lone:s",
+            "3 module nsp.a",
+            "4 module nsp.a",
+            "4 module nsp.deep",
+            "5 module nsp.deep.b",
+            "6 module nsp",
+        ])
+    );
+    let mods = fx.imp.modules();
+    let m = mods.lookup(&fx.ix, b"m").expect("m");
+    assert_eq!(mods.kind(m), ModKind::Module);
+    assert_eq!(fx.qid(mods.node(m).expect("node")), "m");
+    assert_eq!(fx.qid(mods.stub(m).expect("stub")), "m#2");
+    let lone = mods.lookup(&fx.ix, b"lone").expect("lone");
+    assert_eq!((mods.kind(lone), mods.stub(lone)), (ModKind::Module, None));
+    let nsp = mods.lookup(&fx.ix, b"nsp").expect("nsp");
+    assert_eq!(mods.kind(nsp), ModKind::Namespace);
+    let mut name = Vec::new();
+    mods.dotted(&fx.ix, mods.lookup(&fx.ix, b"nsp.deep.b").expect("b"), &mut name);
+    assert_eq!(name, b"nsp.deep.b");
+    assert_eq!(mods.lookup(&fx.ix, b"nsp.nothing"), None);
+}
+
+/// Files of several groups with explicit statuses (what `Inputs::from_roots` produces).
+#[test]
+fn groups_shadowing_and_third_party_targets() {
+    use crate::roots::FileStatus;
+    let t = TempDir::new("groups");
+    t.file("app/main.py", "import lib\nfrom lib.core import run\nimport other\nimport json\n")
+        .file("app/lib.py", "def shadowed_def():\n    pass\n")
+        .file("site/lib/__init__.py", "")
+        .file("site/lib/core.py", "def run():\n    pass\n")
+        .file("site/other/__init__.py", "")
+        .file("std/json/__init__.py", "")
+        .file("std/other.py", "");
+    let p = |rel: &str| t.path().join(rel).into_os_string().into_encoded_bytes();
+    let mut inp = Inputs::new();
+    let fp = inp.add_group(b"app", Origin::FirstParty, None);
+    let tp = inp.add_group(b"lib-dist", Origin::ThirdParty, Some(DistId(0)));
+    let sl = inp.add_group(b"stdlib", Origin::Stdlib, None);
+    inp.push(&p("app/main.py"), fp, b"main", FileStatus::Active).expect("push");
+    // A first-party module shadowed by the installed package (e.g. a later root).
+    inp.push(&p("app/lib.py"), fp, b"lib", FileStatus::Shadowed).expect("push");
+    inp.push(&p("site/lib/__init__.py"), tp, b"lib", FileStatus::Active).expect("push");
+    inp.push(&p("site/lib/core.py"), tp, b"lib.core", FileStatus::Active).expect("push");
+    inp.push(&p("site/other/__init__.py"), tp, b"other", FileStatus::Shadowed).expect("push");
+    inp.push(&p("std/json/__init__.py"), sl, b"json", FileStatus::Active).expect("push");
+    inp.push(&p("std/other.py"), sl, b"other", FileStatus::Active).expect("push");
+    let ix = load(inp);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let fx = Fx { ix, imp };
+    assert_eq!(
+        fx.rows("main"),
+        s(&["1 module lib#2", "2 symbol lib.core:run", "3 module other#2", "4 module json"])
+    );
+    let main = fx.file("main");
+    let origins: Vec<Origin> = fx
+        .imp
+        .module_edges(main)
+        .iter()
+        .map(|e| fx.ix.file_origin(fx.ix.file(e.dst).expect("file")))
+        .collect();
+    assert_eq!(origins, [Origin::ThirdParty, Origin::ThirdParty, Origin::Stdlib, Origin::Stdlib]);
+    assert!(fx.imp.ext_edges(main).is_empty());
+}
+
+/// Dump of every row and edge, independent of `Sym` numbering.
+fn dump(fx: &Fx) -> String {
+    let mut out = String::new();
+    for f in 0..fx.ix.file_count() {
+        let _ = writeln!(out, "file {}", String::from_utf8_lossy(fx.ix.str(fx.ix.file_module(f))));
+        for row in fx.ix.file_facts(f).imports.range() {
+            let via = fx.imp.via(row).map_or(String::new(), |v| format!(" via {v}"));
+            let _ = writeln!(out, "  {}{via}", fx.row(row));
+        }
+        for e in fx.imp.module_edges(f) {
+            let _ = writeln!(out, "  -> {} x{} {}", fx.qid(e.dst), e.rows, e.flags);
+        }
+        for e in fx.imp.ext_edges(f) {
+            let key = match e.kind {
+                ExtKind::ThirdParty => e.key.to_string(),
+                _ => String::from_utf8_lossy(edges::ext_name(&fx.ix, e.key)).into_owned(),
+            };
+            let _ = writeln!(out, "  => {:?} {key} x{} {}", e.kind, e.rows, e.flags);
+        }
+    }
+    out
+}
+
+fn fixture_threads(root: &Path, threads: usize) -> Fx {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+    pool.install(|| fixture(root))
+}
+
+fn corpus_root(sub: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus").join(sub)
+}
+
+#[test]
+fn corpus_sample_python_resolves_fully() {
+    let root = corpus_root("sample_python");
+    let fx = fixture_threads(&root, 4);
+    for row in 0..fx.imp.len() {
+        let st = fx.imp.status(row);
+        assert!(matches!(st, ImportStatus::Symbol | ImportStatus::Module), "row {row}: {}", fx.row(row));
+    }
+    assert_eq!(
+        fx.rows("app"),
+        s(&[
+            "1 symbol services.auth:require_auth",
+            "2 symbol services.user_service:create_user",
+            "3 symbol middleware.pipeline:run_pipeline",
+            "4 symbol utils.decorators:log_calls",
+            "5 symbol cycles:ping",
+        ])
+    );
+    assert_eq!(
+        fx.rows("models"),
+        s(&[
+            "1 symbol models.base:BaseModel [exported]",
+            "2 symbol models.user:User [exported]",
+            "3 symbol models.product:Product [exported]",
+        ])
+    );
+    assert_eq!(fx.edges("models.user"), s(&["models.base x1"]));
+    assert_eq!(dump(&fixture_threads(&root, 1)), dump(&fx));
+}
+
+#[test]
+fn corpus_fixtures_cross_module() {
+    let fx = fixture(&corpus_root("fixtures/cross_module"));
+    assert_eq!(
+        fx.rows("a"),
+        s(&["1 symbol b:foo", "2 symbol b:bar", "3 module utils", "4 stdlib os"])
+    );
+    let a = fx.file("a");
+    assert_eq!(fx.imp.global(&fx.ix, a, fx.sym("b_bar")).map(|g| fx.global_str(g)).as_deref(), Some("def b:bar"));
+    assert_eq!(fx.ext_edges("a"), s(&["Stdlib os x1"]));
+}
+
+#[test]
+fn whole_corpus_is_deterministic() {
+    let root = corpus_root("");
+    let many = fixture_threads(&root, 8);
+    assert_eq!(dump(&fixture_threads(&root, 1)), dump(&many));
+    let st = many.imp.stats();
+    assert_eq!(st.rows, many.ix.facts().imports.len() as u64);
+    assert_eq!(st.by_status.iter().sum::<u64>(), st.rows);
+    assert!(many.imp.heap_bytes() > 0);
+}
+
+#[test]
+fn empty_index() {
+    let t = TempDir::new("empty");
+    let fx = fixture(t.path());
+    assert!(fx.imp.is_empty());
+    assert!(fx.imp.modules().is_empty());
+    assert_eq!(fx.imp.all_module_edges().count(), 0);
+}
+
+/// Real-world run: the stdlib (`PYMAPPER_STDLIB`, else the default path of docs/design.md)
+/// resolves deterministically, and nearly every import of it resolves to stdlib code. Slow in
+/// debug builds: `cargo test --release -p pymapper-core stdlib_ -- --ignored`.
+#[test]
+#[ignore]
+fn stdlib_imports_resolve() {
+    let root = std::env::var_os("PYMAPPER_STDLIB").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("/Users/bt386671/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13")
+    });
+    if !root.is_dir() {
+        eprintln!("skipping: {} not found", root.display());
+        return;
+    }
+    let mut attr = Attribution::new();
+    attr.add_stdlib_dir(&root);
+    let many = fixture_threads_with(&root, 14, &attr);
+    let st = *many.imp.stats();
+    // Stdlib-attributed rows are built-in / extension modules (no source); dynamic ones are
+    // `globals()` / `__getattr__` modules. The rest would be resolver bugs or real breakage
+    // (`idlelib.idle_test` is not shipped, PEP 695 `type` statements are not extracted yet).
+    let unexpected = st.by_status[ImportStatus::MissingName as usize]
+        + st.by_status[ImportStatus::MissingModule as usize]
+        + st.by_status[ImportStatus::BeyondTop as usize]
+        + st.by_status[ImportStatus::External as usize];
+    eprintln!("stdlib imports: {st:?}");
+    if std::env::var_os("PYMAPPER_DEBUG_RESOLVE").is_some() {
+        let mut hist: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for f in 0..many.ix.file_count() {
+            for row in many.ix.file_facts(f).imports.range() {
+                let st = many.imp.status(row);
+                if matches!(st, ImportStatus::External | ImportStatus::MissingModule | ImportStatus::MissingName) {
+                    let segs = many.ix.file_view(f).import_module(row);
+                    let m: Vec<String> = segs.iter().map(|&s| String::from_utf8_lossy(many.ix.str(s)).into_owned()).collect();
+                    let lvl = many.ix.facts().imports.level[row];
+                    let name = many.ix.facts().imports.name[row].map_or(String::new(), |n| String::from_utf8_lossy(many.ix.str(n)).into_owned());
+                    let from = String::from_utf8_lossy(many.ix.str(many.ix.file_module(f))).into_owned();
+                    let key = format!("{} {}{} {name} (in {from})", st.as_str(), ".".repeat(lvl as usize), m.join("."));
+                    *hist.entry(key).or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, n) in v.iter().take(40) {
+            eprintln!("{n:6} {k}");
+        }
+    }
+    assert!(unexpected * 100 <= st.rows * 3, "{unexpected} of {} rows unresolved", st.rows);
+    // Spot checks when the root is a stdlib (the variable may point at any tree).
+    if many.imp.modules().lookup(&many.ix, b"json.decoder").is_some() {
+        let rows: Vec<String> = many.rows("json").into_iter().filter(|r| r.contains("JSONDecoder")).collect();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ends_with("symbol json.decoder:JSONDecoder [exported]"), "{rows:?}");
+        let rows = many.rows("collections");
+        assert!(rows.iter().any(|r| r.ends_with("module _collections_abc")), "{rows:?}");
+    }
+    let one = fixture_threads_with(&root, 1, &attr);
+    assert_eq!(dump(&one), dump(&many));
+}
+
+/// The stdlib as one root, without the interpreter's site-packages (like `Roots::sources`).
+fn fixture_threads_with(root: &Path, threads: usize, attr: &Attribution) -> Fx {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+    pool.install(|| {
+        let opts = WalkOptions { excludes: vec!["/site-packages".to_owned()], ..WalkOptions::everything() };
+        let w = walk(&[root], &opts);
+        let ix = load(Inputs::from_root_dir(root, &w.files, Origin::Stdlib, b"stdlib"));
+        let imp = resolve_imports(&ix, attr);
+        Fx { ix, imp }
+    })
+}

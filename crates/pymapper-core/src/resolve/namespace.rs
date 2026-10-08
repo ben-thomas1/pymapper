@@ -2,6 +2,7 @@
 
 use rayon::prelude::*;
 
+use crate::extract::events::Receiver;
 use crate::extract::facts::{file_flags, import_flags};
 use crate::index::{FileId, Index};
 use crate::intern::Sym;
@@ -19,6 +20,9 @@ pub(super) mod kind {
     pub const UNBOUND: u8 = 3;
     /// `from m import *` (name [`super::STAR_NAME`], sorted last): `r` is the import row.
     pub const STAR: u8 = 4;
+    /// The file calls `globals()` or `exec()`: names may be bound dynamically (name
+    /// [`super::STAR_NAME`], sorted after the star imports, at most one per file).
+    pub const DYNAMIC: u8 = 5;
     pub const MASK: u8 = 0b111;
     /// Flag: the name is listed in `__all__`.
     pub const IN_ALL: u8 = 1 << 7;
@@ -98,7 +102,8 @@ pub(super) struct Namespaces {
 
 impl Namespaces {
     pub fn build(ix: &Index) -> Namespaces {
-        let (entries, start) = par_concat(ix.file_count() as usize, |f, out| file_entries(ix, f, out));
+        let dynamic = [ix.strings().get(b"globals"), ix.strings().get(b"exec")];
+        let (entries, start) = par_concat(ix.file_count() as usize, |f, out| file_entries(ix, f, dynamic, out));
         Namespaces { entries, start }
     }
 
@@ -119,7 +124,13 @@ impl Namespaces {
     pub fn stars(&self, f: FileId) -> impl Iterator<Item = u32> + '_ {
         let run = self.run(f);
         let i = run.partition_point(|e| e.name != STAR_NAME);
-        run[i..].iter().map(|e| e.r)
+        run[i..].iter().filter(|e| e.kind == kind::STAR).map(|e| e.r)
+    }
+
+    /// File `f` may bind names dynamically (`globals()`, `exec()`).
+    #[inline]
+    pub fn is_dynamic(&self, f: FileId) -> bool {
+        self.run(f).last().is_some_and(|e| e.name == STAR_NAME && e.kind == kind::DYNAMIC)
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -128,11 +139,18 @@ impl Namespaces {
 }
 
 /// Appends the namespace run of file `f` to `out`.
-fn file_entries(ix: &Index, f: FileId, out: &mut Vec<Entry>) {
+fn file_entries(ix: &Index, f: FileId, dynamic: [Option<Sym>; 2], out: &mut Vec<Entry>) {
     let base = out.len();
     let ff = ix.file_facts(f);
     let fv = ix.file_view(f);
     let st = ix.facts();
+    let calls = &st.calls;
+    let is_dynamic = ff.calls.range().any(|row| {
+        calls.chain_len[row] == 1 && calls.receiver(row) == Receiver::None && dynamic.contains(&Some(calls.chain[row]))
+    });
+    if is_dynamic {
+        out.push(Entry { name: STAR_NAME, r: u32::MAX, kind: kind::DYNAMIC });
+    }
     let d0 = ff.defs.start as usize;
     for row in ff.defs.range().skip(1) {
         if st.defs.parent[row] == 0

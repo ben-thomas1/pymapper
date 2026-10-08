@@ -4,7 +4,8 @@
 use super::attrib::{Attributed, Attribution};
 use super::modules::{ModId, ModuleTable};
 use super::namespace::{Entry, Namespaces, kind};
-use crate::extract::facts::{file_flags, import_flags};
+use crate::extract::events::AssignKind;
+use crate::extract::facts::{ValueKind, assign_kind, binding_flags, file_flags, import_flags};
 use crate::index::{FileId, Index, NONE, NodeId, NodeKind};
 use crate::intern::Sym;
 
@@ -109,6 +110,8 @@ pub(super) struct ModRes {
     pub ext: u32,
     /// `Module` when the module part resolved, else the final status.
     pub status: u8,
+    /// Segments of the module part matched by the module table.
+    pub matched: u8,
 }
 
 /// Phase-2 (final) result of a row.
@@ -156,7 +159,7 @@ impl Ctx<'_> {
         } else {
             match self.relative_base(f, level) {
                 Some(p) => Some(p),
-                None => return ModRes { module: NONE, ext: NONE, status: ImportStatus::BeyondTop as u8 },
+                None => return ModRes { module: NONE, ext: NONE, status: ImportStatus::BeyondTop as u8, matched: 0 },
             }
         };
         let (deep, k) = self.mods.walk(start, segs);
@@ -164,7 +167,7 @@ impl Ctx<'_> {
             && let Some(m) = deep
             && self.mods.node(m).is_some()
         {
-            return ModRes { module: m, ext: NONE, status: ImportStatus::Module as u8 };
+            return ModRes { module: m, ext: NONE, status: ImportStatus::Module as u8, matched: k as u8 };
         }
         // A regular package/module prefix makes the rest a missing submodule; otherwise (no
         // prefix, or only namespace directories) absolute names come from outside.
@@ -172,15 +175,15 @@ impl Ctx<'_> {
         if level == 0 && regular.is_none() {
             let Some(&top) = segs.first() else {
                 // A recovered `from import x`.
-                return ModRes { module: NONE, ext: NONE, status: ImportStatus::External as u8 };
+                return ModRes { module: NONE, ext: NONE, status: ImportStatus::External as u8, matched: 0 };
             };
             return match attr.classify(self.ix.str(top)) {
-                Attributed::Stdlib => ModRes { module: NONE, ext: top.to_raw(), status: ImportStatus::Stdlib as u8 },
-                Attributed::ThirdParty(d) => ModRes { module: NONE, ext: d.0, status: ImportStatus::ThirdParty as u8 },
-                Attributed::Unknown => ModRes { module: NONE, ext: top.to_raw(), status: ImportStatus::External as u8 },
+                Attributed::Stdlib => ModRes { module: NONE, ext: top.to_raw(), status: ImportStatus::Stdlib as u8, matched: 0 },
+                Attributed::ThirdParty(d) => ModRes { module: NONE, ext: d.0, status: ImportStatus::ThirdParty as u8, matched: 0 },
+                Attributed::Unknown => ModRes { module: NONE, ext: top.to_raw(), status: ImportStatus::External as u8, matched: 0 },
             };
         }
-        ModRes { module: deep.unwrap_or(NONE), ext: NONE, status: ImportStatus::MissingModule as u8 }
+        ModRes { module: deep.unwrap_or(NONE), ext: NONE, status: ImportStatus::MissingModule as u8, matched: k as u8 }
     }
 }
 
@@ -194,6 +197,25 @@ enum Found {
 #[inline]
 fn hit(status: ImportStatus, target: NodeId) -> Found {
     Found::Hit(NameRes { target, via: NONE, status: status as u8, flags: 0 })
+}
+
+/// Attributes every module object has (set by the import system).
+fn is_module_attr(name: &[u8]) -> bool {
+    name.starts_with(b"__")
+        && matches!(
+            name,
+            b"__doc__"
+                | b"__name__"
+                | b"__file__"
+                | b"__path__"
+                | b"__spec__"
+                | b"__loader__"
+                | b"__package__"
+                | b"__dict__"
+                | b"__builtins__"
+                | b"__cached__"
+                | b"__annotations__"
+        )
 }
 
 #[inline]
@@ -258,17 +280,17 @@ impl Names<'_> {
         }
         let p = self.p1[row];
         let mut r = NameRes { target: NONE, via: NONE, status: p.status, flags };
-        if p.status != ImportStatus::Module as u8 {
-            return r;
-        }
+        sc.visited.clear();
+        let Some(m) = self.effective_module(Some(f), row, 0, sc) else { return r };
         let name = st.imports.name[row].filter(|_| fl & import_flags::FROM != 0);
         let Some(name) = name else {
             // `import a.b [as c]` and `from a import *`: the module itself.
-            r.target = self.cx.mods.node(p.module).unwrap_or(NONE);
+            r.status = ImportStatus::Module as u8;
+            r.target = self.cx.mods.node(m).unwrap_or(NONE);
             return r;
         };
         sc.visited.clear();
-        match self.find(p.module, name, false, row as u32, 0, sc) {
+        match self.find(m, name, false, row as u32, 0, sc) {
             Found::Hit(h) => {
                 r.target = h.target;
                 r.via = h.via;
@@ -279,6 +301,48 @@ impl Names<'_> {
             Found::Dynamic => r.status = ImportStatus::Dynamic as u8,
         }
         r
+    }
+
+    /// The module the module part of `row` names: the phase-1 module, or for a
+    /// `MissingModule` row, the module its missing segments name as attributes (`os.path`,
+    /// `collections.abc`: modules bound in their parent and registered in `sys.modules`).
+    /// `f` is the row's file if known.
+    fn effective_module(&self, f: Option<FileId>, row: usize, depth: u32, sc: &mut Scratch) -> Option<ModId> {
+        let p = self.p1[row];
+        if p.status == ImportStatus::Module as u8 {
+            return Some(p.module);
+        }
+        if p.status != ImportStatus::MissingModule as u8 || p.module == NONE {
+            return None;
+        }
+        let cx = self.cx;
+        let f = f.unwrap_or_else(|| self.file_of(row));
+        let segs = cx.ix.file_view(f).import_module(row);
+        let mut cur = p.module;
+        for &seg in segs.get(p.matched as usize..)? {
+            match self.find(cur, seg, false, row as u32, depth + 1, sc) {
+                Found::Hit(h) if h.status == ImportStatus::Module as u8 && h.target != NONE => {
+                    cur = cx.mods.file_mod(cx.ix.file(h.target)?)?;
+                }
+                _ => return None,
+            }
+        }
+        cx.mods.node(cur).map(|_| cur)
+    }
+
+    /// File of store-absolute import row `row` (binary search over the files).
+    fn file_of(&self, row: usize) -> FileId {
+        let ix = self.cx.ix;
+        let (mut lo, mut hi) = (0, ix.file_count());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if ix.file_facts(mid).imports.range().end <= row {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Whether module-level import `row` of file `f` is re-exported.
@@ -340,7 +404,7 @@ impl Names<'_> {
         if let Some((f, e)) = entry {
             return match e.base() {
                 kind::DEF => hit(ImportStatus::Symbol, cx.ix.def_node(f, e.r)),
-                kind::VAR => hit(ImportStatus::Variable, node),
+                kind::VAR => self.alias(f, e.r as usize, m, depth, sc).unwrap_or_else(|| hit(ImportStatus::Variable, node)),
                 _ => self.follow(e.r as usize, depth, sc),
             };
         }
@@ -354,11 +418,13 @@ impl Names<'_> {
             Found::Miss => {}
             other => return other,
         }
-        // PEP 562 module `__getattr__`.
-        if let Some(g) = cx.getattr
-            && files.into_iter().flatten().any(|f| cx.ns.get(f, g).is_some_and(|e| e.base() == kind::DEF))
-        {
+        // PEP 562 module `__getattr__`, or names bound through `globals()` / `exec()`.
+        let getattr = |f: FileId| cx.getattr.is_some_and(|g| cx.ns.get(f, g).is_some_and(|e| e.base() == kind::DEF));
+        if files.into_iter().flatten().any(|f| cx.ns.is_dynamic(f) || getattr(f)) {
             return Found::Dynamic;
+        }
+        if !via_star && is_module_attr(cx.ix.str(name)) {
+            return hit(ImportStatus::Variable, node);
         }
         Found::Miss
     }
@@ -395,32 +461,59 @@ impl Names<'_> {
         if dynamic { Found::Dynamic } else { Found::Miss }
     }
 
+    /// Follows a module-level alias `X = Y` / `X = a.b` (binding `brow` of file `f`, module
+    /// `m`) to the class, function or module the value names; `None` for other values or when
+    /// the value does not resolve to one (the name is then a plain variable).
+    fn alias(&self, f: FileId, brow: usize, m: ModId, depth: u32, sc: &mut Scratch) -> Option<Found> {
+        let cx = self.cx;
+        let b = &cx.ix.facts().bindings;
+        let plain = matches!(assign_kind(b.kind[brow]), AssignKind::Plain | AssignKind::Annotated);
+        let single = b.flags[brow] & (binding_flags::UNPACKED | binding_flags::STARRED) == 0;
+        if !plain || !single || b.value_kind(brow) != ValueKind::Name {
+            return None;
+        }
+        let chain = cx.ix.file_view(f).binding_value(brow);
+        let (&first, rest) = chain.split_first()?;
+        let Found::Hit(mut cur) = self.find(m, first, false, NONE, depth + 1, sc) else { return None };
+        for &seg in rest {
+            if cur.status != ImportStatus::Module as u8 || cur.target == NONE {
+                return None;
+            }
+            let cm = cx.mods.file_mod(cx.ix.file(cur.target)?)?;
+            let Found::Hit(mut next) = self.find(cm, seg, false, NONE, depth + 1, sc) else { return None };
+            next.flags |= cur.flags;
+            if cur.via != NONE {
+                next.via = cur.via;
+            }
+            cur = next;
+        }
+        let named = cur.status == ImportStatus::Symbol as u8 || cur.status == ImportStatus::Module as u8;
+        (named && cur.target != NONE).then_some(Found::Hit(cur))
+    }
+
     /// Follows module-level import `row` (of the module a name was found in) to what it binds.
     fn follow(&self, row: usize, depth: u32, sc: &mut Scratch) -> Found {
         let cx = self.cx;
         let st = cx.ix.facts();
         let p = self.p1[row];
-        let mut found = if p.status != ImportStatus::Module as u8 {
-            // Re-exported from code that is not resolved: keep its attribution.
-            Found::Hit(NameRes { target: NONE, via: NONE, status: p.status, flags: 0 })
-        } else if st.imports.flags[row] & import_flags::FROM != 0 {
-            match st.imports.name[row] {
-                Some(n) => match self.find(p.module, n, false, row as u32, depth + 1, sc) {
-                    Found::Miss => hit(ImportStatus::MissingName, NONE),
-                    other => other,
-                },
-                None => Found::Dynamic,
-            }
-        } else if st.imports.alias[row].is_some() {
-            // `import a.b as c` binds `a.b`.
-            hit(ImportStatus::Module, cx.mods.node(p.module).unwrap_or(NONE))
+        let from = st.imports.flags[row] & import_flags::FROM != 0;
+        let mut found = if !from && st.imports.alias[row].is_none() && p.module != NONE {
+            // `import a.b` binds the top-level package `a` (also when `a.b` is missing).
+            hit(ImportStatus::Module, cx.mods.node(cx.mods.top(p.module)).unwrap_or(NONE))
         } else {
-            // `import a.b` binds the top-level package `a`.
-            let mut top = p.module;
-            while let Some(parent) = cx.mods.parent(top) {
-                top = parent;
+            match self.effective_module(None, row, depth, sc) {
+                // Re-exported from code that is not resolved: keep its attribution.
+                None => Found::Hit(NameRes { target: NONE, via: NONE, status: p.status, flags: 0 }),
+                Some(m) if from => match st.imports.name[row] {
+                    Some(n) => match self.find(m, n, false, row as u32, depth + 1, sc) {
+                        Found::Miss => hit(ImportStatus::MissingName, NONE),
+                        other => other,
+                    },
+                    None => Found::Dynamic,
+                },
+                // `import a.b as c` binds `a.b`.
+                Some(m) => hit(ImportStatus::Module, cx.mods.node(m).unwrap_or(NONE)),
             }
-            hit(ImportStatus::Module, cx.mods.node(top).unwrap_or(NONE))
         };
         if let Found::Hit(h) = &mut found {
             h.via = row as u32;

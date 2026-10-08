@@ -196,6 +196,16 @@ impl ModuleTable {
         (v != NONE).then_some(v)
     }
 
+    /// The top-level ancestor of `m` (`m` itself if top-level).
+    #[inline]
+    pub fn top(&self, m: ModId) -> ModId {
+        let mut cur = m;
+        while let Some(p) = self.parent(cur) {
+            cur = p;
+        }
+        cur
+    }
+
     /// The name `m.seg` (`m = None`: the top-level name `seg`). One hash lookup.
     #[inline]
     pub fn child(&self, m: Option<ModId>, seg: Sym) -> Option<ModId> {

@@ -316,12 +316,10 @@ impl Imports {
     pub fn bound_by(&self, ix: &Index, row: usize) -> Global {
         let st = ix.facts();
         let plain = st.imports.flags[row] & crate::extract::facts::import_flags::FROM == 0;
-        if plain && st.imports.alias[row].is_none() && self.status(row) == ImportStatus::Module {
-            let mut top = self.p1[row].module;
-            while let Some(p) = self.modules.parent(top) {
-                top = p;
-            }
-            if let Some(v) = self.modules.node(top) {
+        let m = self.p1[row].module;
+        if plain && st.imports.alias[row].is_none() && m != NONE {
+            // Also when the rest of the dotted name is missing: `a` itself is bound.
+            if let Some(v) = self.modules.node(self.modules.top(m)) {
                 return Global::Module(v);
             }
         }
