@@ -311,8 +311,6 @@ pub enum DiagKind {
     ExpectedName,
     /// Python 2 syntax (`print x`, `exec code`, backticks, `except E, e`).
     Python2,
-    /// Nesting deeper than the parser's limit; the construct is skipped.
-    TooDeep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

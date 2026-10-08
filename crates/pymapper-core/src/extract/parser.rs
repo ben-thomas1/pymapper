@@ -63,19 +63,17 @@ pub struct Parser<'src, V: Visitor> {
     pub(super) v: V,
     /// Enclosing definitions (0 = module level).
     pub(super) def_depth: u32,
-    /// Recursion depth of blocks/brackets, bounded by [`MAX_NESTING`].
-    pub(super) nesting: u32,
     // Reusable scratch buffers (never shrink; no per-statement allocation).
     pub(super) chain: Vec<Token>,
     pub(super) names: Vec<Token>,
     pub(super) params: Vec<Param>,
     pub(super) type_params: Vec<Token>,
+    /// Dotted chain of the last [`super::expr::Shape`] `Name`/`Call`/`Subscript`.
+    pub(super) shape: Vec<Token>,
+    /// Strings of the last [`super::expr::Shape::Strings`].
+    pub(super) strings: Vec<Token>,
     pub(super) diag_count: u32,
 }
-
-/// Maximum nesting of blocks plus brackets before the parser skips a construct.
-/// Keeps recursion bounded on adversarial input.
-pub(super) const MAX_NESTING: u32 = 200;
 
 impl<'src, V: Visitor> Parser<'src, V> {
     pub fn new(src: &'src [u8], v: V) -> Self {
@@ -92,11 +90,12 @@ impl<'src, V: Visitor> Parser<'src, V> {
             lines: LineCursor { off: 0, line: 1, line_start: 0 },
             v,
             def_depth: 0,
-            nesting: 0,
             chain: Vec::new(),
             names: Vec::new(),
             params: Vec::new(),
             type_params: Vec::new(),
+            shape: Vec::new(),
+            strings: Vec::new(),
             diag_count: 0,
         }
     }

@@ -4,6 +4,8 @@
 //! with a token-scanning expression level. It reports what it sees through the
 //! [`events::Visitor`] trait; facts and metrics are independent visitors.
 
+mod compound;
+mod defs;
 pub mod events;
 mod expr;
 pub mod parser;
