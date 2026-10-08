@@ -49,6 +49,7 @@ entered, and symlinks are not followed.
 | `walk`       | `walk`                 | parallel `pymapper_core::walk` only, corpus options       |
 | `walk-seq`   | `walk`                 | single-threaded reference walker only (same file set)     |
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
+| `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -168,3 +169,24 @@ profiled; the machine was also loaded). The `walk-git` file set equals
 Peak RSS above `walk-seq` comes from the exactly sized sorted output being built while the
 per-thread lists (relative paths) are still alive; the output itself is one byte buffer plus
 one `u32` per file.
+
+### Import roots (S2.4)
+
+`cargo xtask bench -t roots -c venv -n 5`: `discover` finds the venv enclosing the corpus
+(nearest ancestor with `pyvenv.cfg`), the stdlib, parses all 504 `*.dist-info` directories
+(`METADATA` prefix, `RECORD` = 9.7 MB, `top_level.txt`, `direct_url.json`) and the `.pth` files;
+`module-map` runs `ModuleMapBuilder` over every `RECORD` `.py`/`.pyi` file (60528 files, 62522
+dotted names). 14-core Apple Silicon Mac, release build, warm cache, best of 5, load average
+about 2-3 from other work.
+
+| threads | discover | module-map | total   | peak RSS MB |
+|---------|----------|------------|---------|-------------|
+| 14      | 43.9ms   | 12.4ms     | 56.4ms  | 28.9        |
+| 4       | 47.9ms   | 12.3ms     | 60.5ms  | 28.3        |
+| 1       | 126.2ms  | 12.3ms     | 138.5ms | 26.7        |
+
+Heap after the run: `Distributions` 7.1 MB (per-site interned `RECORD` paths, owners, top-level
+names), `ModuleMap` 8.5 MB. `discover` is dominated by opening and reading the metadata files
+(a plain sequential `read` of every `METADATA` alone took 40-110 ms in isolation, while parsing
+all of `RECORD` costs about 14 ms of CPU); like the walker it stops scaling at about 4 threads.
+`module-map` is single-threaded (interning plus one sort of the (name, root) entries).

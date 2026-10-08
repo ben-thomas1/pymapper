@@ -32,6 +32,9 @@ pub enum Target {
     /// Parallel walk only with first-party options: gitignore files honoured, hidden
     /// directories skipped.
     WalkGit,
+    /// Import-root discovery (`pymapper_core::roots`) for the venv enclosing the corpus (or the
+    /// corpus as a project without one), plus the module map over every `RECORD` file.
+    Roots,
 }
 
 impl Target {
@@ -42,6 +45,7 @@ impl Target {
             Target::Walk => "walk",
             Target::WalkSeq => "walk-seq",
             Target::WalkGit => "walk-git",
+            Target::Roots => "roots",
         }
     }
 }
@@ -102,6 +106,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
             let (files, errors, counters) = walk_corpus(root, &opts)?;
             (ReadStats { files: files.len() as u64, bytes: 0, errors }, counters)
         }
+        Target::Roots => roots_target(root)?,
         Target::Read | Target::ParseOnly => {
             let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
             let (mut stats, acc) = if target == Target::Read {
@@ -152,6 +157,41 @@ fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64
         ("hidden".to_owned(), s.hidden),
     ];
     Ok((w.files, w.diagnostics.len() as u64, counters))
+}
+
+/// `roots`: discovery as phase `discover` (deps and stdlib on), then the module map over every
+/// `RECORD` file as phase `module-map`. The venv is the nearest ancestor of `root` (up to 4
+/// levels) with a `pyvenv.cfg`, i.e. a site-packages corpus; without one `root` is the project.
+/// Files = `RECORD` files mapped.
+fn roots_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::roots::{self, ModuleMapBuilder, RootOptions};
+    anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+    let venv = root.ancestors().take(5).find(|d| d.join("pyvenv.cfg").is_file());
+    let project = venv.and_then(Path::parent).unwrap_or(root);
+    let opts = RootOptions {
+        venv: venv.map(Path::to_path_buf),
+        include_deps: true,
+        include_stdlib: true,
+        path_env: std::env::var_os("PATH"),
+        ..RootOptions::default()
+    };
+    let r = timing::time("discover", || roots::discover(project, &opts));
+    let map = timing::time("module-map", || {
+        let mut b = ModuleMapBuilder::new();
+        for d in r.dists.ids() {
+            r.add_record_files(&mut b, d);
+        }
+        b.finish()
+    });
+    let counters = vec![
+        ("roots".to_owned(), r.roots.len() as u64),
+        ("dists".to_owned(), r.dists.len() as u64),
+        ("names".to_owned(), map.names().len() as u64),
+        ("diags".to_owned(), r.diagnostics.len() as u64),
+        ("dists-kb".to_owned(), (r.dists.heap_bytes() / 1000) as u64),
+        ("map-kb".to_owned(), (map.heap_bytes() / 1000) as u64),
+    ];
+    Ok((ReadStats { files: map.file_count() as u64, bytes: 0, errors: 0 }, counters))
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -252,7 +292,11 @@ mod tests {
             assert!(phase_sum <= rec.total_s + 1e-6, "phases {phase_sum} > total {}", rec.total_s);
         }
         // Same test: `run` uses the process-global phase table.
-        for target in [Target::Read, Target::Walk, Target::WalkSeq] {
+        let rec = run(Target::Roots, &root).expect("roots");
+        let names: Vec<&str> = rec.phases.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["discover", "module-map"]);
+        assert!(rec.counters.iter().any(|(n, v)| n == "roots" && *v >= 1));
+        for target in [Target::Read, Target::Walk, Target::WalkSeq, Target::Roots] {
             assert!(run(target, Path::new("/no/such/xtask/root")).is_err(), "{target:?}");
         }
     }
