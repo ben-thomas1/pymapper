@@ -46,15 +46,24 @@
 //! scheduling or `Sym` values.
 
 mod attrib;
+mod builtins;
+mod calls;
+mod classes;
 mod edges;
 mod imports;
+mod lookup;
 mod modules;
 mod namespace;
 
 #[cfg(test)]
+mod calls_tests;
+#[cfg(test)]
 mod tests;
 
 pub use attrib::{Attributed, Attribution, is_builtin_stdlib};
+pub use builtins::{BUILTIN_METHODS, BUILTINS};
+pub use calls::{CallEdge, CallStats, Confidence, Reason, ResolvedCalls, resolve_calls};
+pub use classes::{ClassId, Classes, class_flags};
 pub use edges::{ExtEdge, ExtKind, ModuleEdge};
 pub use imports::{ImportStatus, res_flags};
 pub use modules::{ModId, ModKind, ModuleTable};
