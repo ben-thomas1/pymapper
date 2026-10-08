@@ -117,7 +117,7 @@ mod tests {
         drop(phase("walk"));
         record("read", Duration::from_millis(5));
         assert_eq!(time("x", || 7), 7);
-        assert!(take().is_empty());
+        assert!(own(&["walk", "read", "x"]).is_empty());
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
                 Phase { name: "read", elapsed: Duration::from_millis(3), count: 1 },
             ]
         );
-        assert!(take().is_empty(), "take clears the table");
+        assert!(own(&["walk", "read"]).is_empty(), "take clears the table");
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
         drop(inert);
         enable(false);
         drop(live);
-        let phases = take();
+        let phases = own(&["inert", "live"]);
         assert_eq!(phases.len(), 1);
         assert_eq!(phases[0].name, "live");
     }
@@ -180,7 +180,7 @@ mod tests {
         record(a, Duration::from_millis(1));
         record(owned, Duration::from_millis(1));
         enable(false);
-        let phases = take();
+        let phases = own(&["phase"]);
         assert_eq!(phases.len(), 1);
         assert_eq!(phases[0].count, 2);
     }
@@ -199,7 +199,7 @@ mod tests {
             }
         });
         enable(false);
-        let phases = take();
+        let phases = own(&["p"]);
         assert_eq!(phases.len(), 1);
         assert_eq!(phases[0].count, 800);
         assert_eq!(phases[0].elapsed, Duration::from_nanos(800));

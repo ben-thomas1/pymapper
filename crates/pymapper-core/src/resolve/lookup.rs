@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use super::imports::Scratch;
 use super::{Global, Imports};
 use crate::extract::events::AssignKind;
-use crate::extract::facts::{DefKind, ValueKind, assign_kind, binding_flags, decl_kind, import_flags};
+use crate::extract::facts::{DefKind, ValueKind, assign_kind, binding_flags, decl_kind, def_flags, import_flags};
 use crate::index::{FileId, Index, NodeId, NodeKind};
 use crate::intern::Sym;
 
@@ -144,7 +144,7 @@ impl R {
     }
 
     #[inline]
-    fn new(val: Val, conf: Confidence, why: Reason) -> R {
+    pub fn new(val: Val, conf: Confidence, why: Reason) -> R {
         R { val, conf, why }
     }
 
@@ -206,6 +206,40 @@ impl Cx<'_> {
                 return self.class_of_def(f, p);
             }
             s = p;
+        }
+        None
+    }
+
+    /// The class of a classmethod when `name`, looked up from `scope`, is that classmethod's
+    /// first parameter and nothing else (`cls` in `return cls(...)`), through nested functions
+    /// like [`Cx::name`].
+    pub fn cls_param(&self, loc: &Locals, f: FileId, scope: u32, name: Sym) -> Option<ClassId> {
+        if !loc.is_for(f) {
+            return None;
+        }
+        let mut s = scope;
+        let mut first = true;
+        while s != 0 {
+            let is_class = self.def_kind(f, s) == DefKind::Class as u8;
+            if !is_class || first {
+                let sl = loc.get(s, name);
+                if let Some(l) = sl.first() {
+                    if l.kind != lkind::PARAM || is_class {
+                        return None;
+                    }
+                    let fv = self.ix.file_view(f);
+                    let row = fv.def_row(s);
+                    let p = self.parent(f, s);
+                    let classmethod = self.ix.facts().defs.flags[row] & def_flags::CLASSMETHOD != 0;
+                    let first_param = fv.params(s).next() == Some(l.r as usize);
+                    if !classmethod || !first_param || p == 0 || self.def_kind(f, p) != DefKind::Class as u8 {
+                        return None;
+                    }
+                    return self.class_of_def(f, p);
+                }
+            }
+            first = false;
+            s = self.parent(f, s);
         }
         None
     }

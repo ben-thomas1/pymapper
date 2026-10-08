@@ -496,10 +496,10 @@ column is the `resolve` target (14 threads: measured alongside; one thread: the 
 
 | corpus | threads | call rows | classes | resolve.classes | resolve.mro | resolve.calls | calls total | edges | `ResolvedCalls::heap_bytes` | peak RSS MB (resolve / calls) |
 |--------|---------|-----------|---------|-----------------|-------------|---------------|-------------|-------|-----------------------------|-------------------------------|
-| stdlib | 1       | 83,013    | 3,471   | 0.95ms          | 0.48ms      | 8.74ms        | 10.2ms      | 39,956 | 1.23 MB                    | 20.6 / 21.0                   |
-| stdlib | 14      | 83,013    | 3,471   | 0.48ms          | 0.45ms      | 1.18ms        | 2.1ms       | 39,956 | 1.23 MB                    | 27.9 / 28.6                   |
-| venv   | 1       | 3,496,139 | 159,758 | 33.1ms          | 25.1ms      | 437.5ms       | 496ms       | 2,227,154 | 60.0 MB                 | 431.7 / 518.3                 |
-| venv   | 14      | 3,496,139 | 159,758 | 4.33ms          | 6.08ms      | 44.0ms        | 54.4ms      | 2,227,154 | 60.0 MB                 | 537.4 / 594.1                 |
+| stdlib | 1       | 83,013    | 3,471   | 0.95ms          | 0.48ms      | 8.74ms        | 10.2ms      | 40,172 | 1.23 MB                    | 20.6 / 21.0                   |
+| stdlib | 14      | 83,013    | 3,471   | 0.48ms          | 0.45ms      | 1.18ms        | 2.1ms       | 40,172 | 1.23 MB                    | 27.9 / 28.6                   |
+| venv   | 1       | 3,496,139 | 159,758 | 33.1ms          | 25.1ms      | 437.5ms       | 496ms       | 2,232,016 | 60.0 MB                 | 431.7 / 518.3                 |
+| venv   | 14      | 3,496,139 | 159,758 | 4.33ms          | 6.08ms      | 44.0ms        | 54.4ms      | 2,232,016 | 60.0 MB                 | 537.4 / 594.1                 |
 
 - **Time**: 125 ns per call row on one core (the per-file locals table included), 13 ns at 14
   threads; call resolution is 1.7% of the end-to-end time on the venv (54ms of 3.2s). The old
@@ -509,9 +509,9 @@ column is the `resolve` target (14 threads: measured alongside; one thread: the 
   111k override and 14k decorator edges), one byte per call row (3.5 MB), class members 12 B
   each, the method index 8 B per method, MROs 4 B per entry. Per-file scratch (the locals
   table, 16 B per local binding) is reused per chunk of files.
-- **Outcome shares** (per mille of call rows): stdlib corpus 311 certain, 42 likely, 35
-  possible, 610 unresolved, of which 389 are builtins / builtin-type methods (`len`,
-  `x.append`) and 73 unloaded code or unloaded bases; venv 416 / 44 / 13 / 525 with 262
+- **Outcome shares** (per mille of call rows): stdlib corpus 311 certain, 43 likely, 35
+  possible, 609 unresolved, of which 389 are builtins / builtin-type methods (`len`,
+  `x.append`) and 73 unloaded code or unloaded bases; venv 416 / 45 / 13 / 524 with 262
   builtin and 81 external. The stdlib alone (`stdlib_calls_resolve`, ignored test, prints the
   reason histogram) leaves 5.8% ambiguous method names, 2.7% variables without a hint, 2.8%
   dynamic (star imports of C modules: `os.stat`), 1.9% unresolved imports (the

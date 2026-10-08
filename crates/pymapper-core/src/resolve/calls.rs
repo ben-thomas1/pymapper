@@ -567,6 +567,8 @@ fn class_bases(cx: &Cx<'_>) -> (Vec<ClassId>, Vec<u32>, Vec<u8>) {
 struct FileScratch {
     loc: Locals,
     linked: Vec<ClassId>,
+    /// `(node, name)` of the methods of one class, in node order (see [`override_edges`]).
+    methods: Vec<(NodeId, Sym)>,
 }
 
 /// Output of the call pass for a chunk of files.
@@ -640,7 +642,7 @@ fn file_calls(cx: &Cx<'_>, methods: &MethodIndex, sc: &mut FileScratch, f: FileI
             }
         }
     }
-    override_edges(cx, f, &mut sc.linked, &mut out.edges);
+    override_edges(cx, f, &mut sc.linked, &mut sc.methods, &mut out.edges);
     out.edge_lens.push((out.edges.len() - before) as u32);
 }
 
@@ -656,7 +658,18 @@ fn resolve_site(
 ) -> (Confidence, Reason) {
     let chain = s.chain;
     let r = match s.recv {
-        Receiver::None | Receiver::Dotted => cx.chain(loc, s.f, s.scope, chain, 0),
+        Receiver::None | Receiver::Dotted => {
+            let r = cx.chain(loc, s.f, s.scope, chain, 0);
+            match chain {
+                // `cls(...)` in a classmethod: an instantiation of the class, or of a subclass
+                // at run time.
+                [name] if r.val == Val::Unknown(Reason::Parameter) => match cx.cls_param(loc, s.f, s.scope, *name) {
+                    Some(c) => R::new(Val::Def(cx.classes.node(c)), Confidence::Likely, Reason::ClsMethod),
+                    None => r,
+                },
+                _ => r,
+            }
+        }
         Receiver::SelfAttr | Receiver::ClsAttr => match cx.self_class(s.f, s.scope) {
             Some(c) if chain.len() >= 2 => {
                 let instance = s.recv == Receiver::SelfAttr;
@@ -691,7 +704,9 @@ fn resolve_site(
         },
         Receiver::Unknown => R::unknown(Reason::UnknownReceiver),
     };
-    // Lambda parameters and comprehension targets are not recorded: a name may be one.
+    // Lambda parameters and comprehension targets are not recorded: a name may be one. Calls
+    // in a lambda are downgraded; comprehensions have no call flag yet (extractor), so
+    // `[helper() for helper in xs]` next to a module-level `helper` is a wrong `certain` edge.
     let r = if s.lambda && !matches!(r.val, Val::Unknown(_)) { R { conf: r.conf.down(), ..r } } else { r };
     finish(cx, methods, loc, r, s, sink, decorator)
 }
@@ -786,8 +801,16 @@ fn subclass_edges(cx: &Cx<'_>, methods: &MethodIndex, c: ClassId, name: Sym, sin
 
 /// Override liveness edges of the classes of file `f`: for every method, an edge from each
 /// nearest overridden method in the MRO (a base method not already shadowed by a linked one,
-/// so a diamond links both sides once).
-fn override_edges(cx: &Cx<'_>, f: FileId, linked: &mut Vec<ClassId>, out: &mut Vec<CallEdge>) {
+/// so a diamond links both sides once). Methods are visited in node order (class members are
+/// sorted by `Sym`, whose values depend on the thread count), so the edge order is
+/// deterministic.
+fn override_edges(
+    cx: &Cx<'_>,
+    f: FileId,
+    linked: &mut Vec<ClassId>,
+    methods: &mut Vec<(NodeId, Sym)>,
+    out: &mut Vec<CallEdge>,
+) {
     let ix = cx.ix;
     let cl = cx.classes;
     for c in cl.file_classes(f) {
@@ -795,18 +818,22 @@ fn override_edges(cx: &Cx<'_>, f: FileId, linked: &mut Vec<ClassId>, out: &mut V
         if mro.len() < 2 {
             continue;
         }
+        methods.clear();
         for m in cl.all_members(c) {
-            if m.kind != mkind::DEF || ix.kind(m.r) != NodeKind::Function {
-                continue;
+            if m.kind == mkind::DEF && ix.kind(m.r) == NodeKind::Function {
+                methods.push((m.r, m.name));
             }
+        }
+        methods.sort_unstable_by_key(|&(r, _)| r);
+        for &(r, name) in methods.iter() {
             linked.clear();
             for &k in &mro[1..] {
-                let Some(b) = cl.members(k, m.name).first().filter(|b| b.kind == mkind::DEF) else { continue };
+                let Some(b) = cl.members(k, name).first().filter(|b| b.kind == mkind::DEF) else { continue };
                 if ix.kind(b.r) != NodeKind::Function {
                     continue;
                 }
                 if !linked.iter().any(|&l| cl.inherits(l, k)) {
-                    out.push(CallEdge { src: b.r, dst: m.r, site: NONE, conf: Confidence::Likely, reason: Reason::Override });
+                    out.push(CallEdge { src: b.r, dst: r, site: NONE, conf: Confidence::Likely, reason: Reason::Override });
                 }
                 linked.push(k);
             }

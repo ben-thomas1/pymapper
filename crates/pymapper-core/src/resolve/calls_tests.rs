@@ -780,8 +780,32 @@ class B:
     def run(self):
         A().go()
 ";
-    let files = [("m.py", src), ("n.py", "from m import A, B\n\ndef f(x):\n    A().go()\n    x.run()\n    B.run(None)\n")];
+    // Overrides in many files: class members are sorted by `Sym`, whose values depend on the
+    // thread count, so this checks that override edges do not follow member order.
+    let mut owned: Vec<(String, String)> = vec![
+        ("m.py".to_owned(), src.to_owned()),
+        ("n.py".to_owned(), "from m import A, B\n\ndef f(x):\n    A().go()\n    x.run()\n    B.run(None)\n".to_owned()),
+    ];
+    for i in 0..24 {
+        let body = format!(
+            "class A{i}:\n    def zeta{i}(self): pass\n    def alpha{i}(self): pass\n    def mid{i}(self): pass\n\n\
+             class B{i}(A{i}):\n    def zeta{i}(self): pass\n    def alpha{i}(self): pass\n    def mid{i}(self): pass\n"
+        );
+        owned.push((format!("o{i}.py"), body));
+    }
+    owned.push((
+        "p.py".to_owned(),
+        "from o0 import A0, B0\n\nclass C(B0):\n    def mid0(self): pass\n    def zeta0(self): pass\n".to_owned(),
+    ));
+    let files: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     let fx = cfx(&files);
+    assert_eq!(fx.out("o0:A0.zeta0"), ["o0:B0.zeta0 likely override"]);
+    let overrides: Vec<String> =
+        fx.calls.edges().iter().filter(|e| e.reason == Reason::Override).map(|e| fx.qid(e.dst)).collect();
+    let p0 = overrides.iter().position(|q| q == "o0:B0.zeta0").expect("override");
+    assert_eq!(overrides[p0..p0 + 3], ["o0:B0.zeta0", "o0:B0.alpha0", "o0:B0.mid0"]);
+    let c0 = overrides.iter().position(|q| q == "p:C.mid0").expect("override");
+    assert_eq!(overrides[c0..c0 + 2], ["p:C.mid0", "p:C.zeta0"]);
     assert_eq!(fx.calls.len(), fx.ix.facts().calls.len() as usize);
     let s = fx.calls.stats();
     assert_eq!(s.calls, fx.calls.len() as u64);
@@ -792,7 +816,7 @@ class B:
         total += fx.calls.file_edges(f).len();
     }
     assert_eq!(total, fx.calls.edges().len());
-    for threads in [1, 3] {
+    for threads in [1, 2, 3, 7] {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
         let other = pool.install(|| cfx(&files));
         let a: Vec<String> = fx.calls.edges().iter().map(|e| format!("{} {}", fx.qid(e.src), fx.fmt(e))).collect();
@@ -894,4 +918,61 @@ fn stdlib_calls_resolve() {
         }
     }
     assert!(st.by_conf[Confidence::Certain as usize] > 0);
+}
+
+#[test]
+fn cls_call_in_a_classmethod_is_an_instantiation() {
+    let src = "\
+class UsesCls:
+    def __init__(self, x=0):
+        self.x = x
+
+    @classmethod
+    def make(cls):
+        return cls()
+
+    @classmethod
+    def later(cls):
+        def inner():
+            return cls(1)
+        return inner
+
+    @classmethod
+    def rebound(cls, other):
+        cls = other
+        return cls()
+
+    @classmethod
+    def factory(cls, kind):
+        return kind()
+
+    @staticmethod
+    def static(cls):
+        return cls()
+
+    def plain(cls):
+        return cls()
+
+class Sub(UsesCls):
+    @classmethod
+    def build(cls):
+        return cls()
+
+def free(cls):
+    return cls()
+";
+    let fx = cfx(&[("mod.py", src)]);
+    let init = ["mod:UsesCls likely constructor", "mod:UsesCls.__init__ likely init"];
+    assert_eq!(fx.out("mod:UsesCls.make"), init);
+    assert_eq!(fx.out("mod:UsesCls.later.inner"), init);
+    // A subclass: its own constructor and the inherited `__init__`.
+    assert_eq!(fx.out("mod:Sub.build"), ["mod:Sub likely constructor", "mod:UsesCls.__init__ likely init"]);
+    assert!(fx.out("mod:UsesCls.rebound").is_empty());
+    assert_eq!(fx.row("mod", "kind"), "unresolved parameter");
+    // Not a classmethod, or not in a class: `cls` is any parameter.
+    for scope in ["mod:UsesCls.static", "mod:UsesCls.plain", "mod:free"] {
+        assert!(fx.out(scope).is_empty(), "{scope}");
+    }
+    let params = fx.rows("mod").iter().filter(|r| r.ends_with(" cls unresolved parameter")).count();
+    assert_eq!(params, 3, "{:?}", fx.rows("mod"));
 }
