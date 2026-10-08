@@ -58,6 +58,8 @@ mod dag;
 mod scc;
 
 #[cfg(test)]
+mod index_tests;
+#[cfg(test)]
 mod tests;
 
 pub use build::{CallFilter, ModuleGraph, call_graph, import_graph, module_call_graph};

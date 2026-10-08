@@ -114,14 +114,14 @@ fn reach_matrix(g: &Graph) -> Vec<Vec<bool>> {
     let n = g.node_count() as usize;
     let mut out = vec![vec![false; n]; n];
     let mut queue = Vec::new();
-    for s in 0..n {
-        out[s][s] = true;
+    for (s, row) in out.iter_mut().enumerate() {
+        row[s] = true;
         queue.clear();
         queue.push(s as u32);
         while let Some(v) = queue.pop() {
             for &w in g.succ(v) {
-                if !out[s][w as usize] {
-                    out[s][w as usize] = true;
+                if !row[w as usize] {
+                    row[w as usize] = true;
                     queue.push(w);
                 }
             }
@@ -158,11 +158,11 @@ fn check_scc_structure(g: &Graph, scc: &Scc) {
 fn check_scc_exact(g: &Graph, scc: &Scc) {
     check_scc_structure(g, scc);
     let r = reach_matrix(g);
-    let n = g.node_count() as usize;
+    let n = g.node_count();
     for u in 0..n {
         for v in 0..n {
-            let same = r[u][v] && r[v][u];
-            assert_eq!(scc.comp(u as u32) == scc.comp(v as u32), same, "nodes {u} {v}");
+            let same = r[u as usize][v as usize] && r[v as usize][u as usize];
+            assert_eq!(scc.comp(u) == scc.comp(v), same, "nodes {u} {v}");
         }
     }
 }
