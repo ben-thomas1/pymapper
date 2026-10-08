@@ -2,6 +2,7 @@
 //! texture view (the swapchain image, or an offscreen texture in tests).
 
 use crate::canvas::{Canvas, PhysicalRect};
+use crate::map::MapState;
 
 /// Everything a frame needs from the UI pass.
 pub struct FrameInput<'a> {
@@ -13,6 +14,8 @@ pub struct FrameInput<'a> {
     pub pixels_per_point: f32,
     /// Canvas area in physical pixels; `None` when panels cover the whole window.
     pub canvas: Option<PhysicalRect>,
+    /// The map drawn in the canvas (updated by the frame: band, labels, stats).
+    pub map: &'a mut MapState,
 }
 
 pub struct Renderer {
@@ -35,6 +38,10 @@ impl Renderer {
         self.format
     }
 
+    pub fn canvas(&self) -> &Canvas {
+        &self.canvas
+    }
+
     /// Records and submits the frame into `target` (which must be `input.size` and of
     /// [`Self::format`]). Drains `input.textures`.
     pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, input: FrameInput<'_>) {
@@ -47,7 +54,7 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let callbacks = self.egui.update_buffers(device, queue, &mut encoder, input.primitives, &screen);
         if let Some(rect) = input.canvas {
-            self.canvas.prepare(queue, rect, input.pixels_per_point);
+            self.canvas.prepare(device, queue, rect, input.size, input.pixels_per_point, input.map);
         }
         {
             let mut pass = encoder

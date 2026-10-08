@@ -15,6 +15,8 @@ Options:
       --measure      Measure frame time and idle CPU, print a report and exit
       --frames <N>   Frames to time in --measure mode [default: 300]
       --idle <SECS>  Idle window in --measure mode [default: 5]
+      --stress <N>   Show a synthetic stress scene with N rects and N edges (with
+                     --measure, the timed frames fly a scripted pan/zoom path)
   -h, --help         Print help
   -V, --version      Print version
 
@@ -38,6 +40,8 @@ pub struct MeasureOpts {
 pub struct Options {
     pub path: PathBuf,
     pub measure: Option<MeasureOpts>,
+    /// Synthetic stress scene size (rects = edges = N).
+    pub stress: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +57,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
     let mut measure = false;
     let mut frames: Option<u32> = None;
     let mut idle: Option<u32> = None;
+    let mut stress: Option<u32> = None;
     let mut it = args.into_iter();
     let mut positional_only = false;
     while let Some(arg) = it.next() {
@@ -70,6 +75,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
                 }
                 "--idle" => {
                     idle = Some(number(s, it.next())?);
+                    continue;
+                }
+                "--stress" => {
+                    stress = Some(number(s, it.next())?);
                     continue;
                 }
                 "--" => {
@@ -92,7 +101,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
         frames: frames.unwrap_or(DEFAULT_FRAMES),
         idle_secs: idle.unwrap_or(DEFAULT_IDLE_SECS),
     });
-    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure }))
+    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure, stress }))
 }
 
 fn number(flag: &str, value: Option<OsString>) -> Result<u32, String> {
@@ -133,6 +142,16 @@ mod tests {
         assert_eq!(o.measure, Some(MeasureOpts { frames: DEFAULT_FRAMES, idle_secs: DEFAULT_IDLE_SECS }));
         let o = opts(&["--measure", "--frames", "10", "--idle", "2"]);
         assert_eq!(o.measure, Some(MeasureOpts { frames: 10, idle_secs: 2 }));
+        assert_eq!(o.stress, None);
+    }
+
+    #[test]
+    fn stress_scene() {
+        assert_eq!(opts(&["--stress", "1000"]).stress, Some(1000));
+        let o = opts(&["--measure", "--stress", "5", "p"]);
+        assert_eq!((o.stress, o.path), (Some(5), PathBuf::from("p")));
+        assert!(run(&["--stress"]).unwrap_err().contains("requires a value"));
+        assert!(run(&["--stress", "0"]).unwrap_err().contains("positive"));
     }
 
     #[test]

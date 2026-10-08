@@ -1,10 +1,15 @@
-//! Renders the full UI (panels + canvas) offscreen with the real device setup and checks the
-//! pixels: the canvas grid lands where egui reports the canvas, and panels cover the rest.
-//! Skips (passes with a note) when no GPU adapter is available, e.g. on headless CI.
+//! Renders offscreen with the real device setup and checks the pixels: the full UI (panels
+//! and canvas) lands where egui reports the canvas, and the map renderer draws rects, edges
+//! and labels where the camera puts them. Skips (passes with a note) when no GPU adapter is
+//! available, e.g. on headless CI.
+
+use std::sync::Arc;
 
 use egui::{RawInput, Rect, ViewportId, pos2, vec2};
 use pymapper_gui::canvas::{CanvasStyle, PhysicalRect};
 use pymapper_gui::gpu;
+use pymapper_gui::map::scene::{Lod, RectStyle, Rgba, SceneBuilder, WorldRect};
+use pymapper_gui::map::{MapState, stress};
 use pymapper_gui::panels::{self, UiState};
 use pymapper_gui::render::{FrameInput, Renderer};
 
@@ -36,20 +41,12 @@ fn render_ui(
     frames: usize,
 ) -> (Vec<u8>, [u32; 2], PhysicalRect) {
     let size = [(points[0] * ppp) as u32, (points[1] * ppp) as u32];
-    let texture = g.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("offscreen"),
-        size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
+    let texture = offscreen_target(g, format, size);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let mut renderer = Renderer::new(&g.device, format);
     let ctx = egui::Context::default();
     let mut state = UiState::new("proj".to_owned(), "offscreen".to_owned());
+    let mut map = MapState::default();
     let mut canvas = None;
     for _ in 0..frames {
         let mut raw = RawInput {
@@ -64,11 +61,28 @@ fn render_ui(
             &g.device,
             &g.queue,
             &view,
-            FrameInput { primitives: &primitives, textures: &mut out.textures_delta, size, pixels_per_point: ppp, canvas },
+            FrameInput { primitives: &primitives, textures: &mut out.textures_delta, size, pixels_per_point: ppp, canvas, map: &mut map },
         );
         assert!(out.textures_delta.is_empty(), "render must drain texture deltas");
     }
+    (readback(g, &texture, size), size, canvas.expect("canvas visible"))
+}
 
+fn offscreen_target(g: &Gpu, format: wgpu::TextureFormat, size: [u32; 2]) -> wgpu::Texture {
+    g.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen"),
+        size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// Copies an RGBA8 texture back to the CPU (tightly packed rows).
+fn readback(g: &Gpu, texture: &wgpu::Texture, size: [u32; 2]) -> Vec<u8> {
     let bytes_per_row = (size[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buffer = g.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -79,7 +93,7 @@ fn render_ui(
     let mut encoder = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &texture,
+            texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -104,7 +118,7 @@ fn render_ui(
     }
     drop(mapped);
     buffer.unmap();
-    (pixels, size, canvas.expect("canvas visible"))
+    pixels
 }
 
 fn px(pixels: &[u8], size: [u32; 2], x: u32, y: u32) -> [u8; 3] {
@@ -126,17 +140,13 @@ fn check_layout(format: wgpu::TextureFormat, ppp: f32) {
     let Some(g) = gpu() else { return };
     let (pixels, size, c) = render_ui(&g, format, [960.0, 640.0], ppp, 3);
     let style = CanvasStyle::DEFAULT;
-    let spacing = (style.spacing_points * ppp).round() as u32;
     let bg = to_u8(style.background);
 
-    // Canvas interior, mid-cell: background. Lines at multiples of `spacing` from the origin.
-    let y = c.y + spacing + spacing / 2;
-    let mid = px(&pixels, size, c.x + spacing + spacing / 2, y);
-    assert!(close(mid, bg), "mid-cell {mid:?} vs background {bg:?} (canvas {c:?})");
-    let minor = px(&pixels, size, c.x + spacing, y);
-    assert!(close(minor, to_u8(style.minor)), "minor line {minor:?} (canvas {c:?})");
-    let major = px(&pixels, size, c.x + 5 * spacing, y);
-    assert!(close(major, to_u8(style.major)), "major line {major:?} (canvas {c:?})");
+    // Empty map: the canvas interior is background.
+    for (fx, fy) in [(0.1, 0.1), (0.5, 0.5), (0.9, 0.8)] {
+        let p = px(&pixels, size, c.x + (c.w as f32 * fx) as u32, c.y + (c.h as f32 * fy) as u32);
+        assert!(close(p, bg), "canvas {p:?} vs background {bg:?} (canvas {c:?})");
+    }
 
     // Panels are opaque egui fill, not canvas background.
     let left = px(&pixels, size, c.x / 2, size[1] / 2);
@@ -167,4 +177,114 @@ fn offscreen_layout_fractional_scale() {
 #[test]
 fn offscreen_layout_srgb_target() {
     check_layout(wgpu::TextureFormat::Rgba8UnormSrgb, 2.0);
+}
+
+/// Renders only the map (no panels) into the whole target and reads it back.
+fn render_map(g: &Gpu, renderer: &mut Renderer, texture: &wgpu::Texture, map: &mut MapState, size: [u32; 2], ppp: f32) -> Vec<u8> {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut textures = egui::TexturesDelta::default();
+    let canvas = Some(PhysicalRect { x: 0, y: 0, w: size[0], h: size[1] });
+    renderer.render(&g.device, &g.queue, &view, FrameInput { primitives: &[], textures: &mut textures, size, pixels_per_point: ppp, canvas, map });
+    readback(g, texture, size)
+}
+
+const FILL_A: Rgba = Rgba::rgb(200, 60, 60);
+const FILL_B: Rgba = Rgba::rgb(60, 60, 200);
+const GREEN: Rgba = Rgba::rgb(0, 255, 0);
+const YELLOW: Rgba = Rgba::rgb(255, 255, 0);
+
+fn test_scene() -> MapState {
+    let mut b = SceneBuilder::new();
+    let a = RectStyle { fill: FILL_A, stroke: Rgba::rgb(255, 255, 255), radius_px: 8.0, stroke_px: 2.0 };
+    b.add_rect(1, 0, WorldRect::new(100.0, 100.0, 400.0, 400.0), a, Some(b"Alpha_label"));
+    let bs = RectStyle { fill: FILL_B, stroke: Rgba::TRANSPARENT, radius_px: 0.0, stroke_px: 0.0 };
+    b.add_rect(2, 1, WorldRect::new(150.0, 250.0, 350.0, 380.0), bs, None);
+    b.add_line(3, [500.0, 50.0], [900.0, 50.0], GREEN, 4.0, Lod::ALWAYS);
+    b.add_curve(4, [[500.0, 300.0], [600.0, 200.0], [800.0, 400.0], [900.0, 300.0]], YELLOW, 3.0, Lod::ALWAYS);
+    MapState::new(Arc::new(b.build()))
+}
+
+fn rgb(c: Rgba) -> [u8; 3] {
+    [c.0[0], c.0[1], c.0[2]]
+}
+
+fn check_map(format: wgpu::TextureFormat) {
+    let Some(g) = gpu() else { return };
+    let size = [1000, 500];
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    // The first frame fits the scene; then pin the camera so world units are pixels.
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    let at = |x, y| px(&p, size, x, y);
+    assert!(close(at(250, 200), rgb(FILL_A)), "fill A {:?}", at(250, 200));
+    assert!(close(at(250, 300), rgb(FILL_B)), "child drawn above parent {:?}", at(250, 300));
+    assert!(close(at(100, 250), [255, 255, 255]), "stroke {:?}", at(100, 250));
+    assert!(close(at(100, 100), bg), "rounded corner {:?}", at(100, 100));
+    assert!(close(at(700, 50), rgb(GREEN)), "line {:?}", at(700, 50));
+    assert!(close(at(700, 57), bg), "line is 4 px wide {:?}", at(700, 57));
+    assert!(close(at(700, 300), rgb(YELLOW)), "curve midpoint {:?}", at(700, 300));
+    assert!(close(at(700, 200), bg), "nothing else {:?}", at(700, 200));
+    // Label: light text on the dark-ish fill, in the top-left of rect A.
+    let bright = (102..260).flat_map(|x| (102..122).map(move |y| (x, y))).filter(|&(x, y)| at(x, y)[1] > 150).count();
+    assert!(bright > 30, "label pixels: {bright}");
+    assert_eq!(map.stats.labels, 1);
+
+    // Panning moves everything without touching band slots or labels.
+    let (band_gen, label_gen) = (map.band_generation, map.labels.generation);
+    map.camera.pan_px(50.0, 0.0);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let at = |x, y| px(&p, size, x, y);
+    assert!(close(at(430, 200), rgb(FILL_A)), "panned fill {:?}", at(430, 200));
+    assert!(close(at(750, 50), rgb(GREEN)));
+    assert_eq!((map.band_generation, map.labels.generation), (band_gen, label_gen));
+
+    // Hovering the line highlights it.
+    let input = pymapper_gui::map::CanvasInput { hover: Some([750.0, 50.0]), ..pymapper_gui::map::CanvasInput::NONE };
+    assert!(map.apply_input(&input, 1.0));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let hover = rgb(pymapper_gui::map::gpu::HOVER_COLOR);
+    assert!(close(px(&p, size, 750, 50), hover), "hover {:?}", px(&p, size, 750, 50));
+
+    // Zoomed far out, the small child rect leaves the band and the label stops fitting.
+    map.apply_input(&pymapper_gui::map::CanvasInput::NONE, 1.0);
+    map.camera.zoom = 0.004;
+    let _ = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert_eq!(map.bands.rects.len(), 0, "300 world units at 0.004 px/unit is under 2 px");
+    assert_eq!(map.stats.labels, 0);
+}
+
+#[test]
+fn map_renders_rects_edges_labels() {
+    check_map(wgpu::TextureFormat::Rgba8Unorm);
+}
+
+#[test]
+fn map_renders_on_srgb_target() {
+    check_map(wgpu::TextureFormat::Rgba8UnormSrgb);
+}
+
+#[test]
+fn stress_scene_renders() {
+    let Some(g) = gpu() else { return };
+    let size = [1600, 1000];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = MapState::new(Arc::new(stress::scene(20_000, 20_000, stress::SEED)));
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    for force in [false, true] {
+        map.force_all = force;
+        let p = render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+        let covered = p.as_chunks::<4>().0.iter().filter(|c| !close([c[0], c[1], c[2]], bg)).count();
+        assert!(covered > (size[0] * size[1] / 2) as usize, "covered {covered}");
+        assert!(map.stats.drawn_instances > 0 && map.stats.draw_calls > 0);
+    }
+    assert_eq!(map.bands.rects.len(), 20_000);
+    let mem = renderer.canvas().map().memory();
+    assert!(mem.buffers >= 20_000 * 32 + 20_000 * 40, "{mem:?}");
 }
