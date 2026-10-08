@@ -598,3 +598,217 @@ fn line_positions_for_all_line_endings() {
         assert_eq!(e[5], "end def L7", "{nl:?}");
     }
 }
+
+/// Tiny xorshift RNG for the randomized tests.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+#[test]
+fn line_cursor_matches_naive_count() {
+    use super::parser::LineCursor;
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..300 {
+        let len = rng.below(200);
+        let alphabet: &[u8] = if rng.below(2) == 0 { b"ab\n\n " } else { b"a\r\n\r" };
+        let src: Vec<u8> = (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect();
+        let mut lc = LineCursor::new(&src);
+        for _ in 0..20 {
+            let off = rng.below(len + 1) as u32;
+            let got = lc.pos(&src, off);
+            // Naive: lines end at `\n`, `\r\n` (once) and lone `\r`.
+            let (mut line, mut start) = (1u32, 0u32);
+            for i in 0..off as usize {
+                let end = src[i] == b'\n' || (src[i] == b'\r' && src.get(i + 1) != Some(&b'\n'));
+                if end {
+                    line += 1;
+                    start = i as u32 + 1;
+                }
+            }
+            assert_eq!((got.line, got.col), (line, off - start), "{src:?} @{off}");
+        }
+    }
+}
+
+#[test]
+fn recovery_unclosed_bracket_before_def() {
+    let src = "x = f(a,\ndef g():\n    return 1\ny = 2\n";
+    let e = events(src);
+    assert_eq!(e[1], "diag UnclosedBracket 2:0 def", "{e:?}");
+    assert!(e.contains(&"def g @2:4 L2 d0".to_string()), "{e:?}");
+    assert!(e.contains(&"end def L3".to_string()), "{e:?}");
+    assert!(e.contains(&"assign Plain y = other L4".to_string()), "{e:?}");
+}
+
+#[test]
+fn recovery_unclosed_bracket_in_headers() {
+    let src = "def f(a, b:\n    pass\nclass C(Base:\n    pass\nfrom m import (a, b\nimport os\n";
+    let e = defs(src);
+    assert!(e.contains("def f"), "{e}");
+    assert!(e.contains("class C"), "{e}");
+    assert!(e.contains("import os L6"), "{e}");
+    assert!(e.contains("diag"), "{e}");
+}
+
+#[test]
+fn recovery_missing_colon_and_indent() {
+    let e = events("if x\n    y = 1\nwhile True\n    pass\n");
+    assert!(e[0].starts_with("diag ExpectedColon 1:4"), "{e:?}");
+    assert!(e.contains(&"assign Plain y = other L2".to_string()), "{e:?}");
+    assert_eq!(blocks("if x\n    pass\n"), "diag ExpectedColon 1:4 \n If{ }If");
+    assert_eq!(blocks("if x:\npass\n"), "If{ diag ExpectedIndent 2:0 pass }If");
+    assert_eq!(blocks("for x in y:"), "For{ diag ExpectedIndent 1:11  }For");
+}
+
+#[test]
+fn recovery_unexpected_indent_and_brackets() {
+    let e = events("x = 1\n    y = 2\nz = 3)\n");
+    assert!(e.contains(&"diag UnexpectedIndent 2:4 ".to_string()) || e.iter().any(|l| l.starts_with("diag UnexpectedIndent 2:")), "{e:?}");
+    assert!(e.contains(&"assign Plain y = other L2".to_string()), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag UnmatchedBracket 3:")), "{e:?}");
+    assert!(e.contains(&"assign Plain z = other L3".to_string()), "{e:?}");
+}
+
+#[test]
+fn recovery_lexer_errors_and_bad_names() {
+    let e = events("x = $\ndef (a): pass\nclass : pass\nimport\n@dec\nx = 1\ns = 'abc\ny = 2\n");
+    assert!(e.iter().any(|l| l.starts_with("diag Lex 1:4")), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag ExpectedName 2:4")), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag ExpectedName 3:6")), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag ExpectedName 4:")), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag UnexpectedToken 6:0")), "{e:?}");
+    assert!(e.iter().any(|l| l.starts_with("diag Lex 7:4")), "{e:?}");
+    assert!(e.contains(&"assign Plain y = other L8".to_string()), "{e:?}");
+}
+
+#[test]
+fn recovery_inconsistent_dedent() {
+    let src = "def f():\n        x = 1\n    y = 2\nz = 3\n";
+    let e = events(src);
+    assert!(e.iter().any(|l| l.starts_with("diag")), "{e:?}");
+    assert!(e.contains(&"assign Plain z = other L4".to_string()), "{e:?}");
+}
+
+/// Checks event balance and span sanity for arbitrary input.
+struct Check<'s> {
+    src: &'s [u8],
+    defs: i64,
+    blocks: Vec<BlockKind>,
+    lambdas: i64,
+    last_token_end: u32,
+}
+
+impl Visitor for Check<'_> {
+    fn token(&mut self, t: Token) {
+        assert!(t.end() as usize <= self.src.len());
+        assert!(t.start >= self.last_token_end, "tokens out of order");
+        self.last_token_end = t.end();
+    }
+    fn def_enter(&mut self, d: &Def<'_>) {
+        assert!(d.start <= d.name.start);
+        self.defs += 1;
+    }
+    fn def_exit(&mut self, _: DefKind, _: End) {
+        self.defs -= 1;
+        assert!(self.defs >= 0);
+    }
+    fn block_enter(&mut self, b: &Block<'_>) {
+        self.blocks.push(b.kind);
+    }
+    fn block_exit(&mut self, kind: BlockKind, _: End, _: bool) {
+        assert_eq!(self.blocks.pop(), Some(kind));
+    }
+    fn lambda_enter(&mut self, _: Token) {
+        self.lambdas += 1;
+    }
+    fn lambda_exit(&mut self, _: u32) {
+        self.lambdas -= 1;
+        assert!(self.lambdas >= 0);
+    }
+    fn call(&mut self, c: &Call<'_>) {
+        for t in c.names {
+            assert!(t.end() as usize <= self.src.len());
+        }
+    }
+    fn assign(&mut self, a: &Assign<'_>) {
+        assert!(!a.target.is_empty());
+    }
+}
+
+fn check(src: &[u8]) {
+    let c = parse(src, Check { src, defs: 0, blocks: Vec::new(), lambdas: 0, last_token_end: 0 });
+    assert_eq!(c.defs, 0, "{:?}", String::from_utf8_lossy(src));
+    assert!(c.blocks.is_empty(), "{:?}", String::from_utf8_lossy(src));
+    assert_eq!(c.lambdas, 0, "{:?}", String::from_utf8_lossy(src));
+}
+
+#[test]
+fn fuzz_fragment_soup_is_balanced() {
+    const FRAGS: &[&str] = &[
+        "def ", "class ", "async ", "f", "x", "self", "super", "match ", "case ", "type ", "_", "lambda", " ", "\n",
+        "    ", "\t", ":", "(", ")", "[", "]", "{", "}", ",", ".", "=", ":=", "+=", "*", "**", "@", "->", "if ",
+        "elif ", "else", "for ", " in ", "while ", "try", "except", "finally", "with ", " as ", "return ", "import ",
+        "from ", "pass", "global ", "'s'", "f'{x}'", "\"\"\"", "1", "and ", "or ", "not ", "|", ";", "\\\n", "#c\n",
+        "yield ", "await ", "del ", "raise ", "assert ", "nonlocal ", "...", "!", "$", "print ",
+    ];
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for _ in 0..20_000 {
+        let n = rng.below(40);
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(FRAGS[rng.below(FRAGS.len())]);
+        }
+        check(s.as_bytes());
+    }
+}
+
+#[test]
+fn fuzz_random_bytes_and_mutated_code() {
+    let mut rng = Rng(0xdead_beef_cafe_f00d);
+    for _ in 0..5_000 {
+        let n = rng.below(64);
+        let v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+        check(&v);
+    }
+    let base = b"@d(1)\nclass C(B, metaclass=M):\n    def m(self, a=1, *b, **c) -> int:\n        match a:\n            case [x, *_] if x: return (lambda: x)()\n            case _: pass\n        with (open(a) as f, g):\n            for i, j in f: yield {k: v for k, v in i}\n        try:\n            pass\n        except* E as e:\n            raise\n        finally:\n            del a\ntype T[X] = list[X]\n";
+    for _ in 0..5_000 {
+        let mut v = base.to_vec();
+        for _ in 0..1 + rng.below(4) {
+            let i = rng.below(v.len());
+            match rng.below(3) {
+                0 => {
+                    v.remove(i);
+                }
+                1 => v.insert(i, b"()[]{}:\n \t'\"#\\,=@"[rng.below(17)]),
+                _ => v[i] = rng.next() as u8,
+            }
+        }
+        check(&v);
+    }
+}
+
+#[test]
+fn deep_nesting_does_not_overflow() {
+    let mut s = String::new();
+    for i in 0..120 {
+        s.push_str(&" ".repeat(i));
+        s.push_str("if x:\n");
+    }
+    s.push_str(&" ".repeat(120));
+    s.push_str("pass\n");
+    check(s.as_bytes());
+    let brackets = "(".repeat(100_000) + &")".repeat(100_000) + "\n";
+    check(brackets.as_bytes());
+    let lambdas = "x = ".to_string() + &"lambda: ".repeat(10_000) + "1\n";
+    check(lambdas.as_bytes());
+}

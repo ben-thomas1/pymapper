@@ -211,12 +211,13 @@ impl<V: Visitor> Parser<'_, V> {
             let k = t.kind;
             match k {
                 K::Newline | K::EndOfFile | K::Indent | K::Dedent => break,
+                // Never part of an expression: ends it, recovering from an
+                // unclosed bracket if one is open (also one opened before this scan).
                 _ if is_stmt_keyword(k) => {
-                    if depth == 0 {
-                        break;
-                    }
-                    self.diag_at(DiagKind::UnclosedBracket, t);
-                    if self.recover_brackets_at(t) {
+                    if depth == 0 || self.recover_unclosed(t) {
+                        if depth == 0 {
+                            self.recover_unclosed(t);
+                        }
                         break;
                     }
                 }
@@ -247,7 +248,8 @@ impl<V: Visitor> Parser<'_, V> {
         // Close everything still open (normal end: only the top level).
         while self.levels.len() > base {
             if let Some(l) = self.levels.pop() {
-                self.exit_lambdas(l.active);
+                // Malformed input can leave lambdas without their `:`.
+                self.exit_lambdas(l.active + l.lambdas);
             }
         }
         if self.collect {
@@ -376,7 +378,7 @@ impl<V: Visitor> Parser<'_, V> {
             K::RPar | K::RSqb | K::RBrace => {
                 // depth > 0 here: the caller stops at an unmatched closer.
                 if let Some(l) = self.levels.pop() {
-                    self.exit_lambdas(l.active);
+                    self.exit_lambdas(l.active + l.lambdas);
                     s.impure -= l.impure as u32;
                     s.chain_base = if l.super_call { ChainBase::Super } else { ChainBase::Unknown };
                 }

@@ -25,6 +25,7 @@ impl<V: Visitor> Parser<'_, V> {
                     self.bump();
                 }
                 K::EndOfFile => return,
+                _ if self.take_resync() => {}
                 _ => {
                     self.diag(DiagKind::UnexpectedToken);
                     self.skip_line();
@@ -281,12 +282,7 @@ impl<V: Visitor> Parser<'_, V> {
                     }
                 }
                 K::Newline | K::EndOfFile | K::Indent | K::Dedent => return,
-                k if super::expr::is_stmt_keyword(k) => {
-                    self.diag_at(DiagKind::UnclosedBracket, t);
-                    if self.recover_brackets_at(t) {
-                        return;
-                    }
-                }
+                k if super::expr::is_stmt_keyword(k) && self.recover_unclosed(t) => return,
                 _ => {}
             }
             self.bump();

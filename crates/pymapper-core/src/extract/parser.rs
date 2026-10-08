@@ -30,8 +30,37 @@ pub(super) struct LineCursor {
 }
 
 impl LineCursor {
-    fn new(src: &[u8]) -> Self {
+    pub(super) fn new(src: &[u8]) -> Self {
         LineCursor { off: 0, line: 1, line_start: 0, cr: src.contains(&b'\r') }
+    }
+
+    /// Counts `\n` in `src[cur..end]` (no `\r` in the source), 8 bytes at a
+    /// time with an exact SWAR zero-byte mask, tracking the last one.
+    #[inline]
+    fn advance_lf(&mut self, src: &[u8], cur: usize, end: usize) {
+        const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        const NL: u64 = 0x0a0a_0a0a_0a0a_0a0a;
+        let mut i = cur;
+        while i + 8 <= end {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&src[i..i + 8]);
+            let x = u64::from_le_bytes(w) ^ NL;
+            // High bit set exactly in the bytes of `x` that are zero.
+            let m = !(((x & LO7).wrapping_add(LO7)) | x | LO7);
+            if m != 0 {
+                self.line += m.count_ones();
+                let last = 7 - (m.leading_zeros() / 8) as usize;
+                self.line_start = (i + last + 1) as u32;
+            }
+            i += 8;
+        }
+        while i < end {
+            if src[i] == b'\n' {
+                self.line += 1;
+                self.line_start = i as u32 + 1;
+            }
+            i += 1;
+        }
     }
 
     #[inline]
@@ -47,13 +76,7 @@ impl LineCursor {
                     }
                 }
             } else {
-                let seg = &src[cur..end];
-                let n = seg.iter().filter(|&&c| c == b'\n').count();
-                if n > 0 {
-                    self.line += n as u32;
-                    let last = seg.iter().rposition(|&c| c == b'\n').unwrap_or(0);
-                    self.line_start = (cur + last + 1) as u32;
-                }
+                self.advance_lf(src, cur, end);
             }
         } else {
             // Walk back (queries go backwards only a little: decorator starts,
@@ -114,6 +137,9 @@ pub struct Parser<'src, V: Visitor> {
     pub(super) tgt: Vec<Token>,
     pub(super) tgt_recs: Vec<TargetRec>,
     pub(super) tgt_unpack: bool,
+    /// An unclosed bracket was recovered from: the current statement ended
+    /// early at a statement keyword (already reported).
+    pub(super) resync: bool,
     /// Scanning a case pattern: no call/keyword events; tokens go to `tgt`.
     pub(super) pattern: bool,
     pub(super) diag_count: u32,
@@ -146,6 +172,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
             tgt_recs: Vec::new(),
             tgt_unpack: false,
             pattern: false,
+            resync: false,
             diag_count: 0,
         }
     }
@@ -177,18 +204,26 @@ impl<'src, V: Visitor> Parser<'src, V> {
     }
 
     /// The `k`-th token ahead (`k < 4`), without consuming.
-    #[inline]
+    #[inline(always)]
     pub(super) fn peek(&mut self, k: usize) -> Token {
         debug_assert!(k < RING);
+        if self.len <= k {
+            self.fill(k);
+        }
+        self.buf[(self.head + k) & RING_MASK]
+    }
+
+    /// Lexes until `k + 1` tokens are buffered.
+    #[inline(never)]
+    fn fill(&mut self, k: usize) {
         while self.len <= k {
             let t = self.lex();
             self.buf[(self.head + self.len) & RING_MASK] = t;
             self.len += 1;
         }
-        self.buf[(self.head + k) & RING_MASK]
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn kind(&mut self, k: usize) -> TokenKind {
         self.peek(k).kind
     }
@@ -199,7 +234,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
     }
 
     /// Consumes the current token. EndOfFile is never consumed (it repeats).
-    #[inline]
+    #[inline(always)]
     pub(super) fn bump(&mut self) -> Token {
         let t = self.peek(0);
         use TokenKind as K;
@@ -262,15 +297,25 @@ impl<'src, V: Visitor> Parser<'src, V> {
         r
     }
 
-    /// Drops the buffered lookahead and the lexer's open brackets, resuming at
-    /// `tok` (error recovery for an unclosed bracket). Returns false when the
-    /// lexer cannot recover there (inside an f-string).
-    pub(super) fn recover_brackets_at(&mut self, tok: Token) -> bool {
-        if !self.lx.recover_at(tok.start) {
+    /// Unclosed-bracket recovery at statement keyword `tok`: reports it, drops
+    /// the buffered lookahead and the lexer's open brackets and resumes lexing
+    /// at `tok`, then flags the current statement as ended (`resync`). Returns
+    /// false (nothing changed) when the lexer cannot recover there (inside an
+    /// f-string) or no bracket is open.
+    pub(super) fn recover_unclosed(&mut self, tok: Token) -> bool {
+        if self.lx.bracket_depth() == 0 || !self.lx.recover_at(tok.start) {
             return false;
         }
+        self.diag_at(DiagKind::UnclosedBracket, tok);
         self.len = 0;
+        self.resync = true;
         true
+    }
+
+    /// Clears `resync`, returning whether it was set.
+    #[inline]
+    pub(super) fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.resync)
     }
 
     /// Position of byte offset `off`.

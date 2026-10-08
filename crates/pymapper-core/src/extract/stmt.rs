@@ -21,6 +21,7 @@ impl<V: Visitor> Parser<'_, V> {
 
     /// One statement, or a stray NEWLINE / unexpected INDENT block.
     pub(super) fn statement_or_stray(&mut self) {
+        self.resync = false;
         match self.kind(0) {
             K::Newline => {
                 self.bump();
@@ -68,7 +69,7 @@ impl<V: Visitor> Parser<'_, V> {
     /// Expects the `:` ending a compound header; on error reports it and skips
     /// the rest of the line (the body, if indented, is still parsed).
     pub(super) fn header_colon(&mut self) {
-        if self.eat(K::Colon).is_none() {
+        if self.eat(K::Colon).is_none() && !self.take_resync() {
             self.diag(DiagKind::ExpectedColon);
             self.skip_to_colon_or_eol();
         }
@@ -131,8 +132,15 @@ impl<V: Visitor> Parser<'_, V> {
                 self.bump();
             }
             K::EndOfFile | K::Dedent | K::Indent => {}
-            _ => {
-                self.diag(DiagKind::UnexpectedToken);
+            // The statement ended at a keyword after an unclosed bracket.
+            _ if self.take_resync() => {}
+            k => {
+                let kind = if matches!(k, K::RPar | K::RSqb | K::RBrace) {
+                    DiagKind::UnmatchedBracket
+                } else {
+                    DiagKind::UnexpectedToken
+                };
+                self.diag(kind);
                 self.skip_line();
             }
         }
@@ -302,7 +310,11 @@ impl<V: Visitor> Parser<'_, V> {
                     return;
                 }
                 K::Newline | K::EndOfFile | K::Indent | K::Dedent => return,
-                k if super::expr::is_stmt_keyword(k) => return,
+                k if super::expr::is_stmt_keyword(k) => {
+                    let t = self.peek(0);
+                    self.recover_unclosed(t);
+                    return;
+                }
                 _ => {
                     self.bump();
                 }

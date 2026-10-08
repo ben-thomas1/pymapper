@@ -51,6 +51,7 @@ entered, and symlinks are not followed.
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
 | `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
+| `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters

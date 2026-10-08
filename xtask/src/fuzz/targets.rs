@@ -5,6 +5,10 @@
 //! extractor steps plug in `lex` and `extract` here (put them first).
 
 use std::hint::black_box;
+
+use pymapper_core::extract::{self, Visitor};
+use pymapper_core::extract::events::{Block, BlockKind, Def, DefKind, End};
+use pymapper_core::lex::Token;
 use std::time::Duration;
 
 /// A named fuzz target.
@@ -17,6 +21,12 @@ pub struct FuzzTarget {
 }
 
 pub const TARGETS: &[FuzzTarget] = &[
+    FuzzTarget {
+        name: "parse",
+        about: "pymapper_core::extract parser: event balance, token order and span invariants",
+        selftest: false,
+        run: parse,
+    },
     FuzzTarget {
         name: "demo",
         about: "toy tokenizer with invariant checks (placeholder until lex/extract land)",
@@ -45,6 +55,52 @@ pub const TARGETS: &[FuzzTarget] = &[
 
 pub fn find(name: &str) -> Option<&'static FuzzTarget> {
     TARGETS.iter().find(|t| t.name == name)
+}
+
+/// Parser invariant checker: definition/block/lambda events balance, consumed
+/// tokens are in order and inside the source.
+struct ParseCheck {
+    len: usize,
+    defs: u32,
+    blocks: Vec<BlockKind>,
+    lambdas: u32,
+    last_end: u32,
+}
+
+impl Visitor for ParseCheck {
+    fn token(&mut self, t: Token) {
+        assert!(t.end() as usize <= self.len, "token out of bounds");
+        assert!(t.start >= self.last_end, "tokens out of order");
+        self.last_end = t.end();
+    }
+    fn def_enter(&mut self, d: &Def<'_>) {
+        assert!(d.start <= d.name.start, "def start after its name");
+        self.defs += 1;
+    }
+    fn def_exit(&mut self, _: DefKind, end: End) {
+        assert!(end.end as usize <= self.len);
+        self.defs = self.defs.checked_sub(1).expect("def_exit without def_enter");
+    }
+    fn block_enter(&mut self, b: &Block<'_>) {
+        self.blocks.push(b.kind);
+    }
+    fn block_exit(&mut self, kind: BlockKind, _: End, _: bool) {
+        assert_eq!(self.blocks.pop(), Some(kind), "unbalanced block events");
+    }
+    fn lambda_enter(&mut self, _: Token) {
+        self.lambdas += 1;
+    }
+    fn lambda_exit(&mut self, _: u32) {
+        self.lambdas = self.lambdas.checked_sub(1).expect("lambda_exit without lambda_enter");
+    }
+}
+
+fn parse(src: &[u8]) {
+    let c = extract::parse(src, ParseCheck { len: src.len(), defs: 0, blocks: Vec::new(), lambdas: 0, last_end: 0 });
+    assert_eq!(c.defs, 0, "def_enter without def_exit");
+    assert!(c.blocks.is_empty(), "block_enter without block_exit");
+    assert_eq!(c.lambdas, 0, "lambda_enter without lambda_exit");
+    black_box(c.last_end);
 }
 
 /// Token classes of the toy tokenizer.
