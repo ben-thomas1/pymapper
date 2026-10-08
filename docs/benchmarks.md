@@ -140,3 +140,31 @@ best of 3. Other worktrees were building at the same time, so the machine was no
 | stdlib | parse-only | 1043   | 15.8  | 15.9ms | 28.8ms            | 45.0ms | 351  | 5.21        |
 | venv   | read       | 60529  | 650.1 | 2.93s  | 1.89s             | 4.86s  | 134  | 24.0        |
 | venv   | parse-only | 60529  | 650.1 | 2.75s  | 1.92s             | 4.71s  | 138  | 23.3        |
+
+### Walker (S2.2)
+
+`pymapper_core::walk` vs the single-threaded reference walker, same file set, 14-core Apple
+Silicon Mac, release build, warm cache, best of 5 (load average about 9 from other builds, so
+absolute times are noisy). `lectio` is the repository that contains the venv, walked with
+first-party options (`walk-git`: gitignore on, hidden directories skipped) and with corpus
+options (`walk`: everything, including `.venv` and `node_modules`).
+
+| corpus | target   | files | dirs  | walk    | peak RSS MB |
+|--------|----------|-------|-------|---------|-------------|
+| stdlib | walk     | 1043  | 105   | 2.04ms  | 3.44        |
+| stdlib | walk-seq | 1043  | 105   | 3.19ms  | 3.06        |
+| venv   | walk     | 60529 | 19618 | 783.5ms | 20.4        |
+| venv   | walk-seq | 60529 | 19618 | 2.25s   | 13.2        |
+| lectio | walk-git | 1803  | 914   | 43.2ms  | 3.82        |
+| lectio | walk     | 93289 | 30543 | 1.37s   | 38.0        |
+
+Thread scaling on the venv (`-j N`, best of 3): 1 thread 2.79s, 2 threads 1.51s, 4 threads
+842ms, 8 threads 807ms, 14 threads 784ms. It flattens after about 4 threads, most likely because
+the filesystem calls (`opendir` on full paths, `getdirentries`) serialise in the kernel (not
+profiled; the machine was also loaded). The `walk-git` file set equals
+`git ls-files --cached --others --exclude-standard` filtered to non-hidden `*.py`/`*.pyi`
+(1803 files).
+
+Peak RSS above `walk-seq` comes from the exactly sized sorted output being built while the
+per-thread lists (relative paths) are still alive; the output itself is one byte buffer plus
+one `u32` per file.
