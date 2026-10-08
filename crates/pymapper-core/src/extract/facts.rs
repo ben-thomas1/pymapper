@@ -464,6 +464,10 @@ macro_rules! soa {
             pub fn clear(&mut self) {
                 $(self.$f.clear();)+
             }
+            /// Reserves room for exactly `n` more rows in every column.
+            pub fn reserve_exact(&mut self, n: usize) {
+                $(self.$f.reserve_exact(n);)+
+            }
 
             /// Moves all rows of `other` to the end; returns the base to shift by.
             #[allow(dead_code)]
@@ -812,6 +816,24 @@ impl FactStore {
             diags: self.diags.len(),
             suppressions: self.suppressions.len(),
         }
+    }
+
+    /// Reserves room for exactly `n.<table>` more rows in every table (e.g. the summed
+    /// lengths of the stores about to be appended, so the merge allocates once).
+    pub fn reserve_exact(&mut self, n: &TableBases) {
+        self.defs.reserve_exact(n.defs as usize);
+        self.decorators.reserve_exact(n.decorators as usize);
+        self.bases.reserve_exact(n.bases as usize);
+        self.params.reserve_exact(n.params as usize);
+        self.imports.reserve_exact(n.imports as usize);
+        self.calls.reserve_exact(n.calls as usize);
+        self.bindings.reserve_exact(n.bindings as usize);
+        self.decls.reserve_exact(n.decls as usize);
+        self.names.reserve_exact(n.names as usize);
+        self.exports.reserve_exact(n.exports as usize);
+        self.evidence.reserve_exact(n.evidence as usize);
+        self.diags.reserve_exact(n.diags as usize);
+        self.suppressions.reserve_exact(n.suppressions as usize);
     }
 
     /// Removes all facts, keeping the allocations.
