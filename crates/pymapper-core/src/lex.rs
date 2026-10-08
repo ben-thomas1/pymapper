@@ -252,6 +252,9 @@ impl<'src> Lexer<'src> {
         self.st.pending_error = None;
         self.st.at_bol = false;
         self.st.blank = false;
+        // Comments after `pos` are lexed (and their suppressions recorded) again.
+        let keep = self.suppressions.partition_point(|s| s.start < pos);
+        self.suppressions.truncate(keep);
         true
     }
 

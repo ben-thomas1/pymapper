@@ -828,3 +828,13 @@ fn exclamation_outside_fstring_and_suppressions() {
     let (_, sup) = p.finish();
     assert_eq!(sup.len(), 2);
 }
+
+#[test]
+fn recovery_does_not_duplicate_suppressions() {
+    let src = b"x = f(a,\ndef g(): pass  # pymapper: ignore[PM1]\n";
+    let mut p = super::Parser::new(src, NoopVisitor);
+    p.parse_file();
+    assert_eq!(p.diagnostics(), 1);
+    let (_, sup) = p.finish();
+    assert_eq!(sup.len(), 1);
+}

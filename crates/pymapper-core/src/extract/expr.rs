@@ -217,10 +217,8 @@ impl<V: Visitor> Parser<'_, V> {
                 // Never part of an expression: ends it, recovering from an
                 // unclosed bracket if one is open (also one opened before this scan).
                 _ if is_stmt_keyword(k) => {
-                    if depth == 0 || self.recover_unclosed(t) {
-                        if depth == 0 {
-                            self.recover_unclosed(t);
-                        }
+                    let recovered = self.recover_unclosed(t);
+                    if depth == 0 || recovered {
                         break;
                     }
                 }
