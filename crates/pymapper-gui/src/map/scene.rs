@@ -86,8 +86,8 @@ impl WorldRect {
 }
 
 /// Rect instance (32 bytes): a rounded rectangle with fill and inner stroke, drawn as one
-/// instanced quad with an SDF fragment shader. Radius and stroke are in physical pixels so
-/// they stay crisp at any zoom.
+/// instanced quad with an SDF fragment shader. Radius and stroke width are in points
+/// (scaled by the DPI factor in the shader), so they look the same at any zoom.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RectInstance {
@@ -95,12 +95,12 @@ pub struct RectInstance {
     pub max: [f32; 2],
     pub fill: Rgba,
     pub stroke: Rgba,
-    pub radius_px: f32,
-    pub stroke_px: f32,
+    pub radius: f32,
+    pub stroke_width: f32,
 }
 
 /// Edge instance (40 bytes): a cubic Bezier `p0, c0, c1, p1` in world units, drawn as a
-/// ribbon of constant pixel width (instanced triangle strip, tessellated in the vertex
+/// ribbon of constant width in points (instanced triangle strip, tessellated in the vertex
 /// shader). Straight lines use the line batch, which draws one quad per instance.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,7 +110,7 @@ pub struct EdgeInstance {
     pub c1: [f32; 2],
     pub p1: [f32; 2],
     pub color: Rgba,
-    pub width_px: f32,
+    pub width: f32,
 }
 
 /// Glyph instance (32 bytes): one glyph of a label, anchored at the top-left of the
@@ -287,13 +287,13 @@ pub struct LabelSpan {
     pub len: u32,
 }
 
-/// Style of a rect: fill, inner stroke, corner radius and stroke width in physical pixels.
+/// Style of a rect: fill, inner stroke, corner radius and stroke width in points.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RectStyle {
     pub fill: Rgba,
     pub stroke: Rgba,
-    pub radius_px: f32,
-    pub stroke_px: f32,
+    pub radius: f32,
+    pub stroke_width: f32,
 }
 
 /// Rects smaller than this many physical pixels are left out of a band (auto LOD).
@@ -346,8 +346,8 @@ impl SceneBuilder {
             max: r.max,
             fill: style.fill,
             stroke: style.stroke,
-            radius_px: style.radius_px,
-            stroke_px: style.stroke_px,
+            radius: style.radius,
+            stroke_width: style.stroke_width,
         });
         self.rect_meta.push(Meta { id, layer, lod });
         self.rect_label.push(span);
@@ -365,14 +365,14 @@ impl SceneBuilder {
     }
 
     /// Adds a straight edge (one quad per instance).
-    pub fn add_line(&mut self, id: u32, p0: [f32; 2], p1: [f32; 2], color: Rgba, width_px: f32, lod: Lod) {
-        self.lines.push(EdgeInstance { p0, c0: p0, c1: p1, p1, color, width_px });
+    pub fn add_line(&mut self, id: u32, p0: [f32; 2], p1: [f32; 2], color: Rgba, width: f32, lod: Lod) {
+        self.lines.push(EdgeInstance { p0, c0: p0, c1: p1, p1, color, width });
         self.line_meta.push(Meta { id, layer: 0, lod });
     }
 
     /// Adds a cubic Bezier edge `p0, c0, c1, p1`.
-    pub fn add_curve(&mut self, id: u32, pts: [[f32; 2]; 4], color: Rgba, width_px: f32, lod: Lod) {
-        self.curves.push(EdgeInstance { p0: pts[0], c0: pts[1], c1: pts[2], p1: pts[3], color, width_px });
+    pub fn add_curve(&mut self, id: u32, pts: [[f32; 2]; 4], color: Rgba, width: f32, lod: Lod) {
+        self.curves.push(EdgeInstance { p0: pts[0], c0: pts[1], c1: pts[2], p1: pts[3], color, width });
         self.curve_meta.push(Meta { id, layer: 0, lod });
     }
 
@@ -392,8 +392,8 @@ impl SceneBuilder {
         for l in rects.layers.iter().chain(&lines.layers).chain(&curves.layers) {
             bounds = bounds.union(&l.bounds);
         }
-        let max_edge_px = lines.inst.iter().chain(&curves.inst).map(|e| e.width_px).fold(0.0f32, f32::max);
-        Scene { rects, rect_label, lines, curves, text: self.text, bounds, max_edge_px }
+        let max_edge_width = lines.inst.iter().chain(&curves.inst).map(|e| e.width).fold(0.0f32, f32::max);
+        Scene { rects, rect_label, lines, curves, text: self.text, bounds, max_edge_width }
     }
 }
 
@@ -471,8 +471,8 @@ pub struct Scene {
     pub text: Vec<u8>,
     /// Union of all item bboxes (`WorldRect::EMPTY` for an empty scene).
     pub bounds: WorldRect,
-    /// Widest edge in physical pixels (cull and hit margin).
-    pub max_edge_px: f32,
+    /// Widest edge in points (cull and hit margin).
+    pub max_edge_width: f32,
 }
 
 impl Scene {

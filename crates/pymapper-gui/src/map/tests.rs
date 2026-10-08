@@ -194,7 +194,7 @@ fn change_points() {
 }
 
 fn style(fill: Rgba) -> RectStyle {
-    RectStyle { fill, stroke: Rgba::TRANSPARENT, radius_px: 0.0, stroke_px: 0.0 }
+    RectStyle { fill, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn scene_build_sorts_by_layer_and_bin() {
     assert_eq!(s.rects.len(), 2000);
     assert_eq!(s.lines.len(), 1);
     assert_eq!(s.curves.len(), 1);
-    assert_eq!(s.max_edge_px, 3.0);
+    assert_eq!(s.max_edge_width, 3.0);
     assert_eq!(s.rects.layers.iter().map(|l| l.layer).collect::<Vec<_>>(), vec![0, 2, 4]);
     let ids: HashSet<u32> = s.rects.id.iter().copied().collect();
     assert_eq!(ids.len(), 2000);
@@ -245,7 +245,7 @@ fn instance_sizes_have_no_padding() {
     assert_eq!(size_of::<EdgeInstance>(), 40);
     assert_eq!(size_of::<GlyphInstance>(), 32);
     assert_eq!(size_of::<Rgba>(), 4);
-    let r = RectInstance { min: [1.0, 2.0], max: [3.0, 4.0], fill: Rgba([5, 6, 7, 8]), stroke: Rgba([9, 10, 11, 12]), radius_px: 0.5, stroke_px: 0.25 };
+    let r = RectInstance { min: [1.0, 2.0], max: [3.0, 4.0], fill: Rgba([5, 6, 7, 8]), stroke: Rgba([9, 10, 11, 12]), radius: 0.5, stroke_width: 0.25 };
     let bytes = as_bytes(std::slice::from_ref(&r));
     assert_eq!(bytes.len(), 32);
     assert_eq!(&bytes[16..24], &[5, 6, 7, 8, 9, 10, 11, 12]);
@@ -323,33 +323,37 @@ fn band_query_matches_brute_force() {
 
 #[test]
 fn rect_contains_respects_rounded_corners() {
-    let r = RectInstance { min: [0.0, 0.0], max: [10.0, 10.0], fill: Rgba::TRANSPARENT, stroke: Rgba::TRANSPARENT, radius_px: 4.0, stroke_px: 0.0 };
+    let r = RectInstance { min: [0.0, 0.0], max: [10.0, 10.0], fill: Rgba::TRANSPARENT, stroke: Rgba::TRANSPARENT, radius: 4.0, stroke_width: 0.0 };
     // zoom 1: radius 4 world units.
-    assert!(rect_contains(&r, [5.0, 5.0], 1.0));
-    assert!(rect_contains(&r, [0.0, 5.0], 1.0));
-    assert!(!rect_contains(&r, [0.2, 0.2], 1.0), "outside the corner arc");
-    assert!(rect_contains(&r, [1.5, 1.5], 1.0));
+    assert!(rect_contains(&r, [5.0, 5.0], 1.0, 1.0));
+    assert!(rect_contains(&r, [0.0, 5.0], 1.0, 1.0));
+    assert!(!rect_contains(&r, [0.2, 0.2], 1.0, 1.0), "outside the corner arc");
+    assert!(rect_contains(&r, [1.5, 1.5], 1.0, 1.0));
     // zoom 10: radius 0.4 world units, so that point is inside.
-    assert!(rect_contains(&r, [0.2, 0.2], 10.0));
-    assert!(!rect_contains(&r, [10.5, 5.0], 1.0));
-    assert!(!rect_contains(&r, [f32::NAN, 5.0], 1.0));
+    assert!(!rect_contains(&r, [0.2, 0.2], 10.0, 20.0), "radius is in points: 8 world units at 2x");
+    assert!(rect_contains(&r, [0.2, 0.2], 10.0, 1.0));
+    assert!(!rect_contains(&r, [10.5, 5.0], 1.0, 1.0));
+    assert!(!rect_contains(&r, [f32::NAN, 5.0], 1.0, 1.0));
 }
 
 #[test]
 fn edge_distance() {
-    let line = EdgeInstance { p0: [0.0, 0.0], c0: [0.0, 0.0], c1: [10.0, 0.0], p1: [10.0, 0.0], color: Rgba::TRANSPARENT, width_px: 1.0 };
+    let line = EdgeInstance { p0: [0.0, 0.0], c0: [0.0, 0.0], c1: [10.0, 0.0], p1: [10.0, 0.0], color: Rgba::TRANSPARENT, width: 1.0 };
     assert_eq!(hit::edge_dist2(&line, [5.0, 3.0], 1), 9.0);
     assert_eq!(hit::edge_dist2(&line, [-3.0, 4.0], 1), 25.0);
-    let curve = EdgeInstance { p0: [0.0, 0.0], c0: [0.0, 10.0], c1: [10.0, 10.0], p1: [10.0, 0.0], color: Rgba::TRANSPARENT, width_px: 1.0 };
+    let curve = EdgeInstance { p0: [0.0, 0.0], c0: [0.0, 10.0], c1: [10.0, 10.0], p1: [10.0, 0.0], color: Rgba::TRANSPARENT, width: 1.0 };
     let top = hit::bezier(&curve, 0.5);
     assert_eq!(top, [5.0, 7.5]);
     assert!(hit::edge_dist2(&curve, top, hit::CURVE_SEGMENTS) < 1e-6);
     assert!(hit::edge_dist2(&curve, [5.0, 0.0], hit::CURVE_SEGMENTS) > 10.0);
 }
 
+/// DPI factor used by the hit-test checks.
+const PPP: f32 = 2.0;
+
 /// Brute-force topmost rect under `p` among the band's rects (highest layer, then latest).
 fn brute_rect(s: &Scene, bands: &Bands, p: [f32; 2], zoom: f32) -> Option<u32> {
-    bands.rects.slots.iter().rev().copied().find(|&i| rect_contains(&s.rects.inst[i as usize], p, zoom))
+    bands.rects.slots.iter().rev().copied().find(|&i| rect_contains(&s.rects.inst[i as usize], p, zoom, PPP))
 }
 
 #[test]
@@ -382,12 +386,12 @@ fn check_hits(s: &Scene, points: usize) -> HitScratch {
         for _ in 0..points {
             let screen = [rng.f32() * 1600.0, rng.f32() * 1000.0];
             let p = cam.screen_to_world(screen);
-            let got = hit::hit_test(s, &bands, &cam, screen, 3.0, &mut scratch);
+            let got = hit::hit_test(s, &bands, &cam, screen, 3.0, PPP, &mut scratch);
             // Brute-force edges: the nearest band curve within reach.
             let mut best_edge: Option<(f32, u32)> = None;
             for &i in &bands.curves.slots {
                 let e = &s.curves.inst[i as usize];
-                let lim = (e.width_px * 0.5 + 3.0) / cam.zoom;
+                let lim = (hit::edge_px(e.width, PPP) * 0.5 + 3.0) / cam.zoom;
                 let d2 = hit::edge_dist2(e, p, hit::CURVE_SEGMENTS);
                 if d2 <= lim * lim && best_edge.is_none_or(|(bd, _)| d2 <= bd) {
                     best_edge = Some((d2, i));
@@ -405,7 +409,7 @@ fn check_hits(s: &Scene, points: usize) -> HitScratch {
                 (Some(h), None) if h.kind == HitKind::Curve => {
                     // Only acceptable right at the tolerance boundary (rounding).
                     let e = &s.curves.inst[h.index as usize];
-                    let lim = (e.width_px * 0.5 + 3.0) / cam.zoom;
+                    let lim = (hit::edge_px(e.width, PPP) * 0.5 + 3.0) / cam.zoom;
                     let d = hit::edge_dist2(e, p, hit::CURVE_SEGMENTS).sqrt();
                     assert!((d - lim).abs() <= 4e-3, "spurious edge hit at {p:?}: {d} vs {lim}");
                 }
@@ -419,7 +423,7 @@ fn check_hits(s: &Scene, points: usize) -> HitScratch {
                 }
                 (None, Some((d_want, i))) => {
                     // Only acceptable right at the tolerance boundary (rounding).
-                    let lim = (s.curves.inst[i as usize].width_px * 0.5 + 3.0) / cam.zoom;
+                    let lim = (hit::edge_px(s.curves.inst[i as usize].width, PPP) * 0.5 + 3.0) / cam.zoom;
                     assert!(lim - d_want.sqrt() <= 4e-3, "edge missed at {p:?}");
                 }
             }

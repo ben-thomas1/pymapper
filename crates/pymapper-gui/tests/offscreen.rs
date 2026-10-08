@@ -195,9 +195,9 @@ const YELLOW: Rgba = Rgba::rgb(255, 255, 0);
 
 fn test_scene() -> MapState {
     let mut b = SceneBuilder::new();
-    let a = RectStyle { fill: FILL_A, stroke: Rgba::rgb(255, 255, 255), radius_px: 8.0, stroke_px: 2.0 };
+    let a = RectStyle { fill: FILL_A, stroke: Rgba::rgb(255, 255, 255), radius: 8.0, stroke_width: 2.0 };
     b.add_rect(1, 0, WorldRect::new(100.0, 100.0, 400.0, 400.0), a, Some(b"Alpha_label"));
-    let bs = RectStyle { fill: FILL_B, stroke: Rgba::TRANSPARENT, radius_px: 0.0, stroke_px: 0.0 };
+    let bs = RectStyle { fill: FILL_B, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 };
     b.add_rect(2, 1, WorldRect::new(150.0, 250.0, 350.0, 380.0), bs, None);
     b.add_line(3, [500.0, 50.0], [900.0, 50.0], GREEN, 4.0, Lod::ALWAYS);
     b.add_curve(4, [[500.0, 300.0], [600.0, 200.0], [800.0, 400.0], [900.0, 300.0]], YELLOW, 3.0, Lod::ALWAYS);
@@ -287,4 +287,24 @@ fn stress_scene_renders() {
     assert_eq!(map.bands.rects.len(), 20_000);
     let mem = renderer.canvas().map().memory();
     assert!(mem.buffers >= 20_000 * 32 + 20_000 * 40, "{mem:?}");
+}
+
+#[test]
+fn style_sizes_are_points() {
+    let Some(g) = gpu() else { return };
+    let size = [1000, 500];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    // The 4 pt line is 8 px wide at 2x; the 2 pt stroke is 4 px.
+    assert!(close(px(&p, size, 700, 53), rgb(GREEN)), "{:?}", px(&p, size, 700, 53));
+    assert!(close(px(&p, size, 700, 55), bg), "{:?}", px(&p, size, 700, 55));
+    assert!(close(px(&p, size, 103, 250), [255, 255, 255]), "{:?}", px(&p, size, 103, 250));
+    assert!(close(px(&p, size, 105, 250), rgb(FILL_A)), "{:?}", px(&p, size, 105, 250));
 }

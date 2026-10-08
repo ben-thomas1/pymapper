@@ -35,15 +35,16 @@ pub struct Bands {
     pub curves: BandBatch,
 }
 
-/// True if world point `p` is inside the rounded rect as drawn at `zoom` (corner radius is
-/// in pixels, so it depends on zoom).
-pub fn rect_contains(r: &RectInstance, p: [f32; 2], zoom: f32) -> bool {
+/// True if world point `p` is inside the rounded rect as drawn at `zoom` physical pixels
+/// per world unit and `ppp` pixels per point (the corner radius is in points, so its world
+/// size depends on both).
+pub fn rect_contains(r: &RectInstance, p: [f32; 2], zoom: f32, ppp: f32) -> bool {
     if !(p[0] >= r.min[0] && p[0] <= r.max[0] && p[1] >= r.min[1] && p[1] <= r.max[1]) {
         return false;
     }
     let hw = (r.max[0] - r.min[0]) * 0.5;
     let hh = (r.max[1] - r.min[1]) * 0.5;
-    let rad = (r.radius_px.max(0.0) / zoom).min(hw).min(hh);
+    let rad = (r.radius.max(0.0) * ppp / zoom).min(hw).min(hh);
     if rad <= 0.0 {
         return true;
     }
@@ -161,12 +162,36 @@ fn nearer(a: (f32, u32), b: (f32, u32)) -> (f32, u32) {
 }
 
 /// Nearest edge within reach of `p` among the slots in `ranges`: (squared distance, slot).
-fn nearest_edge(batch: &Batch<EdgeInstance>, band: &BandBatch, ranges: &[Range<u32>], p: [f32; 2], tol: f32, zoom: f32, curve: bool) -> Option<(f32, u32)> {
+/// Hit-test parameters shared by every candidate.
+#[derive(Clone, Copy)]
+struct Probe {
+    p: [f32; 2],
+    /// Tolerance in physical pixels.
+    tol: f32,
+    zoom: f32,
+    ppp: f32,
+    curve: bool,
+}
+
+impl Probe {
+    /// World-space reach of an edge of `width` points: half the drawn ribbon plus tolerance.
+    fn limit(&self, width: f32) -> f32 {
+        (edge_px(width, self.ppp) * 0.5 + self.tol) / self.zoom
+    }
+}
+
+/// Drawn ribbon width in physical pixels (the shader keeps at least one pixel).
+pub fn edge_px(width: f32, ppp: f32) -> f32 {
+    (width * ppp).max(1.0)
+}
+
+fn nearest_edge(batch: &Batch<EdgeInstance>, band: &BandBatch, ranges: &[Range<u32>], q: Probe) -> Option<(f32, u32)> {
+    let Probe { p, curve, .. } = q;
     let mut best: Option<(f32, u32)> = None;
     for r in ranges {
         for slot in r.clone() {
             let e = &batch.inst[band.slots[slot as usize] as usize];
-            let lim = (e.width_px * 0.5 + tol) / zoom;
+            let lim = q.limit(e.width);
             // Cheap rejects first: the edge lies inside its control-point bbox and its fat
             // line. In dense scenes nearly all grid candidates fail here.
             let x0 = e.p0[0].min(e.c0[0]).min(e.c1[0]).min(e.p1[0]) - lim;
@@ -185,23 +210,24 @@ fn nearest_edge(batch: &Batch<EdgeInstance>, band: &BandBatch, ranges: &[Range<u
 }
 
 /// Topmost drawn item under screen point `screen` (canvas pixels): edges first (within
-/// `tol_px` of the ribbon), then rects from the highest layer down.
-pub fn hit_test(scene: &Scene, bands: &Bands, cam: &Camera, screen: [f32; 2], tol_px: f32, s: &mut HitScratch) -> Option<Hit> {
+/// `tol_px` pixels of the ribbon), then rects from the highest layer down. `ppp` is the
+/// DPI factor that style sizes in points are drawn with.
+pub fn hit_test(scene: &Scene, bands: &Bands, cam: &Camera, screen: [f32; 2], tol_px: f32, ppp: f32, s: &mut HitScratch) -> Option<Hit> {
     let p = cam.screen_to_world(screen);
     if !(p[0].is_finite() && p[1].is_finite()) {
         return None;
     }
     let tol = tol_px.max(0.0);
-    let reach = (scene.max_edge_px * 0.5 + tol) / cam.zoom;
+    let reach = (edge_px(scene.max_edge_width, ppp) * 0.5 + tol) / cam.zoom;
     let q = WorldRect { min: [p[0] - reach, p[1] - reach], max: [p[0] + reach, p[1] + reach] };
     for (kind, batch, band) in [(HitKind::Curve, &scene.curves, &bands.curves), (HitKind::Line, &scene.lines, &bands.lines)] {
-        let curve = kind == HitKind::Curve;
+        let probe = Probe { p, tol, zoom: cam.zoom, ppp, curve: kind == HitKind::Curve };
         let mut best: Option<(f32, u32)> = None;
         for li in 0..batch.layers.len() {
             band.query(batch, li, &q, usize::MAX, &mut s.query, &mut s.ranges);
             let total: usize = s.ranges.iter().map(|r| r.len()).sum();
             let found = if total < PAR_MIN {
-                nearest_edge(batch, band, &s.ranges, p, tol, cam.zoom, curve)
+                nearest_edge(batch, band, &s.ranges, probe)
             } else {
                 use rayon::prelude::*;
                 s.parallel_scans += 1;
@@ -216,7 +242,7 @@ pub fn hit_test(scene: &Scene, bands: &Bands, cam: &Camera, screen: [f32; 2], to
                 }
                 s.chunks
                     .par_iter()
-                    .filter_map(|r| nearest_edge(batch, band, std::slice::from_ref(r), p, tol, cam.zoom, curve))
+                    .filter_map(|r| nearest_edge(batch, band, std::slice::from_ref(r), probe))
                     .reduce_with(nearer)
             };
             // Slots of later layers draw on top: compare by (distance, layer order).
@@ -236,7 +262,7 @@ pub fn hit_test(scene: &Scene, bands: &Bands, cam: &Camera, screen: [f32; 2], to
         for r in s.ranges.iter().rev() {
             for slot in r.clone().rev() {
                 let i = bands.rects.slots[slot as usize];
-                if rect_contains(&scene.rects.inst[i as usize], p, cam.zoom) {
+                if rect_contains(&scene.rects.inst[i as usize], p, cam.zoom, ppp) {
                     return Some(Hit { kind: HitKind::Rect, index: i, id: scene.rects.id[i as usize] });
                 }
             }

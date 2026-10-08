@@ -321,7 +321,7 @@ impl MapState {
     /// Topmost item at canvas pixel `screen` among what the current band draws. Uses the
     /// band slots of the last [`Self::update`].
     pub fn hit_test(&mut self, screen: [f32; 2], tol_px: f32) -> Option<Hit> {
-        hit::hit_test(&self.scene, &self.bands, &self.camera, screen, tol_px, &mut self.hit_scratch)
+        hit::hit_test(&self.scene, &self.bands, &self.camera, screen, tol_px, self.pixels_per_point, &mut self.hit_scratch)
     }
 
     /// A one-line description of the hovered item, written into `out` (reused).

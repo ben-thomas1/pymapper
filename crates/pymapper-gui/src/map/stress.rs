@@ -128,7 +128,7 @@ pub fn scene(rects: usize, edges: usize, seed: u64) -> Scene {
         let hue = p as f32 / pkgs as f32;
         label.clear();
         let _ = write!(label, "package_{p}");
-        let style = RectStyle { fill: hsl(hue, 0.35, 0.22), stroke: hsl(hue, 0.4, 0.35), radius_px: 4.0, stroke_px: 1.0 };
+        let style = RectStyle { fill: hsl(hue, 0.35, 0.22), stroke: hsl(hue, 0.4, 0.35), radius: 4.0, stroke_width: 1.0 };
         let i = b.add_rect(id, 0, pr, style, Some(label.as_bytes()));
         if tiny {
             // Tiny scenes: containers are edge endpoints too.
@@ -139,7 +139,7 @@ pub fn scene(rects: usize, edges: usize, seed: u64) -> Scene {
         for (m, &mr) in sub.iter().enumerate() {
             label.clear();
             let _ = write!(label, "package_{p}.module_{m}");
-            let style = RectStyle { fill: hsl(hue, 0.3, 0.32), stroke: hsl(hue, 0.35, 0.45), radius_px: 3.0, stroke_px: 1.0 };
+            let style = RectStyle { fill: hsl(hue, 0.3, 0.32), stroke: hsl(hue, 0.35, 0.45), radius: 3.0, stroke_width: 1.0 };
             let i = b.add_rect(id, 1, mr, style, Some(label.as_bytes()));
             if tiny {
                 leaf_pts.push((mr.center(), b.rect_lod(i)));
@@ -152,7 +152,7 @@ pub fn scene(rects: usize, edges: usize, seed: u64) -> Scene {
                 label.clear();
                 let _ = write!(label, "function_{s}");
                 let heat = rng.f32();
-                let style = RectStyle { fill: hsl(0.33 - 0.33 * heat, 0.45, 0.55), stroke: Rgba::new(0, 0, 0, 90), radius_px: 2.0, stroke_px: 1.0 };
+                let style = RectStyle { fill: hsl(0.33 - 0.33 * heat, 0.45, 0.55), stroke: Rgba::new(0, 0, 0, 90), radius: 2.0, stroke_width: 1.0 };
                 let i = b.add_rect(id, 2, sr, style, Some(label.as_bytes()));
                 leaf_pts.push((sr.center(), b.rect_lod(i)));
                 id += 1;
@@ -163,7 +163,7 @@ pub fn scene(rects: usize, edges: usize, seed: u64) -> Scene {
     // Degenerate splits (tiny inputs) can drop leaves: top up with small filler rects in
     // the top-left corner so the count is exact.
     while b.rect_count() < rects {
-        let style = RectStyle { fill: Rgba::rgb(60, 60, 60), stroke: Rgba::TRANSPARENT, radius_px: 0.0, stroke_px: 0.0 };
+        let style = RectStyle { fill: Rgba::rgb(60, 60, 60), stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 };
         let r = WorldRect::new(0.0, 0.0, 1.0, 1.0);
         let i = b.add_rect(id, 3, r, style, None);
         leaf_pts.push((r.center(), b.rect_lod(i)));

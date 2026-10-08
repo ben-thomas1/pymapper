@@ -11,7 +11,8 @@ struct Camera {
     srgb: f32,          // 1.0 if the target is *Srgb (decode colours to linear)
     origin: vec2<f32>,  // canvas centre, target pixels
     viewport: vec2<f32>, // render target size, pixels
-    text: vec4<f32>,    // label line height, padding, ascent (pixels), unused
+    text: vec3<f32>,    // label line height, padding, ascent (pixels)
+    ppp: f32,           // pixels per point: style sizes (radius, stroke, width) are points
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
@@ -57,7 +58,7 @@ struct RectIn {
     @location(2) fill: vec4<f32>,
     @location(3) stroke: vec4<f32>,
     @location(4) radius: f32,
-    @location(5) stroke_px: f32,
+    @location(5) stroke_width: f32,
 };
 
 struct RectOut {
@@ -65,7 +66,7 @@ struct RectOut {
     @location(0) local: vec2<f32>,  // pixels from the rect centre
     @location(1) @interpolate(flat) half: vec2<f32>,
     @location(2) @interpolate(flat) radius: f32,
-    @location(3) @interpolate(flat) stroke_px: f32,
+    @location(3) @interpolate(flat) stroke_width: f32,
     @location(4) @interpolate(flat) fill: vec4<f32>,
     @location(5) @interpolate(flat) stroke: vec4<f32>,
 };
@@ -83,8 +84,8 @@ fn vs_rect(@builtin(vertex_index) vi: u32, r: RectIn) -> RectOut {
     o.pos = px_to_clip(center + local);
     o.local = local;
     o.half = half;
-    o.radius = clamp(r.radius, 0.0, min(half.x, half.y));
-    o.stroke_px = max(r.stroke_px, 0.0);
+    o.radius = clamp(r.radius * cam.ppp, 0.0, min(half.x, half.y));
+    o.stroke_width = max(r.stroke_width * cam.ppp, 0.0);
     o.fill = r.fill;
     o.stroke = r.stroke;
     return o;
@@ -99,8 +100,8 @@ fn sd_round_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
 fn fs_rect(i: RectOut) -> @location(0) vec4<f32> {
     let d = sd_round_box(i.local, i.half, i.radius);
     let outer = clamp(0.5 - d, 0.0, 1.0);
-    // Inner stroke: coverage of the shape minus coverage of the shape shrunk by stroke_px.
-    let inner = clamp(0.5 - (d + i.stroke_px), 0.0, 1.0);
+    // Inner stroke: coverage of the shape minus coverage of the shape shrunk by the stroke.
+    let inner = clamp(0.5 - (d + i.stroke_width), 0.0, 1.0);
     let s = (outer - inner) * i.stroke.a;
     let f = inner * i.fill.a;
     let rgb = decode(i.stroke.rgb) * s + decode(i.fill.rgb) * f * (1.0 - s);
@@ -144,14 +145,15 @@ fn edge_vertex(vi: u32, e: EdgeIn, segments: u32) -> EdgeOut {
     }
     let n = normalize(vec2<f32>(-d.y, d.x));
     // Ribbons narrower than a pixel stay one pixel wide and fade instead.
-    let w = max(e.width, 1.0);
+    let wpx = e.width * cam.ppp;
+    let w = max(wpx, 1.0);
     // Half a pixel of margin: coverage reaches zero there.
     let half = w * 0.5 + 0.5;
     var o: EdgeOut;
     o.pos = px_to_clip(p + n * (half * side));
     o.across = half * side;
     o.half_width = w * 0.5;
-    o.color = vec4<f32>(e.color.rgb, e.color.a * min(e.width, 1.0));
+    o.color = vec4<f32>(e.color.rgb, e.color.a * clamp(wpx, 0.0, 1.0));
     return o;
 }
 

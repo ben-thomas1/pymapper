@@ -391,18 +391,17 @@ impl MapRenderer {
     fn sync_hover(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &MapState) {
         self.overlay_rects.clear();
         self.overlay_edges.clear();
-        let ppp = state.pixels_per_point;
         if let Some(h) = state.hover {
             let scene = &*state.scene;
             match h.kind {
                 HitKind::Rect => {
                     let r = scene.rects.inst[h.index as usize];
-                    self.overlay_rects.push(RectInstance { fill: Rgba::TRANSPARENT, stroke: HOVER_COLOR, stroke_px: 2.0 * ppp, ..r });
+                    self.overlay_rects.push(RectInstance { fill: Rgba::TRANSPARENT, stroke: HOVER_COLOR, stroke_width: 2.0, ..r });
                 }
                 HitKind::Line | HitKind::Curve => {
                     let b = if h.kind == HitKind::Line { &scene.lines } else { &scene.curves };
                     let e = b.inst[h.index as usize];
-                    self.overlay_edges.push(EdgeInstance { color: HOVER_COLOR, width_px: (e.width_px + 2.0 * ppp).max(3.0 * ppp), ..e });
+                    self.overlay_edges.push(EdgeInstance { color: HOVER_COLOR, width: (e.width + 2.0).max(3.0), ..e });
                 }
             }
         }
@@ -427,7 +426,7 @@ impl MapRenderer {
             line_h,
             pad,
             ascent,
-            0.0,
+            state.pixels_per_point,
         ];
         if u == self.last_uniform {
             return;
@@ -457,7 +456,7 @@ impl MapRenderer {
         // Margins: AA fringe for rects; half the widest ribbon for edges.
         let m = 2.0 / cam.zoom;
         self.push_batch(&scene.rects, &state.bands.rects, &view.expand(m, m), Pipe::Rect, Buf::Rects);
-        let m = (scene.max_edge_px * 0.5 + 2.0) / cam.zoom;
+        let m = (super::hit::edge_px(scene.max_edge_width, state.pixels_per_point) * 0.5 + 2.0) / cam.zoom;
         let q = view.expand(m, m);
         self.push_batch(&scene.lines, &state.bands.lines, &q, Pipe::Line, Buf::Lines);
         self.push_batch(&scene.curves, &state.bands.curves, &q, Pipe::Curve, Buf::Curves);
