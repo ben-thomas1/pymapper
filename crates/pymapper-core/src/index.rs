@@ -83,6 +83,7 @@ mod tests;
 
 pub use inputs::{Group, Inputs};
 pub use load::{LoadOptions, LoadStats, ReadError, load, load_with};
+pub(crate) use load::load_cached;
 
 use std::ops::Range;
 use std::path::Path;

@@ -89,6 +89,14 @@ use crate::rules::{Arg, FileId, Findings, Location, Pass, RuleEngine, SymbolId};
 /// Largest k-gram length.
 const MAX_K: u32 = 20;
 
+/// Bump whenever normalisation, hashing or winnowing changes the fingerprints taken for some
+/// input: cached fingerprints with another version are not reused.
+const FINGERPRINT_VERSION: u32 = 1;
+
+/// What fingerprints depend on besides the source: `[version, k, w]`. Stored with cached
+/// fingerprints; a load reuses them only when its key is equal.
+pub type FingerprintKey = [u32; 3];
+
 /// Detection parameters (from `thresholds.dupes-min-tokens` / `dupes-min-lines`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DupesParams {
@@ -134,6 +142,12 @@ impl DupesParams {
     #[inline]
     pub fn w(&self) -> u32 {
         self.min_tokens.max(2) - self.k() + 1
+    }
+
+    /// Key of the fingerprints taken with these parameters (`min_lines` does not matter).
+    #[inline]
+    pub fn fingerprint_key(&self) -> FingerprintKey {
+        [FINGERPRINT_VERSION, self.k(), self.w()]
     }
 }
 

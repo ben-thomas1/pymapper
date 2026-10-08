@@ -11,10 +11,11 @@ use rayon::prelude::*;
 use super::{FileId, Index, Inputs, build};
 use crate::analysis::dupes::{DupesParams, FingerprintScratch, FingerprintVisitor, Fingerprints};
 use crate::arena::PerThread;
+use crate::cache::{Lookup, Probe, SegRemap, Stamp};
 use crate::extract::facts::{FactStore, FileFacts, TableBases, extract_with};
 use crate::extract::{MetricsScratch, MetricsTable, MetricsVisitor, Tee};
+use crate::intern::{Interner, hash_bytes};
 use crate::roots::Origin;
-use crate::intern::Interner;
 use crate::timing;
 
 /// A file that could not be read. It is loaded as an empty module.
@@ -28,7 +29,7 @@ pub struct ReadError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub files: u64,
-    /// Source bytes read.
+    /// Source bytes (read, or the cached size of files loaded from the cache).
     pub bytes: u64,
     /// Lines of all files.
     pub lines: u64,
@@ -59,6 +60,8 @@ struct Worker {
     metrics: MetricsTable,
     fp_scratch: FingerprintScratch,
     fps: Fingerprints,
+    /// Local ids of the cache segment being copied -> ids of `interner`.
+    remap: SegRemap,
 }
 
 /// The facts of consecutive files `first..first + files.len()`, with `Sym`s of worker
@@ -68,6 +71,8 @@ struct Chunk {
     store: FactStore,
     metrics: MetricsTable,
     files: Vec<FileFacts>,
+    /// Per file, when loading with a cache.
+    stamps: Vec<Stamp>,
     errors: Vec<ReadError>,
     bytes: u64,
     fps: Fingerprints,
@@ -96,6 +101,20 @@ pub fn load(inputs: Inputs) -> Index {
 /// [`load`] with optional extra work in the extraction pass; returns the duplication
 /// fingerprints (in FileId order) when `opts.dupes` is set.
 pub fn load_with(inputs: Inputs, opts: &LoadOptions) -> (Index, Option<Fingerprints>) {
+    let (index, fps, _) = load_cached(inputs, opts, None);
+    (index, fps)
+}
+
+/// [`load_with`] with cached facts: files the cache lookup has are copied from it instead of
+/// read and extracted (with their fingerprints when `opts.dupes` is set; the lookup only
+/// reports hits for segments that hold fingerprints of the same parameters). Also returns
+/// the [`Stamp`] of every file (empty without a cache), for writing the cache back. Same
+/// result as [`load_with`] for the same file contents.
+pub(crate) fn load_cached(
+    inputs: Inputs,
+    opts: &LoadOptions,
+    cache: Option<&Lookup>,
+) -> (Index, Option<Fingerprints>, Vec<Stamp>) {
     let n = inputs.len();
     let t0 = Instant::now();
     let workers = PerThread::new(Worker::default);
@@ -114,7 +133,7 @@ pub fn load_with(inputs: Inputs, opts: &LoadOptions) -> (Index, Option<Fingerpri
                     break;
                 }
                 let range = c * size..((c + 1) * size).min(n);
-                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range, opts));
+                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range, opts, cache));
                 *lock(&slots[c]) = Some(chunk);
                 drain(&sink, &slots);
             }
@@ -144,14 +163,14 @@ pub fn load_with(inputs: Inputs, opts: &LoadOptions) -> (Index, Option<Fingerpri
     });
     let merge = t1.elapsed();
 
-    let Sink { facts, metrics, files, errors, bytes, mut fps, .. } = sink;
+    let Sink { facts, metrics, files, errors, bytes, stamps, mut fps, .. } = sink;
     fps.shrink_to_fit();
     let lines = files.iter().map(|ff| u64::from(ff.lines)).sum();
     let stats = LoadStats { files: n as u64, bytes, lines, extract, merge, build: Duration::ZERO };
     let t2 = Instant::now();
     let mut index = timing::time("load.build", || build::build(inputs, strings, facts, metrics, files, errors, stats));
     index.stats.build = t2.elapsed();
-    (index, opts.dupes.map(|_| fps))
+    (index, opts.dupes.map(|_| fps), stamps)
 }
 
 /// Locks a mutex, ignoring poisoning (a panicking worker aborts the load anyway).
@@ -179,31 +198,81 @@ fn drain(sink: &Mutex<Sink>, slots: &[Mutex<Option<Chunk>>]) {
 }
 
 impl Worker {
-    fn chunk(&mut self, wi: usize, inputs: &Inputs, range: std::ops::Range<usize>, opts: &LoadOptions) -> Chunk {
+    /// Copies entry `i` of group `g`'s cache segment as file `f` (see [`Lookup::copy`]).
+    #[inline]
+    fn copy(&mut self, c: &Lookup, g: u32, i: u32, f: FileId, verified: bool) -> Option<FileFacts> {
+        c.copy(g, i, f, verified, &mut self.store, &mut self.metrics, &mut self.interner, &mut self.remap, &mut self.fps)
+    }
+
+    fn chunk(
+        &mut self,
+        wi: usize,
+        inputs: &Inputs,
+        range: std::ops::Range<usize>,
+        opts: &LoadOptions,
+        cache: Option<&Lookup>,
+    ) -> Chunk {
         debug_assert!(self.store.defs.is_empty() && self.metrics.is_empty());
         let mut files = Vec::with_capacity(range.len());
+        let mut stamps = Vec::with_capacity(if cache.is_some() { range.len() } else { 0 });
         let mut errors = Vec::new();
         let mut bytes = 0u64;
         let mut buf = std::mem::take(&mut self.buf);
         for f in range {
+            let path = inputs.paths.get(f);
+            let g = inputs.group[f];
+            let probe = cache.map_or(Probe::Miss, |c| c.probe(g, path));
+            if let (Probe::Hit(i, st), Some(c)) = (probe, cache)
+                && let Some(ff) = self.copy(c, g, i, f as FileId, false)
+            {
+                files.push(ff);
+                bytes += st.size;
+                stamps.push(st);
+                c.done(g);
+                continue;
+            }
             buf.clear();
-            let res = File::open(inputs.paths.get(f)).and_then(|mut h| h.read_to_end(&mut buf));
+            let mut mtime = 0;
+            let res = File::open(path).and_then(|mut h| {
+                if cache.is_some() {
+                    mtime = crate::cache::mtime_ns(&h.metadata()?);
+                }
+                h.read_to_end(&mut buf)
+            });
+            let read_ok = res.is_ok();
             if let Err(e) = res {
                 errors.push(ReadError { file: f as FileId, kind: e.kind() });
                 buf.clear();
             }
             bytes += buf.len() as u64;
             let src = &buf[..];
+            if let Some(c) = cache {
+                let st = Stamp { size: src.len() as u64, mtime_ns: mtime, hash: hash_bytes(src) };
+                stamps.push(st);
+                if let Probe::Verify(i, old) = probe
+                    && read_ok
+                    && old.size == st.size
+                    && old.hash == st.hash
+                    && let Some(ff) = self.copy(c, g, i, f as FileId, true)
+                {
+                    files.push(ff);
+                    c.done(g);
+                    continue;
+                }
+            }
             let m = MetricsVisitor::new(src, &mut self.scratch, &mut self.metrics);
             // Two monomorphised loops: no per-token cost when duplication is off.
             match opts.dupes {
-                Some(p) if inputs.groups[inputs.group[f] as usize].origin == Origin::FirstParty => {
+                Some(p) if inputs.groups[g as usize].origin == Origin::FirstParty => {
                     let fv = FingerprintVisitor::new(src, &mut self.fp_scratch);
                     let (ff, Tee(_, fv)) = extract_with(src, &mut self.store, &mut self.interner, Tee(m, fv));
                     fv.finish(f as FileId, &p, &mut self.fps);
                     files.push(ff);
                 }
                 _ => files.push(extract_with(src, &mut self.store, &mut self.interner, m).0),
+            }
+            if let Some(c) = cache {
+                c.done(g);
             }
         }
         // Keep the buffer for the next chunk unless one huge file grew it.
@@ -222,7 +291,7 @@ impl Worker {
             fps.reserve_exact(self.fps.len());
             fps.append(&mut self.fps);
         }
-        Chunk { worker: wi, store, metrics, files, errors, bytes, fps }
+        Chunk { worker: wi, store, metrics, files, stamps, errors, bytes, fps }
     }
 }
 
@@ -240,6 +309,7 @@ struct Sink {
     files: Vec<FileFacts>,
     /// Worker (interner) of each file's `Sym`s, until remapped.
     worker: Vec<u32>,
+    stamps: Vec<Stamp>,
     errors: Vec<ReadError>,
     bytes: u64,
     fps: Fingerprints,
@@ -305,6 +375,7 @@ impl Sink {
             self.files.push(ff);
             self.worker.push(c.worker as u32);
         }
+        self.stamps.extend_from_slice(&c.stamps);
         self.metrics.append(&c.metrics);
         self.errors.extend_from_slice(&c.errors);
         self.bytes += c.bytes;

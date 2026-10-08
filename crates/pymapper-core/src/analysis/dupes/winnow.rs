@@ -20,8 +20,10 @@ pub struct Fingerprint {
 
 const _: () = assert!(std::mem::size_of::<Fingerprint>() == 12);
 
-/// Fingerprints of many files plus the parameters they were taken with. Build one per thread
-/// (rows of one file are contiguous) and concatenate with [`append`](Self::append).
+/// Fingerprints of many files, all taken with the same [`DupesParams`] (the caller keeps
+/// those; the cache stores their [`DupesParams::fingerprint_key`] next to cached rows). Build
+/// one per thread (rows of one file are contiguous and in position order) and concatenate
+/// with [`append`](Self::append).
 #[derive(Clone, Debug, Default)]
 pub struct Fingerprints {
     pub(crate) rows: Vec<Fingerprint>,
