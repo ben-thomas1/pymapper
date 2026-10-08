@@ -52,6 +52,7 @@ entered, and symlinks are not followed.
 | `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 | `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
+| `metrics-mem` | `walk`, `load`, `parse` | like `parse-mem`, with `pymapper_core::extract::metrics` teed into the same pass; every metrics row is kept to the end (extra counters `metric_rows`, `metrics_kb` = heap of the kept tables) |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
@@ -245,3 +246,29 @@ parser in the baseline. Of the parser's own time, the line cursor is about 14% a
 expression scanner about 24% (samply, venv, `-j 1`). All 14 venv diagnostics are in 4 files
 of genuine Python 2 code (`print >>f, x`). Peak RSS in `parse-mem` is the loaded corpus. The
 parser itself uses a handful of reused scratch vectors per file and allocates nothing per token.
+
+### Metrics (S1.4)
+
+Same machine, release build, warm cache, load average about 5-7 from other worktrees.
+`metrics-mem` is `parse-mem` plus the metrics visitor (McCabe, cognitive, nesting, LOC,
+Halstead, MI, params per definition) via `Tee`, so the difference between the two rows is the
+metrics cost. 14-thread rows best of 5, `-j 1` rows best of 3 (stdlib `-j 1`: best of 10).
+
+| corpus | target             | threads | parse phase | MB/s/core | peak RSS MB | metrics rows | metrics_kb |
+|--------|--------------------|---------|-------------|-----------|-------------|--------------|------------|
+| stdlib | parse-mem          | 14      | 4.42ms      | 282       | 23.9        | -            | -          |
+| stdlib | metrics-mem        | 14      | 6.01ms      | 201       | 29.2        | 24,394       | 1,418      |
+| stdlib | parse-mem `-j 1`   | 1       | 43.0ms      | 364       | 22.3        | -            | -          |
+| stdlib | metrics-mem `-j 1` | 1       | 57.1ms      | 268       | 24.8        | 24,394       | 1,474      |
+| venv   | parse-mem          | 14      | 154ms       | 305       | 825.4       | -            | -          |
+| venv   | metrics-mem        | 14      | 217ms       | 225       | 884.9       | 927,612      | 54,920     |
+| venv   | parse-mem `-j 1`   | 1       | 1.63s       | 394       | 674.9       | -            | -          |
+| venv   | metrics-mem `-j 1` | 1       | 2.18s       | 293       | 848.4       | 927,612      | 55,050     |
+
+Metrics add about 33-40% to parse time; parse + metrics still runs at 268-293 MB/s on one
+core, above ruff's parser alone (217 MB/s/core). About half of the visitor's
+time is the operand path (text hash plus one probe of the per-file last-seen table); operators
+use a `u128` kind bitset per open definition. A row is 40 bytes (9 x u32/f32 + 2 x u16), so the
+venv's 928k definitions need 37 MB raw; the bench's per-job tables grow by doubling, and the
+`-j 1` peak RSS (+174 MB) also includes the freed generations of one large growing table.
+Storing metrics inside per-file def records (S1.3) avoids that growth pattern.
