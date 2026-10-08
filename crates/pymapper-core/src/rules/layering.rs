@@ -52,7 +52,7 @@ import lower layers, never higher ones. With `containers`, each container has it
 imports between containers are not checked. Reported at each violating import (sibling imports \
 under `independent-siblings` are PM304). With `transitive = true`, an import of a module outside \
 the contract that leads to a higher layer through other such modules counts too; the message \
-names the higher-layer module reached.\n\n\
+names the higher-layer module reached. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the imported code down a layer, or pass it in from the higher layer (dependency \
 injection, callbacks).",
         severity: Severity::Error,
@@ -74,7 +74,7 @@ injection, callbacks).",
 submodules) from importing its `forbidden` modules, which may be first- or third-party. Modules \
 that are not analysed match unresolved imports by dotted prefix. Reported at each violating \
 import; with `transitive = true` also at imports that lead to a forbidden module through modules \
-outside the contract.\n\n\
+outside the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: remove the dependency, or move the code that needs it out of the source modules.",
         severity: Severity::Error,
         default_enabled: true,
@@ -94,7 +94,7 @@ Fix: remove the dependency, or move the code that needs it out of the source mod
 another (submodules included); the same applies to siblings within a layer of a `layers` \
 contract with `independent-siblings`. Reported at each violating import; with \
 `transitive = true` also at imports that lead to another listed module through modules outside \
-the contract.\n\n\
+the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the shared code into a separate module that both may import.",
         severity: Severity::Error,
         default_enabled: true,

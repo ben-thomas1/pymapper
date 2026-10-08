@@ -228,7 +228,7 @@ fn package_init_cycles() {
 }
 
 #[test]
-fn row_module_matches_graph_edges() {
+fn module_node_of_rows() {
     let f = fx(&[
         ("pkg/__init__.py", "from .m import f\n"),
         ("pkg/m.py", "def f(): pass\n"),
@@ -240,7 +240,7 @@ fn row_module_matches_graph_edges() {
         .file_facts(n)
         .imports
         .range()
-        .map(|r| match row_module(&f.imp, r) {
+        .map(|r| match f.imp.module_node(r) {
             NONE => "-".to_owned(),
             v => f.qid(v),
         })

@@ -286,3 +286,29 @@ fn import_patterns() {
     assert!(m("a.**.b.**.c", "a.x.b.y.b.z.c"));
     assert!(!m("a.**.b.*.c", "a.x.b.c"));
 }
+
+#[test]
+fn stub_files_are_not_checked() {
+    // `y.py` + `y.pyi` both import the higher layer: one finding, at the implementation, naming
+    // the module (not the index's `#2` stub disambiguation). Stubs never run, so a stub-only
+    // module and a stub's imports in a transitive chain do not count either.
+    let f = fx(&[
+        ("ns/__init__.py", ""),
+        ("ns/hi/__init__.py", ""),
+        ("ns/hi/x.py", ""),
+        ("ns/lo/__init__.py", ""),
+        ("ns/lo/y.py", "import ns.hi.x\n"),
+        ("ns/lo/y.pyi", "import ns.hi.x\n"),
+        ("ns/lo/z.pyi", "import ns.hi.x\n"),
+        ("ns/mid.py", ""),
+        ("ns/mid.pyi", "import ns.hi.x\n"),
+        ("ns/lo/w.py", "import ns.mid\n"),
+    ]);
+    let want = ["ns/lo/y.py:1:8: PM302 `ns.lo.y` imports higher layer `ns.hi.x` (contract `arch`)"];
+    let mut c = layers("arch", &[&["ns.hi"], &["ns.lo"]]);
+    let (_, lines) = check(&f, std::slice::from_ref(&c));
+    assert_eq!(lines, want);
+    c.transitive = true;
+    let (_, lines) = check(&f, &[c]);
+    assert_eq!(lines, want);
+}

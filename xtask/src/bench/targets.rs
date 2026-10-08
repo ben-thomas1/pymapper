@@ -89,8 +89,10 @@ pub enum Target {
     /// `cycles`, graph + SCC + witnesses + PM301 findings) and the layering contract analysis
     /// (`pymapper_core::analysis::layers`) with synthetic contracts over the corpus' top-level
     /// packages: a 6-layer `layers`, a 12-module `independence` and a `forbidden` contract
-    /// (sources: up to 32 top-level packages; forbidden: `os`, `sys`, `typing`), checked
-    /// directly (phase `layers`) and transitively (phase `layers.transitive`).
+    /// (sources: up to 32 top-level packages; forbidden: `os`, `sys`, `typing`), plus the same
+    /// `forbidden` contract with every top-level package and module as a source (every import
+    /// row of an importable file is checked), checked directly (phase `layers`) and
+    /// transitively (phase `layers.transitive`).
     Cycles,
     /// `calls`, then the rollups (`pymapper_core::rollup`): the base tables (phase
     /// `rollup.build`), the node aggregates (`rollup.aggregates`) and the edges of every level
@@ -758,16 +760,25 @@ fn graph_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
 fn bench_contracts(ix: &pymapper_core::index::Index, transitive: bool) -> Vec<pymapper_core::config::Contract> {
     use pymapper_core::config::{Contract, ContractKind};
     use pymapper_core::index::NodeKind;
+    // Top-level packages, and every top-level package or module (`all`).
     let mut tops: Vec<String> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
     for g in 0..ix.groups().len() as u32 {
         for v in ix.children(ix.group_node(g)) {
-            if ix.kind(v) == NodeKind::Package {
-                tops.push(String::from_utf8_lossy(ix.name(v)).into_owned());
+            let kind = ix.kind(v);
+            if kind == NodeKind::Package || kind == NodeKind::Module {
+                let name = String::from_utf8_lossy(ix.name(v)).into_owned();
+                if kind == NodeKind::Package {
+                    tops.push(name.clone());
+                }
+                all.push(name);
             }
         }
     }
     tops.sort();
     tops.dedup();
+    all.sort();
+    all.dedup();
     let mk = |name: &str, kind| Contract {
         name: name.to_owned(),
         kind,
@@ -784,6 +795,11 @@ fn bench_contracts(ix: &pymapper_core::index::Index, transitive: bool) -> Vec<py
     if !tops.is_empty() {
         let forbidden = ["os", "sys", "typing"].iter().map(|s| (*s).to_owned()).filter(|s| !tops[..tops.len().min(32)].contains(s)).collect();
         out.push(mk("bench-forbidden", ContractKind::Forbidden { source: tops.iter().take(32).cloned().collect(), forbidden }));
+    }
+    if !all.is_empty() {
+        // Worst case per row: every importable file has a source role, so all its rows are checked.
+        let forbidden = ["os", "sys", "typing"].iter().map(|s| (*s).to_owned()).filter(|s| !all.contains(s)).collect();
+        out.push(mk("bench-forbidden-all", ContractKind::Forbidden { source: all, forbidden }));
     }
     out
 }

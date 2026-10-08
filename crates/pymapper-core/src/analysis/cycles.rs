@@ -50,7 +50,7 @@ use std::os::unix::ffi::OsStrExt;
 use crate::config::Config;
 use crate::graph::{CallFilter, Graph, ModuleGraph, Scc, import_graph_where, module_call_graph};
 use crate::index::{FileId, Index, NONE, NodeId};
-use crate::resolve::{ImportStatus, Imports, ResolvedCalls, res_flags};
+use crate::resolve::{Imports, ResolvedCalls, res_flags};
 use crate::roots::{FileStatus, Origin};
 use crate::rules::codes::IMPORT_CYCLE;
 use crate::rules::{self, Arg, Findings, Location, SymbolId};
@@ -254,26 +254,13 @@ pub fn call_cycles(ix: &Index, calls: &ResolvedCalls, filter: CallFilter) -> Cyc
     Cycles::from_local(&mg, lc)
 }
 
-/// The package/module node an import row adds an edge to (as the module graph does): the
-/// submodule of `from pkg import sub`, else the named module or its deepest resolved prefix.
-/// `NONE` for imports of code that is not loaded.
-#[inline]
-pub fn row_module(imp: &Imports, row: usize) -> NodeId {
-    if imp.status(row) == ImportStatus::Module
-        && let Some(t) = imp.target(row)
-    {
-        return t;
-    }
-    imp.module(row).and_then(|m| imp.modules().node(m)).unwrap_or(NONE)
-}
-
 /// Location of the first import of `dst` by file `f` whose flags avoid `exclude` (falling
 /// back to the first import of `dst`); `None` if `f` does not import `dst`.
 pub fn import_location(ix: &Index, imp: &Imports, f: FileId, dst: NodeId, exclude: u8) -> Option<Location> {
     let st = ix.facts();
     let mut fallback = None;
     for row in ix.file_facts(f).imports.range() {
-        if row_module(imp, row) != dst {
+        if imp.module_node(row) != dst {
             continue;
         }
         let loc = Location::new(rules::FileId(f), st.imports.line[row], st.imports.col[row] + 1);

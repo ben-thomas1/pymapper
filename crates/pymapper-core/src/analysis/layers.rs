@@ -19,7 +19,7 @@
 //!
 //! - A contract module covers its submodules; a module gets the role of its nearest listed
 //!   ancestor-or-self. Imports are checked as the module graph sees them (see
-//!   [`row_module`](super::cycles::row_module)): `from pkg import sub` imports `pkg.sub`, a
+//!   [`Imports::module_node`]): `from pkg import sub` imports `pkg.sub`, a
 //!   symbol import imports the module it is imported from.
 //! - `layers`: highest layer first. A module of layer `i` importing a module of layer `j < i`
 //!   of the same container is a PM302. With `independent-siblings`, importing a sibling of the
@@ -31,8 +31,8 @@
 //! - `independence`: a module of one entry importing a module of another is a PM304.
 //! - `allow-type-checking` (default on) exempts `if TYPE_CHECKING:` imports; `ignore-imports`
 //!   exempts `importer -> imported` pairs (exact dotted names; `*` one segment, `**` zero or
-//!   more). A file importing its own module and stub-shadowed `.py` files count, shadowed and
-//!   non-importable files do not.
+//!   more). A file importing its own module and stub-shadowed `.py` files count; `.pyi` stubs
+//!   (they never run), shadowed and non-importable files do not.
 //! - `transitive`: also an import of an unlisted module that reaches a violating module
 //!   through unlisted modules only, reported at that import with the module reached (chains
 //!   through other listed modules are reported where they leave a listed module).
@@ -62,13 +62,12 @@ use rayon::prelude::*;
 use compile::{Compiled, ExtName, Kind, NO_ROLE, Space, compile, pattern_matches};
 use reach::Reach;
 
-use super::cycles::row_module;
+use super::cycles::runtime_file;
 use crate::config::Contract;
 use crate::graph::{ModuleGraph, import_graph_where};
 use crate::index::{FileId, Index, NONE};
 use crate::intern::Sym;
 use crate::resolve::{Imports, ModuleTable};
-use crate::roots::FileStatus;
 use crate::rules::codes::{FORBIDDEN_IMPORT, INDEPENDENCE_VIOLATION, LAYER_VIOLATION};
 use crate::rules::{self, Arg, Findings, Location, Rule, SymbolId};
 
@@ -89,11 +88,12 @@ pub struct LayersReport {
     pub heap_bytes: usize,
 }
 
-/// Whether the imports of file `f` are checked: importable files (stubs and stub-shadowed
-/// implementations included).
+/// Whether the imports of file `f` are checked: importable implementation files (stub-shadowed
+/// `.py` files included), never `.pyi` stubs, which do not run (import-linter skips them too,
+/// and checking both halves of an `x.py` + `x.pyi` pair would report every violation twice).
 #[inline]
 pub fn contract_file(ix: &Index, f: FileId) -> bool {
-    matches!(ix.file_status(f), FileStatus::Active | FileStatus::StubShadowed)
+    runtime_file(ix, f, false)
 }
 
 /// Checks every contract against the imports of `ix` and appends the findings to `out`, in
@@ -296,7 +296,7 @@ impl Cx<'_> {
         let rows = ix.file_facts(f).imports.range();
         let n = rows.len() as u64;
         for row in rows {
-            let dst_node = row_module(self.imp, row);
+            let dst_node = self.imp.module_node(row);
             if dst_node == src_node {
                 continue;
             }
