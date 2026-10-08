@@ -21,7 +21,7 @@
 
 use std::cmp::Ordering;
 
-use super::wildmatch::wildmatch;
+use super::wildmatch::{GlobFlaw, glob_flaw, wildmatch};
 
 /// Outcome of matching one path against an ignore file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,34 +107,25 @@ impl Gitignore {
         self.pats.is_empty()
     }
 
+    /// Checks one configured pattern (a single gitignore line). Git accepts every line and
+    /// silently never matches the broken ones; configured excludes are reported instead.
+    pub fn check_pattern(line: &[u8]) -> Result<(), PatternError> {
+        if line.first() == Some(&b'#') {
+            return Err(PatternError::Comment);
+        }
+        let Some((pat, _)) = parse_line(line) else { return Err(PatternError::Empty) };
+        match glob_flaw(pat) {
+            None => Ok(()),
+            Some(GlobFlaw::TrailingBackslash) => Err(PatternError::TrailingBackslash),
+            Some(GlobFlaw::BadClass) => Err(PatternError::BadClass),
+        }
+    }
+
     fn add_line(&mut self, line: &[u8]) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.first() == Some(&b'#') {
             return;
         }
-        let mut line = trim_trailing_spaces(line);
-        let mut flags = 0u8;
-        if line.first() == Some(&b'!') {
-            flags |= NEGATIVE;
-            line = &line[1..];
-        }
-        if line.last() == Some(&b'/') {
-            flags |= MUST_BE_DIR;
-            line = &line[..line.len() - 1];
-        }
-        if line.is_empty() {
-            // Blank, "!", "/" or "!/": git keeps such patterns but they can never match.
-            return;
-        }
-        if !line.contains(&b'/') {
-            flags |= NO_DIR;
-        } else if line[0] == b'/' {
-            // Anchoring is implicit for patterns containing '/'; drop the leading one.
-            line = &line[1..];
-            if line.is_empty() {
-                return;
-            }
-        }
+        let Some((line, mut flags)) = parse_line(line) else { return };
         let prefix = simple_length(line);
         if line[0] == b'*' && simple_length(&line[1..]) == line.len() - 1 {
             flags |= ENDS_WITH;
@@ -268,6 +259,53 @@ impl Gitignore {
         }
         wildmatch(&pat[prefix..], &path[prefix..])
     }
+}
+
+/// Why a configured pattern is rejected ([`Gitignore::check_pattern`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PatternError {
+    /// Starts with `#`, so gitignore syntax reads it as a comment.
+    #[error("starts with `#`, which makes it a comment (write `\\#` for a literal `#`)")]
+    Comment,
+    /// Nothing left after `!`, a trailing `/` and spaces are stripped.
+    #[error("matches nothing (empty pattern)")]
+    Empty,
+    /// Ends in a lone `\`.
+    #[error("ends in a lone backslash and matches nothing")]
+    TrailingBackslash,
+    /// Unterminated `[...]` or unknown `[:name:]` class.
+    #[error("has an unterminated `[` or an unknown `[:class:]` and matches nothing")]
+    BadClass,
+}
+
+/// Normalises one line (CR, trailing spaces, `!`, trailing `/`, leading `/`) into the pattern
+/// bytes and flags, or `None` for a line that can never match (blank, `!`, `/`, `!/`). The
+/// caller has already dropped `#` comments.
+fn parse_line(line: &[u8]) -> Option<(&[u8], u8)> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut line = trim_trailing_spaces(line);
+    let mut flags = 0u8;
+    if line.first() == Some(&b'!') {
+        flags |= NEGATIVE;
+        line = &line[1..];
+    }
+    if line.last() == Some(&b'/') {
+        flags |= MUST_BE_DIR;
+        line = &line[..line.len() - 1];
+    }
+    if line.is_empty() {
+        return None;
+    }
+    if !line.contains(&b'/') {
+        flags |= NO_DIR;
+    } else if line[0] == b'/' {
+        // Anchoring is implicit for patterns containing '/'; drop the leading one.
+        line = &line[1..];
+        if line.is_empty() {
+            return None;
+        }
+    }
+    Some((line, flags))
 }
 
 /// git's `trim_trailing_spaces`: drops trailing unescaped spaces (not tabs).

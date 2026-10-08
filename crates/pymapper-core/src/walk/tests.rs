@@ -882,3 +882,199 @@ fn walk_agrees_with_git() {
     eprintln!("agreed with git on 300 trees: {found} files kept, {ignored} ignored");
     assert!(found > 1000 && ignored > 1000, "generator too weak: {found} kept, {ignored} ignored");
 }
+
+// ---------------------------------------------------------------------------------------------
+// wildmatch against a plain backtracking reference without git's abort codes and fast skips,
+// so the pruning in `dowild`/`star_loop` is checked to never lose a match.
+
+/// Reference matcher: `pat[p..]` against `text[t..]` by exhaustive backtracking.
+fn naive_wm(pat: &[u8], p: usize, text: &[u8], t: usize) -> bool {
+    if p == pat.len() {
+        return t == text.len();
+    }
+    let rest_t = &text[t..];
+    match pat[p] {
+        b'\\' => p + 1 < pat.len() && rest_t.first() == Some(&pat[p + 1]) && naive_wm(pat, p + 2, text, t + 1),
+        b'?' => rest_t.first().is_some_and(|&c| c != b'/') && naive_wm(pat, p + 1, text, t + 1),
+        b'[' => match rest_t.first() {
+            None => false,
+            Some(&c) => match super::wildmatch::class(pat, p, c) {
+                Some((end, true)) => naive_wm(pat, end + 1, text, t + 1),
+                _ => false,
+            },
+        },
+        b'*' => {
+            let mut q = p;
+            while q < pat.len() && pat[q] == b'*' {
+                q += 1;
+            }
+            let seg_start = p == 0 || pat[p - 1] == b'/';
+            let seg_end = q == pat.len() || pat[q] == b'/' || (pat[q] == b'\\' && pat.get(q + 1) == Some(&b'/'));
+            if q - p >= 2 && seg_start && seg_end {
+                // `**` as a whole segment: any run of bytes; `**/` also matches zero dirs.
+                if q == pat.len() {
+                    return true;
+                }
+                if pat[q] == b'/' && naive_wm(pat, q + 1, text, t) {
+                    return true;
+                }
+                (t..=text.len()).any(|j| naive_wm(pat, q, text, j))
+            } else {
+                // Any run of non-`/` bytes.
+                let mut j = t;
+                loop {
+                    if naive_wm(pat, q, text, j) {
+                        return true;
+                    }
+                    if j == text.len() || text[j] == b'/' {
+                        return false;
+                    }
+                    j += 1;
+                }
+            }
+        }
+        c => rest_t.first() == Some(&c) && naive_wm(pat, p + 1, text, t + 1),
+    }
+}
+
+#[test]
+fn wildmatch_agrees_with_backtracking_reference() {
+    const PAT: &[&str] = &["a", "b", "/", "*", "**", "?", "[ab]", "[!a]", "\\a", "\\/", "ab", "[", "\\"];
+    const TXT: &[u8] = b"aab/";
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut matches = 0u32;
+    for _ in 0..200_000 {
+        let mut pat = Vec::new();
+        for _ in 0..1 + rng.below(6) {
+            pat.extend_from_slice(rng.pick(PAT).as_bytes());
+        }
+        let text: Vec<u8> = (0..rng.below(9)).map(|_| TXT[rng.below(TXT.len())]).collect();
+        let want = naive_wm(&pat, 0, &text, 0);
+        matches += u32::from(want);
+        assert_eq!(
+            wildmatch(&pat, &text),
+            want,
+            "pattern {:?} text {:?}",
+            String::from_utf8_lossy(&pat),
+            String::from_utf8_lossy(&text)
+        );
+    }
+    assert!(matches > 5_000, "generator too weak: {matches} matches");
+}
+
+// ---------------------------------------------------------------------------------------------
+// `.ignore` files, exclude base, pattern validation, config options.
+
+#[test]
+fn walk_dot_ignore_beats_gitignore_of_same_directory() {
+    let t = TempDir::new("dot-ignore");
+    t.file(".gitignore", "*.pyi\nkeep.py\n")
+        .file(".ignore", "!keep.py\ngen.py\n")
+        .file("keep.py", "")
+        .file("gen.py", "")
+        .file("a.py", "")
+        .file("s.pyi", "")
+        // A deeper `.gitignore` beats a shallower `.ignore`.
+        .file("sub/.gitignore", "!gen.py\n")
+        .file("sub/gen.py", "");
+    assert_eq!(rel_files(t.path(), &opts()), ["a.py", "keep.py", "sub/gen.py"]);
+    // Switched off together with gitignore.
+    let off = WalkOptions { gitignore: false, ..opts() };
+    assert_eq!(rel_files(t.path(), &off), ["a.py", "gen.py", "keep.py", "s.pyi", "sub/gen.py"]);
+    // Parent `.ignore` files apply to a root below the repository top.
+    t.dir(".git");
+    t.file("sub/x/x.py", "").file("sub/x/gen.py", "");
+    assert_eq!(rel_files(&t.path().join("sub/x"), &opts()), ["gen.py", "x.py"]);
+    t.file("sub/.ignore", "x.py\n");
+    assert_eq!(rel_files(&t.path().join("sub/x"), &opts()), ["gen.py"]);
+}
+
+#[test]
+fn walk_excludes_relative_to_exclude_base() {
+    let t = TempDir::new("ex-base");
+    t.file("src/pkg/gen/g.py", "")
+        .file("src/pkg/m.py", "")
+        .file("src/pkg/gen.py", "")
+        .file("other/gen/o.py", "")
+        .file("tests/gen/t.py", "");
+    let ex = |base: Option<PathBuf>| WalkOptions {
+        excludes: vec!["src/pkg/gen/".into(), "/tests".into()],
+        exclude_base: base,
+        ..opts()
+    };
+    let based = ex(Some(t.path().to_path_buf()));
+    // Anchored patterns see the path from the project root, whichever root is walked.
+    assert_eq!(rel_files(t.path(), &based), ["other/gen/o.py", "src/pkg/gen.py", "src/pkg/m.py"]);
+    assert_eq!(rel_files(&t.path().join("src/pkg"), &based), ["gen.py", "m.py"]);
+    assert_eq!(rel_files(&t.path().join("src"), &based), ["pkg/gen.py", "pkg/m.py"]);
+    // Without a base they are relative to each root, so `src/pkg/gen/` matches nothing here.
+    assert_eq!(rel_files(&t.path().join("src/pkg"), &ex(None)), ["gen/g.py", "gen.py", "m.py"]);
+    // An unnormalised base is resolved before comparing.
+    let messy = t.path().join("src/../.");
+    assert_eq!(rel_files(&t.path().join("src/pkg"), &ex(Some(messy))), ["gen.py", "m.py"]);
+    // A base reached through a symlink still lines up (canonical fallback).
+    let link = t.path().with_extension("link");
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(t.path(), &link).unwrap();
+    assert_eq!(rel_files(&t.path().join("src/pkg"), &ex(Some(link.clone()))), ["gen.py", "m.py"]);
+    fs::remove_file(&link).unwrap();
+    // A root outside the base matches the patterns relative to itself.
+    let outside = TempDir::new("ex-outside");
+    outside.file("tests/x.py", "").file("y.py", "");
+    assert_eq!(rel_files(outside.path(), &based), ["y.py"]);
+}
+
+#[test]
+fn gitignore_check_pattern() {
+    for ok in ["build/", "*.py", "!keep.py", "\\#x", "a/**/b", "[ab]", "[[:alpha:]]x", "\\\\", "a\\ "] {
+        assert_eq!(Gitignore::check_pattern(ok.as_bytes()), Ok(()), "{ok:?}");
+    }
+    let bad = [
+        ("#x", PatternError::Comment),
+        ("", PatternError::Empty),
+        ("!", PatternError::Empty),
+        ("/", PatternError::Empty),
+        ("   ", PatternError::Empty),
+        ("a\\", PatternError::TrailingBackslash),
+        ("[ab", PatternError::BadClass),
+        ("x[[:nope:]]", PatternError::BadClass),
+        ("[\\", PatternError::BadClass),
+    ];
+    for (pat, want) in bad {
+        assert_eq!(Gitignore::check_pattern(pat.as_bytes()), Err(want), "{pat:?}");
+    }
+    assert!(PatternError::Comment.to_string().contains("comment"));
+}
+
+#[test]
+fn walk_reports_invalid_excludes() {
+    let t = TempDir::new("bad-ex");
+    t.file("a.py", "").file("b.py", "");
+    let o = WalkOptions { excludes: vec!["#a.py".into(), "b.py".into(), "[x".into()], ..opts() };
+    let w = walk(&[t.path()], &o);
+    // The comment does not exclude `a.py`; valid patterns still apply.
+    assert_eq!(rel_list(t.path(), &w.files), ["a.py"]);
+    let got: Vec<(DiagnosticKind, &Path)> = w.diagnostics.iter().map(|d| (d.kind, d.path.as_path())).collect();
+    assert_eq!(got, [(DiagnosticKind::Exclude, Path::new("#a.py")), (DiagnosticKind::Exclude, Path::new("[x"))]);
+    assert_eq!(w.diagnostics[0].error.kind(), io::ErrorKind::InvalidInput);
+    assert!(w.diagnostics[1].to_string().starts_with("invalid exclude pattern [x: "));
+}
+
+#[test]
+fn walk_options_from_config() {
+    let root = Path::new("/proj");
+    let mut cfg = Config::new(root);
+    cfg.extend_exclude.push("gen".into());
+    cfg.respect_gitignore = false;
+    let o = WalkOptions::first_party(&cfg, root);
+    assert!(!o.gitignore && o.parents && !o.hidden && o.sort);
+    assert_eq!(o.exclude_base.as_deref(), Some(root));
+    assert_eq!(o.excludes.last().map(String::as_str), Some("gen"));
+    assert_eq!(o.excludes.len(), crate::config::DEFAULT_EXCLUDES.len() + 1);
+    // The default excludes are all valid patterns.
+    for p in crate::config::DEFAULT_EXCLUDES {
+        assert_eq!(Gitignore::check_pattern(p.as_bytes()), Ok(()), "{p}");
+    }
+    let e = WalkOptions::everything();
+    assert!(!e.gitignore && !e.parents && e.hidden && e.excludes.is_empty());
+}

@@ -105,8 +105,9 @@ fn dowild(pat: &[u8], text: &[u8]) -> M {
                 return star_loop(&pat[p..], text, t, match_slash);
             }
             b'[' => match class(pat, p, t_ch) {
-                Ok(end) => p = end,
-                Err(m) => return m,
+                Some((end, true)) => p = end,
+                Some((_, false)) => return M::NoMatch,
+                None => return M::AbortAll,
             },
             _ => {
                 if t_ch != p_ch {
@@ -159,9 +160,10 @@ fn star_loop(rest: &[u8], text: &[u8], mut t: usize, match_slash: bool) -> M {
     M::AbortAll
 }
 
-/// Matches the bracket expression starting at `pat[start] == '['` against `t_ch`.
-/// Returns the index of the closing `]`, or the result to return from `dowild`.
-fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
+/// Matches the bracket expression starting at `pat[start] == '['` against `t_ch`. Returns the
+/// index of the closing `]` and whether `t_ch` is a member, or `None` for a malformed class
+/// (no closing `]`, dangling backslash, unknown `[:name:]`), which aborts the whole match.
+pub(super) fn class(pat: &[u8], start: usize, t_ch: u8) -> Option<(usize, bool)> {
     let mut p = start + 1;
     let mut p_ch = at(pat, p);
     if p_ch == b'^' {
@@ -176,13 +178,13 @@ fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
     let mut matched = false;
     loop {
         if p_ch == 0 {
-            return Err(M::AbortAll);
+            return None;
         }
         if p_ch == b'\\' {
             p += 1;
             p_ch = at(pat, p);
             if p_ch == 0 {
-                return Err(M::AbortAll);
+                return None;
             }
             if t_ch == p_ch {
                 matched = true;
@@ -194,7 +196,7 @@ fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
                 p += 1;
                 p_ch = at(pat, p);
                 if p_ch == 0 {
-                    return Err(M::AbortAll);
+                    return None;
                 }
             }
             if prev_ch <= t_ch && t_ch <= p_ch {
@@ -209,7 +211,7 @@ fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
                 q += 1;
             }
             if q >= pat.len() {
-                return Err(M::AbortAll);
+                return None;
             }
             if q == s || pat[q - 1] != b':' {
                 // No closing ":]": the '[' is an ordinary member.
@@ -221,7 +223,7 @@ fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
                 match posix_class(&pat[s..q - 1], t_ch) {
                     Some(true) => matched = true,
                     Some(false) => {}
-                    None => return Err(M::AbortAll),
+                    None => return None,
                 }
                 p = q;
                 p_ch = 0;
@@ -236,10 +238,7 @@ fn class(pat: &[u8], start: usize, t_ch: u8) -> Result<usize, M> {
             break;
         }
     }
-    if matched == negated || t_ch == b'/' {
-        return Err(M::NoMatch);
-    }
-    Ok(p)
+    Some((p, matched != negated && t_ch != b'/'))
 }
 
 /// `[:name:]` membership (C locale); `None` for an unknown class name.
@@ -259,4 +258,36 @@ fn posix_class(name: &[u8], c: u8) -> Option<bool> {
         b"xdigit" => c.is_ascii_hexdigit(),
         _ => return None,
     })
+}
+
+/// Why a glob can never match anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlobFlaw {
+    /// A `\` with nothing after it.
+    TrailingBackslash,
+    /// A `[` without a closing `]`, or an unknown `[:name:]` class.
+    BadClass,
+}
+
+/// Finds structural flaws that make [`wildmatch`] fail on every text (git keeps such
+/// patterns silently; configured excludes report them instead).
+pub(crate) fn glob_flaw(pat: &[u8]) -> Option<GlobFlaw> {
+    let mut p = 0usize;
+    while p < pat.len() {
+        match pat[p] {
+            b'\\' => {
+                if p + 1 >= pat.len() {
+                    return Some(GlobFlaw::TrailingBackslash);
+                }
+                p += 1;
+            }
+            b'[' => match class(pat, p, b'a') {
+                Some((end, _)) => p = end,
+                None => return Some(GlobFlaw::BadClass),
+            },
+            _ => {}
+        }
+        p += 1;
+    }
+    None
 }

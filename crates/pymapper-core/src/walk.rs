@@ -8,13 +8,16 @@
 //!   resolved like `find -H`: a root that is a symlink is followed.
 //! - `__pycache__` and `.git` are never entered. Hidden directories (`.name`) are skipped
 //!   unless [`WalkOptions::hidden`] is set.
-//! - Gitignore ([`WalkOptions::gitignore`]): `.gitignore` in every directory (deeper files take
-//!   precedence), `.git/info/exclude` of the enclosing repository (`.git` directory or
-//!   worktree/submodule `.git` file), and, with [`WalkOptions::parents`], the ignore files of
-//!   the directories between the repository top and a root. A directory containing `.git`
-//!   starts a new repository: outer ignore files stop applying below it.
-//! - Configured excludes ([`WalkOptions::excludes`]) use gitignore syntax, are relative to each
-//!   root and are checked before (and regardless of) gitignore files.
+//! - Gitignore ([`WalkOptions::gitignore`]): `.gitignore` and `.ignore` in every directory
+//!   (deeper files take precedence; `.ignore` beats `.gitignore` of the same directory),
+//!   `.git/info/exclude` of the enclosing repository (`.git` directory or worktree/submodule
+//!   `.git` file), and, with [`WalkOptions::parents`], the ignore files of the directories
+//!   between the repository top and a root. A directory containing `.git` starts a new
+//!   repository: outer ignore files stop applying below it. Ignore files also apply outside
+//!   any repository. The global `core.excludesFile` is not read.
+//! - Configured excludes ([`WalkOptions::excludes`]) use gitignore syntax, are relative to
+//!   [`WalkOptions::exclude_base`] (or each root) and are checked before (and regardless of)
+//!   ignore files.
 //! - Roots themselves are never ignored or skipped. A root that is a file is yielded as is,
 //!   whatever its extension.
 //! - Errors (unreadable directories, entries, ignore files, missing roots) become
@@ -29,7 +32,7 @@ mod wildmatch;
 #[cfg(test)]
 mod tests;
 
-pub use gitignore::{Gitignore, Match};
+pub use gitignore::{Gitignore, Match, PatternError};
 
 use std::cmp::Ordering;
 use std::ffi::OsStr;
@@ -38,6 +41,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+
+use crate::config::Config;
 
 /// Walk configuration. `Default` is the setting for first-party code.
 #[derive(Clone, Debug)]
@@ -53,9 +58,13 @@ pub struct WalkOptions {
     /// Descend into hidden directories (name starts with `.`). Default `false`. `.git` is
     /// never entered either way.
     pub hidden: bool,
-    /// Gitignore-syntax patterns relative to each root, checked before gitignore files. A
-    /// negated pattern only cancels an earlier exclude; it cannot override gitignore files.
+    /// Gitignore-syntax patterns, checked before gitignore files. A negated pattern only
+    /// cancels an earlier exclude; it cannot override gitignore files. Invalid patterns
+    /// ([`Gitignore::check_pattern`]) are reported as [`DiagnosticKind::Exclude`].
     pub excludes: Vec<String>,
+    /// Directory the `excludes` are relative to (the project root). `None`: relative to each
+    /// root. A root outside this directory also matches them relative to itself.
+    pub exclude_base: Option<PathBuf>,
     /// Sort the output component-wise (deterministic order). Default `true`. Costs one sort
     /// and one copy of the path bytes (a few ms for 60k files).
     pub sort: bool,
@@ -63,7 +72,33 @@ pub struct WalkOptions {
 
 impl Default for WalkOptions {
     fn default() -> WalkOptions {
-        WalkOptions { gitignore: true, parents: true, hidden: false, excludes: Vec::new(), sort: true }
+        WalkOptions {
+            gitignore: true,
+            parents: true,
+            hidden: false,
+            excludes: Vec::new(),
+            exclude_base: None,
+            sort: true,
+        }
+    }
+}
+
+impl WalkOptions {
+    /// Options for the first-party `paths` of a loaded configuration: `respect-gitignore`,
+    /// `exclude` + `extend-exclude` relative to the project root.
+    pub fn first_party(config: &Config, project_root: &Path) -> WalkOptions {
+        WalkOptions {
+            gitignore: config.respect_gitignore,
+            excludes: config.all_excludes().map(str::to_owned).collect(),
+            exclude_base: Some(project_root.to_path_buf()),
+            ..WalkOptions::default()
+        }
+    }
+
+    /// Options for third-party and stdlib roots: every Python file except `__pycache__` and
+    /// `.git` contents, hidden directories included, no ignore files, no excludes.
+    pub fn everything() -> WalkOptions {
+        WalkOptions { gitignore: false, parents: false, hidden: true, ..WalkOptions::default() }
     }
 }
 
@@ -80,6 +115,8 @@ pub enum DiagnosticKind {
     IgnoreFile,
     /// The path list exceeded 4 GiB of path bytes; further files were dropped.
     PathListFull,
+    /// A configured exclude pattern is invalid (the path is the pattern). It is skipped.
+    Exclude,
 }
 
 /// A non-fatal problem found while walking.
@@ -98,6 +135,7 @@ impl std::fmt::Display for Diagnostic {
             DiagnosticKind::DirEntry => "cannot read directory entry in",
             DiagnosticKind::IgnoreFile => "cannot read ignore file",
             DiagnosticKind::PathListFull => "path list full, dropped",
+            DiagnosticKind::Exclude => "invalid exclude pattern",
         };
         write!(f, "{what} {}: {}", self.path.display(), self.error)
     }
@@ -266,10 +304,12 @@ struct IgnoreNode {
 ///
 /// Paths below a root are `out_prefix + rel`. Gitignore matching uses the *match key*
 /// `key_prefix + rel`, which is the path relative to the enclosing repository top (or to the
-/// root when there is none), so ancestor ignore files see the paths they expect.
+/// root when there is none), so ancestor ignore files see the paths they expect. Configured
+/// excludes use `ex_prefix + rel`, the path relative to [`WalkOptions::exclude_base`].
 struct RootCtx {
     out_len: usize,
     key_prefix: Box<[u8]>,
+    ex_prefix: Box<[u8]>,
 }
 
 struct DirTask {
@@ -300,6 +340,7 @@ struct Worker {
     names: Vec<u8>,
     ents: Vec<Ent>,
     key: Vec<u8>,
+    ex_key: Vec<u8>,
     files: PathList,
     diags: Vec<Diagnostic>,
     stats: WalkStats,
@@ -327,8 +368,19 @@ fn bytes_path(b: &[u8]) -> &Path {
 /// Walks `roots` in parallel on the current rayon pool and returns the Python files found.
 pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
     let threads = rayon::current_num_threads().max(1);
-    let excludes = if opts.excludes.is_empty() { None } else { Some(Gitignore::from_patterns(&opts.excludes)) };
     let mut main = Worker::default();
+    for pat in &opts.excludes {
+        if let Err(e) = Gitignore::check_pattern(pat.as_bytes()) {
+            let error = io::Error::new(io::ErrorKind::InvalidInput, e);
+            main.diag(DiagnosticKind::Exclude, Path::new(pat), error);
+        }
+    }
+    let excludes = Gitignore::from_patterns(&opts.excludes);
+    let excludes = if excludes.is_empty() { None } else { Some(excludes) };
+    let base = match &opts.exclude_base {
+        Some(b) if excludes.is_some() => Some(abs_normal(b)),
+        _ => None,
+    };
     let mut ctxs = Vec::with_capacity(roots.len());
     let mut seeds = Vec::with_capacity(roots.len());
     for root in roots {
@@ -352,7 +404,11 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
         } else {
             (Box::default(), None)
         };
-        ctxs.push(RootCtx { out_len: out.len(), key_prefix });
+        let ex_prefix = match &base {
+            Some(b) => rel_prefix(root, b),
+            None => Box::default(),
+        };
+        ctxs.push(RootCtx { out_len: out.len(), key_prefix, ex_prefix });
         seeds.push(DirTask { path: out, root: (ctxs.len() - 1) as u32, ignore });
     }
     let sh = Shared { opts, roots: ctxs, excludes, workers: (0..threads).map(|_| Mutex::default()).collect() };
@@ -383,6 +439,38 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
         });
     }
     out
+}
+
+/// `path` made absolute against the working directory and lexically normalised.
+fn abs_normal(path: &Path) -> PathBuf {
+    match std::path::absolute(path) {
+        Ok(p) => crate::config::normalize(&p),
+        Err(_) => crate::config::normalize(path),
+    }
+}
+
+/// `root` relative to the exclude base `base` plus `/` (empty when `root` is `base`). Tried
+/// lexically first, then with symlinks resolved; a root outside `base` gets an empty prefix.
+fn rel_prefix(root: &Path, base: &Path) -> Box<[u8]> {
+    let lexical = abs_normal(root);
+    let rel = match lexical.strip_prefix(base) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => match (fs::canonicalize(root), fs::canonicalize(base)) {
+            (Ok(r), Ok(b)) => match r.strip_prefix(&b) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => return Box::default(),
+            },
+            _ => return Box::default(),
+        },
+    };
+    let rel = rel.as_os_str().as_bytes();
+    if rel.is_empty() {
+        return Box::default();
+    }
+    let mut v = Vec::with_capacity(rel.len() + 1);
+    v.extend_from_slice(rel);
+    v.push(b'/');
+    v.into_boxed_slice()
 }
 
 /// Output prefix for paths below `root`: `root/`, or empty for `.`.
@@ -479,9 +567,13 @@ fn parent_chain(root: &Path, w: &mut Worker) -> (Box<[u8]>, Option<Arc<IgnoreNod
     let mut dir = top.to_path_buf();
     let mut base = 0usize;
     for comp in rel.split(|&c| c == b'/') {
-        let file = dir.join(".gitignore");
-        if fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
-            chain = load_ignore(&file, base, chain, w);
+        // `.ignore` goes on top: it beats `.gitignore` of the same directory.
+        for name in [".gitignore", ".ignore"] {
+            let file = dir.join(name);
+            // Like git, an ignore file that is a symlink is not read.
+            if fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+                chain = load_ignore(&file, base, chain, w);
+            }
         }
         dir.push(bytes_path(comp));
         base += comp.len() + 1;
@@ -492,24 +584,21 @@ fn parent_chain(root: &Path, w: &mut Worker) -> (Box<[u8]>, Option<Arc<IgnoreNod
     (key_prefix.into_boxed_slice(), chain)
 }
 
-/// Whether the entry `name` (directory part of the key already in `key[..dir_len]`) is
-/// ignored by the configured excludes or the gitignore chain.
-fn is_ignored(
-    key: &mut Vec<u8>,
-    dir_len: usize,
-    name: &[u8],
-    is_dir: bool,
-    excludes: Option<(&Gitignore, usize)>,
-    chain: Option<&Arc<IgnoreNode>>,
-) -> bool {
+/// Whether the entry `name` is excluded by the configured patterns. `key[..dir_len]` holds the
+/// directory part of the exclude key.
+#[inline]
+fn is_excluded(ex: &Gitignore, key: &mut Vec<u8>, dir_len: usize, name: &[u8], is_dir: bool) -> bool {
     key.truncate(dir_len);
     key.extend_from_slice(name);
-    if let Some((ex, base)) = excludes
-        && ex.matched(&key[base..], is_dir) == Match::Ignore
-    {
-        return true;
-    }
-    let mut node = chain;
+    ex.matched(key, is_dir) == Match::Ignore
+}
+
+/// Whether the entry `name` is ignored by the ignore-file chain. `key[..dir_len]` holds the
+/// directory part of the match key.
+fn is_gitignored(key: &mut Vec<u8>, dir_len: usize, name: &[u8], is_dir: bool, chain: &Arc<IgnoreNode>) -> bool {
+    key.truncate(dir_len);
+    key.extend_from_slice(name);
+    let mut node = Some(chain);
     while let Some(n) = node {
         match n.gi.matched(&key[n.base..], is_dir) {
             Match::Ignore => return true,
@@ -543,6 +632,7 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
     w.names.clear();
     w.ents.clear();
     let mut has_gitignore = false;
+    let mut has_ignore = false;
     let mut dot_git: Option<Kind> = None;
     for entry in rd {
         let entry = match entry {
@@ -568,6 +658,8 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
         if opts.gitignore {
             if name == b".gitignore" && kind == Kind::File {
                 has_gitignore = true;
+            } else if name == b".ignore" && kind == Kind::File {
+                has_ignore = true;
             } else if name == b".git" && (kind == Kind::Dir || kind == Kind::File) {
                 dot_git = Some(kind);
             }
@@ -596,13 +688,27 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
     if has_gitignore {
         chain = load_ignore(&dir.join(".gitignore"), dir_key_len, chain, w);
     }
-    let excludes = sh.excludes.as_ref().map(|g| (g, ctx.key_prefix.len()));
-    let check = chain.is_some() || excludes.is_some();
-    if check {
+    // `.ignore` goes on top: it beats `.gitignore` of the same directory.
+    if has_ignore {
+        chain = load_ignore(&dir.join(".ignore"), dir_key_len, chain, w);
+    }
+    let rel = &task.path[ctx.out_len..];
+    if chain.is_some() {
         w.key.clear();
         w.key.extend_from_slice(&ctx.key_prefix);
-        w.key.extend_from_slice(&task.path[ctx.out_len..]);
+        w.key.extend_from_slice(rel);
     }
+    let excludes = sh.excludes.as_ref();
+    let ex_dir_len = ctx.ex_prefix.len() + rel.len();
+    if excludes.is_some() {
+        w.ex_key.clear();
+        w.ex_key.extend_from_slice(&ctx.ex_prefix);
+        w.ex_key.extend_from_slice(rel);
+    }
+    let ignored = |w_key: &mut Vec<u8>, ex_key: &mut Vec<u8>, name: &[u8], is_dir: bool| {
+        excludes.is_some_and(|ex| is_excluded(ex, ex_key, ex_dir_len, name, is_dir))
+            || chain.as_ref().is_some_and(|c| is_gitignored(w_key, dir_key_len, name, is_dir, c))
+    };
 
     // Pass 2: classify.
     for &Ent { start, end, kind } in &w.ents {
@@ -612,7 +718,7 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
                 if !is_python(name) {
                     continue;
                 }
-                if check && is_ignored(&mut w.key, dir_key_len, name, false, excludes, chain.as_ref()) {
+                if ignored(&mut w.key, &mut w.ex_key, name, false) {
                     w.stats.ignored += 1;
                     continue;
                 }
@@ -633,7 +739,7 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
                     w.stats.hidden += 1;
                     continue;
                 }
-                if check && is_ignored(&mut w.key, dir_key_len, name, true, excludes, chain.as_ref()) {
+                if ignored(&mut w.key, &mut w.ex_key, name, true) {
                     w.stats.ignored += 1;
                     continue;
                 }

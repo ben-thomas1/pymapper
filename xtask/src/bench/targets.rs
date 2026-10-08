@@ -134,7 +134,7 @@ type Counters = Vec<(String, u64)>;
 /// hidden directories included, no gitignore (the same file set as the sequential reference
 /// walker, so `walk` and `walk-seq` are comparable).
 fn corpus_options() -> WalkOptions {
-    WalkOptions { gitignore: false, parents: false, hidden: true, ..WalkOptions::default() }
+    WalkOptions::everything()
 }
 
 /// Runs the core walker as phase `walk`: files, non-fatal error count and walk counters. An
