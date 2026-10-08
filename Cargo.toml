@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pymapper-core", "crates/pymapper-cli", "xtask"]
+members = ["crates/pymapper-core", "crates/pymapper-cli", "crates/pymapper-gui", "xtask"]
 default-members = ["crates/pymapper-core", "crates/pymapper-cli"]
 
 [workspace.package]
@@ -21,6 +21,13 @@ serde_json = "1"
 thiserror = "2"
 # Config parsing only. No serde: we walk the spanned document ourselves.
 toml = { version = "1", default-features = false, features = ["std", "parse"] }
+# GUI only (crates/pymapper-gui). The CLI must not depend on these.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+egui = { version = "0.36.2", default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "0.36.2", default-features = false }
+egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard"] }
+pollster = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
