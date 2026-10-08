@@ -62,7 +62,7 @@ mod index_tests;
 #[cfg(test)]
 mod tests;
 
-pub use build::{CallFilter, ModuleGraph, call_graph, import_graph, module_call_graph};
+pub use build::{CallFilter, ModuleGraph, call_graph, import_graph, import_graph_where, module_call_graph, module_nodes};
 pub use csr::{Csr, Graph};
 pub use dag::Condensed;
 pub use scc::{Scc, tarjan};
