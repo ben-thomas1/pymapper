@@ -113,7 +113,7 @@ as tokens tiling the input or spans staying in bounds.
 
 | target           | what it does                                                             |
 |------------------|--------------------------------------------------------------------------|
-| `extract`        | facts + metrics in one pass (`extract_with` + `MetricsVisitor`): one `<module>` row, parents before children and enclosing them, def spans/lines in bounds and ordered, every scope and fact line inside the file, sorted unique evidence, one metrics row per def with sane values; rendering resolves every name and chain (bounds); a second extraction into the same store with an interner is identical and renders the same |
+| `extract`        | facts + metrics in one pass (`extract_with` + `MetricsVisitor`): one `<module>` row, parents before children and enclosing them, def spans/lines in bounds and ordered, decorator/base rows grouped by owner with counts matching each def's, every scope and fact line inside the file, sorted unique evidence, one metrics row per def with sane values; rendering resolves every name and chain (bounds); a second extraction into the same store with an interner is identical and renders the same |
 | `lex`            | lexer in both modes: tokens in order, in bounds, at most `3 * len + 8` of them, sticky EOF; trivia mode minus comments/NL equals parser mode, same suppressions; a checkpoint taken mid-line and restored replays the rest of the stream exactly |
 | `parse`          | parser events: def/block/lambda events balance, consumed tokens in order and in bounds |
 | `demo`           | toy tokenizer with invariant checks (tests the fuzzer itself)            |
@@ -132,3 +132,17 @@ Measured on the 14-core Mac, `--profile fuzz`, all cores, demo target:
 
 These numbers mostly measure input generation, because the demo target is trivial. Expect
 real targets to be limited by the target itself.
+
+## Campaigns (S1.5)
+
+Front end at the end of S1.5, 14 threads, default budget (1 s per input) and `--max-len`
+(64 KiB), 14-core M4 Pro shared with other work:
+
+| target    | seeds                         | time   | execs      | execs/s | crashes | hangs |
+|-----------|-------------------------------|--------|------------|---------|---------|-------|
+| `extract` | tests/corpus + stdlib 3.13    | 600 s  | 31,656,959 | 52.8 k  | 0       | 0     |
+| `lex`     | tests/corpus + stdlib 3.13    | 300 s  | 55,230,010 | 184 k   | 0       | 0     |
+| `extract` | tests/corpus only             | 240 s  | 238,823,568 | 995 k | 0     | 0     |
+
+The earlier, interrupted S1.5 attempt ran the same targets and found one bug (end-of-input
+diagnostics placed on a line after the last one; fixed, see `docs/parity.md`).

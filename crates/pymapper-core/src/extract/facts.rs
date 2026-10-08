@@ -65,9 +65,10 @@
 //! `m.n` once, and `x = Foo()` / `@app.route(...)` reuse the chain of the call
 //! event just before them.
 //!
-//! Measured on the stdlib (437k LOC): 13.4 B/LOC of rows (calls 3.6, bindings
-//! 3.2, defs 3.0, names 1.3, evidence 1.1, the rest 1.2) plus 0.27 B/LOC of
-//! headers; see "Facts (S1.3)" in `docs/benchmarks.md` (also the venv).
+//! Measured (rows plus 112 B headers): 12.9 B/LOC on the stdlib (437k LOC), 13.7 B/LOC
+//! on the venv (17M LOC: calls 3.7, bindings 2.7, defs 2.5, imports 1.4, names 1.2,
+//! evidence 1.0, params 0.5, headers 0.4, the rest 0.3); see "Front end (S1.5)" in
+//! `docs/benchmarks.md`.
 //!
 //! # What is recorded
 //!
