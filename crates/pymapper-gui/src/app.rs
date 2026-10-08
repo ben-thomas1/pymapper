@@ -13,7 +13,8 @@ use winit::window::{Window, WindowId, WindowLevel};
 use crate::args::Options;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
-use crate::measure::{FrameTimes, Measure, STALL};
+use crate::map::{MapState, stress};
+use crate::measure::{self, FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
@@ -34,6 +35,9 @@ pub struct App {
     egui_ctx: egui::Context,
     sched: Scheduler,
     measure: Option<Measure>,
+    map: MapState,
+    /// Time to build the scene (stress mode), for the measurement report.
+    scene_build: Option<Duration>,
     win: Option<WindowState>,
     error: Option<anyhow::Error>,
     report: Option<String>,
@@ -68,6 +72,14 @@ impl App {
         });
         let measure = opts.measure.clone().map(|m| Measure::new(m, launched));
         let name = opts.path.file_name().map_or_else(|| project.clone(), |n| n.to_string_lossy().into_owned());
+        let (map, scene_build) = match opts.stress {
+            Some(n) => {
+                let t = Instant::now();
+                let scene = stress::scene(n as usize, n as usize, stress::SEED);
+                (MapState::new(Arc::new(scene)), Some(t.elapsed()))
+            }
+            None => (MapState::default(), None),
+        };
         Self {
             opts,
             title: format!("pymapper - {name}"),
@@ -76,6 +88,8 @@ impl App {
             egui_ctx,
             sched: Scheduler::new(),
             measure,
+            map,
+            scene_build,
             win: None,
             error: None,
             report: None,
@@ -158,7 +172,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -208,9 +222,20 @@ impl App {
         let t1 = Instant::now();
 
         let raw = w.egui.take_egui_input(&w.window);
+        w.ui.map_empty = !map.scene.bounds.is_positive();
         let mut full = egui_ctx.run_ui(raw, |ui| panels::show(ui, &mut w.ui));
         w.egui.handle_platform_output(&w.window, full.platform_output);
         let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
+        let hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
+        if let Some(t) = measure.as_ref().and_then(Measure::progress)
+            && map.scene.bounds.is_positive()
+        {
+            // Scripted navigation for measurements: zoom 2^7 in and back while drifting.
+            let fit = (map.camera.viewport[0] / map.scene.bounds.width()).min(map.camera.viewport[1] / map.scene.bounds.height());
+            let (center, zoom) = stress::camera_path(t, &map.scene.bounds, fit, 7.0);
+            map.camera.center = center;
+            map.camera.zoom = zoom.clamp(map.camera.min_zoom, map.camera.max_zoom);
+        }
         let t2 = Instant::now();
 
         let size = [w.config.width, w.config.height];
@@ -221,6 +246,7 @@ impl App {
             size,
             pixels_per_point: full.pixels_per_point,
             canvas: PhysicalRect::from_points(w.ui.canvas_rect, full.pixels_per_point, size),
+            map,
         };
         w.renderer.render(&w.device, &w.queue, &view, input);
         w.window.pre_present_notify();
@@ -235,6 +261,28 @@ impl App {
         }
         let delay = full.viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |v| v.repaint_delay);
         sched.frame_done(t3, delay);
+        if !w.ui.map_empty {
+            use std::fmt::Write as _;
+            let st = &map.stats;
+            w.ui.map_info.clear();
+            let _ = write!(
+                w.ui.map_info,
+                "band {}  zoom {:.3}\n{} instances, {} draws\n{} labels, {} glyphs\nband rebuilds {}, label rebuilds {}",
+                map.camera.band(),
+                map.camera.zoom,
+                st.drawn_instances,
+                st.draw_calls,
+                st.labels,
+                st.glyphs,
+                st.band_rebuilds.count,
+                st.label_rebuilds.count
+            );
+        }
+        if hover_changed {
+            // The details panel was laid out before the hit test: show the new hover next frame.
+            map.describe_hover(&mut w.ui.hover_text);
+            sched.request(t3, Duration::ZERO);
+        }
         if let Some(m) = measure.as_mut() {
             let times = FrameTimes { acquire: t1 - t0, ui: t2 - t1, submit: t3 - t2 };
             if m.on_frame(t3, times, t3 - *launched) {
@@ -361,7 +409,11 @@ impl ApplicationHandler<UserEvent> for App {
             && m.poll(now)
         {
             if let Some(w) = &self.win {
-                self.report = Some(m.report(&w.ui.renderer_info, [w.config.width, w.config.height], w.window.scale_factor() as f32));
+                let mut report = m.report(&w.ui.renderer_info, [w.config.width, w.config.height], w.window.scale_factor() as f32);
+                if self.map.scene.bounds.is_positive() {
+                    measure::map_report(&mut report, &self.map, w.renderer.canvas().map().memory(), self.scene_build);
+                }
+                self.report = Some(report);
             }
             event_loop.exit();
             return;

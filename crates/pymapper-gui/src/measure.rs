@@ -8,6 +8,8 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::args::MeasureOpts;
+use crate::map::MapState;
+use crate::map::gpu::GpuMemory;
 use crate::stats::{Samples, Summary, process_usage};
 
 const WARMUP_FRAMES: u32 = 30;
@@ -170,6 +172,14 @@ impl Measure {
         }
     }
 
+    /// Progress through the timed frames in [0, 1), or `None` outside that phase.
+    pub fn progress(&self) -> Option<f32> {
+        match self.phase {
+            Phase::Frames { left } => Some(1.0 - left as f32 / self.opts.frames.max(1) as f32),
+            _ => None,
+        }
+    }
+
     pub fn idle_result(&self) -> Option<IdleResult> {
         self.idle
     }
@@ -213,6 +223,32 @@ impl Measure {
         let _ = writeln!(out, "peak RSS: {:.1} MiB", usage.peak_rss_bytes as f64 / (1024.0 * 1024.0));
         out
     }
+}
+
+/// Appends map renderer statistics (scene size, LOD rebuilds, memory) to a report.
+pub fn map_report(out: &mut String, map: &MapState, gpu: GpuMemory, scene_build: Option<Duration>) {
+    let s = &map.scene;
+    let st = &map.stats;
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let _ = writeln!(out, "map: {} rects, {} curves, {} lines", s.rects.len(), s.curves.len(), s.lines.len());
+    if let Some(d) = scene_build {
+        let _ = writeln!(out, "  scene build (generate + sort + grids): {:.1} ms", ms(d));
+    }
+    for (name, r) in [("band rebuilds", &st.band_rebuilds), ("band uploads", &st.band_uploads), ("label rebuilds", &st.label_rebuilds)] {
+        let _ = writeln!(out, "  {name}: {} (mean {:.2} ms, max {:.2} ms)", r.count, ms(r.mean()), ms(r.max));
+    }
+    let _ = writeln!(
+        out,
+        "  last frame: {} instances in {} draw calls; {} labels, {} glyphs",
+        st.drawn_instances, st.draw_calls, st.labels, st.glyphs
+    );
+    let _ = writeln!(
+        out,
+        "  memory: scene {:.1} MiB (CPU), GPU buffers {:.1} MiB, glyph atlas {:.1} MiB",
+        mib(s.heap_bytes() as u64),
+        mib(gpu.buffers),
+        mib(gpu.atlas)
+    );
 }
 
 fn ms(d: Duration) -> f64 {

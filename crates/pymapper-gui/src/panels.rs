@@ -11,7 +11,9 @@
 //! +-----------+--------------------------+------------+
 //! ```
 
-use egui::{Align2, FontId, Rect};
+use egui::{Align2, Event, FontId, Key, MouseWheelUnit, PointerButton, Rect, Sense};
+
+use crate::map::CanvasInput;
 
 pub const LEFT_ID: &str = "pm_left";
 pub const RIGHT_ID: &str = "pm_right";
@@ -31,11 +33,28 @@ pub struct UiState {
     pub renderer_info: String,
     /// Output: the canvas rect of the last frame, in points.
     pub canvas_rect: Rect,
+    /// Output: pointer/keyboard input over the canvas during the last frame.
+    pub canvas_input: CanvasInput,
+    /// Input: whether the map has content (otherwise a placeholder hint is shown).
+    pub map_empty: bool,
+    /// Input: one-line description of the hovered map item (empty: nothing hovered).
+    pub hover_text: String,
+    /// Input: renderer statistics line for the details panel.
+    pub map_info: String,
 }
 
 impl UiState {
     pub fn new(project: String, renderer_info: String) -> Self {
-        Self { search: String::new(), project, renderer_info, canvas_rect: Rect::NOTHING }
+        Self {
+            search: String::new(),
+            project,
+            renderer_info,
+            canvas_rect: Rect::NOTHING,
+            canvas_input: CanvasInput::NONE,
+            map_empty: true,
+            hover_text: String::new(),
+            map_info: String::new(),
+        }
     }
 }
 
@@ -61,15 +80,57 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
 
     let central = egui::CentralPanel::no_frame().show(ui, |ui| {
         let rect = ui.max_rect();
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "code map",
-            FontId::proportional(14.0),
-            ui.visuals().weak_text_color(),
-        );
+        let response = ui.interact(rect, ui.id().with("pm_canvas"), Sense::click_and_drag());
+        state.canvas_input = canvas_input(ui, &response, rect);
+        if state.map_empty {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "code map",
+                FontId::proportional(14.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
     });
     state.canvas_rect = central.response.rect;
+}
+
+/// Mouse wheel (line/page units) zooms about the pointer; trackpad scrolling (point units)
+/// pans; pinch and Cmd/Ctrl+scroll zoom; dragging pans; double click or Home fits.
+fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasInput {
+    let mut input = CanvasInput::NONE;
+    let rel = |p: egui::Pos2| [p.x - rect.min.x, p.y - rect.min.y];
+    if response.dragged_by(PointerButton::Primary) || response.dragged_by(PointerButton::Middle) {
+        let d = response.drag_delta();
+        input.drag = [d.x, d.y];
+    }
+    input.hover = response.hover_pos().map(rel);
+    input.fit = response.double_clicked();
+    if !response.hovered() {
+        return input;
+    }
+    ui.input(|i| {
+        let mut zoom = i.zoom_delta();
+        for e in &i.events {
+            if let Event::MouseWheel { unit, delta, modifiers, .. } = e {
+                if modifiers.command || modifiers.ctrl {
+                    continue; // already in zoom_delta
+                }
+                match unit {
+                    MouseWheelUnit::Line => zoom *= 1.15f32.powf(delta.y),
+                    MouseWheelUnit::Page => zoom *= 2f32.powf(delta.y),
+                    MouseWheelUnit::Point => {
+                        input.drag[0] += delta.x;
+                        input.drag[1] += delta.y;
+                    }
+                }
+            }
+        }
+        input.zoom = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+        input.zoom_anchor = i.pointer.hover_pos().map(rel);
+        input.fit |= i.key_pressed(Key::Home);
+    });
+    input
 }
 
 fn left(ui: &mut egui::Ui, state: &mut UiState) {
@@ -91,8 +152,17 @@ fn left(ui: &mut egui::Ui, state: &mut UiState) {
 fn right(ui: &mut egui::Ui, state: &UiState) {
     ui.add_space(4.0);
     ui.strong("Details");
-    ui.weak("Nothing selected.");
+    if state.hover_text.is_empty() {
+        ui.weak("Nothing selected.");
+    } else {
+        ui.label(&state.hover_text);
+    }
     ui.separator();
+    if !state.map_info.is_empty() {
+        ui.collapsing("Map", |ui| {
+            ui.monospace(&state.map_info);
+        });
+    }
     ui.collapsing("Renderer", |ui| {
         ui.monospace(&state.renderer_info);
     });
