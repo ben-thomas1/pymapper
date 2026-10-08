@@ -541,7 +541,9 @@ impl MetricsVisitor<'_> {
     #[inline]
     fn cog_nested(&mut self) {
         if let Some(f) = self.top() {
-            f.cog += 1 + f.nest;
+            // Saturating: pathological input (thousands of nested lambdas
+            // around ternaries) is quadratic in the nesting.
+            f.cog = f.cog.saturating_add(1 + f.nest);
             f.nk += 1;
         }
     }
@@ -549,7 +551,7 @@ impl MetricsVisitor<'_> {
     #[inline]
     fn cog_flat(&mut self) {
         if let Some(f) = self.top() {
-            f.cog += 1;
+            f.cog = f.cog.saturating_add(1);
         }
     }
 
@@ -559,7 +561,7 @@ impl MetricsVisitor<'_> {
         let big_n1 = self.s.ops - f.hal.ops0;
         let big_n2 = self.s.opds - f.hal.opds0;
         let loc = end.line.saturating_sub(f.start_line) + 1;
-        let cognitive = f.cog + u32::from(f.recursive);
+        let cognitive = f.cog.saturating_add(u32::from(f.recursive));
         let n1 = f.hal.ops_seen.count_ones();
         let volume = halstead_volume(n1, f.hal.n2, big_n1, big_n2);
         let m = DefMetrics {
@@ -586,11 +588,12 @@ impl MetricsVisitor<'_> {
             // contents, so the method-body shifts it skips are kept in
             // `extra` and applied once the class reaches a function.
             if p.is_class {
-                p.cog += cognitive;
-                p.extra += f.extra + if f.is_class { 0 } else { f.nk };
+                p.cog = p.cog.saturating_add(cognitive);
+                p.extra = p.extra.saturating_add(f.extra).saturating_add(if f.is_class { 0 } else { f.nk });
             } else {
                 let shift = p.nest + u32::from(!f.is_class);
-                p.cog += cognitive + f.extra + f.nk * shift;
+                let shifted = f.nk.saturating_mul(shift).saturating_add(f.extra);
+                p.cog = p.cog.saturating_add(cognitive).saturating_add(shifted);
             }
             p.nk += f.nk;
             p.max_depth = p.max_depth.max(p.depth + f.max_depth);

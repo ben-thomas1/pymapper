@@ -628,6 +628,40 @@ fn corpus_invariants() {
 }
 
 #[test]
+fn deep_lambda_nesting_is_linear_and_saturates() {
+    // Nested lambdas whose bodies are ternaries: the score is quadratic in the
+    // nesting (arithmetic saturates instead of overflowing). Small case
+    // exactly, then a big one without overflow (debug builds check).
+    let src = "def f():\n    return lambda: lambda: (1 if a else 2)\n";
+    // Ternary at nesting 2: +3.
+    assert_eq!(ccn(src), vec![(1, 3, 0)]);
+    let n = 20_000;
+    let mut big = String::from("def f():\n    return ");
+    for _ in 0..n {
+        big.push_str("lambda: (1 if a else ");
+    }
+    big.push('2');
+    for _ in 0..n {
+        big.push(')');
+    }
+    big.push('\n');
+    let m = one(&big);
+    // Ternary k (0-based) sits at nesting k + 1: sum = n(n+3)/2 (fits in u32 here).
+    assert_eq!(u64::from(m.cognitive), (n as u64) * (n as u64 + 3) / 2);
+    // Nested functions multiply nothing quadratically beyond that: a chain of
+    // nested defs with one ternary each stays exact.
+    let mut chain = String::new();
+    for d in 0..50 {
+        let ind = "    ".repeat(d);
+        chain.push_str(&format!("{ind}def f{d}():\n{ind}    x = 1 if a else 2\n"));
+    }
+    let r = rows(&chain);
+    // f0: ternary at nesting k in f_k counts 1 + k towards f0: sum_{k<50} (1 + k) = 1275.
+    assert_eq!(r[0].cognitive, 1275);
+    assert_eq!(r[49].cognitive, 1);
+}
+
+#[test]
 fn malformed_inputs_do_not_panic() {
     // Truncations of every corpus file (unbalanced brackets, cut headers,
     // missing bodies) plus hand-written broken definitions.
