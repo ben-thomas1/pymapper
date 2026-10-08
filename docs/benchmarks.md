@@ -58,6 +58,7 @@ entered, and symlinks are not followed.
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
 | `resolve`    | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges` | `load`, then `pymapper_core::resolve::resolve_imports` (module table + namespaces, per-row resolution, module edges) with the built-in stdlib table as the only attribution. Counters `imports`, `modules`, shares of import rows in per mille (`found_pm`, `dynamic_pm`, `missing_pm`, `external_pm`), `module_edges`, `ext_edges`, `resolve_kb` = `Imports::heap_bytes`, `index_kb` |
 | `calls`      | `walk`, `load.*`, `resolve.modules`, `resolve.imports`, `resolve.edges`, `resolve.classes`, `resolve.mro`, `resolve.calls` | `resolve`, then `pymapper_core::resolve::resolve_calls` (class table + method index, bases + C3 MROs, then every call row, uncalled decorator and override in parallel per file). Counters `calls`, shares of call rows in per mille (`certain_pm`, `likely_pm`, `possible_pm`, `unresolved_pm`; of which `builtin_pm` = builtins and builtin-type methods, `external_pm` = unloaded code and unloaded bases), `edges`, `override_edges`, `decorator_edges`, `classes`, `incomplete_classes`, `calls_kb` = `ResolvedCalls::heap_bytes`, `resolve_kb`, `index_kb` |
+| `graph`      | `calls` phases, `graph.build`, `graph.scc`, `graph.modules` | `calls`, then `pymapper_core::graph`: `graph.build` = `call_graph` over every node (all edges with a target), `graph.scc` = its `Condensed` (iterative Tarjan + DAG), `graph.modules` = `import_graph` (no flag mask) + `module_call_graph` and both condensations. Counters `graph_nodes`, `graph_edges` (distinct), `sccs`, `cyclic_sccs`, `largest_scc`, `dag_edges`, `modules`, `import_edges`, `import_cycles` and `module_call_cycles` (components with 2+ modules), `module_call_edges`, `callgraph_kb` (call graph + condensation heap), `graph_kb` (all six structures), `calls_kb`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -516,6 +517,50 @@ column is the `resolve` target (14 threads: measured alongside; one thread: the 
   reason histogram) leaves 5.8% ambiguous method names, 2.7% variables without a hint, 2.8%
   dynamic (star imports of C modules: `os.stat`), 1.9% unresolved imports (the
   non-importable `site-packages` files), 0.9% parameters.
+
+### Graph (S3.3)
+
+`graph` target: `calls`, then the call graph, its condensation and the module graphs. 14-core
+M4 Pro, release, warm cache, best of 3 (RSS worst of 3), load average about 5-7 from other
+worktrees. Everything in `pymapper_core::graph` is sequential (Tarjan is inherently so; the
+counting-sort build is memory bound), so the thread count does not matter for the new phases.
+
+| corpus | graph nodes | distinct edges | SCCs | cyclic SCCs | largest | DAG edges | graph.build | graph.scc | graph.modules | `callgraph_kb` | `graph_kb` | peak RSS MB (calls / graph) |
+|--------|-------------|----------------|------|-------------|---------|-----------|-------------|-----------|---------------|----------------|------------|-----------------------------|
+| stdlib | 25,441      | 31,873         | 24,624 | 564       | 94      | 29,429    | 0.71ms      | 1.34ms    | 0.68ms        | 1,315          | 1,473      | 28.9 / 29.9                 |
+| venv   | 998,345     | 1,382,184      | 963,231 | 9,453    | 9,686   | 1,261,259 | 30.5ms      | 43.4ms    | 46.3ms        | 53,966         | 66,427     | 590.1 / 642.9               |
+
+Module graphs: stdlib 1,046 modules, 3,974 import edges (9 import cycles), 3,446 module call
+edges (5 cycles); venv 70,732 modules, 329,342 import edges (520 cycles), 215,974 module call
+edges (469 cycles).
+
+- **Time**: 120 ms for all graphs of the venv (3.5% of the 3.4s pipeline). `graph.build`
+  turns 2.23M call edges into 1.38M distinct ones (parallel call sites merged) at 73M input
+  edges/s. `graph.scc` is Tarjan plus the DAG build. `graph.modules` includes lifting
+  2.2M call edges to modules (two node -> file -> module lookups per edge, twice).
+- **Memory**: a graph is `8 (n + 1) + 10 m` bytes with labels (forward + reverse offsets and
+  targets, one label byte per direction). The venv call graph is 22 MB, its condensation 32 MB
+  (call graphs are nearly acyclic, so the DAG is almost as large as the graph; `Scc` is
+  `8 n + 4 k`). Peak RSS grows by 53 MB over `calls`. The build needs no edge list: two passes
+  over the source (count, scatter), then counting-sort transposes; before deduplication both
+  directions hold every input edge.
+
+Synthetic graphs (`cargo bench -p pymapper-core --bench graph -- <shape>`, 1M nodes, average
+out-degree 3 unless noted; times best of 5, peak RSS from a separate single-rep run because
+the allocator keeps freed pages across reps; peak RSS includes the generated edge list, 24-32
+MB resident):
+
+| shape   | input edges | distinct | SCCs | largest | build  | `Scc::of` | `Condensed::of` | graph MB | condensed MB | peak RSS MB |
+|---------|-------------|----------|------|---------|--------|-----------|-----------------|----------|--------------|-------------|
+| random  | 3,000,000   | 2,999,997 | 114,964 | 885,037 | 37.6ms | 62.1ms  | 90.7ms          | 32.0     | 10.5         | 83.3        |
+| calls   | 3,000,000   | 2,965,149 | 172,243 | 827,540 | 36.9ms | 37.4ms  | 65.9ms          | 31.7     | 11.9         | 84.5        |
+| chain   | 999,999     | 999,999  | 1,000,000 | 1     | 9.8ms  | 7.1ms     | 24.4ms          | 16.0     | 28.0         | 84.5        |
+| cycle   | 1,000,000   | 1,000,000 | 1      | 1,000,000 | 9.7ms | 9.2ms    | 12.4ms          | 16.0     | 8.0          | 60.7        |
+| blocks  | 1,399,998   | 1,399,998 | 200,000 | 5     | 17.8ms | 19.0ms    | 32.7ms          | 19.2     | 13.6         | 54.7        |
+| random, degree 10 | 10,000,000 | 9,999,948 | 85 | 999,916 | 120.8ms | 128.0ms | 152.2ms   | -        | -            | -           |
+
+`chain` is a million-deep DFS (no recursion, 8 bytes per DFS frame). Tarjan runs at 64-280M
+nodes + edges per second; random graphs are the slow case (cache misses on `rindex`).
 
 ### Cache (S2.5)
 
