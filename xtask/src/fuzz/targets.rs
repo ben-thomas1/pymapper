@@ -219,6 +219,23 @@ fn extract(src: &[u8]) {
         let p = d.parent[i] as usize;
         assert!(d.start[p] <= d.start[i] && d.end[i] <= d.end[p], "child outside parent");
     }
+    // Decorator and base rows: grouped by owner in def order, every row owned by a def
+    // whose count includes it (no orphans).
+    for (owner, lens, rows, what) in [
+        (&st.decorators.owner, &d.decorators_len, ff.decorators, "decorator"),
+        (&st.bases.owner, &d.bases_len, ff.bases, "base"),
+    ] {
+        let owner = &owner[rows.range()];
+        assert!(owner.windows(2).all(|w| w[0] <= w[1]), "{what} rows not grouped by def");
+        assert!(owner.iter().all(|&o| o >= 1 && o < n), "{what} owner out of range");
+        let mut count = vec![0u32; n as usize];
+        for &o in owner {
+            count[o as usize] += 1;
+        }
+        for (i, &c) in count.iter().enumerate() {
+            assert_eq!(c, u32::from(lens[ff.defs.start as usize + i]), "{what} count of def {i}");
+        }
+    }
     for (scopes, what) in [(&st.imports.scope, "import"), (&st.calls.scope, "call"), (&st.bindings.scope, "binding"), (&st.decls.scope, "decl")] {
         assert!(scopes.iter().all(|&s| s < n), "{what} scope out of range");
     }

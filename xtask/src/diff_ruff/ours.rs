@@ -166,7 +166,7 @@ impl<'a> Cx<'a> {
         for row in self.v.ff.calls.range() {
             let chain = self.v.call_chain(row);
             let start = out.begin_str();
-            let prefix: &[u8] = match cf::receiver(c.receiver[row]) {
+            let prefix: &[u8] = match c.receiver(row) {
                 Receiver::Super => b"super()",
                 Receiver::Unknown => b"?",
                 _ => b"",

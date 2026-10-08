@@ -42,16 +42,16 @@
 //!   FactStore (one per thread)
 //!   ├── defs        kind u8 | flags u16 | name Option<Sym> | parent u32 | start,end u32 |
 //!   │               start_line,end_line u32 | name_line,name_col u32 |
-//!   │               decorators u32+u8 | bases u32+u8 | params u32+u16          51 B/row
-//!   ├── decorators  chain Sym+u8 | flags u8                                     6 B/row
-//!   ├── bases       chain Sym+u8 | keyword Option<Sym> | flags u8              10 B/row
+//!   │               decorators u8 | bases u8 | params u32+u16                  43 B/row
+//!   ├── decorators  owner u32 | chain Sym+u8 | flags u8                        10 B/row
+//!   ├── bases       owner u32 | chain Sym+u8 | keyword Option<Sym> | flags u8  14 B/row
 //!   ├── params      name Sym | kind+flags u8                                    5 B/row
 //!   ├── imports     scope u32 | module Sym+u8 | name,alias Option<Sym> |
 //!   │               level u8 | flags u8 | line,col u32                         27 B/row
-//!   ├── calls       scope u32 | chain Sym+u8 | receiver u8 | flags u8 |
-//!   │               line,col u32                                               19 B/row
-//!   ├── bindings    scope u32 | target Sym+u8 | kind u8 | flags u8 | value u8 |
-//!   │               value_chain Sym+u8 | line u32                              21 B/row
+//!   ├── calls       scope u32 | chain Sym+u8 | flags+receiver u8 |
+//!   │               line,col u32                                               18 B/row
+//!   ├── bindings    scope u32 | target Sym+u8 | kind u8 | flags+value u8 |
+//!   │               value_chain Sym+u8 | line u32                              20 B/row
 //!   ├── decls       scope u32 | kind u8 | name Sym                              9 B/row
 //!   ├── names       Sym           chains of 2+ names                            4 B/row
 //!   ├── exports     Sym           `__all__` contents                            4 B/row
@@ -263,6 +263,10 @@ pub mod call_flags {
     pub const TYPE_CHECKING: u8 = 1 << 1;
     /// Inside a lambda (scope is the lambda's enclosing def).
     pub const LAMBDA: u8 = 1 << 2;
+    /// The [`Receiver`](super::Receiver) is packed into the top bits of the flags column
+    /// (see [`Calls::receiver`](super::Calls::receiver)); one byte per call row less.
+    pub const RECEIVER_SHIFT: u32 = 5;
+    pub const RECEIVER_MASK: u8 = 0b111 << RECEIVER_SHIFT;
 }
 
 #[inline]
@@ -298,6 +302,11 @@ pub mod binding_flags {
     pub const STARRED: u8 = 1 << 1;
     pub const TYPE_CHECKING: u8 = 1 << 2;
     pub const CONDITIONAL: u8 = 1 << 3;
+    /// The [`ValueKind`](super::ValueKind) is packed into the high bits of the flags column
+    /// (see [`Bindings::value_kind`](super::Bindings::value_kind)); one byte per binding row
+    /// less.
+    pub const VALUE_SHIFT: u32 = 4;
+    pub const VALUE_MASK: u8 = 0b111 << VALUE_SHIFT;
 }
 
 #[inline]
@@ -456,6 +465,11 @@ macro_rules! soa {
             }
 
             /// Moves all rows of `other` to the end; returns the base to shift by.
+            #[allow(dead_code)]
+            fn drain_rows(&mut self, r: std::ops::Range<usize>) {
+                $(self.$f.drain(r.clone());)+
+            }
+
             fn shrink_to_fit(&mut self) {
                 $(self.$f.shrink_to_fit();)+
             }
@@ -501,11 +515,10 @@ soa! {
         /// Position of the name token (1-based line, 0-based byte column).
         name_line: u32,
         name_col: u32,
-        /// File-relative first row of [`Decorators`] (see [`Defs::decorators_run`]).
-        decorators: u32,
+        /// Number of [`Decorators`] rows (found by their `owner`, see
+        /// [`FileView::decorators`]).
         decorators_len: u8,
-        /// File-relative first row of [`Bases`] (classes; see [`Defs::bases_run`]).
-        bases: u32,
+        /// Number of [`Bases`] rows (classes; found by their `owner`, see [`FileView::bases`]).
         bases_len: u8,
         /// File-relative first row of [`Params`] (functions; see [`Defs::params_run`]).
         params: u32,
@@ -514,18 +527,6 @@ soa! {
 }
 
 impl Defs {
-    /// File-relative decorator rows of row `i`.
-    #[inline]
-    pub fn decorators_run(&self, i: usize) -> Run {
-        Run { start: self.decorators[i], len: self.decorators_len[i] as u32 }
-    }
-
-    /// File-relative base rows of row `i`.
-    #[inline]
-    pub fn bases_run(&self, i: usize) -> Run {
-        Run { start: self.bases[i], len: self.bases_len[i] as u32 }
-    }
-
     /// File-relative param rows of row `i`.
     #[inline]
     pub fn params_run(&self, i: usize) -> Run {
@@ -534,8 +535,12 @@ impl Defs {
 }
 
 soa! {
-    /// Decorators, grouped per def (see [`Defs::decorators`]).
+    /// Decorators, grouped per def in def row order (see [`FileView::decorators`]).
     Decorators {
+        /// File-relative def row the decorator belongs to (non-decreasing within a file).
+        /// Decorators are rare, so a 4-byte owner here is cheaper than a start column on
+        /// every def.
+        owner: Scope,
         /// Name chain ([`ChainCol`] encoding; empty when not a plain dotted name).
         chain: Sym,
         chain_len: u8,
@@ -545,8 +550,11 @@ soa! {
 }
 
 soa! {
-    /// Class bases and class keywords (`metaclass=M`), grouped per class.
+    /// Class bases and class keywords (`metaclass=M`), grouped per class in def row order
+    /// (see [`FileView::bases`]).
     Bases {
+        /// File-relative def row of the class (non-decreasing within a file).
+        owner: Scope,
         /// Name chain ([`ChainCol`] encoding; empty for other expressions).
         chain: Sym,
         chain_len: u8,
@@ -592,13 +600,19 @@ soa! {
         /// The callee chain ([`ChainCol`] encoding; see [`Receiver`]).
         chain: Sym,
         chain_len: u8,
-        /// [`Receiver`] as `u8` (see [`receiver`]).
-        receiver: u8,
-        /// [`call_flags`].
+        /// [`call_flags`], with the [`Receiver`] in the top bits (see [`Calls::receiver`]).
         flags: u8,
         /// Position of the first token of the callee chain.
         line: u32,
         col: u32,
+    }
+}
+
+impl Calls {
+    /// Receiver of call `i` (store-absolute row).
+    #[inline]
+    pub fn receiver(&self, i: usize) -> Receiver {
+        receiver((self.flags[i] & call_flags::RECEIVER_MASK) >> call_flags::RECEIVER_SHIFT)
     }
 }
 
@@ -611,14 +625,21 @@ soa! {
         target_len: u8,
         /// [`AssignKind`] as `u8` (see [`assign_kind`]).
         kind: u8,
-        /// [`binding_flags`].
+        /// [`binding_flags`], with the [`ValueKind`] in the high bits (see
+        /// [`Bindings::value_kind`]).
         flags: u8,
-        /// [`ValueKind`] as `u8`.
-        value: u8,
         /// The value chain for `ValueKind::Call` / `ValueKind::Name` ([`ChainCol`] encoding).
         value_chain: Sym,
         value_len: u8,
         line: u32,
+    }
+}
+
+impl Bindings {
+    /// Value shape of binding `i` (store-absolute row).
+    #[inline]
+    pub fn value_kind(&self, i: usize) -> ValueKind {
+        ValueKind::from_u8((self.flags[i] & binding_flags::VALUE_MASK) >> binding_flags::VALUE_SHIFT)
     }
 }
 
@@ -748,6 +769,18 @@ pub struct FileFacts {
     pub lines: u32,
     /// [`file_flags`].
     pub flags: u8,
+}
+
+/// The `n` rows of `file` (store-absolute) whose owner is `d`; `owner` is non-decreasing
+/// within the file.
+#[inline]
+fn owned_rows(owner: &[Scope], file: Run, d: Scope, n: usize) -> std::ops::Range<usize> {
+    let r = file.range();
+    if n == 0 {
+        return r.start..r.start;
+    }
+    let start = r.start + owner[r].partition_point(|&o| o < d);
+    start..start + n
 }
 
 /// Converts a store length to `u32`; tables are limited to `u32::MAX` rows.
@@ -1036,16 +1069,19 @@ impl<'a> FileView<'a> {
         r.shift(table_start).range()
     }
 
-    /// Decorator rows of def `d` (store-absolute).
+    /// Decorator rows of def `d` (store-absolute): a binary search over the file's owner
+    /// column, skipped for the many defs without decorators.
     #[inline]
     pub fn decorators(&self, d: Scope) -> std::ops::Range<usize> {
-        self.rows(self.ff.decorators.start, self.store.defs.decorators_run(self.def_row(d)))
+        let n = self.store.defs.decorators_len[self.def_row(d)] as usize;
+        owned_rows(&self.store.decorators.owner, self.ff.decorators, d, n)
     }
 
-    /// Base rows of def `d` (store-absolute).
+    /// Base rows of def `d` (store-absolute), like [`FileView::decorators`].
     #[inline]
     pub fn bases(&self, d: Scope) -> std::ops::Range<usize> {
-        self.rows(self.ff.bases.start, self.store.defs.bases_run(self.def_row(d)))
+        let n = self.store.defs.bases_len[self.def_row(d)] as usize;
+        owned_rows(&self.store.bases.owner, self.ff.bases, d, n)
     }
 
     /// Param rows of def `d` (store-absolute).
