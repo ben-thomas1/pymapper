@@ -1,0 +1,12 @@
+{"version":1,"tool":{"name":"pymapper","version":"<version>"},"min_confidence":80,"findings":[
+  {"code":"PM301","name":"import-cycle","severity":"warning","confidence":100,"path":null,"line":null,"col":null,"symbol":null,"message":"import cycle: pkg.alpha -> pkg.zeta -> pkg.alpha"},
+  {"code":"PM602","name":"unused-dependency","severity":"warning","confidence":100,"path":null,"line":null,"col":null,"symbol":null,"message":"dependency `requests` is declared but never imported"},
+  {"code":"PM401","name":"unused-function","severity":"warning","confidence":60,"path":"odd dir/a,b:c%d\"e.py","line":1,"col":1,"symbol":"odd:f","message":"function `odd:f` is never used"},
+  {"code":"PM107","name":"long-module","severity":"info","confidence":100,"path":"pkg/__init__.py","line":null,"col":null,"symbol":"pkg","message":"module `pkg` is 900 lines long (> 500)"},
+  {"code":"PM303","name":"forbidden-import","severity":"error","confidence":100,"path":"pkg/alpha.py","line":3,"col":1,"symbol":"pkg.alpha","message":"`pkg.alpha` imports forbidden module `we\"ird\nname` (contract `core-layers`)"},
+  {"code":"PM405","name":"unused-import","severity":"warning","confidence":90,"path":"pkg/alpha.py","line":3,"col":1,"symbol":"pkg.alpha","message":"`os.path` is imported but never used"},
+  {"code":"PM405","name":"unused-import","severity":"warning","confidence":90,"path":"pkg/alpha.py","line":3,"col":1,"symbol":"pkg.alpha","message":"`yaml` is imported but never used"},
+  {"code":"PM106","name":"low-maintainability","severity":"info","confidence":100,"path":"pkg/alpha.py","line":20,"col":5,"symbol":"pkg.alpha:Big.run","message":"`pkg.alpha:Big.run` has a low maintainability index (12.2 < 20.0)"},
+  {"code":"PM601","name":"undeclared-dependency","severity":"error","confidence":100,"path":"pkg/café/�.py","line":2,"col":null,"symbol":null,"message":"`yaml` is provided by `PyYAML`, which is not a declared dependency"},
+  {"code":"PM101","name":"complex-function","severity":"warning","confidence":100,"path":"pkg/zeta.py","line":12,"col":5,"symbol":"pkg.zeta:handle","message":"`pkg.zeta:handle` is too complex (McCabe 14 > 10)"}
+],"summary":{"findings":10,"gated":9,"files":5,"files_checked":42,"suppressed":1,"baselined":0,"file_ignored":3,"below_confidence_hidden":1}}
