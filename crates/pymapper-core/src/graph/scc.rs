@@ -17,13 +17,12 @@ pub struct Scc {
 impl Scc {
     /// Computes the components of `g` (see [`tarjan`]).
     pub fn of(g: &Graph) -> Scc {
-        let comp = tarjan(g.forward());
-        Scc::from_comp(comp)
+        let (comp, k) = tarjan_count(g.forward());
+        Scc::from_comp(comp, k as usize)
     }
 
-    /// Groups nodes by component (counting sort, members ascending).
-    fn from_comp(comp: Vec<u32>) -> Scc {
-        let k = comp.iter().map(|&c| c as usize + 1).max().unwrap_or(0);
+    /// Groups nodes by component (counting sort, members ascending); `k` components.
+    fn from_comp(comp: Vec<u32>, k: usize) -> Scc {
         let mut start = vec![0u32; k + 1];
         for &c in &comp {
             start[c as usize + 1] += 1;
@@ -108,6 +107,11 @@ impl Scc {
 /// completed component (0-based). Completed values are always larger than every active one, so
 /// edges into completed components never lower a node's `rindex` (no on-stack flag needed).
 pub fn tarjan(fwd: &Csr) -> Vec<u32> {
+    tarjan_count(fwd).0
+}
+
+/// [`tarjan`] plus the number of components.
+fn tarjan_count(fwd: &Csr) -> (Vec<u32>, u32) {
     let n = fwd.node_count();
     assert!(n < u32::MAX, "too many nodes");
     let adj = fwd.targets();
@@ -178,5 +182,5 @@ pub fn tarjan(fwd: &Csr) -> Vec<u32> {
     for r in &mut rindex {
         *r -= c + 1;
     }
-    rindex
+    (rindex, n - c)
 }
