@@ -60,6 +60,11 @@ pub enum Target {
     /// the hierarchy. The corpus root is the import root of one first-party group. Peak RSS
     /// includes the whole index.
     Load,
+    /// `load` with duplication fingerprints taken in the extraction pass
+    /// (`pymapper_core::index::load_with`), then clone matching
+    /// (`pymapper_core::analysis::dupes`, phases `dupes.*`) with the default thresholds. Peak
+    /// RSS includes the whole index.
+    Dupes,
 }
 
 impl Target {
@@ -77,6 +82,7 @@ impl Target {
             Target::MetricsMem => "metrics-mem",
             Target::ExtractMem => "extract-mem",
             Target::Load => "load",
+            Target::Dupes => "dupes",
         }
     }
 }
@@ -399,6 +405,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         }
         Target::Roots => roots_target(root)?,
         Target::Load => load_target(root)?,
+        Target::Dupes => dupes_target(root)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -486,6 +493,44 @@ fn load_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("intern_kb".to_owned(), kb(ix.strings().heap_bytes())),
         // Retained index bytes per 1000 LOC (milli-bytes per LOC).
         ("index_B_per_kLOC".to_owned(), (ix.heap_bytes() as u64 * 1000).checked_div(s.lines).unwrap_or(0)),
+    ];
+    Ok((stats, counters))
+}
+
+/// `dupes`: walk, [`pymapper_core::index::load_with`] with fingerprints (phases `load.*`),
+/// then matching and findings (phases `dupes.seeds`, `dupes.relex`, `dupes.extend`,
+/// `dupes.locate`, `dupes.group`). The corpus is one first-party group.
+fn dupes_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::analysis::dupes::{self, DupesParams};
+    use pymapper_core::index::{Inputs, LoadOptions, load_with};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::rules::Findings;
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let params = DupesParams::default();
+    let (ix, fps) = load_with(inputs, &LoadOptions { dupes: Some(params) });
+    let fps = fps.context("fingerprints were requested")?;
+    let (nfps, fps_bytes) = (fps.len() as u64, fps.heap_bytes() as u64);
+    let mut findings = Findings::new();
+    let report = dupes::analyse(&ix, fps, &params, &mut findings);
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let r = &report.stats;
+    let dup_lines: u64 = report.members.iter().map(|m| u64::from(m.lines())).sum();
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("fingerprints".to_owned(), nfps),
+        ("fingerprints_kb".to_owned(), fps_bytes / 1000),
+        ("seeds".to_owned(), r.seeds),
+        ("extended".to_owned(), r.extended),
+        ("files_reread".to_owned(), r.files_read),
+        ("bytes_reread_kb".to_owned(), r.bytes_read / 1000),
+        ("pairs".to_owned(), report.pairs.len() as u64),
+        ("copies".to_owned(), report.members.len() as u64),
+        ("groups".to_owned(), report.groups.len() as u64),
+        ("duplicated_lines".to_owned(), dup_lines),
+        ("findings".to_owned(), findings.len() as u64),
     ];
     Ok((stats, counters))
 }
@@ -612,6 +657,7 @@ mod tests {
             Target::MetricsMem,
             Target::ExtractMem,
             Target::Load,
+            Target::Dupes,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -630,6 +676,17 @@ mod tests {
                 Target::ParseMem | Target::MetricsMem | Target::ExtractMem => &["walk", "load", "parse"],
                 Target::Walk | Target::WalkSeq | Target::WalkGit => &["walk"],
                 Target::Load => &["walk", "load.extract", "load.merge", "load.build"],
+                Target::Dupes => &[
+                    "walk",
+                    "load.extract",
+                    "load.merge",
+                    "load.build",
+                    "dupes.seeds",
+                    "dupes.relex",
+                    "dupes.extend",
+                    "dupes.locate",
+                    "dupes.group",
+                ],
                 Target::Roots => unreachable!("checked below"),
             };
             assert_eq!(names, expected, "{target:?}");
@@ -668,6 +725,14 @@ mod tests {
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("nodes").unwrap() > counter("defs").unwrap());
                 assert!(counter("index_B_per_kLOC").unwrap() > 1000);
+            } else if target == Target::Dupes {
+                let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, [
+                    "loc", "fingerprints", "fingerprints_kb", "seeds", "extended", "files_reread", "bytes_reread_kb",
+                    "pairs", "copies", "groups", "duplicated_lines", "findings"
+                ]);
+                assert!(counter("fingerprints").unwrap() > 0);
+                assert_eq!(counter("findings"), counter("copies"));
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }

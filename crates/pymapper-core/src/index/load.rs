@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use super::{FileId, Index, Inputs, build};
+use crate::analysis::dupes::{DupesParams, FingerprintScratch, FingerprintVisitor, Fingerprints};
 use crate::arena::PerThread;
 use crate::extract::facts::{FactStore, FileFacts, TableBases, extract_with};
-use crate::extract::{MetricsScratch, MetricsTable, MetricsVisitor};
+use crate::extract::{MetricsScratch, MetricsTable, MetricsVisitor, Tee};
+use crate::roots::Origin;
 use crate::intern::Interner;
 use crate::timing;
 
@@ -38,6 +40,14 @@ pub struct LoadStats {
     pub build: Duration,
 }
 
+/// Optional work done in the extraction pass of [`load_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Take duplication fingerprints of first-party files (`analysis.dupes`, see
+    /// [`crate::analysis::dupes`]). `None` costs nothing.
+    pub dupes: Option<DupesParams>,
+}
+
 /// Per-thread state: a reused read buffer, the fact store (rows are moved out per chunk, the
 /// allocations and extractor scratch stay), the worker interner and metrics state.
 #[derive(Default)]
@@ -47,6 +57,8 @@ struct Worker {
     interner: Interner,
     scratch: MetricsScratch,
     metrics: MetricsTable,
+    fp_scratch: FingerprintScratch,
+    fps: Fingerprints,
 }
 
 /// The facts of consecutive files `first..first + files.len()`, with `Sym`s of worker
@@ -58,6 +70,7 @@ struct Chunk {
     files: Vec<FileFacts>,
     errors: Vec<ReadError>,
     bytes: u64,
+    fps: Fingerprints,
 }
 
 /// Files per chunk: small enough to balance uneven file sizes over the threads, large enough
@@ -77,6 +90,12 @@ fn chunk_size(files: usize) -> usize {
 /// are reserved once from an early estimate; capacity that is never written is never touched
 /// (no RSS) and is released at the end.
 pub fn load(inputs: Inputs) -> Index {
+    load_with(inputs, &LoadOptions::default()).0
+}
+
+/// [`load`] with optional extra work in the extraction pass; returns the duplication
+/// fingerprints (in FileId order) when `opts.dupes` is set.
+pub fn load_with(inputs: Inputs, opts: &LoadOptions) -> (Index, Option<Fingerprints>) {
     let n = inputs.len();
     let t0 = Instant::now();
     let workers = PerThread::new(Worker::default);
@@ -95,7 +114,7 @@ pub fn load(inputs: Inputs) -> Index {
                     break;
                 }
                 let range = c * size..((c + 1) * size).min(n);
-                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range));
+                let chunk = workers.with(|wi, w| w.chunk(wi, &inputs, range, opts));
                 *lock(&slots[c]) = Some(chunk);
                 drain(&sink, &slots);
             }
@@ -125,13 +144,14 @@ pub fn load(inputs: Inputs) -> Index {
     });
     let merge = t1.elapsed();
 
-    let Sink { facts, metrics, files, errors, bytes, .. } = sink;
+    let Sink { facts, metrics, files, errors, bytes, mut fps, .. } = sink;
+    fps.shrink_to_fit();
     let lines = files.iter().map(|ff| u64::from(ff.lines)).sum();
     let stats = LoadStats { files: n as u64, bytes, lines, extract, merge, build: Duration::ZERO };
     let t2 = Instant::now();
     let mut index = timing::time("load.build", || build::build(inputs, strings, facts, metrics, files, errors, stats));
     index.stats.build = t2.elapsed();
-    index
+    (index, opts.dupes.map(|_| fps))
 }
 
 /// Locks a mutex, ignoring poisoning (a panicking worker aborts the load anyway).
@@ -159,7 +179,7 @@ fn drain(sink: &Mutex<Sink>, slots: &[Mutex<Option<Chunk>>]) {
 }
 
 impl Worker {
-    fn chunk(&mut self, wi: usize, inputs: &Inputs, range: std::ops::Range<usize>) -> Chunk {
+    fn chunk(&mut self, wi: usize, inputs: &Inputs, range: std::ops::Range<usize>, opts: &LoadOptions) -> Chunk {
         debug_assert!(self.store.defs.is_empty() && self.metrics.is_empty());
         let mut files = Vec::with_capacity(range.len());
         let mut errors = Vec::new();
@@ -175,7 +195,16 @@ impl Worker {
             bytes += buf.len() as u64;
             let src = &buf[..];
             let m = MetricsVisitor::new(src, &mut self.scratch, &mut self.metrics);
-            files.push(extract_with(src, &mut self.store, &mut self.interner, m).0);
+            // Two monomorphised loops: no per-token cost when duplication is off.
+            match opts.dupes {
+                Some(p) if inputs.groups[inputs.group[f] as usize].origin == Origin::FirstParty => {
+                    let fv = FingerprintVisitor::new(src, &mut self.fp_scratch);
+                    let (ff, Tee(_, fv)) = extract_with(src, &mut self.store, &mut self.interner, Tee(m, fv));
+                    fv.finish(f as FileId, &p, &mut self.fps);
+                    files.push(ff);
+                }
+                _ => files.push(extract_with(src, &mut self.store, &mut self.interner, m).0),
+            }
         }
         // Keep the buffer for the next chunk unless one huge file grew it.
         if buf.capacity() <= 16 << 20 {
@@ -188,7 +217,12 @@ impl Worker {
         metrics.append(&self.metrics);
         self.metrics.clear();
         debug_assert_eq!(metrics.len(), store.defs.len() as usize - files.len());
-        Chunk { worker: wi, store, metrics, files, errors, bytes }
+        let mut fps = Fingerprints::new();
+        if !self.fps.is_empty() {
+            fps.reserve_exact(self.fps.len());
+            fps.append(&mut self.fps);
+        }
+        Chunk { worker: wi, store, metrics, files, errors, bytes, fps }
     }
 }
 
@@ -208,6 +242,7 @@ struct Sink {
     worker: Vec<u32>,
     errors: Vec<ReadError>,
     bytes: u64,
+    fps: Fingerprints,
 }
 
 impl Sink {
@@ -254,6 +289,9 @@ impl Sink {
         self.facts.reserve_exact(&extra);
         let m = more(self.metrics.len() as u32) as usize;
         reserve_metrics(&mut self.metrics, m);
+        if !self.fps.is_empty() {
+            self.fps.reserve_exact(more(self.fps.len() as u32) as usize);
+        }
         let rest = self.chunks.saturating_sub(self.next);
         let per_chunk = self.files.len() / self.next.max(1) + 1;
         self.files.reserve_exact(rest * per_chunk);
@@ -270,6 +308,7 @@ impl Sink {
         self.metrics.append(&c.metrics);
         self.errors.extend_from_slice(&c.errors);
         self.bytes += c.bytes;
+        self.fps.append(&mut c.fps);
     }
 }
 

@@ -1,0 +1,623 @@
+//! Whole-program matching: fingerprint buckets -> seeds -> verified, extended clone pairs ->
+//! clusters and groups.
+
+use rayon::prelude::*;
+
+use super::norm::{Normaliser, exact};
+use super::winnow::{Fingerprints, for_each_token};
+use super::{ClonePair, DupesParams, Region};
+use crate::lex::TokenKind;
+use crate::timing;
+
+/// Buckets up to this size seed every pair; larger ones seed a star from their first
+/// occurrence (linear, and enough: extension and grouping recover the rest).
+const ALL_PAIRS_MAX: usize = 8;
+
+/// Largest gap (in tokens, in each copy) bridged between two matching segments of the same
+/// pair of files: tolerates a few inserted, deleted or changed tokens.
+const MAX_GAP: u32 = 8;
+
+/// Merge candidates looked at per segment (most recent chains of the file pair).
+const CHAIN_LOOKBACK: usize = 8;
+
+/// Repetition filter: periods tried, and the share of positions that must repeat.
+const MAX_PERIOD: usize = 24;
+const REPEAT_PCT: usize = 90;
+
+/// Data filter: code has at least one name or keyword per this many tokens.
+const WORD_SHARE: usize = 8;
+
+/// The most similar other copy of a [`DupesReport::members`] entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Best {
+    pub other: Region,
+    pub similarity: u8,
+}
+
+/// Counters of one [`find_clones`] run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DupesStats {
+    pub fingerprints: u64,
+    /// Seed position pairs generated from shared fingerprints.
+    pub seeds: u64,
+    /// Seeds whose tokens matched and were extended (the rest were hash collisions or
+    /// covered by an earlier extension).
+    pub extended: u64,
+    /// File reads of the matching stage: every file with seeds, then every file with a
+    /// candidate clone.
+    pub files_read: u64,
+    pub bytes_read: u64,
+}
+
+/// Result of [`find_clones`].
+#[derive(Clone, Debug, Default)]
+pub struct DupesReport {
+    /// Every clone pair, sorted by (a, b) position.
+    pub pairs: Vec<ClonePair>,
+    /// Copies: overlapping regions of the pairs in one file merged, sorted by (file, position).
+    pub members: Vec<Region>,
+    /// Per member, its most similar other copy (`None` only in degenerate overlaps).
+    pub best: Vec<Option<Best>>,
+    /// Per member, its group (groups are numbered in order of their first member).
+    pub group: Vec<u32>,
+    /// Per group, the range of its members in `group_members`.
+    pub groups: Vec<(u32, u32)>,
+    /// Member indices, grouped (ascending within a group).
+    pub group_members: Vec<u32>,
+    pub stats: DupesStats,
+}
+
+impl DupesReport {
+    /// Member indices of group `g`.
+    pub fn group(&self, g: usize) -> &[u32] {
+        let (s, e) = self.groups[g];
+        &self.group_members[s as usize..e as usize]
+    }
+}
+
+/// Two positions with the same fingerprint; `(a_file, a_pos) < (b_file, b_pos)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seed {
+    a_file: u32,
+    b_file: u32,
+    a_pos: u32,
+    b_pos: u32,
+}
+
+impl Seed {
+    #[inline]
+    fn diag(&self) -> i64 {
+        i64::from(self.b_pos) - i64::from(self.a_pos)
+    }
+}
+
+/// Seeds from the hash-sorted fingerprints: every pair of a small bucket, a star from the
+/// first occurrence of a large one. Same-file seeds closer than `min_tokens` are skipped (their
+/// copies would overlap).
+fn make_seeds(fps: &Fingerprints, params: &DupesParams) -> Vec<Seed> {
+    let min_d = params.min_tokens;
+    let mut seeds = Vec::new();
+    let push = |a: &super::Fingerprint, b: &super::Fingerprint, seeds: &mut Vec<Seed>| {
+        if a.file != b.file || b.pos - a.pos >= min_d {
+            seeds.push(Seed { a_file: a.file, b_file: b.file, a_pos: a.pos, b_pos: b.pos });
+        }
+    };
+    for bucket in fps.rows.chunk_by(|x, y| x.hash == y.hash) {
+        if bucket.len() < 2 {
+            continue;
+        }
+        if bucket.len() <= ALL_PAIRS_MAX {
+            for (i, a) in bucket.iter().enumerate() {
+                for b in &bucket[i + 1..] {
+                    push(a, b, &mut seeds);
+                }
+            }
+        } else {
+            for b in &bucket[1..] {
+                push(&bucket[0], b, &mut seeds);
+            }
+        }
+    }
+    seeds
+}
+
+/// Finds clone pairs and groups from the fingerprints of all files. `read(file, buf)` appends a
+/// file's source to `buf` (empty when called) and returns false when it cannot. Sources are not
+/// retained by extraction, so files are re-read here: every file with seeds once to re-lex it
+/// (only one byte of normalised code and one byte of exact hash per token are kept until
+/// matching ends), then every file with a candidate clone once more for line numbers. Runs on
+/// the current rayon pool; deterministic.
+pub fn find_clones<R>(mut fps: Fingerprints, params: &DupesParams, read: R) -> DupesReport
+where
+    R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
+{
+    let mut stats = DupesStats { fingerprints: fps.len() as u64, ..DupesStats::default() };
+    let nfiles = fps.iter().map(|f| f.file as usize + 1).max().unwrap_or(0);
+    let seeds = timing::time("dupes.seeds", || {
+        fps.rows.par_sort_unstable();
+        let mut seeds = make_seeds(&fps, params);
+        drop(fps);
+        seeds.par_sort_unstable_by_key(|s| (s.a_file, s.b_file, s.diag(), s.a_pos));
+        seeds
+    });
+    stats.seeds = seeds.len() as u64;
+    let cache = timing::time("dupes.relex", || CodeCache::build(&seeds, nfiles, &read, &mut stats));
+    let cands = timing::time("dupes.extend", || {
+        let groups: Vec<&[Seed]> = seeds.chunk_by(|x, y| x.a_file == y.a_file).collect();
+        let per_file: Vec<(Vec<Cand>, u64)> = groups
+            .par_iter()
+            .map_init(Scratch::default, |sc, g| {
+                let mut out = Vec::new();
+                let extended = match_file(g, params, &cache, sc, &mut out);
+                (out, extended)
+            })
+            .collect();
+        let mut cands = Vec::with_capacity(per_file.iter().map(|p| p.0.len()).sum());
+        for (mut c, extended) in per_file {
+            cands.append(&mut c);
+            stats.extended += extended;
+        }
+        cands
+    });
+    drop(cache);
+    drop(seeds);
+    let mut pairs = timing::time("dupes.locate", || locate(&cands, params, &read, &mut stats));
+    drop(cands);
+    timing::time("dupes.group", || {
+        pairs.sort_unstable_by_key(|p| (p.a.file, p.a.start_tok, p.b.file, p.b.start_tok, p.a.end_tok));
+        let mut report = cluster(pairs);
+        report.stats = stats;
+        report
+    })
+}
+
+/// Normalised codes and 8-bit exact hashes of every file with seeds (2 bytes per token).
+#[derive(Debug, Default)]
+struct CodeCache {
+    /// Index into `codes` / `exact` per file (`u32::MAX`: no seeds).
+    slot: Vec<u32>,
+    codes: Vec<Box<[u8]>>,
+    exact: Vec<Box<[u8]>>,
+}
+
+impl CodeCache {
+    /// Re-reads and re-lexes every file of `seeds` in parallel.
+    fn build<R>(seeds: &[Seed], nfiles: usize, read: &R, stats: &mut DupesStats) -> CodeCache
+    where
+        R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
+    {
+        const SEEDED: u32 = u32::MAX - 1;
+        let mut slot = vec![u32::MAX; nfiles];
+        for s in seeds {
+            slot[s.a_file as usize] = SEEDED;
+            slot[s.b_file as usize] = SEEDED;
+        }
+        let mut files = Vec::new();
+        for (f, s) in slot.iter_mut().enumerate() {
+            if *s == SEEDED {
+                *s = files.len() as u32;
+                files.push(f as u32);
+            }
+        }
+        // Codes, exact hashes and bytes read of each file.
+        type Lexed = (Box<[u8]>, Box<[u8]>, u64);
+        let lexed: Vec<Lexed> = files
+            .par_iter()
+            .map_init(
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |(buf, codes, exact8), &f| {
+                    buf.clear();
+                    codes.clear();
+                    exact8.clear();
+                    if read(f, buf) {
+                        let src = &buf[..];
+                        let mut norm = Normaliser::default();
+                        for_each_token(src, |t| {
+                            if let Some(c) = norm.push(src, t) {
+                                codes.push(c);
+                                exact8.push(exact(src, t) as u8);
+                            }
+                        });
+                    }
+                    let bytes = buf.len() as u64;
+                    // Keep the read buffer unless one huge file grew it.
+                    if buf.capacity() > 16 << 20 {
+                        *buf = Vec::new();
+                    }
+                    (codes.as_slice().into(), exact8.as_slice().into(), bytes)
+                },
+            )
+            .collect();
+        stats.files_read += files.len() as u64;
+        let mut cache = CodeCache { slot, codes: Vec::with_capacity(files.len()), exact: Vec::with_capacity(files.len()) };
+        for (c, e, bytes) in lexed {
+            stats.bytes_read += bytes;
+            cache.codes.push(c);
+            cache.exact.push(e);
+        }
+        cache
+    }
+
+    /// Codes and exact hashes of `file` (which must have seeds).
+    #[inline]
+    fn get(&self, file: u32) -> (&[u8], &[u8]) {
+        let i = self.slot[file as usize] as usize;
+        (&self.codes[i], &self.exact[i])
+    }
+}
+
+/// Per-thread buffers of the matching stage.
+#[derive(Debug, Default)]
+struct Scratch {
+    segs: Vec<Segment>,
+    chains: Vec<Segment>,
+}
+
+/// A run of aligned tokens: `a0..a1` in A matches `b0..b1` in B. A raw segment is a maximal
+/// run of equal codes on one diagonal; a chain joins segments across small gaps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Segment {
+    a0: u32,
+    a1: u32,
+    b0: u32,
+    b1: u32,
+    /// Aligned positions with identical tokens (by 8-bit exact hash).
+    same: u32,
+}
+
+/// A clone found by matching, before line numbers are known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cand {
+    a_file: u32,
+    b_file: u32,
+    a0: u32,
+    a1: u32,
+    b0: u32,
+    b1: u32,
+    similarity: u8,
+}
+
+/// Matches every seed of file A (`seeds`, sorted by partner, diagonal, position) and appends
+/// the chains of at least `min_tokens` tokens; returns the number of seeds extended.
+fn match_file(seeds: &[Seed], params: &DupesParams, cache: &CodeCache, sc: &mut Scratch, out: &mut Vec<Cand>) -> u64 {
+    let a_file = seeds[0].a_file;
+    let a = cache.get(a_file);
+    let mut extended = 0;
+    let Scratch { segs, chains } = sc;
+    for sub in seeds.chunk_by(|x, y| x.b_file == y.b_file) {
+        let b_file = sub[0].b_file;
+        let same_file = b_file == a_file;
+        let b = cache.get(b_file);
+        segs.clear();
+        // Extent of the last extension: later seeds inside it (same diagonal) add nothing.
+        let mut cover: Option<(i64, u32, u32)> = None;
+        for s in sub {
+            if let Some((d, c0, c1)) = cover
+                && d == s.diag()
+                && (c0..c1).contains(&s.a_pos)
+            {
+                continue;
+            }
+            if let Some(seg) = extend(a, b, same_file, s.a_pos, s.b_pos, params.k()) {
+                extended += 1;
+                cover = Some((s.diag(), seg.a0, seg.a1));
+                segs.push(seg);
+            }
+        }
+        chain_segments(segs, chains, same_file);
+        for c in chains.iter() {
+            let len = (c.a1 - c.a0).max(c.b1 - c.b0);
+            if len < params.min_tokens {
+                continue;
+            }
+            let similarity = (u64::from(c.same) * 100 / u64::from(len)) as u8;
+            if similarity < 100 && boilerplate(&a.0[c.a0 as usize..c.a1 as usize]) {
+                continue;
+            }
+            out.push(Cand { a_file, b_file, a0: c.a0, a1: c.a1, b0: c.b0, b1: c.b1, similarity });
+        }
+    }
+    extended
+}
+
+/// Verifies a seed (`k` equal codes at `pa` / `pb`) and extends it to the maximal run of equal
+/// codes on its diagonal. `a` / `b` are (codes, exact hashes). In one file (`pa < pb`) the
+/// copies may not overlap.
+fn extend(a: (&[u8], &[u8]), b: (&[u8], &[u8]), same_file: bool, pa: u32, pb: u32, k: u32) -> Option<Segment> {
+    let ((ca, ea), (cb, eb)) = (a, b);
+    let (na, nb) = (ca.len() as u32, cb.len() as u32);
+    // Longest allowed run: the copies of one file may not overlap.
+    let max_len = if same_file { pb - pa } else { u32::MAX };
+    if k > max_len || pa + k > na || pb + k > nb {
+        return None;
+    }
+    if ca[pa as usize..(pa + k) as usize] != cb[pb as usize..(pb + k) as usize] {
+        return None;
+    }
+    let (mut a0, mut b0) = (pa, pb);
+    while a0 > 0 && b0 > 0 && ca[a0 as usize - 1] == cb[b0 as usize - 1] && pa + k - a0 < max_len {
+        a0 -= 1;
+        b0 -= 1;
+    }
+    let (mut a1, mut b1) = (pa + k, pb + k);
+    while a1 < na && b1 < nb && ca[a1 as usize] == cb[b1 as usize] && a1 - a0 < max_len {
+        a1 += 1;
+        b1 += 1;
+    }
+    let ea = &ea[a0 as usize..a1 as usize];
+    let eb = &eb[b0 as usize..b1 as usize];
+    let same = ea.iter().zip(eb).filter(|(x, y)| x == y).count() as u32;
+    Some(Segment { a0, a1, b0, b1, same })
+}
+
+/// Per-thread buffers of [`locate`].
+#[derive(Debug, Default)]
+struct LocScratch {
+    buf: Vec<u8>,
+    /// Byte span per kept token.
+    start: Vec<u32>,
+    end: Vec<u32>,
+    /// Byte offset of every line start (line 1 at index 0).
+    line_starts: Vec<u32>,
+}
+
+impl LocScratch {
+    /// Re-reads and re-lexes `file`; false when it cannot be read.
+    fn load<R: Fn(u32, &mut Vec<u8>) -> bool>(&mut self, file: u32, read: &R) -> bool {
+        let LocScratch { buf, start, end, line_starts } = self;
+        buf.clear();
+        start.clear();
+        end.clear();
+        line_starts.clear();
+        line_starts.push(0);
+        if !read(file, buf) {
+            return false;
+        }
+        let src = &buf[..];
+        let mut norm = Normaliser::default();
+        for_each_token(src, |t| {
+            if norm.push(src, t).is_some() {
+                start.push(t.start);
+                end.push(t.end());
+            }
+        });
+        for (i, &b) in src.iter().enumerate() {
+            if b == b'\n' || (b == b'\r' && src.get(i + 1) != Some(&b'\n')) {
+                line_starts.push(i as u32 + 1);
+            }
+        }
+        true
+    }
+
+    /// 1-based line of byte offset `off`.
+    #[inline]
+    fn line(&self, off: u32) -> u32 {
+        self.line_starts.partition_point(|&s| s <= off) as u32
+    }
+
+    /// The region of tokens `t0..t1` of `file`, or `None` if the file has fewer tokens (it
+    /// changed since extraction).
+    fn region(&self, file: u32, t0: u32, t1: u32) -> Option<Region> {
+        if t0 >= t1 || t1 as usize > self.start.len() {
+            return None;
+        }
+        let off = self.start[t0 as usize];
+        let start_line = self.line(off);
+        let col = off - self.line_starts[start_line as usize - 1] + 1;
+        let end_line = self.line(self.end[t1 as usize - 1].saturating_sub(1).max(off));
+        Some(Region { file, start_line, end_line, col, start_tok: t0, end_tok: t1 })
+    }
+}
+
+/// Resolves the line ranges of both copies of every candidate (each file is re-read once) and
+/// keeps those spanning at least `min_lines` lines in both copies.
+fn locate<R>(cands: &[Cand], params: &DupesParams, read: &R, stats: &mut DupesStats) -> Vec<ClonePair>
+where
+    R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
+{
+    // (file, t0, t1, candidate * 2 + side)
+    let mut refs: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(cands.len() * 2);
+    for (i, c) in cands.iter().enumerate() {
+        refs.push((c.a_file, c.a0, c.a1, i as u32 * 2));
+        refs.push((c.b_file, c.b0, c.b1, i as u32 * 2 + 1));
+    }
+    refs.par_sort_unstable();
+    let by_file: Vec<&[(u32, u32, u32, u32)]> = refs.chunk_by(|x, y| x.0 == y.0).collect();
+    stats.files_read += by_file.len() as u64;
+    let located: Vec<(Vec<(u32, Region)>, u64)> = by_file
+        .par_iter()
+        .map_init(LocScratch::default, |sc, rs| {
+            let file = rs[0].0;
+            let mut out = Vec::new();
+            if sc.load(file, read) {
+                for &(_, t0, t1, id) in rs.iter() {
+                    if let Some(r) = sc.region(file, t0, t1) {
+                        out.push((id, r));
+                    }
+                }
+            }
+            let bytes = sc.buf.len() as u64;
+            if sc.buf.capacity() > 16 << 20 {
+                sc.buf = Vec::new();
+            }
+            (out, bytes)
+        })
+        .collect();
+    drop(by_file);
+    drop(refs);
+    let mut regions: Vec<Option<Region>> = vec![None; cands.len() * 2];
+    for (rs, bytes) in located {
+        stats.bytes_read += bytes;
+        for (id, r) in rs {
+            regions[id as usize] = Some(r);
+        }
+    }
+    let mut pairs = Vec::new();
+    for (i, c) in cands.iter().enumerate() {
+        if let (Some(a), Some(b)) = (regions[i * 2], regions[i * 2 + 1])
+            && a.lines() >= params.min_lines
+            && b.lines() >= params.min_lines
+        {
+            pairs.push(ClonePair { a, b, similarity: c.similarity });
+        }
+    }
+    pairs
+}
+
+/// Chains segments that follow each other in both files with gaps of at most [`MAX_GAP`]
+/// tokens (in one file, without making the copies overlap). Gap tokens count as different.
+fn chain_segments(segs: &mut [Segment], chains: &mut Vec<Segment>, same_file: bool) {
+    segs.sort_unstable_by_key(|s| (s.a0, s.b0));
+    chains.clear();
+    for s in segs.iter() {
+        let lo = chains.len().saturating_sub(CHAIN_LOOKBACK);
+        let found = chains[lo..].iter_mut().rev().find(|c| {
+            s.a0 >= c.a1
+                && s.a0 - c.a1 <= MAX_GAP
+                && s.b0 >= c.b1
+                && s.b0 - c.b1 <= MAX_GAP
+                && (!same_file || s.a1 <= c.b0)
+        });
+        match found {
+            Some(c) => {
+                c.a1 = s.a1;
+                c.b1 = s.b1;
+                c.same += s.same;
+            }
+            None => chains.push(*s),
+        }
+    }
+}
+
+/// Builds members, best partners and groups from the sorted pairs.
+///
+/// Members: the copies of all pairs sorted by (file, position); a copy that overlaps the
+/// current member of its file by at least half of the shorter of the two joins it (the member
+/// grows to the union). Groups: connected components of members linked by pairs.
+fn cluster(pairs: Vec<ClonePair>) -> DupesReport {
+    // (region, pair index * 2 + side)
+    let mut ends: Vec<(Region, u32)> = Vec::with_capacity(pairs.len() * 2);
+    for (i, p) in pairs.iter().enumerate() {
+        ends.push((p.a, i as u32 * 2));
+        ends.push((p.b, i as u32 * 2 + 1));
+    }
+    ends.sort_unstable_by_key(|(r, i)| (r.file, r.start_tok, r.end_tok, *i));
+    let mut members: Vec<Region> = Vec::new();
+    // Member of each pair end.
+    let mut member_of = vec![0u32; pairs.len() * 2];
+    for (r, i) in &ends {
+        match members.last_mut() {
+            Some(m) if m.file == r.file && {
+                let overlap = m.end_tok.min(r.end_tok).saturating_sub(m.start_tok.max(r.start_tok));
+                overlap * 2 >= m.tokens().min(r.tokens())
+            } =>
+            {
+                if r.end_tok > m.end_tok {
+                    m.end_tok = r.end_tok;
+                    m.end_line = m.end_line.max(r.end_line);
+                }
+            }
+            _ => members.push(*r),
+        }
+        member_of[*i as usize] = members.len() as u32 - 1;
+    }
+    drop(ends);
+
+    // Best partner per member, and union-find over members.
+    let mut best: Vec<Option<Best>> = vec![None; members.len()];
+    let mut parent: Vec<u32> = (0..members.len() as u32).collect();
+    for (i, p) in pairs.iter().enumerate() {
+        let (ma, mb) = (member_of[i * 2], member_of[i * 2 + 1]);
+        if ma == mb {
+            continue;
+        }
+        offer(&mut best[ma as usize], p.b, p.similarity);
+        offer(&mut best[mb as usize], p.a, p.similarity);
+        let (ra, rb) = (find(&mut parent, ma), find(&mut parent, mb));
+        if ra != rb {
+            // Lower index as root: roots are the first member of their group.
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            parent[hi as usize] = lo;
+        }
+    }
+    drop(member_of);
+
+    // Group ids in order of first member; counting sort of members by group.
+    let n = members.len();
+    let mut group = vec![u32::MAX; n];
+    let mut groups: Vec<(u32, u32)> = Vec::new();
+    for m in 0..n {
+        let r = find(&mut parent, m as u32) as usize;
+        if group[r] == u32::MAX {
+            group[r] = groups.len() as u32;
+            groups.push((0, 0));
+        }
+        group[m] = group[r];
+        groups[group[m] as usize].1 += 1;
+    }
+    let mut at = 0u32;
+    for g in &mut groups {
+        let size = g.1;
+        *g = (at, at);
+        at += size;
+    }
+    let mut group_members = vec![0u32; n];
+    for (m, &g) in group.iter().enumerate() {
+        let slot = &mut groups[g as usize].1;
+        group_members[*slot as usize] = m as u32;
+        *slot += 1;
+    }
+    DupesReport { pairs, members, best, group, groups, group_members, stats: DupesStats::default() }
+}
+
+/// Keeps the more similar partner (ties: the earlier one).
+#[inline]
+fn offer(best: &mut Option<Best>, other: Region, similarity: u8) {
+    let better = match best {
+        None => true,
+        Some(b) => {
+            similarity > b.similarity
+                || (similarity == b.similarity && (other.file, other.start_tok) < (b.other.file, b.other.start_tok))
+        }
+    };
+    if better {
+        *best = Some(Best { other, similarity });
+    }
+}
+
+/// Union-find root with path halving.
+#[inline]
+fn find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        let gp = parent[parent[x as usize] as usize];
+        parent[x as usize] = gp;
+        x = gp;
+    }
+    x
+}
+
+/// Runs that are reported only as exact copies: data (fewer than one token in [`WORD_SHARE`]
+/// is a name or keyword, e.g. tables of tuples or dict literals) or [`repetitive`] code.
+fn boilerplate(codes: &[u8]) -> bool {
+    let words = codes.iter().filter(|&&c| is_word(c)).count();
+    words * WORD_SHARE < codes.len() || repetitive(codes)
+}
+
+/// The code of a name or a keyword.
+#[inline]
+fn is_word(c: u8) -> bool {
+    c == TokenKind::Name as u8 || (TokenKind::False as u8..=TokenKind::Yield as u8).contains(&c)
+}
+
+/// The run is (nearly) periodic with a short period: at least [`REPEAT_PCT`]% of its positions
+/// repeat the code [`MAX_PERIOD`] or fewer positions earlier.
+fn repetitive(codes: &[u8]) -> bool {
+    let n = codes.len();
+    for p in 1..=MAX_PERIOD.min(n / 2) {
+        let same = codes[p..].iter().zip(codes).filter(|(x, y)| x == y).count();
+        if same * 100 >= (n - p) * REPEAT_PCT {
+            return true;
+        }
+    }
+    false
+}

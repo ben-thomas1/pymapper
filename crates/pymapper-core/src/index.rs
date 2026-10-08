@@ -82,7 +82,7 @@ mod qid;
 mod tests;
 
 pub use inputs::{Group, Inputs};
-pub use load::{LoadStats, ReadError, load};
+pub use load::{LoadOptions, LoadStats, ReadError, load, load_with};
 
 use std::ops::Range;
 use std::path::Path;
