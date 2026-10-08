@@ -12,7 +12,7 @@ use super::{Options, Report, Summary, concise};
 use crate::rules::{FileId, Severity};
 
 pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut Out<'_>) {
-    let mut msg = String::new();
+    let mut msg = String::with_capacity(super::SCRATCH);
     for f in r.iter() {
         let def = f.rule.def();
         out.str(match def.severity {

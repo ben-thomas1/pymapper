@@ -509,6 +509,80 @@ fn baseline_keys_are_unambiguous() {
 }
 
 #[test]
+fn baseline_parse_accepts_variations() {
+    // BOM, field order, unknown fields of every type, escapes (incl. a surrogate pair), missing
+    // `count` (1) and `detail`, and duplicate entries (counts add up).
+    let text = concat!(
+        "\u{feff}{\"comment\": {\"nested\": [1, 2.5e3, -0.5, 1E-2, true, false, null, \"s\"]},\n",
+        "  \"entries\": [\n",
+        r#"    {"count": 3, "detail": ["PyYAML", "yaml"], "id": "pkg/café/😀.py", "code": "PM601", "x": {}},"#,
+        "\n",
+        r#"    {"code": "PM999", "id": "\"\\\/\b\f\n\r\t"},"#,
+        "\n",
+        r#"    {"code": "PM999", "id": "\"\\/\b\f\n\r\t", "count": 4}"#,
+        "\n  ],\n  \"version\": 1\n}"
+    );
+    let b = parse(text);
+    assert_eq!((b.len(), b.total()), (2, 8));
+    let shown = b.to_string();
+    assert!(
+        shown.contains(r#"{"code": "PM601", "id": "pkg/café/😀.py", "detail": ["PyYAML", "yaml"], "count": 3}"#),
+        "{shown}"
+    );
+    assert!(shown.contains(r#"{"code": "PM999", "id": "\"\\/\u0008\u000c\n\r\t", "count": 5}"#), "{shown}");
+    let empty = parse(r#"{"version":1,"entries":[]}"#);
+    assert!(empty.is_empty());
+    assert_eq!(empty.to_string(), "{\n  \"version\": 1,\n  \"tool\": \"pymapper\",\n  \"entries\": []\n}\n");
+}
+
+#[test]
+fn baseline_parse_errors() {
+    let cases: &[(&str, &str)] = &[
+        ("", "invalid JSON at byte 0: expected `{`"),
+        ("[]", "invalid JSON at byte 0: expected `{`"),
+        (r#"{"version": 2, "entries": []}"#, "unsupported baseline version 2 (this pymapper reads version 1)"),
+        (r#"{"entries": []}"#, "not a pymapper baseline: missing `version`"),
+        (r#"{"version": 1}"#, "not a pymapper baseline: missing `entries`"),
+        (r#"{"version": 1, "entries": [{"id": "x"}]}"#, "not a pymapper baseline: entry without `code`"),
+        (r#"{"version": 1, "entries": [{"code": "PM101"}]}"#, "not a pymapper baseline: entry without `id`"),
+        (r#"{"version": 1, "entries": [{"code": "E501", "id": "x"}]}"#, "not a pymapper baseline: entry `code` is not PMxxx"),
+        (r#"{"version": 1, "entries": [1]}"#, "invalid JSON at byte 27: expected `{`"),
+        (r#"{"version": "1", "entries": []}"#, "invalid JSON at byte 12: expected a non-negative integer"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "x", "count": -1}]}"#, "invalid JSON at byte 65: expected a non-negative integer"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "x", "count": 1.5}]}"#, "invalid JSON at byte 66: expected an integer"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "x", "count": 4294967296}]}"#, "invalid JSON at byte 74: number out of range"),
+        (r#"{"version": 1, "entries": []} x"#, "invalid JSON at byte 30: trailing characters"),
+        (r#"{"version": 1, "entries": [],}"#, "invalid JSON at byte 29: expected a string"),
+        (r#"{"version": 1 "entries": []}"#, "invalid JSON at byte 14: expected `,` or `}`"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "\ud800"}]}"#, "invalid JSON at byte 58: unpaired surrogate"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "\udc00"}]}"#, "invalid JSON at byte 58: unpaired surrogate"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "\x"}]}"#, "invalid JSON at byte 54: invalid escape"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "\u12"}]}"#, "invalid JSON at byte 54: invalid \\u escape"),
+        ("{\"version\": 1, \"entries\": [{\"code\": \"PM101\", \"id\": \"a\nb\"}]}", "invalid JSON at byte 53: control character in string"),
+        (r#"{"version": 1, "entries": [{"code": "PM101", "id": "x"#, "invalid JSON at byte 53: unterminated string"),
+        (r#"{"version": 1, "x": tru, "entries": []}"#, "invalid JSON at byte 20: invalid literal"),
+        (r#"{"version": 1, "x": 01, "entries": []}"#, "invalid JSON at byte 22: invalid number"),
+        (r#"{"version": 1, "x": 1., "entries": []}"#, "invalid JSON at byte 22: invalid number"),
+        (r#"{"version": 1, "x": -, "entries": []}"#, "invalid JSON at byte 21: invalid number"),
+    ];
+    let mut wrong = Vec::new();
+    for &(text, want) in cases {
+        match Baseline::parse(text.as_bytes()) {
+            Ok(_) => wrong.push(format!("accepted {text}")),
+            Err(e) if e.to_string() != want => wrong.push(format!("{text}\n  got:  {e}\n  want: {want}")),
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // Deep nesting in skipped values is bounded, not a stack overflow.
+    let deep = format!("{{\"x\": {}{}, \"version\": 1, \"entries\": []}}", "[".repeat(100_000), "]".repeat(100_000));
+    let err = Baseline::parse(deep.as_bytes()).expect_err("too deep");
+    assert!(err.to_string().ends_with("nesting too deep"), "{err}");
+    let ok = format!("{{\"x\": {}{}, \"version\": 1, \"entries\": []}}", "[".repeat(100), "]".repeat(100));
+    assert!(Baseline::parse(ok.as_bytes()).is_ok());
+}
+
+#[test]
 fn baseline_tolerates_non_utf8_ids() {
     // A non-UTF-8 path is stored lossily and still matches on the next run.
     let c = ctx();
@@ -542,6 +616,75 @@ fn uri_encoding() {
     let mut out = Vec::new();
     super::sarif::push_uri(&mut out, b"a b/c%d#e?f/caf\xc3\xa9/\xff/x-y_z.~py");
     assert_eq!(out, b"a%20b/c%25d%23e%3Ff/caf%C3%A9/%FF/x-y_z.~py");
+}
+
+// ---------------------------------------------------------------------------------------------
+// IndexContext over a real index
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn index_context_renders_paths_ids_and_names() {
+    use crate::config::{Contract, ContractKind};
+    use crate::index::{Inputs, load};
+    use crate::roots::Origin;
+    use crate::walk::{WalkOptions, walk};
+
+    let dir = std::env::temp_dir().join(format!("pymapper-output-ctx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("pkg")).expect("mkdir");
+    std::fs::write(dir.join("pkg/__init__.py"), "").expect("write");
+    std::fs::write(dir.join("pkg/mod.py"), "import os\n\nclass C:\n    def run(self):\n        pass\n").expect("write");
+    let w = walk(&[&dir], &WalkOptions::everything());
+    let ix = load(Inputs::from_root_dir(&dir, &w.files, Origin::FirstParty, b"proj"));
+    let run = ix.find(b"pkg.mod:C.run").expect("method node");
+    let file = ix.file(run).expect("file");
+    let os = ix.strings().get(b"os").expect("interned").to_raw();
+    let contracts = [Contract {
+        name: "layers".to_owned(),
+        kind: ContractKind::Independence { modules: Vec::new() },
+        allow_type_checking: false,
+        transitive: false,
+        ignore_imports: Vec::new(),
+    }];
+
+    let mut f = Findings::new();
+    f.push(UNUSED_METHOD, Location::new(FileId(file), 4, 5), SymbolId(run), 90, &[Arg::Symbol(SymbolId(run))]);
+    f.push(FORBIDDEN_IMPORT, Location::new(FileId(file), 1, 1), SymbolId(run), 100, &[
+        Arg::Symbol(SymbolId(run)),
+        Arg::Name(os),
+        Arg::Contract(0),
+    ]);
+    // Unknown ids render as `?` instead of panicking.
+    f.push(FORBIDDEN_IMPORT, Location::new(FileId(file), 2, 1), SymbolId(run), 100, &[
+        Arg::Symbol(SymbolId(u32::MAX - 1)),
+        Arg::Name(0),
+        Arg::Contract(7),
+    ]);
+    let ctx = IndexContext::new(&ix, &dir, &contracts);
+    let opts = Options { footer: false, ..Options::new(OutputFormat::Concise) };
+    let render_ctx = |c: &IndexContext<'_>| {
+        let r = Report::new(&f, c);
+        let mut out = Vec::new();
+        r.write(&opts, &Summary::default(), &mut out).expect("write");
+        String::from_utf8(out).expect("UTF-8")
+    };
+    assert_eq!(
+        render_ctx(&ctx),
+        "pkg/mod.py:1:1: PM303 `pkg.mod:C.run` imports forbidden module `os` (contract `layers`)\n\
+         pkg/mod.py:2:1: PM303 `?` imports forbidden module `?` (contract `?`)\n\
+         pkg/mod.py:4:5: PM403 method `pkg.mod:C.run` is never used (confidence 90)\n"
+    );
+    // A root with a trailing slash strips the same way.
+    let slash = std::path::PathBuf::from(format!("{}/", dir.display()));
+    assert!(render_ctx(&IndexContext::new(&ix, &slash, &contracts)).starts_with("pkg/mod.py:1:1: "));
+    // Files outside the root keep their full path.
+    let other = dir.join("elsewhere");
+    let full = render_ctx(&IndexContext::new(&ix, &other, &contracts));
+    assert!(full.starts_with(&format!("{}/pkg/mod.py:1:1: ", dir.display())), "{full}");
+    // A directory whose name is a prefix of the file's directory is not an ancestor.
+    let prefix = std::path::PathBuf::from(format!("{}/pk", dir.display()));
+    assert!(render_ctx(&IndexContext::new(&ix, &prefix, &contracts)).starts_with(&format!("{}/pkg/", dir.display())));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

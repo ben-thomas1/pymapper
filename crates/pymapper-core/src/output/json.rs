@@ -92,8 +92,8 @@ fn u32_or_null(out: &mut Vec<u8>, v: u32) {
 }
 
 pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut Out<'_>) {
-    let mut msg = String::new();
-    let mut sym = Vec::new();
+    let mut msg = String::with_capacity(super::SCRATCH);
+    let mut sym = Vec::with_capacity(super::SCRATCH);
     {
         let b = out.buf();
         b.extend_from_slice(b"{\"version\":");

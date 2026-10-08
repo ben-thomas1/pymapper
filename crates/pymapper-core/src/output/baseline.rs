@@ -75,7 +75,6 @@ impl From<SyntaxError> for BaselineError {
 /// Encoding: the rule code (2 bytes, little endian), then each part (id first, then the detail
 /// arguments) as a 4-byte little-endian length and its bytes. Length prefixes make the
 /// encoding unambiguous whatever bytes the parts contain.
-#[derive(Default)]
 pub(crate) struct KeyBuf {
     key: Vec<u8>,
     part: Vec<u8>,
@@ -88,6 +87,14 @@ fn push_part(key: &mut Vec<u8>, part: &[u8]) {
 }
 
 impl KeyBuf {
+    pub fn new() -> KeyBuf {
+        KeyBuf {
+            key: Vec::with_capacity(super::SCRATCH),
+            part: Vec::with_capacity(super::SCRATCH),
+            text: String::with_capacity(super::SCRATCH),
+        }
+    }
+
     /// The key of `f` (valid until the next call).
     pub fn build(&mut self, r: &Report<'_>, f: &Finding) -> &[u8] {
         let ctx = r.ctx();
@@ -235,7 +242,7 @@ impl Baseline {
     /// The baseline of every finding in `r`.
     pub fn from_report(r: &Report<'_>) -> Baseline {
         let mut b = Baseline::new();
-        let mut kb = KeyBuf::default();
+        let mut kb = KeyBuf::new();
         for f in r.iter() {
             b.add(kb.build(r, f), 1);
         }
@@ -248,7 +255,7 @@ impl Baseline {
             return 0;
         }
         let mut left: Vec<u32> = self.entries.iter().map(|e| e.count).collect();
-        let mut kb = KeyBuf::default();
+        let mut kb = KeyBuf::new();
         let mut order = std::mem::take(&mut r.order);
         let before = order.len();
         let items = r.findings().as_slice();

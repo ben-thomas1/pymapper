@@ -64,6 +64,10 @@ use crate::rules::{FileId, FilterStats, Finding, Findings, SymbolId};
 /// Version of the JSON output schema (bumped on incompatible changes).
 pub const JSON_VERSION: u32 = 1;
 
+/// Initial capacity of the reused per-line scratch buffers (messages, ids, keys), so typical
+/// lines never grow them.
+pub(crate) const SCRATCH: usize = 512;
+
 /// Process exit status of `check` (design: "Exit 0 clean / 1 findings / 2 usage or fatal").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExitStatus {
@@ -126,25 +130,32 @@ const NO_RANK: u32 = u32::MAX;
 impl Paths {
     fn build(findings: &Findings, ctx: &dyn Context) -> Paths {
         let mut p = Paths::default();
-        // First pass: dense file -> provisional slot, rendering each distinct path once.
-        let mut files: Vec<FileId> = Vec::new();
-        for f in findings.as_slice() {
-            let file = f.loc.file;
-            if file == FileId::NONE {
+        let items = findings.as_slice();
+        // Size every table once: mark the files with findings, then render each distinct path
+        // once, in file id order (slot = index into `files`).
+        let Some(max) = items.iter().filter(|f| f.loc.file != FileId::NONE).map(|f| f.loc.file.0).max() else {
+            return p;
+        };
+        p.rank_of = vec![NO_RANK; max as usize + 1];
+        let mut distinct = 0usize;
+        for f in items {
+            if f.loc.file != FileId::NONE && p.rank_of[f.loc.file.0 as usize] == NO_RANK {
+                p.rank_of[f.loc.file.0 as usize] = 0;
+                distinct += 1;
+            }
+        }
+        let mut files: Vec<FileId> = Vec::with_capacity(distinct);
+        p.spans.reserve_exact(distinct);
+        p.pool.reserve(distinct * 32);
+        for i in 0..=max {
+            if p.rank_of[i as usize] == NO_RANK {
                 continue;
             }
-            let i = file.0 as usize;
-            if i >= p.rank_of.len() {
-                p.rank_of.resize(i + 1, NO_RANK);
-            }
-            if p.rank_of[i] == NO_RANK {
-                p.rank_of[i] = files.len() as u32;
-                let start = p.pool.len() as u32;
-                ctx.write_path(file, &mut p.pool);
-                lossy_tail(&mut p.pool, start as usize);
-                p.spans.push((start, p.pool.len() as u32 - start));
-                files.push(file);
-            }
+            let start = p.pool.len() as u32;
+            ctx.write_path(FileId(i), &mut p.pool);
+            lossy_tail(&mut p.pool, start as usize);
+            p.spans.push((start, p.pool.len() as u32 - start));
+            files.push(FileId(i));
         }
         // Rank slots by path bytes (file id breaks ties between equal display paths).
         let mut order: Vec<u32> = (0..files.len() as u32).collect();

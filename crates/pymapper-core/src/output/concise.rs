@@ -7,7 +7,7 @@ use super::{Options, Report, Summary};
 use crate::rules::{FileId, Finding};
 
 pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut Out<'_>) {
-    let mut msg = String::new();
+    let mut msg = String::with_capacity(super::SCRATCH);
     for f in r.iter() {
         location(r, f, out);
         let _ = write!(out, "{} ", f.rule);

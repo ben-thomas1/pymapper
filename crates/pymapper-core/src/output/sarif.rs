@@ -85,9 +85,9 @@ pub(super) fn write(r: &Report<'_>, out: &mut Out<'_>) {
     b.extend_from_slice(b"}\n      },");
     b.extend_from_slice(b"\n      \"columnKind\": \"unicodeCodePoints\",\n      \"results\": [");
 
-    let mut msg = String::new();
-    let mut sym = Vec::new();
-    let mut keybuf = KeyBuf::default();
+    let mut msg = String::with_capacity(super::SCRATCH);
+    let mut sym = Vec::with_capacity(super::SCRATCH);
+    let mut keybuf = KeyBuf::new();
     for (i, f) in r.iter().enumerate() {
         r.message(f, &mut msg);
         r.symbol_id(f, &mut sym);
