@@ -730,19 +730,54 @@ fn path_list_and_order() {
     assert_eq!(l.byte_len(), 6 + 6 + 4 + 6 + 2 + 8);
     assert_eq!(l.get(4), Path::new("/x"));
     assert_eq!(l.get_bytes(6), b"");
-    l.sort_dedup();
-    let got: Vec<&[u8]> = (0..l.len()).map(|i| l.get_bytes(i)).collect();
-    let want: [&[u8]; 6] = [b"", b"/x", b"a/a/z.py", b"a/b.py", b"a-b.py", b"a.py"];
-    assert_eq!(got, want);
     assert_eq!(path_cmp(b"a/b", b"a-b"), Ordering::Less);
     assert_eq!(path_cmp(b"a", b"a/b"), Ordering::Less);
     assert_eq!(path_cmp(b"ab", b"a/b"), Ordering::Greater);
     assert_eq!(path_cmp(b"x", b"x"), Ordering::Equal);
-    let mut m = PathList::default();
-    m.push(b"q").unwrap();
-    l.append(m).unwrap();
-    assert_eq!(l.get(l.len() - 1), Path::new("q"));
-    assert_eq!(l.get(l.len() - 2), Path::new("a.py"));
+}
+
+/// A worker result from `(root, rel)` pairs.
+fn found(items: &[(u32, &str)]) -> Found {
+    let mut f = Found::default();
+    for &(r, rel) in items {
+        f.push(r, &[rel.as_bytes()]).unwrap();
+    }
+    f
+}
+
+#[test]
+fn merge_joins_prefixes_sorts_and_dedups() {
+    // Roots: "/r/" , "/r/sub/" (nested in the first), "/q/", and the file-root slot "".
+    let prefixes: [&[u8]; 4] = [b"/r/", b"/r/sub/", b"/q/", b""];
+    let a = found(&[(0, "sub/m.py"), (0, "z.py"), (1, "m.py"), (0, "a-b.py")]);
+    let b = found(&[(2, "x.py"), (1, "n.py"), (0, "sub/n.py"), (3, "/r/z.py"), (0, "a/b.py")]);
+    let (out, dropped) = merge(vec![a, Found::default(), b], &prefixes, true);
+    assert_eq!(dropped, 0);
+    let got: Vec<&str> = out.iter().map(|p| p.to_str().unwrap()).collect();
+    assert_eq!(got, ["/q/x.py", "/r/a/b.py", "/r/a-b.py", "/r/sub/m.py", "/r/sub/n.py", "/r/z.py"]);
+    // Exactly sized: no growth slack in the output.
+    assert_eq!(out.bytes.capacity(), out.byte_len() + "/r/sub/m.py".len() + "/r/sub/n.py".len() + "/r/z.py".len());
+    // Unsorted: concatenation in worker order, duplicates kept.
+    let a = found(&[(0, "z.py"), (1, "m.py")]);
+    let (cat, _) = merge(vec![a, found(&[(3, "/f.py")])], &prefixes, false);
+    let got: Vec<&str> = cat.iter().map(|p| p.to_str().unwrap()).collect();
+    assert_eq!(got, ["/r/z.py", "/r/sub/m.py", "/f.py"]);
+}
+
+#[test]
+fn joined_cmp_agrees_with_concatenation() {
+    const PARTS: &[&str] = &["", "a", "/", "a/", "ab", "a-", "a/b", "b", "/a", "aa/"];
+    for a0 in PARTS {
+        for a1 in PARTS {
+            for b0 in PARTS {
+                for b1 in PARTS {
+                    let want = path_cmp(format!("{a0}{a1}").as_bytes(), format!("{b0}{b1}").as_bytes());
+                    let got = joined_cmp(a0.as_bytes(), a1.as_bytes(), b0.as_bytes(), b1.as_bytes());
+                    assert_eq!(got, want, "{a0:?}+{a1:?} vs {b0:?}+{b1:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

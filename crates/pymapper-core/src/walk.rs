@@ -231,32 +231,87 @@ impl PathList {
         self.push_parts(&[path])
     }
 
-    /// Sorts component-wise (`/` orders before every other byte) and drops duplicates.
-    fn sort_dedup(&mut self) {
-        let mut order: Vec<u32> = (0..self.ends.len() as u32).collect();
-        order.sort_unstable_by(|&a, &b| path_cmp(self.get_bytes(a as usize), self.get_bytes(b as usize)));
-        let mut out = PathList { bytes: Vec::with_capacity(self.bytes.len()), ends: Vec::with_capacity(self.len()) };
-        let mut prev: Option<&[u8]> = None;
-        for &i in &order {
-            let p = self.get_bytes(i as usize);
-            if prev == Some(p) {
-                continue;
-            }
-            // Cannot fail: the output is no larger than the input.
-            let _ = out.push(p);
-            prev = Some(p);
-        }
-        *self = out;
-    }
+}
 
-    /// Moves all paths of `other` to the end of `self`.
-    fn append(&mut self, other: PathList) -> Result<(), PathListFull> {
-        let base = self.bytes.len();
-        u32::try_from(base + other.bytes.len()).map_err(|_| PathListFull)?;
-        self.bytes.extend_from_slice(&other.bytes);
-        self.ends.extend(other.ends.iter().map(|&e| e + base as u32));
+/// Files found by one worker: each path relative to its root (the root's output prefix is
+/// left out, so a deep absolute root is not repeated per file while walking) plus the root
+/// index of each file.
+#[derive(Default)]
+struct Found {
+    rel: PathList,
+    root: Vec<u32>,
+}
+
+impl Found {
+    fn push(&mut self, root: u32, parts: &[&[u8]]) -> Result<(), PathListFull> {
+        self.rel.push_parts(parts)?;
+        self.root.push(root);
         Ok(())
     }
+}
+
+/// Joins the per-worker results into one exactly sized list of full paths (`prefixes[root]`
+/// followed by the relative path); with `sort`, ordered component-wise (`/` before every
+/// other byte) without duplicates. Worker results that would push the total past 4 GiB are
+/// left out; the second value counts them.
+fn merge(found: Vec<Found>, prefixes: &[&[u8]], sort: bool) -> (PathList, usize) {
+    let mut bytes = 0usize;
+    let mut n = 0usize;
+    let mut dropped = 0usize;
+    let mut kept = Vec::with_capacity(found.len());
+    for f in found {
+        let mut fb = f.rel.bytes.len();
+        for &r in &f.root {
+            fb += prefixes[r as usize].len();
+        }
+        if u32::try_from(bytes + fb).is_err() {
+            dropped += 1;
+            continue;
+        }
+        bytes += fb;
+        n += f.root.len();
+        kept.push(f);
+    }
+    let mut out = PathList { bytes: Vec::with_capacity(bytes), ends: Vec::with_capacity(n) };
+    let part = |c: u32, i: u32| {
+        let f = &kept[c as usize];
+        (f.root[i as usize], f.rel.get_bytes(i as usize))
+    };
+    let cmp = |a: (u32, &[u8]), b: (u32, &[u8])| {
+        if a.0 == b.0 {
+            path_cmp(a.1, b.1)
+        } else {
+            joined_cmp(prefixes[a.0 as usize], a.1, prefixes[b.0 as usize], b.1)
+        }
+    };
+    if sort {
+        // Sort (worker, index) pairs and copy once into the exact-size output.
+        let mut order: Vec<(u32, u32)> = Vec::with_capacity(n);
+        for (c, f) in kept.iter().enumerate() {
+            for i in 0..f.root.len() {
+                order.push((c as u32, i as u32));
+            }
+        }
+        order.sort_unstable_by(|&(c, i), &(d, j)| cmp(part(c, i), part(d, j)));
+        let mut prev: Option<(u32, &[u8])> = None;
+        for &(c, i) in &order {
+            let cur = part(c, i);
+            if prev.is_some_and(|p| cmp(p, cur) == Ordering::Equal) {
+                continue;
+            }
+            // Cannot fail: the total was checked above.
+            let _ = out.push_parts(&[prefixes[cur.0 as usize], cur.1]);
+            prev = Some(cur);
+        }
+    } else {
+        for (c, f) in kept.iter().enumerate() {
+            for i in 0..f.root.len() {
+                let (r, rel) = part(c as u32, i as u32);
+                let _ = out.push_parts(&[prefixes[r as usize], rel]);
+            }
+        }
+    }
+    (out, dropped)
 }
 
 /// A [`PathList`] cannot hold more than 4 GiB of path bytes.
@@ -274,14 +329,52 @@ impl std::error::Error for PathListFull {}
 /// Component-wise byte order: like comparing the byte strings with `/` mapped below 0x00, so
 /// `a/b` sorts before `a-b` and `a.b`, and a directory's contents stay together.
 fn path_cmp(a: &[u8], b: &[u8]) -> Ordering {
-    let n = a.len().min(b.len());
-    let pos = a[..n].iter().zip(&b[..n]).position(|(x, y)| x != y);
-    match pos {
-        Some(i) => {
-            let key = |c: u8| if c == b'/' { 0u16 } else { c as u16 + 1 };
-            key(a[i]).cmp(&key(b[i]))
-        }
+    match first_diff(a, b) {
+        Some(i) => byte_key(a[i]).cmp(&byte_key(b[i])),
         None => a.len().cmp(&b.len()),
+    }
+}
+
+#[inline]
+fn byte_key(c: u8) -> u16 {
+    if c == b'/' { 0 } else { c as u16 + 1 }
+}
+
+/// First index below the shorter length where `a` and `b` differ.
+#[inline]
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    a[..n].iter().zip(&b[..n]).position(|(x, y)| x != y)
+}
+
+/// [`path_cmp`] of the concatenations `a0 a1` and `b0 b1`, without building them.
+fn joined_cmp(a0: &[u8], a1: &[u8], b0: &[u8], b1: &[u8]) -> Ordering {
+    if a0 == b0 {
+        return path_cmp(a1, b1);
+    }
+    let (mut x, mut x_next) = (a0, a1);
+    let (mut y, mut y_next) = (b0, b1);
+    loop {
+        if x.is_empty() {
+            if x_next.is_empty() {
+                return if y.is_empty() && y_next.is_empty() { Ordering::Equal } else { Ordering::Less };
+            }
+            (x, x_next) = (x_next, &[]);
+            continue;
+        }
+        if y.is_empty() {
+            if y_next.is_empty() {
+                return Ordering::Greater;
+            }
+            (y, y_next) = (y_next, &[]);
+            continue;
+        }
+        if let Some(i) = first_diff(x, y) {
+            return byte_key(x[i]).cmp(&byte_key(y[i]));
+        }
+        let n = x.len().min(y.len());
+        x = &x[n..];
+        y = &y[n..];
     }
 }
 
@@ -302,12 +395,13 @@ struct IgnoreNode {
 
 /// Per-root constants.
 ///
-/// Paths below a root are `out_prefix + rel`. Gitignore matching uses the *match key*
+/// Paths below a root are `out + rel`. Gitignore matching uses the *match key*
 /// `key_prefix + rel`, which is the path relative to the enclosing repository top (or to the
 /// root when there is none), so ancestor ignore files see the paths they expect. Configured
 /// excludes use `ex_prefix + rel`, the path relative to [`WalkOptions::exclude_base`].
 struct RootCtx {
-    out_len: usize,
+    /// Output prefix: the root path plus `/`, or empty for `.`.
+    out: Box<[u8]>,
     key_prefix: Box<[u8]>,
     ex_prefix: Box<[u8]>,
 }
@@ -341,7 +435,7 @@ struct Worker {
     ents: Vec<Ent>,
     key: Vec<u8>,
     ex_key: Vec<u8>,
-    files: PathList,
+    found: Found,
     diags: Vec<Diagnostic>,
     stats: WalkStats,
 }
@@ -383,6 +477,7 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
     };
     let mut ctxs = Vec::with_capacity(roots.len());
     let mut seeds = Vec::with_capacity(roots.len());
+    let mut file_roots = Vec::new();
     for root in roots {
         let root = root.as_ref();
         let meta = match fs::metadata(root) {
@@ -393,8 +488,8 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
             }
         };
         if !meta.is_dir() {
-            if meta.is_file() && main.files.push(root.as_os_str().as_bytes()).is_err() {
-                main.diag(DiagnosticKind::PathListFull, root, io::Error::other(PathListFull));
+            if meta.is_file() {
+                file_roots.push(root);
             }
             continue;
         }
@@ -408,8 +503,15 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
             Some(b) => rel_prefix(root, b),
             None => Box::default(),
         };
-        ctxs.push(RootCtx { out_len: out.len(), key_prefix, ex_prefix });
-        seeds.push(DirTask { path: out, root: (ctxs.len() - 1) as u32, ignore });
+        seeds.push(DirTask { path: out.clone(), root: ctxs.len() as u32, ignore });
+        ctxs.push(RootCtx { out, key_prefix, ex_prefix });
+    }
+    // File roots are stored whole, under an extra root index with an empty prefix.
+    let file_root = ctxs.len() as u32;
+    for root in file_roots {
+        if main.found.push(file_root, &[root.as_os_str().as_bytes()]).is_err() {
+            main.diag(DiagnosticKind::PathListFull, root, io::Error::other(PathListFull));
+        }
     }
     let sh = Shared { opts, roots: ctxs, excludes, workers: (0..threads).map(|_| Mutex::default()).collect() };
     rayon::scope(|s| {
@@ -418,21 +520,27 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
             s.spawn(move |s| run_dir(s, sh, task));
         }
     });
-    let mut out = Walk { files: main.files, diagnostics: main.diags, stats: main.stats };
+    let mut found = Vec::with_capacity(sh.workers.len() + 1);
+    found.push(main.found);
+    let mut out = Walk { files: PathList::default(), diagnostics: main.diags, stats: main.stats };
     for slot in sh.workers {
         let w = slot.into_inner().unwrap_or_else(PoisonError::into_inner);
         out.stats.add(&w.stats);
         out.diagnostics.extend(w.diags);
-        if out.files.append(w.files).is_err() {
-            out.diagnostics.push(Diagnostic {
-                kind: DiagnosticKind::PathListFull,
-                path: PathBuf::new(),
-                error: io::Error::other(PathListFull),
-            });
-        }
+        found.push(w.found);
+    }
+    let mut prefixes: Vec<&[u8]> = sh.roots.iter().map(|r| &*r.out).collect();
+    prefixes.push(b"");
+    let (files, dropped) = merge(found, &prefixes, opts.sort);
+    out.files = files;
+    for _ in 0..dropped {
+        out.diagnostics.push(Diagnostic {
+            kind: DiagnosticKind::PathListFull,
+            path: PathBuf::new(),
+            error: io::Error::other(PathListFull),
+        });
     }
     if opts.sort {
-        out.files.sort_dedup();
         out.diagnostics.sort_by(|a, b| {
             path_cmp(a.path.as_os_str().as_bytes(), b.path.as_os_str().as_bytes())
                 .then((a.kind as u8).cmp(&(b.kind as u8)))
@@ -676,7 +784,8 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
 
     // This directory's ignore chain.
     let ctx = &sh.roots[task.root as usize];
-    let dir_key_len = ctx.key_prefix.len() + task.path.len() - ctx.out_len;
+    let rel = &task.path[ctx.out.len()..];
+    let dir_key_len = ctx.key_prefix.len() + rel.len();
     let mut chain = task.ignore;
     if let Some(kind) = dot_git {
         // A repository top: outer ignore files stop applying; `info/exclude` is the base.
@@ -692,7 +801,6 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
     if has_ignore {
         chain = load_ignore(&dir.join(".ignore"), dir_key_len, chain, w);
     }
-    let rel = &task.path[ctx.out_len..];
     if chain.is_some() {
         w.key.clear();
         w.key.extend_from_slice(&ctx.key_prefix);
@@ -722,7 +830,7 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
                     w.stats.ignored += 1;
                     continue;
                 }
-                if w.files.push_parts(&[&task.path, name]).is_err() {
+                if w.found.push(task.root, &[rel, name]).is_err() {
                     let path = bytes_path(&task.path).join(bytes_path(name));
                     w.diags.push(Diagnostic {
                         kind: DiagnosticKind::PathListFull,
