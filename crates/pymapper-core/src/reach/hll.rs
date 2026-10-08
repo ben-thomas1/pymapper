@@ -19,7 +19,7 @@
 //! Keys of distinct elements collide with probability `2^-32` per pair, so a set of `n`
 //! elements has about `n^2 / 2^33` fewer distinct keys: a relative bias of `-n / 2^33`
 //! (-0.01% at 1M elements, -0.2% at 16M), small against the sketch error. In exchange sparse
-//! sets (see `sketch.rs`) store 4 bytes per element and dense sketches never need a second
+//! sets (see `sizes.rs`) store 4 bytes per element and dense sketches never need a second
 //! hash.
 
 /// Smallest supported precision (16 registers).

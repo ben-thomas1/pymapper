@@ -9,8 +9,8 @@
 //! Shapes as in the `graph` bench (default 1M nodes, average out-degree 3): `random`, `calls`,
 //! `chain`, `blocks`. Every node is a symbol with 1..=30 own lines (mean 15.5). Roots for the
 //! BFS: every 100th node. `--exact` also runs `SizeMode::Exact` and reports the relative error
-//! of the estimated sizes above `2^p / 4` (sets of at most `2^p / 4` nodes and `2^p` lines
-//! are exact).
+//! of the estimated sizes above `2^p / 4` (sets of at most `2^p / 4` nodes and `4 * 2^p`
+//! lines are exact).
 //!
 //! Times are best of R (graph generation and condensation are not timed). Peak RSS is
 //! process-wide: run one configuration per process.

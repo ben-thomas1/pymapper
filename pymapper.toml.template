@@ -261,7 +261,10 @@
 #       O(sum of reached parts), up to O(V * (V + E)) (quadratic on long call chains); memory
 #       4 bytes per component per worker. Measured: 47-55ms on 14 threads (324ms on one) for
 #       a 17M-LOC venv, where the estimate takes ~240ms; a 30k-node chain takes 196ms (75x
-#       the estimate).
+#       the estimate). On shallow call graphs (small reach sets, as in the venv) exact mode
+#       is therefore cheaper than the estimate and bounded in memory, while the estimate
+#       holds 2 * (2^p + 136) bytes per live dense sketch (2.3 KB at p = 10; 3.4 MB on the
+#       venv, 142 MB on an adversarial 200k-node synthetic graph).
 
 # Dead code: a name referenced anywhere (attribute access, identifier-like string literals,
 # getattr) keeps a definition possibly live; it is reported with lower confidence instead of

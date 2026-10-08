@@ -44,7 +44,10 @@ pub struct RootOptions<'a> {
     /// Tests: test files (`test_*.py`, `*_test.py`, `test.py`, `conftest.py`, anything under
     /// a `test` / `tests` package) and in them functions and methods named `test*`, classes named
     /// `Test*`, unittest / pytest hooks, and every module-level function of `conftest.py`
-    /// (fixtures and hooks are found by name).
+    /// (fixtures and hooks are found by name). Deliberately lenient: `test*` methods of any
+    /// class of a test file are roots, not only of `Test*` / `unittest.TestCase` classes, and
+    /// a package named `test` / `tests` at any level above the module makes a test file (the
+    /// distribution, depth 0, is not checked).
     pub tests: bool,
     /// Library mode: the public API is live (see [`roots`]).
     pub public_api: bool,
@@ -221,8 +224,9 @@ struct Scratch {
 ///   the file's imports with `imp` (`models.Model` after `from django.db import models` is
 ///   `django.db.models.Model`), or a loaded ancestor's dotted name (`pkg.mod.Class`) matches;
 ///   its methods are roots too.
-/// - Script targets are looked up as qualified ids ([`Index::find`]); the target and its
-///   module are roots.
+/// - Script targets are looked up as qualified ids ([`Index::find`]), then, with `imp`,
+///   through module-level bindings (re-exports in an `__init__`); the target, the module
+///   named by the target and the module defining the target are roots.
 pub fn roots(ix: &Index, imp: Option<&Imports>, calls: Option<&ResolvedCalls>, opts: &RootOptions<'_>) -> RootSet {
     let mut set = RootSet::new(ix.node_count());
     let mut sc = Scratch::default();
@@ -241,8 +245,9 @@ pub fn roots(ix: &Index, imp: Option<&Imports>, calls: Option<&ResolvedCalls>, o
         sc.buf.clear();
         let target = s.split(|&c| c == b'[').next().unwrap_or(&[]);
         sc.buf.extend(target.iter().copied().filter(|c| !c.is_ascii_whitespace()));
-        match ix.find(&sc.buf) {
-            Some(v) => {
+        match script_target(ix, imp, &sc.buf) {
+            Some((m, v)) => {
+                set.add(m, root_kind::SCRIPT);
                 set.add(v, root_kind::SCRIPT);
                 if let Some(f) = ix.file(v) {
                     set.add(ix.file_node(f), root_kind::SCRIPT);
@@ -252,6 +257,49 @@ pub fn roots(ix: &Index, imp: Option<&Imports>, calls: Option<&ResolvedCalls>, o
         }
     }
     set
+}
+
+/// Resolves script target `pkg.mod[:attr.path]` (whitespace and extras removed) to its module
+/// node and its target node. The attribute path is first looked up as a qualified id
+/// ([`Index::find`]). Failing that, each segment is resolved, with `imp`, as a module-level
+/// binding of the current module (`Imports::global`: re-exports such as `from .cli import main`
+/// in `pkg/__init__.py`, aliases, star imports), else as a child (a def of a class or module,
+/// a submodule of a package). Targets that are
+/// not `module[:path]` (empty, `@group`, several `:`) match nothing.
+fn script_target(ix: &Index, imp: Option<&Imports>, target: &[u8]) -> Option<(NodeId, NodeId)> {
+    if target.is_empty() || target[0] == b'@' || target.iter().filter(|&&c| c == b':').count() > 1 {
+        return None;
+    }
+    let (module, path) = match target.iter().position(|&c| c == b':') {
+        Some(i) => (&target[..i], Some(&target[i + 1..])),
+        None => (target, None),
+    };
+    let m = ix.find(module)?;
+    if !matches!(ix.kind(m), NodeKind::Package | NodeKind::Module) {
+        return None;
+    }
+    let Some(path) = path else { return Some((m, m)) };
+    if let Some(v) = ix.find(target) {
+        return Some((m, v));
+    }
+    let mut cur = m;
+    for seg in path.split(|&c| c == b'.') {
+        let sym = ix.strings().get(seg)?;
+        let module_like = matches!(ix.kind(cur), NodeKind::Package | NodeKind::Module);
+        let via_binding = match (module_like, imp) {
+            (true, Some(imp)) => match ix.file(cur).and_then(|f| imp.global(ix, f, sym)) {
+                Some(Global::Def(n) | Global::Module(n)) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        };
+        cur = match via_binding {
+            Some(n) => n,
+            // A def of a class, or a submodule of a package (`from pkg import sub` semantics).
+            None => ix.children(cur).find(|&c| (ix.kind(c).is_def() || module_like) && ix.name_sym(c) == sym)?,
+        };
+    }
+    Some((m, cur))
 }
 
 /// A dunder name (`__x__`).

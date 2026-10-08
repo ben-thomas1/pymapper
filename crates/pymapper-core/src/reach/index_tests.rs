@@ -232,6 +232,49 @@ fn script_targets() {
 }
 
 #[test]
+fn script_targets_through_reexports() {
+    let f = fx(&[
+        ("mypkg/__init__.py", "from .cli import main\nfrom . import tools as t\n"),
+        ("mypkg/cli.py", "def main():\n    run()\n\ndef run():\n    pass\n\nclass App:\n    def go(self):\n        pass\n"),
+        ("mypkg/tools.py", "from .cli import App as Alias\n"),
+        ("mypkg/sub/__init__.py", ""),
+        ("mypkg/sub/deep.py", "def entry():\n    pass\n"),
+    ]);
+    let scripts: &[&[u8]] = &[
+        b"mypkg:main",
+        b"mypkg:t.Alias.go",
+        b"mypkg.sub:deep.entry",
+        b"mypkg:missing",
+        b"mypkg:main.nope",
+        b"@proj",
+        b"mypkg:main:x",
+        b"",
+    ];
+    let opts = RootOptions { modules: false, main: false, tests: false, scripts, ..RootOptions::application() };
+    let set = roots(&f.ix, Some(&f.imp), None, &opts);
+    assert_eq!(
+        f.roots(&set),
+        vec![
+            "mypkg script",
+            "mypkg.cli script",
+            "mypkg.cli:App.go script",
+            "mypkg.cli:main script",
+            "mypkg.sub script",
+            "mypkg.sub.deep script",
+            "mypkg.sub.deep:entry script",
+        ]
+    );
+    assert_eq!(set.unmatched_scripts(), &[3, 4, 5, 6, 7]);
+    // The call tree of the entry point is reachable from the script root.
+    let g = call_graph(&f.ix, &f.calls, CallFilter::default());
+    let live = forward(&g, set.iter());
+    assert!(live.contains(f.node("mypkg.cli:run")));
+    // Without import resolution only qualified ids match.
+    let set = roots(&f.ix, None, None, &opts);
+    assert_eq!(set.unmatched_scripts(), &[0, 1, 3, 4, 5, 6, 7]);
+}
+
+#[test]
 fn library_mode_resolution() {
     let with_main = fx(APP);
     assert!(!is_library(&with_main.ix, Mode::Auto, false));
