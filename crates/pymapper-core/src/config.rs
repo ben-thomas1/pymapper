@@ -713,6 +713,12 @@ impl EntrypointMatcher {
         !self.qualnames.is_empty()
     }
 
+    /// Whether any base-class pattern is configured (callers can skip class hierarchy work).
+    #[inline]
+    pub fn has_bases(&self) -> bool {
+        !self.bases.is_empty()
+    }
+
     /// Whether no rule is configured at all (callers can skip matching).
     pub fn is_empty(&self) -> bool {
         self.decorators.is_empty() && self.bases.is_empty() && self.names.is_empty() && self.qualnames.is_empty()
