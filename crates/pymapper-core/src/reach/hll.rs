@@ -56,13 +56,19 @@ pub fn rel_std_error(p: u8) -> f64 {
     1.04 / (registers(p) as f64).sqrt()
 }
 
+/// Register index and rank of `key` at precision `p`.
+#[inline]
+pub fn slot(key: u32, p: u8) -> (usize, u8) {
+    let idx = (key >> (32 - u32::from(p))) as usize;
+    let q = 32 - u32::from(p);
+    let rank = ((key << p).leading_zeros() + 1).min(q + 1) as u8;
+    (idx, rank)
+}
+
 /// Adds `key` to the registers of a precision-`p` sketch (`regs.len() == 2^p`).
 #[inline]
 pub fn insert(regs: &mut [u8], p: u8, key: u32) {
-    let idx = (key >> (32 - u32::from(p))) as usize;
-    let rest = key << p;
-    let q = 32 - u32::from(p);
-    let rank = (rest.leading_zeros() + 1).min(q + 1) as u8;
+    let (idx, rank) = slot(key, p);
     let r = &mut regs[idx];
     if rank > *r {
         *r = rank;
@@ -78,15 +84,31 @@ pub fn merge(dst: &mut [u8], src: &[u8]) {
     }
 }
 
+/// Number of distinct register values: histograms have `HIST` entries (values `0..=33`).
+pub const HIST: usize = 34;
+
+/// Histogram of the register values of a precision-`p` sketch (values above `33 - p`, which
+/// [`insert`] never writes, count as `33 - p`).
+pub fn histogram(regs: &[u8], p: u8) -> [u32; HIST] {
+    let top = 33 - usize::from(p);
+    let mut hist = [0u32; HIST];
+    for &r in regs {
+        hist[usize::from(r).min(top)] += 1;
+    }
+    hist
+}
+
 /// Estimated number of distinct keys added to the registers of a precision-`p` sketch.
 pub fn estimate(regs: &[u8], p: u8) -> f64 {
+    estimate_histogram(&histogram(regs, p), p)
+}
+
+/// [`estimate`] from the register histogram of a precision-`p` sketch: O(32), so callers
+/// that keep the histogram up to date avoid the O(2^p) pass.
+pub fn estimate_histogram(hist: &[u32; HIST], p: u8) -> f64 {
     let q = 32 - usize::from(p);
-    let m = regs.len() as f64;
-    let mut hist = [0u32; 34];
-    for &r in regs {
-        hist[usize::from(r).min(q + 1)] += 1;
-    }
-    if hist[q + 1] as usize == regs.len() {
+    let m = registers(p) as f64;
+    if f64::from(hist[q + 1]) == m {
         // Every register saturated (far beyond the 32-bit key range): the estimator diverges;
         // report the top of the representable range instead.
         return m * (1u64 << (q + 1)) as f64;

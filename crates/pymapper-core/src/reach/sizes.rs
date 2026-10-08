@@ -4,7 +4,7 @@
 
 use super::bits::BitSet;
 use super::exact;
-use super::hll;
+use super::hll::{self, HIST};
 use crate::extract::facts::NO_PARENT;
 use crate::graph::Condensed;
 use crate::index::Index;
@@ -17,10 +17,10 @@ pub const DEFAULT_PRECISION: u8 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizeMode {
     /// HyperLogLog sketches at this precision ([`hll::MIN_PRECISION`]`..=`
-    /// [`hll::MAX_PRECISION`]), merged sinks first. Sets of up to `2^p / 4` elements are kept
-    /// exactly (sparse), larger ones as `2^p` one-byte registers. O(V + E + total lines) plus
-    /// `O(2^p)` per DAG edge into a dense sketch; memory: the live sketches (see the module
-    /// docs of [`crate::reach`]).
+    /// [`hll::MAX_PRECISION`]), merged sinks first. A reach set of at most `2^p / 4` nodes and
+    /// `4 * 2^p` lines is kept exactly (sorted node ids), a larger one as two sketches of `2^p`
+    /// one-byte registers (symbols, lines). Costs and memory: see the module docs of
+    /// [`crate::reach`].
     Approx(u8),
     /// Exact sets: one depth-first search over the DAG per component, in parallel.
     /// O(sum over components of the DAG part they reach): up to O(k (k + E)) for `k`
@@ -96,11 +96,11 @@ impl Weights {
 /// Counters of a sketch propagation (all zero in exact mode).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SizeStats {
-    /// Components whose symbol or line set ended dense (one count per set).
+    /// Components whose reach set ended dense (estimated).
     pub dense_sets: u64,
-    /// Most sketches held at once (each component holds two: symbols and lines).
+    /// Most reach sets held at once (sparse or dense).
     pub peak_live: u64,
-    /// Most dense register arrays allocated at once (live plus pooled).
+    /// Most dense buffers allocated at once (live plus pooled), `2 (2^p + 136)` bytes each.
     pub peak_dense: u64,
     /// Peak bytes of live sparse sets.
     pub peak_sparse_bytes: u64,
@@ -167,7 +167,8 @@ pub fn reach_sizes(cd: &Condensed, w: &Weights, mode: SizeMode) -> ReachSizes {
     ReachSizes { symbols, lines, stats }
 }
 
-/// A set of element keys: exact (sorted unique keys) while small, else HLL registers.
+/// The reach set of a component: exact while small (sorted unique node ids), else two HLL
+/// sketches (symbol keys and line keys) in one buffer.
 enum Sketch {
     Sparse(Box<[u32]>),
     Dense(Box<[u8]>),
@@ -177,15 +178,41 @@ fn empty() -> Sketch {
     Sketch::Sparse(Box::default())
 }
 
-/// Sketch storage of a propagation: the live sketch pairs (symbols, lines) of components that
-/// still have unprocessed predecessors, and a pool of free register arrays.
-struct Store {
+/// Bytes of a register histogram stored after the registers of a dense sketch.
+const HIST_BYTES: usize = 4 * HIST;
+
+/// Layout of a dense buffer: the symbol sketch (`m` registers, then its histogram as `HIST`
+/// little-endian `u32`s), then the line sketch in the same shape.
+#[derive(Clone, Copy)]
+struct Layout {
     p: u8,
     m: usize,
-    /// Largest sparse set; one more key and it turns dense (sparse bytes > dense bytes).
-    threshold: usize,
-    /// Live sketch pairs; `free` lists unused slots.
-    slots: Vec<[Sketch; 2]>,
+}
+
+impl Layout {
+    /// Bytes of one sketch (registers + histogram).
+    #[inline]
+    fn part(self) -> usize {
+        self.m + HIST_BYTES
+    }
+
+    /// Registers of sketch `which` (0 = symbols, 1 = lines).
+    #[inline]
+    fn regs(self, which: usize) -> std::ops::Range<usize> {
+        which * self.part()..which * self.part() + self.m
+    }
+}
+
+/// Sketch storage of a propagation: the live sets of components that still have unprocessed
+/// predecessors, and a pool of free dense buffers.
+struct Store {
+    lay: Layout,
+    /// A sparse set holds at most this many nodes...
+    max_nodes: usize,
+    /// ...and at most this many lines (bounds the keys inserted when it meets a dense set).
+    max_lines: u64,
+    /// Live sets; `free` lists unused slots.
+    slots: Vec<Sketch>,
     free: Vec<u32>,
     pool: Vec<Box<[u8]>>,
     dense_allocated: u64,
@@ -195,7 +222,7 @@ struct Store {
 }
 
 impl Store {
-    /// A zeroed register array (pooled when possible).
+    /// A zeroed dense buffer (pooled when possible); histograms are set by [`Acc`].
     fn take_dense(&mut self) -> Box<[u8]> {
         match self.pool.pop() {
             Some(mut b) => {
@@ -205,152 +232,256 @@ impl Store {
             None => {
                 self.dense_allocated += 1;
                 self.stats.peak_dense = self.stats.peak_dense.max(self.dense_allocated);
-                vec![0u8; self.m].into_boxed_slice()
+                vec![0u8; 2 * self.lay.part()].into_boxed_slice()
             }
         }
     }
 
-    fn release(&mut self, s: Sketch) {
-        match s {
-            Sketch::Dense(b) => self.pool.push(b),
-            Sketch::Sparse(k) => self.sparse_bytes -= (k.len() * 4) as u64,
+    /// Stores a set; returns its slot.
+    fn put(&mut self, set: Sketch) -> u32 {
+        if let Sketch::Sparse(k) = &set {
+            self.sparse_bytes += (k.len() * 4) as u64;
         }
-    }
-
-    /// Stores a pair; returns its slot.
-    fn put(&mut self, pair: [Sketch; 2]) -> u32 {
-        for s in &pair {
-            if let Sketch::Sparse(k) = s {
-                self.sparse_bytes += (k.len() * 4) as u64;
-            }
-        }
-        self.live += 2;
+        self.live += 1;
         self.stats.peak_live = self.stats.peak_live.max(self.live);
         self.stats.peak_sparse_bytes = self.stats.peak_sparse_bytes.max(self.sparse_bytes);
         match self.free.pop() {
             Some(h) => {
-                self.slots[h as usize] = pair;
+                self.slots[h as usize] = set;
                 h
             }
             None => {
-                self.slots.push(pair);
+                self.slots.push(set);
                 (self.slots.len() - 1) as u32
             }
         }
     }
 
-    /// Frees slot `h`, recycling its register arrays.
+    /// Frees slot `h`, recycling its dense buffer.
     fn drop_slot(&mut self, h: u32) {
-        let [a, b] = std::mem::replace(&mut self.slots[h as usize], [empty(), empty()]);
-        self.release(a);
-        self.release(b);
-        self.live -= 2;
+        match std::mem::replace(&mut self.slots[h as usize], empty()) {
+            Sketch::Dense(b) => self.pool.push(b),
+            Sketch::Sparse(k) => self.sparse_bytes -= (k.len() * 4) as u64,
+        }
+        self.live -= 1;
         self.free.push(h);
     }
 }
 
-/// The set being built for one component: keys while small, registers once large.
-struct Acc {
-    keys: Vec<u32>,
-    dense: Option<Box<[u8]>>,
+/// Adds `key` to registers `regs`, keeping their histogram `hist` in sync.
+#[inline]
+fn insert_tracked(regs: &mut [u8], hist: &mut [u32; HIST], p: u8, key: u32) {
+    let (idx, rank) = hll::slot(key, p);
+    let old = regs[idx];
+    if rank > old {
+        regs[idx] = rank;
+        hist[usize::from(old)] -= 1;
+        hist[usize::from(rank)] += 1;
+    }
 }
 
-impl Acc {
-    fn to_dense(&mut self, st: &mut Store) {
-        if self.dense.is_none() {
-            let mut regs = st.take_dense();
-            for &k in &self.keys {
-                hll::insert(&mut regs, st.p, k);
-            }
-            self.keys.clear();
-            self.dense = Some(regs);
+/// `dst = max(dst, src)` register-wise, keeping `dst`'s histogram in sync. Merged sketches
+/// usually change few registers, so blocks of 16 registers are first compared as a whole
+/// (vectorised) and only blocks with a change are updated one by one.
+fn merge_tracked(dst: &mut [u8], src: &[u8], hist: &mut [u32; HIST]) {
+    debug_assert_eq!(dst.len() % 16, 0);
+    for (d, s) in dst.as_chunks_mut::<16>().0.iter_mut().zip(src.as_chunks::<16>().0) {
+        let mut any = 0u8;
+        for j in 0..16 {
+            any |= u8::from(s[j] > d[j]);
         }
-    }
-
-    /// Sorts and deduplicates the keys; goes dense when still above the threshold.
-    fn compact(&mut self, st: &mut Store) {
-        self.keys.sort_unstable();
-        self.keys.dedup();
-        if self.keys.len() > st.threshold {
-            self.to_dense(st);
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, st: &mut Store, key: u32) {
-        match &mut self.dense {
-            Some(regs) => hll::insert(regs, st.p, key),
-            None => {
-                self.keys.push(key);
-                if self.keys.len() >= 4 * st.threshold {
-                    self.compact(st);
+        if any != 0 {
+            for j in 0..16 {
+                let (old, new) = (d[j], s[j]);
+                if new > old {
+                    d[j] = new;
+                    hist[usize::from(old)] -= 1;
+                    hist[usize::from(new)] += 1;
                 }
             }
         }
     }
+}
 
-    fn add_keys(&mut self, st: &mut Store, keys: &[u32]) {
-        match &mut self.dense {
-            Some(regs) => {
-                for &k in keys {
-                    hll::insert(regs, st.p, k);
-                }
+fn read_hist(buf: &[u8], at: usize) -> [u32; HIST] {
+    let mut hist = [0u32; HIST];
+    for (i, h) in hist.iter_mut().enumerate() {
+        let o = at + 4 * i;
+        *h = u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    }
+    hist
+}
+
+fn write_hist(buf: &mut [u8], at: usize, hist: &[u32; HIST]) {
+    for (i, h) in hist.iter().enumerate() {
+        let o = at + 4 * i;
+        buf[o..o + 4].copy_from_slice(&h.to_le_bytes());
+    }
+}
+
+/// Adds node `v`'s keys (its symbol key, one key per own line) to a dense buffer.
+#[inline]
+fn insert_node(buf: &mut [u8], hist: &mut [[u32; HIST]; 2], lay: Layout, w: &Weights, v: u32) {
+    if w.symbol.contains(v) {
+        insert_tracked(&mut buf[lay.regs(0)], &mut hist[0], lay.p, hll::key(v, 0));
+    }
+    let lines = &mut buf[lay.regs(1)];
+    for i in 0..w.lines[v as usize] {
+        insert_tracked(lines, &mut hist[1], lay.p, hll::key(v, i));
+    }
+}
+
+/// `out = a ∪ b` for sorted unique `a` and `b`; returns the symbols and lines of the nodes
+/// only in `b` (what the union adds to `a`).
+fn union_weighted(a: &[u32], b: &[u32], out: &mut Vec<u32>, w: &Weights) -> (u32, u64) {
+    out.clear();
+    out.reserve(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    let (mut syms, mut lines) = (0u32, 0u64);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if y < x {
+            syms += u32::from(w.symbol.contains(y));
+            lines += u64::from(w.lines[y as usize]);
+        }
+        out.push(x.min(y));
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+    }
+    out.extend_from_slice(&a[i..]);
+    for &y in &b[j..] {
+        syms += u32::from(w.symbol.contains(y));
+        lines += u64::from(w.lines[y as usize]);
+    }
+    out.extend_from_slice(&b[j..]);
+    (syms, lines)
+}
+
+/// The set being built for one component: sorted node ids with exact totals while small,
+/// dense sketches once large. Register histograms are kept in sync on every insert and merge,
+/// so an estimate costs O(32) instead of a pass over the registers.
+struct Acc<'w> {
+    w: &'w Weights,
+    /// Sorted unique node ids while sparse.
+    nodes: Vec<u32>,
+    /// Merge output, swapped with `nodes`.
+    tmp: Vec<u32>,
+    /// Exact symbols and lines of `nodes`.
+    syms: u32,
+    lines: u64,
+    dense: Option<Box<[u8]>>,
+    hist: [[u32; HIST]; 2],
+}
+
+impl Acc<'_> {
+    fn make_dense(&mut self, st: &mut Store) {
+        if self.dense.is_some() {
+            return;
+        }
+        let lay = st.lay;
+        let mut buf = st.take_dense();
+        self.hist = [[0; HIST]; 2];
+        self.hist[0][0] = lay.m as u32;
+        self.hist[1][0] = lay.m as u32;
+        for &v in &self.nodes {
+            insert_node(&mut buf, &mut self.hist, lay, self.w, v);
+        }
+        self.nodes.clear();
+        self.dense = Some(buf);
+    }
+
+    /// Starts from the dense buffer `buf` (stolen or copied, histograms in it).
+    fn adopt(&mut self, lay: Layout, buf: Box<[u8]>) {
+        self.hist = [read_hist(&buf, lay.m), read_hist(&buf, lay.part() + lay.m)];
+        self.dense = Some(buf);
+    }
+
+    /// Adds sorted unique node ids: a linear merge while sparse (going dense past either
+    /// limit), key inserts once dense.
+    fn add_nodes(&mut self, st: &mut Store, nodes: &[u32]) {
+        if let Some(buf) = &mut self.dense {
+            for &v in nodes {
+                insert_node(buf, &mut self.hist, st.lay, self.w, v);
             }
-            None => {
-                self.keys.extend_from_slice(keys);
-                if self.keys.len() >= 4 * st.threshold {
-                    self.compact(st);
-                }
+            return;
+        }
+        let (syms, lines) = if self.nodes.is_empty() {
+            self.nodes.extend_from_slice(nodes);
+            let mut t = (0u32, 0u64);
+            for &v in nodes {
+                t.0 += u32::from(self.w.symbol.contains(v));
+                t.1 += u64::from(self.w.lines[v as usize]);
             }
+            t
+        } else {
+            let t = union_weighted(&self.nodes, nodes, &mut self.tmp, self.w);
+            std::mem::swap(&mut self.nodes, &mut self.tmp);
+            t
+        };
+        self.syms += syms;
+        self.lines += lines;
+        if self.nodes.len() > st.max_nodes || self.lines > st.max_lines {
+            self.make_dense(st);
         }
     }
 
-    fn add_dense(&mut self, st: &mut Store, regs: &[u8]) {
-        self.to_dense(st);
+    /// Adds a dense set.
+    fn merge_dense(&mut self, st: &mut Store, src: &[u8]) {
+        self.make_dense(st);
+        let lay = st.lay;
         if let Some(d) = &mut self.dense {
-            hll::merge(d, regs);
+            for which in 0..2 {
+                let r = lay.regs(which);
+                merge_tracked(&mut d[r.clone()], &src[r], &mut self.hist[which]);
+            }
         }
     }
 
-    /// The finished set's size (exact or estimated) and, when `keep`, the set itself.
-    fn finish(&mut self, st: &mut Store, keep: bool) -> (u32, Option<Sketch>) {
-        if self.dense.is_none() {
-            self.compact(st);
-        }
-        match self.dense.take() {
-            Some(regs) => {
+    /// The finished set's `[symbols, lines]` (exact or estimated) and, when `keep`, the set.
+    fn finish(&mut self, st: &mut Store, keep: bool) -> ([u32; 2], Option<Sketch>) {
+        let lay = st.lay;
+        let out = match self.dense.take() {
+            Some(mut buf) => {
                 st.stats.dense_sets += 1;
-                let est = hll::estimate(&regs, st.p).round().min(f64::from(u32::MAX)) as u32;
+                let mut est = [0u32; 2];
+                for (which, e) in est.iter_mut().enumerate() {
+                    debug_assert_eq!(self.hist[which], hll::histogram(&buf[lay.regs(which)], lay.p), "histogram");
+                    *e = hll::estimate_histogram(&self.hist[which], lay.p).round().min(f64::from(u32::MAX)) as u32;
+                }
                 if keep {
-                    (est, Some(Sketch::Dense(regs)))
+                    write_hist(&mut buf, lay.m, &self.hist[0]);
+                    write_hist(&mut buf, lay.part() + lay.m, &self.hist[1]);
+                    (est, Some(Sketch::Dense(buf)))
                 } else {
-                    st.pool.push(regs);
+                    st.pool.push(buf);
                     (est, None)
                 }
             }
             None => {
-                let len = self.keys.len() as u32;
-                let set = keep.then(|| Sketch::Sparse(self.keys.as_slice().into()));
-                self.keys.clear();
-                (len, set)
+                let sizes = [self.syms, self.lines.min(u64::from(u32::MAX)) as u32];
+                (sizes, keep.then(|| Sketch::Sparse(self.nodes.as_slice().into())))
             }
-        }
+        };
+        self.nodes.clear();
+        self.syms = 0;
+        self.lines = 0;
+        out
     }
 }
 
-/// Sketch propagation over the condensed DAG, sinks first: a component's set is its members'
-/// elements plus its successors' sets. A component's sketches live until its last predecessor
-/// has merged them (reference count = DAG in-degree); the last consumer of a dense sketch takes
-/// its registers instead of copying them.
+/// Sketch propagation over the condensed DAG, sinks first: a component's set is its members
+/// plus its successors' sets. A component's set lives until its last predecessor has merged
+/// it (reference count = DAG in-degree); the last consumer of a dense set takes its buffer
+/// instead of copying it.
 fn propagate(cd: &Condensed, w: &Weights, p: u8, out: &mut [[u32; 2]]) -> SizeStats {
     let dag = cd.dag();
     let scc = cd.scc();
     let k = cd.count();
     let m = hll::registers(p);
     let mut st = Store {
-        p,
-        m,
-        threshold: (m / 4).max(1),
+        lay: Layout { p, m },
+        max_nodes: (m / 4).max(1),
+        max_lines: 4 * m as u64,
         slots: Vec::new(),
         free: Vec::new(),
         pool: Vec::new(),
@@ -361,67 +492,51 @@ fn propagate(cd: &Condensed, w: &Weights, p: u8, out: &mut [[u32; 2]]) -> SizeSt
     };
     let mut pending: Vec<u32> = (0..k).map(|c| dag.reverse().degree(c)).collect();
     let mut slot = vec![u32::MAX; k as usize];
-    let mut acc = Acc { keys: Vec::new(), dense: None };
+    let mut acc = Acc { w, nodes: Vec::new(), tmp: Vec::new(), syms: 0, lines: 0, dense: None, hist: [[0; HIST]; 2] };
     for c in cd.reverse_topo() {
         let succ = dag.succ(c);
         let keep = pending[c as usize] > 0;
-        let mut pair = [empty(), empty()];
-        for which in 0..2 {
-            // Start from a dense successor: steal it if this is its last consumer.
-            let mut base = None;
-            for &s in succ {
-                if let Sketch::Dense(_) = st.slots[slot[s as usize] as usize][which] {
-                    if pending[s as usize] == 1 {
-                        base = Some(s);
-                        break;
-                    }
-                    base.get_or_insert(s);
+        // Start from a dense successor: steal it if this is its last consumer.
+        let mut base = None;
+        for &s in succ {
+            if let Sketch::Dense(_) = st.slots[slot[s as usize] as usize] {
+                if pending[s as usize] == 1 {
+                    base = Some(s);
+                    break;
                 }
-            }
-            if let Some(b) = base {
-                let h = slot[b as usize] as usize;
-                if pending[b as usize] == 1 {
-                    if let Sketch::Dense(regs) = std::mem::replace(&mut st.slots[h][which], empty()) {
-                        acc.dense = Some(regs);
-                    }
-                } else {
-                    let mut regs = st.take_dense();
-                    if let Sketch::Dense(src) = &st.slots[h][which] {
-                        regs.copy_from_slice(src);
-                    }
-                    acc.dense = Some(regs);
-                }
-            }
-            for &s in succ {
-                if Some(s) == base {
-                    continue;
-                }
-                let h = slot[s as usize] as usize;
-                // Move the sketch out while merging so `st` can be borrowed mutably.
-                let set = std::mem::replace(&mut st.slots[h][which], empty());
-                match &set {
-                    Sketch::Sparse(keys) => acc.add_keys(&mut st, keys),
-                    Sketch::Dense(regs) => acc.add_dense(&mut st, regs),
-                }
-                st.slots[h][which] = set;
-            }
-            for &v in scc.members(c) {
-                if which == 0 {
-                    if w.symbol.contains(v) {
-                        acc.push(&mut st, hll::key(v, 0));
-                    }
-                } else {
-                    for i in 0..w.lines[v as usize] {
-                        acc.push(&mut st, hll::key(v, i));
-                    }
-                }
-            }
-            let (size, set) = acc.finish(&mut st, keep);
-            out[c as usize][which] = size;
-            if let Some(set) = set {
-                pair[which] = set;
+                base.get_or_insert(s);
             }
         }
+        if let Some(b) = base {
+            let h = slot[b as usize] as usize;
+            if pending[b as usize] == 1 {
+                if let Sketch::Dense(buf) = std::mem::replace(&mut st.slots[h], empty()) {
+                    acc.adopt(st.lay, buf);
+                }
+            } else {
+                let mut buf = st.take_dense();
+                if let Sketch::Dense(src) = &st.slots[h] {
+                    buf.copy_from_slice(src);
+                }
+                acc.adopt(st.lay, buf);
+            }
+        }
+        for &s in succ {
+            if Some(s) == base {
+                continue;
+            }
+            let h = slot[s as usize] as usize;
+            // Move the set out while merging so `st` can be borrowed mutably.
+            let set = std::mem::replace(&mut st.slots[h], empty());
+            match &set {
+                Sketch::Sparse(nodes) => acc.add_nodes(&mut st, nodes),
+                Sketch::Dense(buf) => acc.merge_dense(&mut st, buf),
+            }
+            st.slots[h] = set;
+        }
+        acc.add_nodes(&mut st, scc.members(c));
+        let (sizes, set) = acc.finish(&mut st, keep);
+        out[c as usize] = sizes;
         for &s in succ {
             pending[s as usize] -= 1;
             if pending[s as usize] == 0 {
@@ -429,8 +544,8 @@ fn propagate(cd: &Condensed, w: &Weights, p: u8, out: &mut [[u32; 2]]) -> SizeSt
                 slot[s as usize] = u32::MAX;
             }
         }
-        if keep {
-            slot[c as usize] = st.put(pair);
+        if let Some(set) = set {
+            slot[c as usize] = st.put(set);
         }
     }
     st.stats

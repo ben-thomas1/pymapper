@@ -37,36 +37,53 @@
 //! the distinct source lines it covers. Members of one SCC reach the same set, so sizes are
 //! computed per component of the [`Condensed`](crate::graph::Condensed) DAG and shared.
 //!
-//! **Approximate (default, `SizeMode::Approx(p)`)**: components are processed in reverse
-//! topological order (sinks first, [`Condensed::reverse_topo`](crate::graph::Condensed::reverse_topo)); a component's set is the union
-//! of its members' elements (one key per symbol, one key per own line) and its successors'
-//! sets. Sets are exact sorted key arrays while they hold at most `2^p / 4` keys (4 bytes each,
-//! never more bytes than a dense sketch) and HyperLogLog sketches of `2^p` one-byte registers
-//! beyond ([`hll`]); unions are merges, so an element reached along several paths counts once.
-//! A component's sets are freed once its last predecessor has merged them (reference count =
-//! DAG in-degree), and that last consumer takes over a dense sketch's registers instead of
-//! copying them; freed register arrays are pooled.
+//! **Approximate (default, `SizeMode::Approx(p)`, `p = 10`)**: components are processed in
+//! reverse topological order (sinks first,
+//! [`Condensed::reverse_topo`](crate::graph::Condensed::reverse_topo)); a component's reach set
+//! is its members plus its successors' sets.
 //!
-//! - Time: O(V + E_dag + total lines) for keys and sparse unions (plus sorting small key
-//!   arrays), and O(2^p) per merge into or estimate of a dense sketch: O(E_dag 2^p) worst case.
-//! - Memory: the live sets: at most one pair per component that has unprocessed
-//!   predecessors, `2^p` bytes per dense sketch, 4 bytes per key of a sparse one
-//!   ([`SizeStats`] reports the peaks). Output: 8 bytes per node.
+//! - Sparse: while a set has at most `2^p / 4` nodes and `4 * 2^p` lines it is a sorted array
+//!   of node ids (4 bytes each) with exact totals; unions are linear merges that sum the
+//!   weights of the nodes they add.
+//! - Dense: beyond that, two HyperLogLog sketches ([`hll`]) of `2^p` one-byte registers, one
+//!   over symbol keys (one per symbol node) and one over line keys (one per own line of every
+//!   node), each followed by its register histogram, so an estimate costs O(32). Unions are
+//!   register-wise maxima (vectorised in blocks of 16, histogram updated only where registers
+//!   change); a sparse set meeting a dense one inserts its nodes' keys (at most `4 * 2^p`).
+//!   An element reached along several paths counts once.
+//! - A set is freed once its last predecessor has merged it (reference count = DAG
+//!   in-degree); that last consumer takes over a dense buffer instead of copying it, and
+//!   freed buffers are pooled.
 //!
-//! **Error bounds**: a size of at most `2^p / 4` is exact (up to 32-bit key collisions,
-//! probability `n^2 / 2^33` of one among `n` elements). A larger size is a HyperLogLog
-//! estimate (Ertl's improved estimator, unbiased): relative standard error `1.04 / sqrt(2^p)`,
-//! 3.25% at the default `p = 10` (1.63% at `p = 12`, 6.5% at `p = 8`), so about 95% of
-//! estimates are within twice that and almost all within three times; key collisions add a
-//! bias of `-n / 2^33` (-0.2% at 16M lines). Estimates are deterministic (fixed hash, fixed
-//! merge order) and the same set always gives the same estimate.
+//! Costs: O(V + E_dag) merges of sparse sets of at most `2^p / 4` nodes, O(2^p / 16) block
+//! compares per dense merge, at most `4 * 2^p` key inserts per sparse-into-dense merge, and one
+//! pass over a node's own lines each time it enters a dense set. Memory: the live sets, at most
+//! one per component with unprocessed predecessors, `2 (2^p + 136)` bytes per dense set and 4
+//! bytes per node of a sparse one ([`SizeStats`] reports the peaks), plus 8 bytes per node of
+//! output. Single-threaded. Measured (`docs/benchmarks.md`, "Reachability (S3.5)"): 240ms
+//! for the 17M-LOC venv call graph (1M nodes, 1.26M DAG edges) with 3.4 MB of dense sets at
+//! the peak; adversarial graphs where many sets stay live (random forward edges between
+//! 200k blocks) hold up to 63k dense sets (142 MB).
+//!
+//! **Error bounds**: a set of at most `2^p / 4` nodes and `4 * 2^p` lines is exact. A larger
+//! one is estimated (Ertl's improved estimator, unbiased over the whole range): relative
+//! standard error `1.04 / sqrt(2^p)` per size, 3.25% at the default `p = 10` (6.5% at `p = 8`,
+//! 1.63% at `p = 12`). Estimates are deterministic, and propagation is lossless with respect
+//! to the sketch: a node's estimate is exactly that of a sketch built from its reach set
+//! directly (checked on the venv). Nested reach sets share most keys, so their errors are
+//! correlated: one unlucky shared subset shifts all its callers alike. Measured on the venv
+//! against exact sizes (sizes above `2^p / 4`): RMSE 7.8% / 2.9% / 1.0% at `p = 8 / 10 / 12`,
+//! worst 37% / 16% / 5.7% (5 standard errors, a cluster of callers of one subset). Keys are
+//! 32 bits; collisions bias a size of `n` by about `-n / 2^33` (-0.2% at 16M lines).
 //!
 //! **Exact (`SizeMode::Exact`)**: a depth-first search over the DAG from every component, in
 //! parallel chunks with a visit stamp per component and chunk. Cost O(sum over components of
 //! the DAG part they reach), worst case O(k (k + E)): quadratic when most components reach a
-//! large common part (call graphs with a big hub SCC). Memory O(k) per chunk (`4 k` bytes) on
-//! top of the output. Gated behind `analysis.exact-reachability`; measured costs are in
-//! `docs/benchmarks.md` ("Reachability (S3.5)").
+//! large common part (long call chains, many callers of a big hub). Memory O(k) per chunk
+//! (`4 k` bytes) on top of the output. Gated behind `analysis.exact-reachability`. Measured:
+//! 50ms on 14 threads (324ms on one) for the venv, whose reach sets are small (at most 13.8k
+//! symbols), but 2.2s for a synthetic 1M-node call graph with a giant SCC (36x the estimate)
+//! and 196ms for a 30k-node chain (75x).
 
 pub mod hll;
 
@@ -76,6 +93,8 @@ mod forward;
 mod roots;
 mod sizes;
 
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod tests;
 

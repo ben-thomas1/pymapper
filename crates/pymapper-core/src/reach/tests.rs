@@ -298,8 +298,8 @@ fn approx_is_exact_below_the_sparse_threshold() {
         }
         let cd = Condensed::of(&g);
         let want = reach_sizes(&cd, &w, SizeMode::Exact);
-        // p = 12: sets of up to 1,024 keys are exact; these graphs have at most 150 symbols and
-        // 300 lines.
+        // p = 12: sets of up to 1,024 nodes and 4,096 lines are exact; these graphs have at most
+        // 150 nodes and 300 lines.
         let got = reach_sizes(&cd, &w, SizeMode::Approx(12));
         for v in 0..n {
             assert_eq!((got.symbols(v), got.lines(v)), (want.symbols(v), want.lines(v)), "seed {seed} node {v}");
@@ -308,8 +308,9 @@ fn approx_is_exact_below_the_sparse_threshold() {
     }
 }
 
-/// Large sets are estimates within the documented error: the RMSE over all nodes with large
-/// sets is about `1.04 / sqrt(2^p)`, and no estimate is off by more than 5 standard errors.
+/// Sets of at most `2^p / 4` nodes and `2^p` lines are exact; sizes above `2^p / 4` of
+/// larger sets are estimates within the documented error: their RMSE is about
+/// `1.04 / sqrt(2^p)`, and no estimate is off by more than 5 standard errors.
 #[test]
 fn approx_error_bounded_on_large_sets() {
     for (seed, p) in [(3u64, 8u8), (5, 10), (7, 10), (11, 12)] {
@@ -319,13 +320,20 @@ fn approx_error_bounded_on_large_sets() {
         let cd = Condensed::of(&g);
         let want = reach_sizes(&cd, &w, SizeMode::Exact);
         let got = reach_sizes(&cd, &w, SizeMode::Approx(p));
+        // Node counts of the reach sets: every node a symbol.
+        let nodes = reach_sizes(&cd, &Weights::uniform(n, 0), SizeMode::Exact);
         let se = hll::rel_std_error(p);
-        let big = (hll::registers(p) / 4) as u32;
+        let m = hll::registers(p) as u32;
+        let big = m / 4;
         let (mut sq, mut cnt) = (0.0, 0u32);
         for v in 0..n {
+            let sparse = nodes.symbols(v) <= m / 4 && want.lines(v) <= m;
             for (a, b) in [(got.symbols(v), want.symbols(v)), (got.lines(v), want.lines(v))] {
+                if sparse {
+                    assert_eq!(a, b, "sparse sets are exact (p={p}, node {v})");
+                    continue;
+                }
                 if b <= big {
-                    assert_eq!(a, b, "small sets are exact (p={p}, node {v})");
                     continue;
                 }
                 let rel = f64::from(a) / f64::from(b) - 1.0;

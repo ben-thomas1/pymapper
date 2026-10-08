@@ -41,8 +41,8 @@ pub struct RootOptions<'a> {
     pub modules: bool,
     /// `__main__` guards and `__main__` modules.
     pub main: bool,
-    /// Tests: in test files (`test_*.py`, `*_test.py`, `test.py`, `conftest.py`, anything under
-    /// a `test` / `tests` package), functions and methods named `test*`, classes named
+    /// Tests: test files (`test_*.py`, `*_test.py`, `test.py`, `conftest.py`, anything under
+    /// a `test` / `tests` package) and in them functions and methods named `test*`, classes named
     /// `Test*`, unittest / pytest hooks, and every module-level function of `conftest.py`
     /// (fixtures and hooks are found by name).
     pub tests: bool,
@@ -314,6 +314,10 @@ fn file_roots(
     }
     let test_file = opts.tests && is_test_module(ix, m);
     let conftest = test_file && mname == b"conftest";
+    if test_file {
+        // The test runner imports test modules.
+        set.add(m, root_kind::TEST);
+    }
     let lib = opts.public_api && module_is_public(ix, m);
     let restrict = lib && ff.has(file_flags::ALL_DEFINED) && !ff.has(file_flags::ALL_DYNAMIC);
     if lib {
