@@ -49,6 +49,8 @@ entered, and symlinks are not followed.
 | `walk`       | `walk`                 | parallel `pymapper_core::walk` only, corpus options       |
 | `walk-seq`   | `walk`                 | single-threaded reference walker only (same file set)     |
 | `walk-git`   | `walk`                 | parallel walk with first-party options (gitignore on, hidden dirs skipped) |
+| `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
+| `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
@@ -57,13 +59,19 @@ Walk-only targets report 0 MB (they do not stat files) and add the walker's coun
 The parse hook is `parse_file(src: &[u8], acc: &mut ParseAcc)` in `xtask/src/bench/targets.rs`.
 Later steps plug the lexer/extractor in there. `ParseAcc` is per-thread state that gets merged
 at the end; its `counters()` (e.g. tokens, defs) show up in the table and the results file.
-Until then the hook does nothing, so `parse-only` costs the same as `read`. `read`, `parse-only`
-and `walk` use `pymapper_core::walk` with the corpus options: no gitignore, hidden directories
+Until then the hook does nothing, so `parse-only` costs the same as `read`. `read`, `parse-only`,
+`lex`, `lex-mem` and `walk` use `pymapper_core::walk` with the corpus options: no gitignore, hidden directories
 entered, `__pycache__`/`.git` skipped, symlinks not followed. That is the same file set as the
 sequential reference walker in `xtask/src/bench/walk.rs` (`walk-seq`), so the two are directly
 comparable. `walk-git` uses `WalkOptions::default()` (what first-party roots get); point it at a
 repository with `-c NAME=PATH`, since on a venv the enclosing `.gitignore` usually ignores
 everything.
+
+The lexer targets add counters: `tokens`, `error_tokens`, `lex_cpu_ms` (time inside the lexer,
+summed over threads) and `lex_MBps_core` (corpus MB per second of lexer time). For a clean
+single-core number run `lex-mem` with `-j 1`: the `lex` phase is then pure lexing on one
+thread (`MB / lex`). `lex-mem` holds the whole corpus in memory, so its peak RSS is about the
+corpus size and says nothing about the lexer's own memory use (a few KB per lexer).
 
 Adding a target: add a `Target` variant and a match arm in `targets::run`.
 
@@ -169,6 +177,25 @@ profiled; the machine was also loaded). The `walk-git` file set equals
 Peak RSS above `walk-seq` comes from the exactly sized sorted output being built while the
 per-thread lists (relative paths) are still alive; the output itself is one byte buffer plus
 one `u32` per file.
+
+### Lexer (S1.1)
+
+Same machine, release build, warm cache, best of 5. Other worktrees were
+building at the same time (load average about 10 on 14 cores), so treat these as lower bounds.
+`lex` MB/s/core is the `lex_MBps_core` counter (MB per second of time inside the lexer,
+summed over all threads). The `-j 1` rows are one thread lexing from memory: MB / `lex` phase.
+
+| corpus | target       | threads | files | MB    | lex phase | lex MB/s | tokens     | peak RSS MB |
+|--------|--------------|---------|-------|-------|-----------|----------|------------|-------------|
+| stdlib | lex          | 14      | 1043  | 15.8  | -         | 653/core | 2,044,807  | 5.72        |
+| stdlib | lex-mem      | 14      | 1043  | 15.8  | 1.82ms    | 8,700    | 2,044,807  | 22.9        |
+| stdlib | lex-mem `-j 1` | 1     | 1043  | 15.8  | 20.5ms    | 771      | 2,044,807  | 21.5        |
+| venv   | lex          | 14      | 60529 | 650.1 | -         | 745/core | 83,594,594 | 24.4        |
+| venv   | lex-mem      | 14      | 60529 | 650.1 | 62.1ms    | 10,470   | 83,594,594 | 793.7       |
+| venv   | lex-mem `-j 1` | 1     | 60529 | 650.1 | 668ms     | 973      | 83,594,594 | 666.6       |
+
+Read + lex costs about the same as read alone (stdlib 46.2ms vs 42.3ms, venv 4.92s vs 4.83s),
+and peak RSS does not change: the lexer allocates nothing per token.
 
 ### Import roots (S2.4)
 
