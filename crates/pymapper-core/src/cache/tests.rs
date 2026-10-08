@@ -361,6 +361,69 @@ fn segment_validation_rejects_bad_references() {
     assert!(matches!(patch(segment::FILE_HDR, 1, 100_000), Err(CacheError::Corrupt(_))), "run past the column");
 }
 
+#[test]
+fn def_parents_must_form_a_preorder_tree() {
+    use crate::extract::facts::NO_PARENT as N;
+    let ok = |p: &[u32]| segment::preorder(p, &mut Vec::new());
+    assert!(ok(&[N]));
+    // <module>; f; f.g; f.g.h; k (back to the module); k.m
+    assert!(ok(&[N, 0, 1, 2, 0, 4]));
+    assert!(!ok(&[]), "no <module> row");
+    assert!(!ok(&[0]), "<module> with a parent");
+    assert!(!ok(&[N, N]), "second root");
+    assert!(!ok(&[N, 1]), "own parent");
+    assert!(!ok(&[N, 2, 0]), "parent after the row");
+    assert!(!ok(&[N, 0, 0, 1]), "parent's subtree already closed");
+}
+
+/// Random words of a valid segment overwritten (checksum re-sealed, so only the structural
+/// validation stands between the bytes and the loader): opening either fails cleanly or the
+/// segment loads into an index without panicking.
+#[test]
+fn corrupted_segments_never_panic() {
+    let t = sample_project("segfuzz");
+    let ix = plain_load(inputs(t.path()));
+    let good = encode_index(&ix);
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let words = (good.len() - format::HEADER_LEN) / 4;
+    let (mut opened, mut rejected) = (0, 0);
+    // `PYMAPPER_CACHE_FUZZ_ITERS` runs a longer campaign.
+    let iters = std::env::var("PYMAPPER_CACHE_FUZZ_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(600u32);
+    for _ in 0..iters {
+        let mut b = good.clone();
+        for _ in 0..1 + next() % 3 {
+            let pos = format::HEADER_LEN + (next() as usize % words) * 4;
+            let r = next();
+            // Small values hit ids, lengths and offsets near their bounds; others are noise.
+            let v = match r % 4 {
+                0 => (r >> 8) as u32 % 8,
+                1 => u32::from_le_bytes(b[pos..pos + 4].try_into().expect("4")).wrapping_add(1),
+                2 => u32::MAX - (r >> 8) as u32 % 4,
+                _ => (r >> 16) as u32,
+            };
+            b[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let sum = format::checksum(&b[format::HEADER_LEN..]);
+        b[40..48].copy_from_slice(&sum.to_le_bytes());
+        match open_bytes(&b) {
+            Ok(seg) => {
+                opened += 1;
+                let (warm, _, _) = load_from_segment(inputs(t.path()), seg);
+                assert_eq!(warm.file_count(), ix.file_count());
+            }
+            Err(_) => rejected += 1,
+        }
+    }
+    // Both outcomes are exercised (most payload words are plain data that loads as-is).
+    assert!(opened > 0 && rejected > 0, "opened {opened}, rejected {rejected}");
+}
+
 // -------------------------------------------------------------------------------------------
 // End to end: cache::load
 // -------------------------------------------------------------------------------------------

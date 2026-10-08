@@ -741,19 +741,20 @@ impl Segment {
         }
         fact_columns!(val_columns!(self, end, n));
         metric_columns!(val_metrics!(self, m_end));
+        let mut stack = Vec::new();
         for i in 0..self.files {
-            self.validate_file(&self.hdr(i).0)?;
+            self.validate_file(&self.hdr(i).0, &mut stack)?;
         }
         Ok(())
     }
 
     /// File-relative references of one file stay inside the file.
-    fn validate_file(&self, ff: &FileFacts) -> Result<(), CacheError> {
+    fn validate_file(&self, ff: &FileFacts, stack: &mut Vec<u32>) -> Result<(), CacheError> {
         let defs = ff.defs.len;
         let names = u64::from(ff.names.len);
         let bad = |what| Err(CacheError::Corrupt(what));
         let d = ff.defs.range();
-        if !self.typed(19, |s| &s.defs.parent)[d.clone()].iter().all(|&p| p == NO_PARENT || p < defs) {
+        if !preorder(&self.typed(19, |s| &s.defs.parent)[d.clone()], stack) {
             return bad("parent");
         }
         let (pstart, plen) = (&self.typed(28, |s| &s.defs.params)[d.clone()], &self.typed(29, |s| &s.defs.params_len)[d]);
@@ -817,6 +818,27 @@ impl<T: Pod> Stored for T {
 
 impl Stored for Sym {
     type Raw = u32;
+}
+
+/// The parent column of one file's defs describes a pre-order tree, as the extractor emits it
+/// and the index hierarchy relies on: row 0 (`<module>`) has no parent and every other row's
+/// parent is an open ancestor (the previous row or one of its ancestors). `stack` is scratch.
+pub(super) fn preorder(parent: &[u32], stack: &mut Vec<u32>) -> bool {
+    if parent.first() != Some(&NO_PARENT) {
+        return false;
+    }
+    stack.clear();
+    stack.push(0);
+    for (i, &p) in parent.iter().enumerate().skip(1) {
+        while stack.last().is_some_and(|&top| top != p) {
+            stack.pop();
+        }
+        if stack.is_empty() {
+            return false;
+        }
+        stack.push(i as u32);
+    }
+    true
 }
 
 /// Rows owned by defs (`owner` column over `rows`, per-def counts over `defs`): owners are
