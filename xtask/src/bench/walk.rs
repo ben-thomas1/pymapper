@@ -24,7 +24,6 @@ impl PathStore {
         self.ends.len()
     }
 
-    #[cfg(test)]
     pub fn get(&self, i: usize) -> &Path {
         let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
         let end = self.ends[i] as usize;
