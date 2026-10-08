@@ -9,6 +9,10 @@
 //!   FILE_HDR         u32    files * 30    FileFacts (13 segment-absolute runs, lines, flags),
 //!                                         first metrics row, reserved
 //!   FILE_STAMP       u64    files * 3     size, mtime (ns), content hash
+//!   FP_KEY           u32    3             optional: duplication fingerprints were taken
+//!                                         with (version, k, w); absent = none stored
+//!   FP_OFFS          u32    files + 1     fingerprint rows of each file
+//!   FP_ROWS          u32    rows * 2      hash, position (the file is implicit)
 //!   16..             ...    one section per fact column, then per metrics column
 //! ```
 //!
@@ -23,6 +27,7 @@ use std::path::Path;
 
 use super::format::{CacheError, Reader, Writer};
 use super::mmap::Pod;
+use crate::analysis::dupes::{FingerprintKey, Fingerprint, Fingerprints};
 use crate::extract::MetricsTable;
 use crate::extract::facts::{FactStore, FileFacts, NO_PARENT, Run, TableBases};
 use crate::intern::{FxHashMap, Interner, Sym, hash_bytes};
@@ -33,6 +38,9 @@ pub(crate) const PATH_OFFS: u32 = 2;
 pub(crate) const PATH_BYTES: u32 = 3;
 pub(crate) const FILE_HDR: u32 = 4;
 pub(crate) const FILE_STAMP: u32 = 5;
+pub(crate) const FP_KEY: u32 = 6;
+pub(crate) const FP_OFFS: u32 = 7;
+pub(crate) const FP_ROWS: u32 = 8;
 /// `u32`s per file in `FILE_HDR`.
 const HDR: usize = 30;
 
@@ -48,14 +56,15 @@ pub struct Stamp {
     pub hash: u64,
 }
 
-/// One file to encode: its path (as stored), header (store-absolute runs), first metrics row
-/// and stamp.
+/// One file to encode: its path (as stored), header (store-absolute runs), first metrics row,
+/// stamp and duplication fingerprints (empty unless the segment stores them).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EncFile<'a> {
     pub path: &'a [u8],
     pub ff: FileFacts,
     pub metrics: u32,
     pub stamp: Stamp,
+    pub fps: &'a [Fingerprint],
 }
 
 /// Global `Sym` -> local id (raw, index + 1) while encoding one segment. Reused across
@@ -409,7 +418,8 @@ macro_rules! enc_metrics {
 
 /// Encodes the facts of `files` (rows of `store`/`metrics`, ids of `strings`) as one segment
 /// file, streamed to `out`; returns `out` and the file length. Strings are renumbered densely
-/// in first-use order, so the segment holds only the strings its files use. Memory: the
+/// in first-use order, so the segment holds only the strings its files use. With `fp`, the
+/// files' fingerprints are stored too, tagged with the key they were taken with. Memory: the
 /// largest column of the segment.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode<W: Write + Seek>(
@@ -417,6 +427,7 @@ pub(crate) fn encode<W: Write + Seek>(
     store: &FactStore,
     metrics: &MetricsTable,
     files: &[EncFile<'_>],
+    fp: Option<FingerprintKey>,
     map: &mut SymMap,
     kind: u32,
     schema: u64,
@@ -425,6 +436,23 @@ pub(crate) fn encode<W: Write + Seek>(
 ) -> io::Result<(W, u64)> {
     let mut w = Writer::new(out);
     map.begin();
+    if let Some(fk) = fp {
+        w.put(FP_KEY, &fk);
+        let mut offs = Vec::with_capacity(files.len() + 1);
+        offs.push(0u32);
+        w.put_with(FP_ROWS, |b| {
+            let mut n = 0u32;
+            for f in files {
+                for r in f.fps {
+                    b.extend_from_slice(&r.hash.to_le_bytes());
+                    b.extend_from_slice(&r.pos.to_le_bytes());
+                }
+                n += f.fps.len() as u32;
+                offs.push(n);
+            }
+        });
+        w.put(FP_OFFS, &offs);
+    }
     fact_columns!(enc_columns!(w, store, files, map));
     metric_columns!(enc_metrics!(w, metrics, files));
 
@@ -484,9 +512,13 @@ pub(crate) struct Segment {
     r: Reader,
     files: u32,
     strings: u32,
-    /// Path hash -> file. A path whose hash collides with an earlier one is not found (it is
-    /// re-extracted), so lookups compare the bytes.
+    /// Path hash -> first file with that hash; lookups compare the bytes.
     by_path: FxHashMap<u64, u32>,
+    /// Later files whose path hash collides with an earlier one (rare, but real: the Fx hash
+    /// maps `.../im_csch/im_csch_request_builder.py` and `.../im_sech/im_sech_...` alike).
+    collided: Vec<u32>,
+    /// Key of the stored fingerprints, if any.
+    fp: Option<FingerprintKey>,
 }
 
 macro_rules! copy_columns {
@@ -542,16 +574,23 @@ impl Segment {
     pub fn from_reader(r: Reader) -> Result<Segment, CacheError> {
         let strings = offsets(r.get::<u32>(STR_OFFS)?, r.bytes(STR_BYTES).len())?;
         let files = offsets(r.get::<u32>(PATH_OFFS)?, r.bytes(PATH_BYTES).len())?;
-        let mut seg = Segment { r, files, strings, by_path: FxHashMap::default() };
+        let mut seg = Segment { r, files, strings, by_path: FxHashMap::default(), collided: Vec::new(), fp: None };
         if seg.r.get::<u32>(FILE_HDR)?.len() != files as usize * HDR
             || seg.r.get::<u64>(FILE_STAMP)?.len() != files as usize * 3
         {
             return Err(CacheError::Corrupt("file table"));
         }
         seg.validate()?;
+        seg.fp = seg.validate_fingerprints()?;
         seg.by_path.reserve(files as usize);
         for i in 0..files {
-            seg.by_path.entry(hash_bytes(seg.path(i))).or_insert(i);
+            let h = hash_bytes(seg.path(i));
+            match seg.by_path.entry(h) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(i);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => seg.collided.push(i),
+            }
         }
         Ok(seg)
     }
@@ -596,7 +635,10 @@ impl Segment {
     #[inline]
     pub fn find(&self, path: &[u8]) -> Option<u32> {
         let i = *self.by_path.get(&hash_bytes(path))?;
-        (self.path(i) == path).then_some(i)
+        if self.path(i) == path {
+            return Some(i);
+        }
+        self.collided.iter().copied().find(|&j| self.path(j) == path)
     }
 
     /// String `i` of the local table.
@@ -610,6 +652,53 @@ impl Segment {
     #[inline]
     pub fn string_count(&self) -> u32 {
         self.strings
+    }
+
+    /// Key of the stored duplication fingerprints (`None`: the segment has none).
+    #[inline]
+    pub fn fingerprint_key(&self) -> Option<FingerprintKey> {
+        self.fp
+    }
+
+    /// Appends the stored fingerprints of file `i` to `out`, as fingerprints of `file`
+    /// (nothing if the segment has none).
+    pub fn copy_fingerprints(&self, i: u32, file: u32, out: &mut Fingerprints) {
+        if self.fp.is_none() {
+            return;
+        }
+        let offs = self.col::<u32>(FP_OFFS);
+        let (a, b) = (offs[i as usize] as usize, offs[i as usize + 1] as usize);
+        let rows = &self.col::<u32>(FP_ROWS)[a * 2..b * 2];
+        out.rows.extend(rows.as_chunks::<2>().0.iter().map(|&[hash, pos]| Fingerprint { hash, file, pos }));
+    }
+
+    /// Checks the optional fingerprint sections: absent together, or a key, one offset per
+    /// file + 1 over the rows, and strictly increasing positions within each file (as taken;
+    /// the matcher relies on it). Returns the key.
+    fn validate_fingerprints(&self) -> Result<Option<FingerprintKey>, CacheError> {
+        let key = self.r.get::<u32>(FP_KEY)?;
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let bad = Err(CacheError::Corrupt("fingerprints"));
+        let Ok(key) = FingerprintKey::try_from(key) else { return bad };
+        let rows = self.r.get::<u32>(FP_ROWS)?;
+        if rows.len() % 2 != 0 {
+            return bad;
+        }
+        let offs = self.r.get::<u32>(FP_OFFS)?;
+        if offsets(offs, rows.len() / 2).ok() != Some(self.files) {
+            return bad;
+        }
+        for w in offs.windows(2) {
+            let r = rows[w[0] as usize * 2..w[1] as usize * 2].as_chunks::<2>().0;
+            // Positions index tokens of a file of at most 4 GiB: keep far from overflow.
+            let ok = r.iter().all(|p| p[1] < u32::MAX / 2) && r.windows(2).all(|q| q[0][1] < q[1][1]);
+            if !ok {
+                return bad;
+            }
+        }
+        Ok(Some(key))
     }
 
     /// Appends the rows of file `i` to `store` / `metrics` and returns its header,

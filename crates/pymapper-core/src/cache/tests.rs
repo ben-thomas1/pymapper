@@ -220,7 +220,8 @@ fn segments_are_unmapped_when_their_files_are_done() {
     // A late copy finds nothing (the loader then reads the file instead).
     let (mut store, mut metrics) = (FactStore::new(), MetricsTable::new());
     let (mut strings, mut remap) = (Interner::new(), SegRemap::default());
-    assert!(l.copy(0, 0, false, &mut store, &mut metrics, &mut strings, &mut remap).is_none());
+    let mut fps = Fingerprints::new();
+    assert!(l.copy(0, 0, 0, false, &mut store, &mut metrics, &mut strings, &mut remap, &mut fps).is_none());
     assert_eq!(l.probe(0, ix.file_path(0)), Probe::Miss);
 }
 
@@ -261,12 +262,12 @@ fn encode_index(ix: &Index) -> Vec<u8> {
             let ff = *ix.file_facts(f);
             let path = ix.file_path(f).as_os_str().as_bytes();
             let stamp = Stamp { size: u64::from(f) * 10, mtime_ns: 7, hash: u64::from(f) };
-            segment::EncFile { path, ff, metrics: ff.defs.start - f, stamp }
+            segment::EncFile { path, ff, metrics: ff.defs.start - f, stamp, fps: &[] }
         })
         .collect();
     let mut map = segment::SymMap::default();
     let out = Cursor::new(Vec::new());
-    let (out, _) = segment::encode(ix.strings(), ix.facts(), ix.metrics(), &files, &mut map, KIND_FACTS, 1, 2, out)
+    let (out, _) = segment::encode(ix.strings(), ix.facts(), ix.metrics(), &files, None, &mut map, KIND_FACTS, 1, 2, out)
         .expect("encode");
     out.into_inner()
 }
@@ -280,9 +281,88 @@ fn load_from_segment(inputs: Inputs, seg: Segment) -> (Index, Vec<Stamp>, u32) {
     let plan = Plan { file: String::new(), key: 2, mode: Mode::Trusted, base: PathBuf::new() };
     let n = inputs.len() as u32;
     let lookup = Lookup::with_segments(vec![plan], vec![Some(seg)], &[n]);
-    let (ix, stamps) = crate::index::load_with(inputs, Some(&lookup));
+    let (ix, _, stamps) = crate::index::load_cached(inputs, &LoadOptions::default(), Some(&lookup));
     let hits = lookup.hits[0].load(Ordering::Relaxed);
     (ix, stamps, hits)
+}
+
+/// Encodes every file of `ix` with `rows[f]` as file `f`'s fingerprints (key `[1, 2, 3]`).
+fn encode_with_fps(ix: &Index, rows: &[Vec<crate::analysis::dupes::Fingerprint>]) -> Vec<u8> {
+    let files: Vec<segment::EncFile<'_>> = (0..ix.file_count())
+        .map(|f| {
+            let ff = *ix.file_facts(f);
+            let path = ix.file_path(f).as_os_str().as_bytes();
+            segment::EncFile { path, ff, metrics: ff.defs.start - f, stamp: Stamp::default(), fps: &rows[f as usize] }
+        })
+        .collect();
+    let mut map = segment::SymMap::default();
+    let out = Cursor::new(Vec::new());
+    let (out, _) =
+        segment::encode(ix.strings(), ix.facts(), ix.metrics(), &files, Some([1, 2, 3]), &mut map, KIND_FACTS, 1, 2, out)
+            .expect("encode");
+    out.into_inner()
+}
+
+#[test]
+fn segment_fingerprints_roundtrip_and_are_validated() {
+    use crate::analysis::dupes::Fingerprint;
+    let t = sample_project("segfp");
+    let ix = plain_load(inputs(t.path()));
+    let n = ix.file_count();
+    let fp = |hash, pos| Fingerprint { hash, file: 99, pos };
+    let mut rows: Vec<Vec<Fingerprint>> = (0..n).map(|f| (0..f).map(|i| fp(f * 100 + i, i * 3)).collect()).collect();
+    let seg = open_bytes(&encode_with_fps(&ix, &rows)).expect("segment");
+    assert_eq!(seg.fingerprint_key(), Some([1, 2, 3]));
+    for f in 0..n {
+        let mut out = Fingerprints::new();
+        seg.copy_fingerprints(f, f + 1000, &mut out);
+        let want: Vec<Fingerprint> = rows[f as usize].iter().map(|r| Fingerprint { file: f + 1000, ..*r }).collect();
+        assert_eq!(out.as_slice(), &want[..]);
+    }
+    // No fingerprint sections: no key, nothing copied.
+    let plain = open_bytes(&encode_index(&ix)).expect("segment");
+    assert_eq!(plain.fingerprint_key(), None);
+    let mut out = Fingerprints::new();
+    plain.copy_fingerprints(n - 1, 0, &mut out);
+    assert!(out.is_empty());
+    // Positions out of order within a file are rejected (the matcher relies on the order).
+    rows[n as usize - 1].swap(0, 1);
+    assert!(matches!(open_bytes(&encode_with_fps(&ix, &rows)), Err(CacheError::Corrupt("fingerprints"))));
+    rows[n as usize - 1].swap(0, 1);
+    rows[n as usize - 1][1].pos = u32::MAX;
+    assert!(matches!(open_bytes(&encode_with_fps(&ix, &rows)), Err(CacheError::Corrupt("fingerprints"))));
+}
+
+#[test]
+fn colliding_path_hashes_are_both_found() {
+    // Two real paths (of the msgraph SDK) with the same `hash_bytes`.
+    let dir = "/Users/bt386671/Code/gsk/aiml-lectio/.venv/lib/python3.12/site-packages/msgraph/generated/drives/item/items/item/workbook/functions";
+    let p1 = format!("{dir}/im_csch/im_csch_request_builder.py");
+    let p2 = format!("{dir}/im_sech/im_sech_request_builder.py");
+    assert_eq!(crate::intern::hash_bytes(p1.as_bytes()), crate::intern::hash_bytes(p2.as_bytes()));
+    let t = sample_project("collide");
+    let ix = plain_load(inputs(t.path()));
+    let files: Vec<segment::EncFile<'_>> = (0..ix.file_count())
+        .map(|f| {
+            let ff = *ix.file_facts(f);
+            let path = match f {
+                0 => p1.as_bytes(),
+                1 => p2.as_bytes(),
+                _ => ix.file_path(f).as_os_str().as_bytes(),
+            };
+            segment::EncFile { path, ff, metrics: ff.defs.start - f, stamp: Stamp::default(), fps: &[] }
+        })
+        .collect();
+    let mut map = segment::SymMap::default();
+    let (out, _) = segment::encode(ix.strings(), ix.facts(), ix.metrics(), &files, None, &mut map, KIND_FACTS, 1, 2, Cursor::new(Vec::new()))
+        .expect("encode");
+    let seg = open_bytes(&out.into_inner()).expect("segment");
+    assert_eq!(seg.find(p1.as_bytes()), Some(0));
+    assert_eq!(seg.find(p2.as_bytes()), Some(1));
+    assert_eq!(seg.find(format!("{dir}/im_sech/other.py").as_bytes()), None);
+    for f in 2..ix.file_count() {
+        assert_eq!(seg.find(ix.file_path(f).as_os_str().as_bytes()), Some(f));
+    }
 }
 
 #[test]
@@ -507,6 +587,101 @@ fn racy_mtimes_are_verified_by_content() {
     let _ = cached(t.path(), &cache);
     let (_, s) = cached(t.path(), &cache);
     assert_eq!((s.hits, s.verified, s.misses), (7, 1, 0));
+}
+
+/// Duplication fingerprints of an uncached load of `root` with `opts`.
+fn fresh_fps(root: &Path, opts: &LoadOptions) -> Vec<crate::analysis::dupes::Fingerprint> {
+    crate::index::load_with(inputs(root), opts).1.expect("fingerprints").as_slice().to_vec()
+}
+
+/// [`cached`] with `opts`; returns the fingerprints as a vector.
+fn cached_with(root: &Path, cache: &Cache, opts: &LoadOptions) -> (Index, CacheStats, Vec<crate::analysis::dupes::Fingerprint>) {
+    let (ix, s, fps) = load_with(inputs(root), None, cache, opts);
+    let fps = fps.map(|f| f.as_slice().to_vec()).unwrap_or_default();
+    (ix, s, fps)
+}
+
+#[test]
+fn fingerprints_are_cached_with_the_facts() {
+    use crate::analysis::dupes::DupesParams;
+    let t = sample_project("fps");
+    // A second copy of the sample so that fingerprints repeat across files.
+    t.file("pkg/copy.py", SAMPLE);
+    set_old_mtime(&t.path().join("pkg/copy.py"), 3600);
+    let cache = Cache::new(t.path().join("c"));
+    let n = 8;
+    let opts = LoadOptions { dupes: Some(DupesParams::new(10, 2)) };
+    let reference = fresh_fps(t.path(), &opts);
+    assert!(reference.len() > 10, "{} fingerprints", reference.len());
+
+    let (_, s, cold) = cached_with(t.path(), &cache, &opts);
+    assert_eq!((s.hits, s.misses, s.written), (0, n, 1));
+    assert_eq!(cold, reference);
+    // Warm: every file is a hit and gets its stored fingerprints.
+    let (warm_ix, s, warm) = cached_with(t.path(), &cache, &opts);
+    assert_eq!((s.hits, s.verified, s.misses, s.written), (n, 0, 0, 0));
+    assert_eq!(warm, reference);
+    assert_eq!(dump(&warm_ix), dump(&plain_load(inputs(t.path()))));
+
+    // A changed file is extracted (and fingerprinted); the others keep their stored rows.
+    t.file("pkg/sibling.py", "def helper(a, b, c):\n    return [a + b * c for _ in range(a)] + [b, c, a, b]\n");
+    set_old_mtime(&t.path().join("pkg/sibling.py"), 3600);
+    let reference = fresh_fps(t.path(), &opts);
+    let (_, s, fps) = cached_with(t.path(), &cache, &opts);
+    assert_eq!((s.hits, s.misses, s.written), (n - 1, 1, 1));
+    assert_eq!(fps, reference);
+    let (_, s, fps) = cached_with(t.path(), &cache, &opts);
+    assert_eq!((s.hits, s.misses, s.written), (n, 0, 0));
+    assert_eq!(fps, reference);
+
+    // Without dupes the cached fingerprints are not needed and stay stored.
+    let (_, s, fps) = cached_with(t.path(), &cache, &LoadOptions::default());
+    assert_eq!((s.hits, s.misses, s.written), (n, 0, 0));
+    assert!(fps.is_empty());
+    let (_, s, _) = cached_with(t.path(), &cache, &opts);
+    assert_eq!((s.hits, s.misses), (n, 0));
+
+    // Other thresholds (other k / w): stored rows do not fit, everything is extracted once.
+    let other = LoadOptions { dupes: Some(DupesParams::new(16, 2)) };
+    let reference16 = fresh_fps(t.path(), &other);
+    assert_ne!(reference16, reference);
+    let (_, s, fps) = cached_with(t.path(), &cache, &other);
+    assert_eq!((s.hits, s.misses, s.written), (0, n, 1));
+    assert_eq!(fps, reference16);
+    let (_, s, fps) = cached_with(t.path(), &cache, &other);
+    assert_eq!((s.hits, s.misses), (n, 0));
+    assert_eq!(fps, reference16);
+
+    // A load without dupes that rewrites the segment drops the fingerprints: the next load
+    // with dupes extracts again, then hits.
+    t.file("empty.py", "y = 2\n");
+    set_old_mtime(&t.path().join("empty.py"), 3600);
+    let (_, s, _) = cached_with(t.path(), &cache, &LoadOptions::default());
+    assert_eq!((s.misses, s.written), (1, 1));
+    let reference16 = fresh_fps(t.path(), &other);
+    let (_, s, fps) = cached_with(t.path(), &cache, &other);
+    assert_eq!((s.hits, s.misses, s.written), (0, n, 1));
+    assert_eq!(fps, reference16);
+    let (_, s, fps) = cached_with(t.path(), &cache, &other);
+    assert_eq!((s.hits, s.misses), (n, 0));
+    assert_eq!(fps, reference16);
+}
+
+#[test]
+fn third_party_groups_store_no_fingerprints() {
+    use crate::analysis::dupes::DupesParams;
+    let t = sample_project("fps3p");
+    let cache = Cache::new(t.path().join("c"));
+    let w = walk(&[t.path()], &WalkOptions::everything());
+    let inp = || Inputs::from_root_dir(t.path(), &w.files, Origin::ThirdParty, b"lib");
+    let opts = LoadOptions { dupes: Some(DupesParams::new(10, 2)) };
+    let (_, s, fps) = load_with(inp(), None, &cache, &opts);
+    assert_eq!((s.misses, s.written), (7, 1));
+    assert!(fps.expect("requested").is_empty());
+    // Third-party hits need no fingerprints.
+    let (_, s, fps) = load_with(inp(), None, &cache, &opts);
+    assert_eq!((s.hits, s.misses), (7, 0));
+    assert!(fps.expect("requested").is_empty());
 }
 
 #[test]

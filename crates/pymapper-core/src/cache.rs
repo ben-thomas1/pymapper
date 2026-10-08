@@ -33,6 +33,14 @@
 //! deleted. A segment that fails validation (version, schema, checksum, structure) is ignored
 //! and rewritten: the cache never makes a load fail.
 //!
+//! With duplication analysis on ([`load_with`] with `LoadOptions::dupes`), first-party
+//! segments also hold each file's fingerprints (8 bytes per fingerprint, about one per 16
+//! tokens with the default thresholds), tagged with the key they were taken with (fingerprint
+//! version, k, w). A cached first-party file gets its stored fingerprints, so a warm load finds
+//! the same clones as a cold one. A first-party segment without fingerprints of the requested
+//! key is stale for such a load: its files are extracted and it is rewritten. A load without
+//! `dupes` ignores stored fingerprints and drops them only if it rewrites the segment.
+//!
 //! The schema hash ([`schema`]) covers the format version, the fact layout and the crate
 //! version: any of them changing invalidates every segment. Bump [`FACTS_VERSION`] whenever
 //! extraction changes what it produces.
@@ -59,11 +67,12 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::analysis::dupes::{FingerprintKey, Fingerprints};
 use crate::arena::PerThread;
 use crate::config::Config;
 use crate::extract::MetricsTable;
 use crate::extract::facts::{FactStore, FileFacts};
-use crate::index::{FileId, Group, Index, Inputs};
+use crate::index::{FileId, Group, Index, Inputs, LoadOptions};
 use crate::intern::{FxHashSet, FxHasher, Interner, hash_bytes};
 use crate::roots::{Origin, Roots};
 
@@ -310,6 +319,10 @@ pub(crate) struct Lookup {
     dir: PathBuf,
     schema: u64,
     plans: Vec<Plan>,
+    /// Per group: the key of the duplication fingerprints the load takes for its files
+    /// (first-party groups when `analysis.dupes` is on), else `None`. Such a group's entries
+    /// are hits only if its segment stores fingerprints of this key.
+    fp: Vec<Option<FingerprintKey>>,
     open: Vec<Open>,
     /// Files copied from each group's segment (hits and verified).
     hits: Vec<AtomicU32>,
@@ -331,6 +344,7 @@ impl Lookup {
     /// the number of input files of group `g`.
     fn new(dir: PathBuf, schema: u64, plans: Vec<Plan>, group_files: &[u32]) -> Lookup {
         let groups = plans.len();
+        let fp = vec![None; groups];
         let open = group_files
             .iter()
             .map(|&n| Open {
@@ -343,6 +357,7 @@ impl Lookup {
             dir,
             schema,
             plans,
+            fp,
             open,
             hits: (0..groups).map(|_| AtomicU32::new(0)).collect(),
             verified: (0..groups).map(|_| AtomicU32::new(0)).collect(),
@@ -408,6 +423,11 @@ impl Lookup {
     pub fn probe(&self, g: u32, path: &Path) -> Probe {
         let guard = self.segment(g as usize);
         let State::Ready(seg) = &*guard else { return Probe::Miss };
+        let want = self.fp[g as usize];
+        if want.is_some() && seg.fingerprint_key() != want {
+            // Fingerprints are needed and not stored: extract (the segment is rewritten).
+            return Probe::Miss;
+        }
         let plan = &self.plans[g as usize];
         let Some(i) = seg.find(stored_path(path.as_os_str().as_bytes(), plan.base.as_os_str().as_bytes())) else {
             return Probe::Miss;
@@ -429,18 +449,21 @@ impl Lookup {
 
     /// Copies entry `i` of group `g`'s segment into `store` / `metrics`, interning its
     /// strings into `strings` (through the worker's `remap` of this segment), and counts the
-    /// hit. `None` only if the segment is gone (every file of the group was already
-    /// [`Lookup::done`]).
+    /// hit. When the group takes fingerprints, the entry's stored ones are appended to `fps`
+    /// as those of `file`. `None` only if the segment is gone (every file of the group was
+    /// already [`Lookup::done`]).
     #[allow(clippy::too_many_arguments)]
     pub fn copy(
         &self,
         g: u32,
         i: u32,
+        file: FileId,
         verified: bool,
         store: &mut FactStore,
         metrics: &mut MetricsTable,
         strings: &mut Interner,
         remap: &mut SegRemap,
+        fps: &mut Fingerprints,
     ) -> Option<FileFacts> {
         let guard = read(&self.open[g as usize].state);
         let State::Ready(seg) = &*guard else { return None };
@@ -450,6 +473,9 @@ impl Lookup {
             remap.ids.resize(seg.string_count() as usize, 0);
         }
         let ff = seg.copy_file(i, store, metrics, strings, &mut remap.ids);
+        if self.fp[g as usize].is_some() {
+            seg.copy_fingerprints(i, file, fps);
+        }
         drop(guard);
         self.hits[g as usize].fetch_add(1, Ordering::Relaxed);
         if verified {
@@ -515,12 +541,30 @@ pub struct CacheStats {
 /// module docs). `roots` identifies distributions and the stdlib (`None`: every group is
 /// validated per file). The index is the same as without a cache.
 pub fn load(inputs: Inputs, roots: Option<&Roots>, cache: &Cache) -> (Index, CacheStats) {
+    let (index, stats, _) = load_with(inputs, roots, cache, &LoadOptions::default());
+    (index, stats)
+}
+
+/// [`load`] with the optional work of [`crate::index::load_with`]. With `opts.dupes`, the
+/// fingerprints of first-party files are cached with their facts (tagged with
+/// [`DupesParams::fingerprint_key`](crate::analysis::dupes::DupesParams::fingerprint_key)):
+/// cached files get the fingerprints stored for them, so the result is the same as without a
+/// cache. A first-party segment without fingerprints of that key (written by a load without
+/// `dupes`, or with other thresholds) counts as stale: its files are extracted again and it is
+/// rewritten with fingerprints. A load without `dupes` leaves stored fingerprints alone unless
+/// it rewrites the segment (a file changed), which drops them.
+pub fn load_with(
+    inputs: Inputs,
+    roots: Option<&Roots>,
+    cache: &Cache,
+    opts: &LoadOptions,
+) -> (Index, CacheStats, Option<Fingerprints>) {
     let mut stats = CacheStats { segments: inputs.groups().len() as u32, ..CacheStats::default() };
     if !cfg!(target_endian = "little") {
         // The format is little-endian and read in place; other hosts load without a cache.
-        let index = crate::index::load(inputs);
+        let (index, fps) = crate::index::load_with(inputs, opts);
         stats.misses = u64::from(index.file_count());
-        return (index, stats);
+        return (index, stats, fps);
     }
     let schema = schema();
     let plans: Vec<Plan> = inputs.groups().iter().map(|g| Plan::for_group(g, roots)).collect();
@@ -528,8 +572,16 @@ pub fn load(inputs: Inputs, roots: Option<&Roots>, cache: &Cache) -> (Index, Cac
     for f in 0..inputs.len() as FileId {
         group_files[inputs.group(f) as usize] += 1;
     }
-    let lookup = Lookup::new(cache.dir.clone(), schema, plans, &group_files);
-    let (index, stamps) = crate::index::load_with(inputs, Some(&lookup));
+    let mut lookup = Lookup::new(cache.dir.clone(), schema, plans, &group_files);
+    if let Some(p) = opts.dupes {
+        for (fp, g) in lookup.fp.iter_mut().zip(inputs.groups()) {
+            // The loader fingerprints exactly the first-party files.
+            if g.origin == Origin::FirstParty {
+                *fp = Some(p.fingerprint_key());
+            }
+        }
+    }
+    let (index, fps, stamps) = crate::index::load_cached(inputs, opts, Some(&lookup));
     let hits: u64 = lookup.hits.iter().map(|h| u64::from(h.load(Ordering::Relaxed))).sum();
     stats.verified = lookup.verified.iter().map(|h| u64::from(h.load(Ordering::Relaxed))).sum();
     stats.hits = hits - stats.verified;
@@ -538,14 +590,35 @@ pub fn load(inputs: Inputs, roots: Option<&Roots>, cache: &Cache) -> (Index, Cac
     stats.invalid = lookup.invalid.load(Ordering::Relaxed);
     stats.opened_bytes = lookup.opened_bytes.load(Ordering::Relaxed);
     let t1 = Instant::now();
-    crate::timing::time("cache.write", || write_back(cache, &index, &stamps, &lookup, schema, &mut stats));
+    crate::timing::time("cache.write", || write_back(cache, &index, &stamps, fps.as_ref(), &lookup, schema, &mut stats));
     stats.write = t1.elapsed();
-    (index, stats)
+    (index, stats, fps)
+}
+
+/// Start of each file's rows in `fps` (rows in FileId order), `files + 1` entries.
+fn fingerprint_starts(fps: &Fingerprints, files: u32) -> Vec<u32> {
+    let mut starts = vec![0u32; files as usize + 1];
+    for r in fps.iter() {
+        starts[r.file as usize + 1] += 1;
+    }
+    for i in 0..files as usize {
+        starts[i + 1] += starts[i];
+    }
+    starts
 }
 
 /// Rewrites the segment of every group that is missing, stale (a file extracted or
 /// verified) or holds files this load does not have.
-fn write_back(cache: &Cache, index: &Index, stamps: &[Stamp], lookup: &Lookup, schema: u64, stats: &mut CacheStats) {
+/// Groups that take fingerprints store `fps` (the load's, in FileId order) with their facts.
+fn write_back(
+    cache: &Cache,
+    index: &Index,
+    stamps: &[Stamp],
+    fps: Option<&Fingerprints>,
+    lookup: &Lookup,
+    schema: u64,
+    stats: &mut CacheStats,
+) {
     let groups = lookup.plans.len();
     let mut members: Vec<Vec<FileId>> = vec![Vec::new(); groups];
     let mut unreadable = vec![false; index.file_count() as usize];
@@ -574,12 +647,14 @@ fn write_back(cache: &Cache, index: &Index, stamps: &[Stamp], lookup: &Lookup, s
         return;
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let fp_starts = fps.map(|f| fingerprint_starts(f, index.file_count()));
     let maps = PerThread::new(segment::SymMap::default);
     let results: Vec<Result<u64, String>> = stale
         .par_iter()
         .map(|&g| {
             let plan = &lookup.plans[g];
             let base = plan.base.as_os_str().as_bytes();
+            let fp = lookup.fp[g].filter(|_| fps.is_some());
             let files: Vec<segment::EncFile<'_>> = members[g]
                 .iter()
                 .map(|&f| {
@@ -591,13 +666,19 @@ fn write_back(cache: &Cache, index: &Index, stamps: &[Stamp], lookup: &Lookup, s
                     // One metrics row per def row except `<module>`, files in FileId order.
                     let metrics = ff.defs.start - f;
                     let path = stored_path(index.file_path(f).as_os_str().as_bytes(), base);
-                    segment::EncFile { path, ff, metrics, stamp }
+                    let fps = match (fp, fps, &fp_starts) {
+                        (Some(_), Some(rows), Some(st)) => {
+                            &rows.as_slice()[st[f as usize] as usize..st[f as usize + 1] as usize]
+                        }
+                        _ => &[],
+                    };
+                    segment::EncFile { path, ff, metrics, stamp, fps }
                 })
                 .collect();
             let path = cache.dir.join(&plan.file);
             let (_, len) = format::write_atomic_with(&path, |out| {
                 maps.with(|_, m| {
-                    segment::encode(index.strings(), index.facts(), index.metrics(), &files, m, KIND_FACTS, schema, plan.key, out)
+                    segment::encode(index.strings(), index.facts(), index.metrics(), &files, fp, m, KIND_FACTS, schema, plan.key, out)
                 })
             })
             .map_err(|e| format!("{}: {e}", path.display()))?;
