@@ -30,7 +30,7 @@ mod tests;
 pub use suppress::Suppression;
 pub use token::{Token, TokenKind};
 
-use scan::{IDENT, find2, find4};
+use scan::{IDENT, find2, find4, skip_ident, skip_spaces};
 
 /// Longest source the lexer accepts: offsets are `u32`. Longer inputs are
 /// truncated to this length (see [`Lexer::truncated`]); callers should skip such
@@ -261,32 +261,48 @@ impl<'src> Lexer<'src> {
     }
 
     /// Returns the next token.
+    #[inline]
     pub fn next_token(&mut self) -> Token {
+        loop {
+            // One combined test keeps the common path (a plain token mid-line) short.
+            let st = &self.st;
+            if st.at_bol | (st.pending_dedents != 0) | st.pending_error.is_some() | (st.modes_len != 0)
+                && let Some(t) = self.special()
+            {
+                return t;
+            }
+            if let Some(t) = self.lex_token() {
+                return t;
+            }
+        }
+    }
+
+    /// Queued DEDENTs/errors, f/t-string literal and format-spec modes, and line starts.
+    /// `None` means the next token is lexed normally by [`Lexer::lex_token`].
+    #[inline(never)]
+    fn special(&mut self) -> Option<Token> {
         loop {
             if self.st.pending_dedents > 0 {
                 self.st.pending_dedents -= 1;
-                return self.tok0(TokenKind::Dedent);
+                return Some(self.tok0(TokenKind::Dedent));
             }
             if let Some(k) = self.st.pending_error.take() {
-                return self.tok0(k);
+                return Some(self.tok0(k));
             }
             if self.st.modes_len > 0 {
                 let top = self.st.modes[self.st.modes_len as usize - 1];
                 if top.flags & F_FIELD == 0 {
-                    return self.fstring_literal(top);
+                    return Some(self.fstring_literal(top));
                 }
                 if top.flags & F_SPEC != 0 {
-                    return self.format_spec(top);
+                    return Some(self.format_spec(top));
                 }
             }
-            if self.st.at_bol {
-                if let Some(t) = self.line_start() {
-                    return t;
-                }
-                continue;
+            if !self.st.at_bol {
+                return None;
             }
-            if let Some(t) = self.lex_token() {
-                return t;
+            if let Some(t) = self.line_start() {
+                return Some(t);
             }
         }
     }
@@ -324,15 +340,7 @@ impl<'src> Lexer<'src> {
                 }
                 self.tok(K::NonLogicalNewline, p, end)
             }
-            b'#' => {
-                let end = find2(src, p + 1, b'\n', b'\r').unwrap_or(src.len());
-                suppress::scan(src, p, end, &mut self.suppressions);
-                self.st.pos = end as u32;
-                if !self.trivia {
-                    return None;
-                }
-                self.tok(K::Comment, p, end)
-            }
+            b'#' => return self.comment(p),
             b'(' => self.open(K::LPar, B_PAREN, p),
             b'[' => self.open(K::LSqb, B_SQB, p),
             b'{' => self.open(K::LBrace, B_BRACE, p),
@@ -389,6 +397,18 @@ impl<'src> Lexer<'src> {
             _ => self.emit(K::ErrorUnknownChar, p, p + 1),
         };
         Some(t)
+    }
+
+    /// Comment at `p` up to the line terminator; records suppressions. `None` unless trivia mode.
+    fn comment(&mut self, p: usize) -> Option<Token> {
+        let src = self.src;
+        let end = find2(src, p + 1, b'\n', b'\r').unwrap_or(src.len());
+        suppress::scan(src, p, end, &mut self.suppressions);
+        self.st.pos = end as u32;
+        if !self.trivia {
+            return None;
+        }
+        Some(self.tok(TokenKind::Comment, p, end))
     }
 
     /// `X` or `X=`-style two-way operator.
@@ -515,9 +535,10 @@ impl<'src> Lexer<'src> {
         self.st.at_bol = false;
         let src = self.src;
         let start = self.st.pos as usize;
-        let mut p = start;
-        let mut col: u32 = 0;
-        let mut alt: u32 = 0;
+        // Spaces only is the common case; tabs and form feeds take the loop.
+        let mut p = skip_spaces(src, start);
+        let mut col = (p - start).min(u32::MAX as usize) as u32;
+        let mut alt = col;
         loop {
             match src.get(p) {
                 Some(b' ') => {
@@ -591,21 +612,14 @@ impl<'src> Lexer<'src> {
 
     fn name_or_string(&mut self, start: usize) -> Token {
         let src = self.src;
-        let mut p = start + 1;
-        while let Some(&b) = src.get(p) {
-            if !IDENT[b as usize] {
-                break;
-            }
-            p += 1;
-        }
-        let word = &src[start..p];
+        let p = skip_ident(src, start + 1);
         if p - start <= 2
             && let Some(b'"' | b'\'') = src.get(p)
-            && let Some(flags) = prefix_flags(word)
+            && let Some(flags) = prefix_flags(&src[start..p])
         {
             return self.string(start, p, flags);
         }
-        let kind = token::keyword(word);
+        let kind = token::keyword(src, start, p);
         self.emit(kind, start, p)
     }
 
@@ -940,7 +954,8 @@ impl<'src> Lexer<'src> {
     /// Lexes the whole input into a vector (convenience for tests and tools;
     /// the parser pulls tokens instead). Includes the final EndOfFile.
     pub fn tokenize(mut self) -> (Vec<Token>, Vec<Suppression>) {
-        let mut out = Vec::with_capacity(self.src.len() / 4 + 8);
+        // About one token per 8 source bytes in real code.
+        let mut out = Vec::with_capacity(self.src.len() / 6 + 8);
         loop {
             let t = self.next_token();
             out.push(t);

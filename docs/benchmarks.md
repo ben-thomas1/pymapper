@@ -46,6 +46,8 @@ entered, and symlinks are not followed.
 |--------------|------------------------|-----------------------------------------------------------|
 | `read`       | `walk`, `read`         | walk, then read every file in parallel (the I/O floor)    |
 | `parse-only` | `walk`, `read+parse`   | same, calling the parse hook on each file's bytes         |
+| `lex`        | `walk`, `read+lex`     | same, lexing each file to EOF (parser mode, no trivia)    |
+| `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 
 The parse hook is `parse_file(src: &[u8], acc: &mut ParseAcc)` in `xtask/src/bench/targets.rs`.
 Later steps plug the lexer/extractor in there. `ParseAcc` is per-thread state that gets merged
@@ -53,6 +55,12 @@ at the end; its `counters()` (e.g. tokens, defs) show up in the table and the re
 Until then the hook does nothing, so `parse-only` costs the same as `read`. The walk is an
 interim sequential walker in `xtask/src/bench/walk.rs`. It should be replaced by
 `pymapper_core::walk` once that exists.
+
+The lexer targets add counters: `tokens`, `error_tokens`, `lex_cpu_ms` (time inside the lexer,
+summed over threads) and `lex_MBps_core` (corpus MB per second of lexer time). For a clean
+single-core number run `lex-mem` with `-j 1`: the `lex` phase is then pure lexing on one
+thread (`MB / lex`). `lex-mem` holds the whole corpus in memory, so its peak RSS is about the
+corpus size and says nothing about the lexer's own memory use (a few KB per lexer).
 
 Adding a target: add a `Target` variant and a match arm in `targets::run`.
 

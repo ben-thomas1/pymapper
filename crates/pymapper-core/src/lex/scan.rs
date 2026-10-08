@@ -32,6 +32,52 @@ fn load(h: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
+/// High bit set in each lane of `x` (all lanes < 0x80) whose byte is in `lo..=hi`.
+/// No carries cross lanes: each lane sum stays <= 0xff.
+#[inline(always)]
+fn in_range(x: u64, lo: u8, hi: u8) -> u64 {
+    let ge = x.wrapping_add(LO * (0x80 - lo) as u64);
+    let gt = x.wrapping_add(LO * (0x7f - hi) as u64);
+    ge & !gt & HI
+}
+
+/// First index `>= i` whose byte is not an identifier byte (see [`IDENT`]), or `h.len()`.
+#[inline(always)]
+pub(super) fn skip_ident(h: &[u8], mut i: usize) -> usize {
+    while i + 8 <= h.len() {
+        let w = load(h, i);
+        let x = w & !HI;
+        let ident = in_range(x | (LO * 0x20), b'a', b'z') | in_range(x, b'0', b'9') | in_range(x, b'_', b'_') | (w & HI);
+        let stop = !ident & HI;
+        if stop != 0 {
+            return i + (stop.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < h.len() && IDENT[h[i] as usize] {
+        i += 1;
+    }
+    i
+}
+
+/// First index `>= i` whose byte is not `b' '`, or `h.len()`.
+#[inline(always)]
+pub(super) fn skip_spaces(h: &[u8], mut i: usize) -> usize {
+    while i + 8 <= h.len() {
+        // Lanes that differ from a space are nonzero after the XOR; find the first one exactly
+        // (no borrow trick, so no false positives in any lane).
+        let x = load(h, i) ^ (LO * b' ' as u64);
+        if x != 0 {
+            return i + (x.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < h.len() && h[i] == b' ' {
+        i += 1;
+    }
+    i
+}
+
 /// First index `>= from` whose byte is `a` or `b`.
 #[inline]
 pub(super) fn find2(h: &[u8], mut i: usize, a: u8, b: u8) -> Option<usize> {
@@ -94,6 +140,25 @@ mod tests {
                 assert_eq!(find2(h, from, 0x00, 0x81), naive(h, from, &[0x00, 0x81]));
             }
         }
+    }
+
+    #[test]
+    fn skip_ident_and_spaces_match_naive() {
+        // Every byte value at every lane position, before and after an identifier run.
+        for b in 0..=255u8 {
+            for pos in 0..20 {
+                let mut h = vec![b'a'; 20];
+                h[pos] = b;
+                let want = if IDENT[b as usize] { 20 } else { pos };
+                assert_eq!(skip_ident(&h, 0), want, "byte {b:#x} at {pos}");
+                let mut s = vec![b' '; 20];
+                s[pos] = b;
+                assert_eq!(skip_spaces(&s, 0), if b == b' ' { 20 } else { pos }, "byte {b:#x} at {pos}");
+            }
+        }
+        assert_eq!(skip_ident(b"", 0), 0);
+        assert_eq!(skip_spaces(b"  ", 2), 2);
+        assert_eq!(skip_ident(b"abc def", 1), 3);
     }
 
     #[test]

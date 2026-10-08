@@ -151,6 +151,30 @@ fn non_ascii_and_non_utf8_identifiers() {
     assert_eq!(v[1].0, K::Equal);
 }
 
+#[test]
+fn word_at_scan_paths_near_eof() {
+    // Identifiers, keywords and indentation of every length up to past one 8-byte word, both
+    // at EOF (short tail path) and followed by more input (word-at-a-time path).
+    for n in 1..20 {
+        let name = "a".repeat(n);
+        for tail in ["", " = 1\n"] {
+            let src = format!("{name}{tail}");
+            assert_eq!(toks(&src)[0], (K::Name, name.clone()), "{src:?}");
+            let indented = format!("if x:\n{}y{tail}", " ".repeat(n));
+            let v = toks(&indented);
+            assert_eq!(v[4], (K::Indent, " ".repeat(n)), "{indented:?}");
+            assert_eq!(v[5], (K::Name, "y".to_owned()), "{indented:?}");
+        }
+    }
+    for kw in ["if", "def", "None", "while", "return", "finally", "continue", "nonlocal"] {
+        assert!(Lexer::new(kw.as_bytes()).next_token().kind.is_keyword(), "{kw}");
+        assert!(Lexer::new(format!("{kw} ").as_bytes()).next_token().kind.is_keyword(), "{kw}");
+        assert_eq!(Lexer::new(format!("{kw}x").as_bytes()).next_token().kind, K::Name, "{kw}");
+    }
+    // A non-ASCII byte right after the first word boundary.
+    assert_eq!(toks("abcdefgh\u{e9}ij = 1\n")[0].1, "abcdefgh\u{e9}ij");
+}
+
 // ---------------------------------------------------------------------------
 // Numbers.
 

@@ -49,8 +49,7 @@ pub(super) fn scan(src: &[u8], start: usize, end: usize, out: &mut Vec<Suppressi
     }
     let c = &src[start..end];
     let mut i = 0;
-    while let Some(off) = c[i..].iter().position(|&b| b == b'#') {
-        let hash = i + off;
+    while let Some(hash) = super::scan::find2(c, i, b'#', b'#') {
         i = hash + 1;
         if let Some(mut s) = parse(c, hash) {
             s.start += start as u32;

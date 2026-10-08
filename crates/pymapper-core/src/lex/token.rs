@@ -213,50 +213,100 @@ impl Token {
     }
 }
 
-/// Maps an identifier to its hard-keyword kind, or [`TokenKind::Name`].
-#[inline]
-pub(super) fn keyword(s: &[u8]) -> TokenKind {
+/// Hard keywords and their kinds (the source of the perfect-hash table below).
+const KEYWORDS: [(&[u8], TokenKind); 35] = {
     use TokenKind as K;
-    // Keywords are 2..=8 bytes and start with a lowercase letter or F/N/T.
-    if s.len() < 2 || s.len() > 8 {
-        return K::Name;
+    [
+        (b"False", K::False), (b"None", K::None), (b"True", K::True), (b"and", K::And), (b"as", K::As),
+        (b"assert", K::Assert), (b"async", K::Async), (b"await", K::Await), (b"break", K::Break),
+        (b"class", K::Class), (b"continue", K::Continue), (b"def", K::Def), (b"del", K::Del),
+        (b"elif", K::Elif), (b"else", K::Else), (b"except", K::Except), (b"finally", K::Finally),
+        (b"for", K::For), (b"from", K::From), (b"global", K::Global), (b"if", K::If),
+        (b"import", K::Import), (b"in", K::In), (b"is", K::Is), (b"lambda", K::Lambda),
+        (b"nonlocal", K::Nonlocal), (b"not", K::Not), (b"or", K::Or), (b"pass", K::Pass),
+        (b"raise", K::Raise), (b"return", K::Return), (b"try", K::Try), (b"while", K::While),
+        (b"with", K::With), (b"yield", K::Yield),
+    ]
+};
+
+/// Multiplier of the keyword hash: `(word * KW_MUL) >> 58` is collision-free over
+/// [`KEYWORDS`] (checked at compile time). Found by random search.
+const KW_MUL: u64 = 0xb57c_8e05_e3c9_b0e1;
+
+#[inline(always)]
+const fn kw_slot(word: u64) -> usize {
+    (word.wrapping_mul(KW_MUL) >> 58) as usize
+}
+
+/// Keyword bytes as a little-endian zero-padded `u64` per hash slot (0 = empty), and the kind.
+/// Identifier bytes are never 0, so a word of 2..=8 bytes is uniquely identified by its `u64`.
+static KW_TABLE: ([u64; 64], [TokenKind; 64]) = {
+    let mut words = [0u64; 64];
+    let mut kinds = [TokenKind::Name; 64];
+    let mut i = 0;
+    while i < KEYWORDS.len() {
+        let (kw, kind) = KEYWORDS[i];
+        let mut a = [0u8; 8];
+        let mut j = 0;
+        while j < kw.len() {
+            a[j] = kw[j];
+            j += 1;
+        }
+        let w = u64::from_le_bytes(a);
+        let slot = kw_slot(w);
+        assert!(words[slot] == 0, "keyword hash collision: pick another KW_MUL");
+        words[slot] = w;
+        kinds[slot] = kind;
+        i += 1;
     }
-    match s {
-        b"if" => K::If,
-        b"in" => K::In,
-        b"is" => K::Is,
-        b"as" => K::As,
-        b"or" => K::Or,
-        b"def" => K::Def,
-        b"for" => K::For,
-        b"and" => K::And,
-        b"not" => K::Not,
-        b"del" => K::Del,
-        b"try" => K::Try,
-        b"None" => K::None,
-        b"True" => K::True,
-        b"else" => K::Else,
-        b"elif" => K::Elif,
-        b"from" => K::From,
-        b"pass" => K::Pass,
-        b"with" => K::With,
-        b"False" => K::False,
-        b"class" => K::Class,
-        b"while" => K::While,
-        b"yield" => K::Yield,
-        b"raise" => K::Raise,
-        b"break" => K::Break,
-        b"async" => K::Async,
-        b"await" => K::Await,
-        b"return" => K::Return,
-        b"import" => K::Import,
-        b"except" => K::Except,
-        b"global" => K::Global,
-        b"lambda" => K::Lambda,
-        b"assert" => K::Assert,
-        b"finally" => K::Finally,
-        b"continue" => K::Continue,
-        b"nonlocal" => K::Nonlocal,
-        _ => K::Name,
+    (words, kinds)
+};
+
+/// Maps the identifier `src[start..end]` to its hard-keyword kind, or [`TokenKind::Name`].
+#[inline(always)]
+pub(super) fn keyword(src: &[u8], start: usize, end: usize) -> TokenKind {
+    let len = end - start;
+    // Keywords are 2..=8 bytes.
+    if len.wrapping_sub(2) > 6 {
+        return TokenKind::Name;
+    }
+    let mut a = [0u8; 8];
+    let w = match src.get(start..start + 8) {
+        Some(chunk) => {
+            a.copy_from_slice(chunk);
+            u64::from_le_bytes(a) & (u64::MAX >> (64 - 8 * len))
+        }
+        None => {
+            a[..len].copy_from_slice(&src[start..end]);
+            u64::from_le_bytes(a)
+        }
+    };
+    let slot = kw_slot(w);
+    if KW_TABLE.0[slot] == w { KW_TABLE.1[slot] } else { TokenKind::Name }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kw(s: &[u8]) -> TokenKind {
+        keyword(s, 0, s.len())
+    }
+
+    #[test]
+    fn keyword_table_matches_list() {
+        for (w, k) in KEYWORDS {
+            assert_eq!(kw(w), k);
+            // With trailing bytes after the word (the 8-byte load path).
+            let mut padded = w.to_vec();
+            padded.extend_from_slice(b"xxxxxxxx");
+            assert_eq!(keyword(&padded, 0, w.len()), k);
+            // Prefixes and extensions are names.
+            assert_eq!(kw(&w[..w.len() - 1]), TokenKind::Name);
+            assert_eq!(keyword(&padded, 0, w.len() + 1), TokenKind::Name);
+        }
+        for w in [&b""[..], b"x", b"match", b"case", b"type", b"_", b"elsewhere", b"nonlocals", b"Nonlocal", b"\xffif"] {
+            assert_eq!(kw(w), TokenKind::Name, "{w:?}");
+        }
     }
 }
