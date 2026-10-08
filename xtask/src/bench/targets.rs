@@ -13,6 +13,8 @@ use clap::ValueEnum;
 use pymapper_core::timing;
 use rayon::prelude::*;
 
+use pymapper_core::walk::{self as core_walk, DiagnosticKind, PathList, WalkOptions};
+
 use super::rusage;
 use super::walk::{PathStore, walk_python};
 
@@ -23,6 +25,13 @@ pub enum Target {
     Read,
     /// Walk + parallel read + per-file parse hook ([`parse_file`]).
     ParseOnly,
+    /// Parallel walk only (`pymapper_core::walk`, corpus options).
+    Walk,
+    /// Sequential reference walk only (single thread, same file set as `walk`).
+    WalkSeq,
+    /// Parallel walk only with first-party options: gitignore files honoured, hidden
+    /// directories skipped.
+    WalkGit,
 }
 
 impl Target {
@@ -30,6 +39,9 @@ impl Target {
         match self {
             Target::Read => "read",
             Target::ParseOnly => "parse-only",
+            Target::Walk => "walk",
+            Target::WalkSeq => "walk-seq",
+            Target::WalkGit => "walk-git",
         }
     }
 }
@@ -78,26 +90,68 @@ fn no_hook(_src: &[u8], _acc: &mut ParseAcc) {}
 pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
     let _ = timing::take();
     let t0 = Instant::now();
-    let mut paths = PathStore::default();
-    let walk_errors = timing::time("walk", || walk_python(root, &mut paths))
-        .with_context(|| format!("walking {}", root.display()))?;
-    let (stats, acc) = match target {
-        Target::Read => timing::time("read", || read_files(&paths, no_hook)),
-        Target::ParseOnly => timing::time("read+parse", || read_files(&paths, parse_file)),
+    let (stats, counters) = match target {
+        Target::WalkSeq => {
+            let mut paths = PathStore::default();
+            let errors = timing::time("walk", || walk_python(root, &mut paths))
+                .with_context(|| format!("walking {}", root.display()))?;
+            (ReadStats { files: paths.len() as u64, bytes: 0, errors }, Vec::new())
+        }
+        Target::Walk | Target::WalkGit => {
+            let opts = if target == Target::Walk { corpus_options() } else { WalkOptions::default() };
+            let (files, errors, counters) = walk_corpus(root, &opts)?;
+            (ReadStats { files: files.len() as u64, bytes: 0, errors }, counters)
+        }
+        Target::Read | Target::ParseOnly => {
+            let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+            let (mut stats, acc) = if target == Target::Read {
+                timing::time("read", || read_files(&files, no_hook))
+            } else {
+                timing::time("read+parse", || read_files(&files, parse_file))
+            };
+            stats.errors += walk_errors;
+            (stats, acc.counters())
+        }
     };
-    drop(paths);
     let total_s = t0.elapsed().as_secs_f64();
     let phases = timing::take().into_iter().map(|p| (p.name.to_owned(), p.elapsed.as_secs_f64())).collect();
     Ok(RunRecord {
         files: stats.files,
         bytes: stats.bytes,
-        errors: walk_errors + stats.errors,
+        errors: stats.errors,
         threads: rayon::current_num_threads() as u64,
         phases,
         total_s,
         peak_rss_bytes: rusage::peak_rss_bytes().context("getrusage")?,
-        counters: acc.counters(),
+        counters,
     })
+}
+
+/// Named counters of a run, in a fixed order.
+type Counters = Vec<(String, u64)>;
+
+/// Walk options for the benchmark corpora: every Python file outside `__pycache__` and `.git`,
+/// hidden directories included, no gitignore (the same file set as the sequential reference
+/// walker, so `walk` and `walk-seq` are comparable).
+fn corpus_options() -> WalkOptions {
+    WalkOptions::everything()
+}
+
+/// Runs the core walker as phase `walk`: files, non-fatal error count and walk counters. An
+/// unreadable root is an error.
+fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64, Counters)> {
+    let w = timing::time("walk", || core_walk::walk(&[root], opts));
+    if let Some(d) = w.diagnostics.iter().find(|d| d.kind == DiagnosticKind::Root || d.path == root) {
+        anyhow::bail!("walking {}: {d}", root.display());
+    }
+    let s = w.stats;
+    let counters = vec![
+        ("dirs".to_owned(), s.dirs),
+        ("entries".to_owned(), s.entries),
+        ("ignored".to_owned(), s.ignored),
+        ("hidden".to_owned(), s.hidden),
+    ];
+    Ok((w.files, w.diagnostics.len() as u64, counters))
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -114,7 +168,7 @@ struct ReadState {
 }
 
 /// Reads every file in parallel into a reused per-job buffer and hands it to `hook`.
-pub fn read_files<F: Fn(&[u8], &mut ParseAcc) + Sync>(paths: &PathStore, hook: F) -> (ReadStats, ParseAcc) {
+pub fn read_files<F: Fn(&[u8], &mut ParseAcc) + Sync>(paths: &PathList, hook: F) -> (ReadStats, ParseAcc) {
     let fresh = || ReadState { buf: Vec::new(), stats: ReadStats::default(), acc: ParseAcc::default() };
     let state = (0..paths.len())
         .into_par_iter()
@@ -158,9 +212,8 @@ mod tests {
         fs::write(dir.join("a.py"), "abc").unwrap();
         fs::write(dir.join("b.py"), "").unwrap();
         fs::write(dir.join("c.py"), vec![b'x'; 100_000]).unwrap();
-        let mut paths = PathStore::default();
-        walk_python(&dir, &mut paths).unwrap();
-        paths.push_join(&dir, std::ffi::OsStr::new("vanished.py")).unwrap();
+        let mut paths = core_walk::walk(&[&dir], &corpus_options()).files;
+        paths.push(dir.join("vanished.py").as_os_str().as_encoded_bytes()).unwrap();
         let (stats, _) = read_files(&paths, parse_file);
         assert_eq!(stats, ReadStats { files: 3, bytes: 100_003, errors: 1 });
         fs::remove_dir_all(&dir).unwrap();
@@ -176,20 +229,31 @@ mod tests {
             bytes += fs::metadata(paths.get(i)).unwrap().len();
         }
         timing::enable(true);
-        for target in [Target::Read, Target::ParseOnly] {
+        for target in [Target::Read, Target::ParseOnly, Target::Walk, Target::WalkSeq, Target::WalkGit] {
             let rec = run(target, &root).expect("run");
+            // The corpus has no ignore files or hidden directories, so all walks agree.
             assert_eq!(rec.files, paths.len() as u64, "{target:?}");
-            assert_eq!(rec.bytes, bytes, "{target:?}");
+            let read = matches!(target, Target::Read | Target::ParseOnly);
+            assert_eq!(rec.bytes, if read { bytes } else { 0 }, "{target:?}");
             assert_eq!(rec.errors, 0);
             assert!(rec.threads >= 1);
             assert!(rec.peak_rss_bytes > 0);
             let names: Vec<&str> = rec.phases.iter().map(|(n, _)| n.as_str()).collect();
-            let second = if target == Target::Read { "read" } else { "read+parse" };
-            assert_eq!(names, ["walk", second], "{target:?}");
+            match target {
+                Target::Read => assert_eq!(names, ["walk", "read"]),
+                Target::ParseOnly => assert_eq!(names, ["walk", "read+parse"]),
+                _ => assert_eq!(names, ["walk"], "{target:?}"),
+            }
+            let counters: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
+            if matches!(target, Target::Walk | Target::WalkGit) {
+                assert_eq!(counters, ["dirs", "entries", "ignored", "hidden"], "{target:?}");
+            }
             let phase_sum: f64 = rec.phases.iter().map(|(_, s)| s).sum();
             assert!(phase_sum <= rec.total_s + 1e-6, "phases {phase_sum} > total {}", rec.total_s);
         }
         // Same test: `run` uses the process-global phase table.
-        assert!(run(Target::Read, Path::new("/no/such/xtask/root")).is_err());
+        for target in [Target::Read, Target::Walk, Target::WalkSeq] {
+            assert!(run(target, Path::new("/no/such/xtask/root")).is_err(), "{target:?}");
+        }
     }
 }
