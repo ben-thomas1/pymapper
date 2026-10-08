@@ -136,17 +136,24 @@ fn file_locals(ix: &Index, nodes: &[NodeId]) -> Vec<u32> {
 /// [`res_flags`](crate::resolve::res_flags) shared by every import row behind it) intersect
 /// `exclude`. `exclude = TYPE_ONLY | LAZY` gives the graph of what runs at import time.
 pub fn import_graph(ix: &Index, imp: &Imports, exclude: u8) -> ModuleGraph {
+    import_graph_where(ix, imp, exclude, |_| true)
+}
+
+/// [`import_graph`] keeping only the edges of files for which `keep` holds (for instance
+/// first-party, non-stub files). Nodes are still every package/module of the index.
+pub fn import_graph_where(ix: &Index, imp: &Imports, exclude: u8, keep: impl Fn(FileId) -> bool) -> ModuleGraph {
     let nodes = module_nodes(ix);
     let locals = file_locals(ix, &nodes);
     // Destination local ids: binary search per edge (module edges are few compared to calls).
     let nodes_ref = &nodes;
     let locals = &locals;
     let local = move |v: NodeId| nodes_ref.binary_search(&v).map_or(NONE, |i| i as u32);
+    let keep = &keep;
     let graph = Graph::build_labelled(nodes.len() as u32, || {
         imp.all_module_edges().filter_map(move |(f, e)| {
             let s = locals[f as usize];
             let d = local(e.dst);
-            (s != NONE && d != NONE && e.flags & exclude == 0).then_some((s, d, e.flags))
+            (s != NONE && d != NONE && e.flags & exclude == 0 && keep(f)).then_some((s, d, e.flags))
         })
     });
     ModuleGraph { nodes, graph }
