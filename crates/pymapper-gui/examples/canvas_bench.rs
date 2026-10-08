@@ -212,6 +212,14 @@ fn main() -> Result<()> {
     })?;
     let rebuild = map.stats.band_rebuilds;
     let labels = map.stats.label_rebuilds;
+    let uploads = map.stats.band_uploads;
+    println!(
+        "  band uploads so far: {} (mean {:.2} ms, max {:.2} ms CPU to fill staging; last {:.1} MiB)",
+        uploads.count,
+        ms(uploads.mean()),
+        ms(uploads.max),
+        map.stats.band_upload_bytes as f64 / 1048576.0
+    );
     println!(
         "  LOD band rebuilds so far: {} (mean {:.2} ms, max {:.2} ms); label rebuilds {} (mean {:.2} ms, max {:.2} ms)",
         rebuild.count,

@@ -76,8 +76,8 @@ fn vs_rect(@builtin(vertex_index) vi: u32, r: RectIn) -> RectOut {
     let b = to_px(r.max);
     let center = (a + b) * 0.5;
     let half = max((b - a) * 0.5, vec2<f32>(0.0));
-    // One pixel of margin for anti-aliasing.
-    let ext = half + vec2<f32>(1.0);
+    // Half a pixel of margin: coverage reaches zero there.
+    let ext = half + vec2<f32>(0.5);
     let local = (corner(vi) * 2.0 - 1.0) * ext;
     var o: RectOut;
     o.pos = px_to_clip(center + local);
@@ -145,7 +145,8 @@ fn edge_vertex(vi: u32, e: EdgeIn, segments: u32) -> EdgeOut {
     let n = normalize(vec2<f32>(-d.y, d.x));
     // Ribbons narrower than a pixel stay one pixel wide and fade instead.
     let w = max(e.width, 1.0);
-    let half = w * 0.5 + 1.0;
+    // Half a pixel of margin: coverage reaches zero there.
+    let half = w * 0.5 + 0.5;
     var o: EdgeOut;
     o.pos = px_to_clip(p + n * (half * side));
     o.across = half * side;
@@ -180,8 +181,9 @@ struct GlyphIn {
     @location(1) rect_max: vec2<f32>,
     @location(2) offset: vec2<i32>,
     @location(3) size: vec2<u32>,
-    @location(4) uv: vec2<u32>,
-    @location(5) color: vec4<f32>,
+    @location(4) need: u32,
+    @location(5) uv: vec2<u32>,
+    @location(6) color: vec4<f32>,
 };
 
 struct GlyphOut {
@@ -203,8 +205,9 @@ fn vs_glyph(@builtin(vertex_index) vi: u32, g: GlyphIn) -> GlyphOut {
     let size = vec2<f32>(g.size);
     var o: GlyphOut;
     o.color = g.color;
-    // Label LOD: the rect must be tall enough for a line and the glyph must fit inside.
-    if b.y - a.y < line_h + 2.0 * pad || tl.x + size.x > b.x - pad {
+    // Label LOD: the rect must be tall enough for a line and wide enough for the label's
+    // first characters, and the glyph itself must fit inside (later glyphs truncate).
+    if b.y - a.y < line_h + 2.0 * pad || b.x - a.x - 2.0 * pad < f32(g.need) || tl.x + size.x > b.x - pad {
         o.pos = CULLED;
         o.texel = vec2<f32>(0.0);
         return o;

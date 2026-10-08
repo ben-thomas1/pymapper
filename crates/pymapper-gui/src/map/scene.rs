@@ -124,7 +124,10 @@ pub struct GlyphInstance {
     pub rect_max: [f32; 2],
     /// Glyph bitmap top-left relative to the label pen origin (baseline-relative y).
     pub offset: [i16; 2],
-    pub size: [u16; 2],
+    pub size: [u8; 2],
+    /// Label LOD: the label shows only if the rect is at least this many pixels wide
+    /// (inside the padding), i.e. its first few characters fit.
+    pub need_px: u16,
     /// Atlas texel origin.
     pub uv: [u16; 2],
     pub color: Rgba,

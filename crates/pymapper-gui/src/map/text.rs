@@ -20,14 +20,16 @@ use super::scene::{GlyphInstance, Rgba, WorldRect};
 
 /// Subpixel bins per pixel along x.
 const BINS: usize = 4;
-/// Gap between atlas entries (avoids bilinear bleeding).
+/// Gap between atlas entries.
 const PAD: u32 = 1;
+/// A label is shown only where at least this many of its characters fit.
+pub const MIN_LABEL_CHARS: usize = 4;
 
 /// One rasterised glyph in the atlas (or an empty one, e.g. a space).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct GlyphEntry {
     pub uv: [u16; 2],
-    pub size: [u16; 2],
+    pub size: [u8; 2],
     /// Bitmap top-left relative to the pen position on the baseline (y down).
     pub offset: [i16; 2],
     pub advance: f32,
@@ -172,7 +174,8 @@ impl TextSystem {
 
     /// Changes the font size; drops the glyph cache and atlas contents.
     pub fn set_px(&mut self, px: f32) {
-        let px = if px.is_finite() { px.clamp(4.0, 256.0) } else { 12.0 };
+        // Glyph bitmaps must fit in u8 sizes (GlyphInstance::size).
+        let px = if px.is_finite() { px.clamp(4.0, 160.0) } else { 12.0 };
         if px == self.px {
             return;
         }
@@ -245,7 +248,7 @@ impl TextSystem {
         let (key, _, _) = CacheKey::new(id, gid, self.px, (x, 0.0), Weight::NORMAL, CacheKeyFlags::empty());
         let Some(img) = self.swash.get_image_uncached(&mut self.fonts, key) else { return entry };
         let (w, h) = (img.placement.width, img.placement.height);
-        if w == 0 || h == 0 || w > u32::from(u16::MAX) || h > u32::from(u16::MAX) {
+        if w == 0 || h == 0 || w > u32::from(u8::MAX) || h > u32::from(u8::MAX) {
             return entry;
         }
         let Some(at) = self.packer.alloc(w, h) else {
@@ -262,16 +265,22 @@ impl TextSystem {
         }
         self.pending.push(PendingGlyph { at, size: [w, h], offset });
         entry.uv = [at[0] as u16, at[1] as u16];
-        entry.size = [w as u16, h as u16];
+        entry.size = [w as u8, h as u8];
         entry.offset = [img.placement.left.clamp(-32768, 32767) as i16, (-img.placement.top).clamp(-32768, 32767) as i16];
         entry
     }
 
     /// Appends the glyphs of `text` for a label on `rect`, stopping once the pen passes
-    /// `max_px`. Returns the label width in pixels.
+    /// `max_px`. Returns the label width in pixels. The label shows only where its first
+    /// [`MIN_LABEL_CHARS`] characters (or all of a shorter label) fit.
     pub fn layout(&mut self, text: &[u8], rect: WorldRect, color: Rgba, max_px: f32, out: &mut Vec<GlyphInstance>) -> f32 {
+        let first = out.len();
         let mut pen = 0.0f32;
-        for ch in String::from_utf8_lossy(text).chars() {
+        let mut need = f32::INFINITY;
+        for (n, ch) in String::from_utf8_lossy(text).chars().enumerate() {
+            if n == MIN_LABEL_CHARS {
+                need = pen;
+            }
             if pen > max_px {
                 break;
             }
@@ -287,11 +296,16 @@ impl TextSystem {
                     rect_max: rect.max,
                     offset: [(ix as i32 + i32::from(g.offset[0])).clamp(-32768, 32767) as i16, g.offset[1]],
                     size: g.size,
+                    need_px: 0,
                     uv: g.uv,
                     color,
                 });
             }
             pen += g.advance;
+        }
+        let need = need.min(pen).ceil().clamp(0.0, f32::from(u16::MAX)) as u16;
+        for g in &mut out[first..] {
+            g.need_px = need;
         }
         pen
     }

@@ -9,10 +9,15 @@ use std::ops::Range;
 use super::grid::{item_ranges, limit_ranges};
 use super::scene::{Band, Batch, WorldRect};
 
+/// Pseudo band of a batch built with every item, ignoring LOD.
+pub const ALL: Band = u8::MAX;
+
 #[derive(Debug, Default)]
 pub struct BandBatch {
-    /// Band the slots were built for (`None`: never built).
+    /// Band the slots were built for (`None`: never built, [`ALL`]: everything).
     pub band: Option<Band>,
+    /// Bumped on every rebuild (the renderer re-uploads when it changes).
+    pub generation: u64,
     /// `slots[s]` is the batch index drawn at instance slot `s`.
     pub slots: Vec<u32>,
     /// Per scene layer: `table[b]..table[b + 1]` are the slots of bin `b`.
@@ -20,9 +25,44 @@ pub struct BandBatch {
 }
 
 impl BandBatch {
+    /// True if the visible set for `band` (`None`: everything) can differ from the built one.
+    pub fn stale<T>(&self, batch: &Batch<T>, band: Option<Band>) -> bool {
+        match (self.band, band) {
+            (None, _) => true,
+            (Some(old), None) => old != ALL,
+            (Some(old), Some(new)) => old == ALL || batch.change_points.changes_between(old, new),
+        }
+    }
+
+    /// Rebuilds if [`Self::stale`]. Returns true if it did.
+    pub fn refresh<T>(&mut self, batch: &Batch<T>, band: Option<Band>) -> bool {
+        if !self.stale(batch, band) {
+            return false;
+        }
+        match band {
+            Some(b) => self.rebuild(batch, b),
+            None => self.rebuild_all(batch),
+        }
+        true
+    }
+
+    /// Every item, ignoring LOD (slots are the identity, tables the batch's bin starts).
+    pub fn rebuild_all<T>(&mut self, batch: &Batch<T>) {
+        self.band = Some(ALL);
+        self.generation += 1;
+        self.slots.clear();
+        self.slots.extend(0..batch.len() as u32);
+        self.tables.resize_with(batch.layers.len(), Vec::new);
+        for (layer, table) in batch.layers.iter().zip(&mut self.tables) {
+            table.clear();
+            table.extend_from_slice(&layer.bin_start);
+        }
+    }
+
     /// Recomputes the visible set for `band`.
     pub fn rebuild<T>(&mut self, batch: &Batch<T>, band: Band) {
         self.band = Some(band);
+        self.generation += 1;
         self.slots.clear();
         self.tables.resize_with(batch.layers.len(), Vec::new);
         for (layer, table) in batch.layers.iter().zip(&mut self.tables) {

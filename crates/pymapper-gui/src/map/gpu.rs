@@ -1,7 +1,7 @@
 //! GPU side of the map: pipelines, static instance buffers, glyph atlas, camera uniform.
 //!
 //! Instance buffers hold the band-filtered batches and are rewritten only when
-//! [`MapState::band_generation`] changes (LOD change); the glyph buffer only when the label
+//! batch's band generation changes (LOD change); the glyph buffer only when the label
 //! set changes. Per frame the renderer writes the 48-byte camera uniform (if it changed)
 //! and turns the grid query for the visible rect into a few instance ranges per layer.
 
@@ -19,6 +19,11 @@ use crate::canvas::PhysicalRect;
 pub const MAX_RANGES_PER_LAYER: usize = 16;
 const UNIFORM_FLOATS: usize = 12;
 const UNIFORM_BYTES: usize = UNIFORM_FLOATS * 4;
+
+/// Instance buffers are sized in multiples of this (bytes).
+const BUFFER_GRANULE: u64 = 64 * 1024;
+/// Buffers above this size shrink when mostly unused.
+const SHRINK_MIN: u64 = 4 * 1024 * 1024;
 
 /// Highlight drawn over the hovered item.
 pub const HOVER_COLOR: Rgba = Rgba::rgb(255, 214, 10);
@@ -57,15 +62,18 @@ struct GpuBuf {
 
 impl GpuBuf {
     fn new(device: &wgpu::Device, label: &'static str) -> Self {
-        Self { buffer: create_vertex_buffer(device, label, 256), cap: 256, label }
+        Self { buffer: create_vertex_buffer(device, label, BUFFER_GRANULE), cap: BUFFER_GRANULE, label }
     }
 
-    /// Makes room for `bytes`, growing by at least 1.5x to amortise re-creation.
+    /// Makes room for `bytes`. Sized to fit (memory first): re-created when too small, or
+    /// when a large buffer would be less than a quarter used (e.g. after zooming out).
+    /// Re-creation only happens on LOD changes, never per frame.
     fn ensure(&mut self, device: &wgpu::Device, bytes: u64) {
-        if bytes <= self.cap {
+        let shrink = self.cap > SHRINK_MIN && bytes < self.cap / 4;
+        if bytes <= self.cap && !shrink {
             return;
         }
-        let cap = bytes.max(self.cap + self.cap / 2).next_multiple_of(256);
+        let cap = bytes.max(256).next_multiple_of(BUFFER_GRANULE);
         self.buffer = create_vertex_buffer(device, self.label, cap);
         self.cap = cap;
     }
@@ -81,18 +89,19 @@ fn create_vertex_buffer(device: &wgpu::Device, label: &'static str, size: u64) -
 }
 
 /// Writes the band's instances into `buf` (slot order) straight into wgpu's staging
-/// memory, one copy per run of consecutive batch items.
-fn upload_band<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buf: &mut GpuBuf, batch: &Batch<T>, band: &BandBatch) {
+/// memory, one copy per run of consecutive batch items. Returns the bytes written.
+fn upload_band<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buf: &mut GpuBuf, batch: &Batch<T>, band: &BandBatch) -> u64 {
     let size = std::mem::size_of::<T>();
     let bytes = (band.len() * size) as u64;
     buf.ensure(device, bytes);
-    let Some(nz) = NonZeroU64::new(bytes) else { return };
-    let Some(mut view) = queue.write_buffer_with(&buf.buffer, 0, nz) else { return };
+    let Some(nz) = NonZeroU64::new(bytes) else { return 0 };
+    let Some(mut view) = queue.write_buffer_with(&buf.buffer, 0, nz) else { return 0 };
     band.for_each_run(|slot, run| {
         let src = as_bytes(&batch.inst[run.start as usize..run.end as usize]);
         let off = slot as usize * size;
         view.slice(off..off + src.len()).copy_from_slice(src);
     });
+    bytes
 }
 
 fn upload_slice<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buf: &mut GpuBuf, items: &[T]) {
@@ -131,7 +140,8 @@ pub struct MapRenderer {
     overlay_edges: Vec<EdgeInstance>,
     srgb_target: bool,
     last_uniform: [f32; UNIFORM_FLOATS],
-    uploaded_band: Option<(u64, u64)>,
+    /// (scene generation, band generation) uploaded per batch: rects, lines, curves.
+    uploaded_band: [Option<(u64, u64)>; 3],
     uploaded_labels: Option<(u64, u64)>,
     uploaded_hover: Option<Option<super::hit::Hit>>,
     glyph_count: u32,
@@ -144,8 +154,8 @@ const RECT_ATTRS: [wgpu::VertexAttribute; 6] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4, 3 => Unorm8x4, 4 => Float32, 5 => Float32];
 const EDGE_ATTRS: [wgpu::VertexAttribute; 6] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Unorm8x4, 5 => Float32];
-const GLYPH_ATTRS: [wgpu::VertexAttribute; 6] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Sint16x2, 3 => Uint16x2, 4 => Uint16x2, 5 => Unorm8x4];
+const GLYPH_ATTRS: [wgpu::VertexAttribute; 7] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Sint16x2, 3 => Uint8x2, 4 => Uint16, 5 => Uint16x2, 6 => Unorm8x4];
 
 fn instance_layout<T>(attrs: &'static [wgpu::VertexAttribute]) -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -286,7 +296,7 @@ impl MapRenderer {
             overlay_edges: Vec::new(),
             srgb_target: format.is_srgb(),
             last_uniform: [f32::NAN; UNIFORM_FLOATS],
-            uploaded_band: None,
+            uploaded_band: [None; 3],
             uploaded_labels: None,
             uploaded_hover: None,
             glyph_count: 0,
@@ -312,16 +322,28 @@ impl MapRenderer {
     /// camera uniform and computes the culled draw list.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &mut MapState, rect: PhysicalRect, target: [u32; 2], ppp: f32) {
         state.update([rect.w as f32, rect.h as f32], ppp);
-        let key = (state.scene_generation, state.band_generation);
-        if self.uploaded_band != Some(key) {
-            let scene = &*state.scene;
-            upload_band(device, queue, &mut self.rects, &scene.rects, &state.bands.rects);
-            upload_band(device, queue, &mut self.lines, &scene.lines, &state.bands.lines);
-            upload_band(device, queue, &mut self.curves, &scene.curves, &state.bands.curves);
-            self.uploaded_band = Some(key);
+        let t = std::time::Instant::now();
+        let mut bytes = 0u64;
+        let scene = &*state.scene;
+        let sg = state.scene_generation;
+        let gens = [state.bands.rects.generation, state.bands.lines.generation, state.bands.curves.generation].map(|g| Some((sg, g)));
+        if self.uploaded_band[0] != gens[0] {
+            bytes += upload_band(device, queue, &mut self.rects, &scene.rects, &state.bands.rects);
         }
+        if self.uploaded_band[1] != gens[1] {
+            bytes += upload_band(device, queue, &mut self.lines, &scene.lines, &state.bands.lines);
+        }
+        if self.uploaded_band[2] != gens[2] {
+            bytes += upload_band(device, queue, &mut self.curves, &scene.curves, &state.bands.curves);
+        }
+        let band_changed = self.uploaded_band != gens;
+        if band_changed {
+            state.stats.band_uploads.record(t.elapsed());
+            state.stats.band_upload_bytes = bytes;
+        }
+        self.uploaded_band = gens;
         self.sync_labels(device, queue, state);
-        if self.uploaded_hover != Some(state.hover) || self.uploaded_band != Some(key) {
+        if self.uploaded_hover != Some(state.hover) || band_changed {
             self.sync_hover(device, queue, state);
         }
         self.write_uniform(queue, state, rect, target);

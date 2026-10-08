@@ -354,7 +354,18 @@ fn brute_rect(s: &Scene, bands: &Bands, p: [f32; 2], zoom: f32) -> Option<u32> {
 
 #[test]
 fn hit_test_matches_brute_force() {
-    let s = stress::scene(30_000, 3_000, 2);
+    let scratch = check_hits(&stress::scene(30_000, 3_000, 2), 400);
+    assert_eq!(scratch.parallel_scans, 0);
+}
+
+#[test]
+fn dense_edge_hit_test_matches_brute_force() {
+    // Enough long edges that the candidate scan takes the parallel path.
+    let scratch = check_hits(&stress::scene(3_000, 80_000, 6), 30);
+    assert!(scratch.parallel_scans > 0);
+}
+
+fn check_hits(s: &Scene, points: usize) -> HitScratch {
     let mut cam = Camera { viewport: [1600.0, 1000.0], ..Camera::default() };
     cam.set_limits(&s.bounds);
     cam.fit(&s.bounds, 1.0);
@@ -368,10 +379,10 @@ fn hit_test_matches_brute_force() {
         bands.rects.rebuild(&s.rects, band);
         bands.lines.rebuild(&s.lines, band);
         bands.curves.rebuild(&s.curves, band);
-        for _ in 0..400 {
+        for _ in 0..points {
             let screen = [rng.f32() * 1600.0, rng.f32() * 1000.0];
             let p = cam.screen_to_world(screen);
-            let got = hit::hit_test(&s, &bands, &cam, screen, 3.0, &mut scratch);
+            let got = hit::hit_test(s, &bands, &cam, screen, 3.0, &mut scratch);
             // Brute-force edges: the nearest band curve within reach.
             let mut best_edge: Option<(f32, u32)> = None;
             for &i in &bands.curves.slots {
@@ -386,22 +397,36 @@ fn hit_test_matches_brute_force() {
                 (Some(h), Some((d_want, _))) => {
                     assert_eq!(h.kind, HitKind::Curve);
                     let d_got = hit::edge_dist2(&s.curves.inst[h.index as usize], p, hit::CURVE_SEGMENTS);
-                    assert!((d_got - d_want).abs() <= d_want * 1e-5 + 1e-12, "{d_got} vs {d_want}");
+                    // Subdivision and direct evaluation differ by float rounding: allow a
+                    // few ulps of the world coordinates (~16k, ulp ~1e-3).
+                    assert!((d_got.sqrt() - d_want.sqrt()).abs() <= 4e-3, "{d_got} vs {d_want}");
                     edge_hits += 1;
                 }
+                (Some(h), None) if h.kind == HitKind::Curve => {
+                    // Only acceptable right at the tolerance boundary (rounding).
+                    let e = &s.curves.inst[h.index as usize];
+                    let lim = (e.width_px * 0.5 + 3.0) / cam.zoom;
+                    let d = hit::edge_dist2(e, p, hit::CURVE_SEGMENTS).sqrt();
+                    assert!((d - lim).abs() <= 4e-3, "spurious edge hit at {p:?}: {d} vs {lim}");
+                }
                 (got, None) => {
-                    let want = brute_rect(&s, &bands, p, cam.zoom);
+                    let want = brute_rect(s, &bands, p, cam.zoom);
                     assert_eq!(got.map(|h| h.index), want, "zoom {} at {p:?}", cam.zoom);
                     if let Some(h) = got {
                         assert_eq!(h.kind, HitKind::Rect);
                         assert_eq!(h.id, s.rects.id[h.index as usize]);
                     }
                 }
-                (None, Some(_)) => panic!("edge missed at {p:?}"),
+                (None, Some((d_want, i))) => {
+                    // Only acceptable right at the tolerance boundary (rounding).
+                    let lim = (s.curves.inst[i as usize].width_px * 0.5 + 3.0) / cam.zoom;
+                    assert!(lim - d_want.sqrt() <= 4e-3, "edge missed at {p:?}");
+                }
             }
         }
     }
     assert!(edge_hits > 0, "the sample should hit some edges");
+    scratch
 }
 
 #[test]
@@ -450,6 +475,13 @@ fn text_layout_and_atlas() {
     let w2 = t.layout(b"a b", rect, white, 1000.0, &mut out);
     assert_eq!(out.len(), 2);
     assert!(w2 > 0.0);
+    // Label LOD: short labels need their full width, long ones their first few characters.
+    assert!(out.iter().all(|g| g.need_px == w2.ceil() as u16));
+    out.clear();
+    let w3 = t.layout(b"hello_world", rect, white, 1000.0, &mut out);
+    let need = out[0].need_px;
+    assert!(out.iter().all(|g| g.need_px == need));
+    assert!(f32::from(need) < w3 * 0.6 && need > 10, "{need} of {w3}");
     out.clear();
     t.layout(b"abcdefghijklmnopqrstuvwxyz", rect, white, 30.0, &mut out);
     assert!(out.len() < 10, "{}", out.len());

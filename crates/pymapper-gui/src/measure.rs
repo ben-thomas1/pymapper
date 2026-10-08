@@ -234,7 +234,7 @@ pub fn map_report(out: &mut String, map: &MapState, gpu: GpuMemory, scene_build:
     if let Some(d) = scene_build {
         let _ = writeln!(out, "  scene build (generate + sort + grids): {:.1} ms", ms(d));
     }
-    for (name, r) in [("band rebuilds", &st.band_rebuilds), ("label rebuilds", &st.label_rebuilds)] {
+    for (name, r) in [("band rebuilds", &st.band_rebuilds), ("band uploads", &st.band_uploads), ("label rebuilds", &st.label_rebuilds)] {
         let _ = writeln!(out, "  {name}: {} (mean {:.2} ms, max {:.2} ms)", r.count, ms(r.mean()), ms(r.max));
     }
     let _ = writeln!(

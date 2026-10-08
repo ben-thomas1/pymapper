@@ -19,6 +19,7 @@ egui-winit.workspace = true
 glyphon.workspace = true
 libc.workspace = true
 pollster.workspace = true
+rayon.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use band::QueryScratch;
 use camera::Camera;
 use hit::{Bands, Hit, HitKind, HitScratch};
-use scene::{Band, ChangePoints, GlyphInstance, Rgba, Scene, WorldRect, band_zoom};
+use scene::{Band, GlyphInstance, Rgba, Scene, WorldRect, band_zoom};
 use text::TextSystem;
 
 /// Label font size in points (scaled by the DPI factor).
@@ -83,7 +83,7 @@ pub struct RebuildStats {
 }
 
 impl RebuildStats {
-    fn record(&mut self, d: Duration) {
+    pub fn record(&mut self, d: Duration) {
         self.count += 1;
         self.total += d;
         self.max = self.max.max(d);
@@ -97,6 +97,10 @@ impl RebuildStats {
 pub struct MapStats {
     pub band_rebuilds: RebuildStats,
     pub label_rebuilds: RebuildStats,
+    /// Instance buffer uploads after band rebuilds (CPU time to fill wgpu's staging memory).
+    pub band_uploads: RebuildStats,
+    /// Bytes written by the last band upload.
+    pub band_upload_bytes: u64,
     /// Instances in the last frame's draw ranges (after grid culling).
     pub drawn_instances: u64,
     pub draw_calls: u32,
@@ -117,13 +121,14 @@ pub struct Labels {
     candidates: Vec<(f32, u32)>,
 }
 
+type HoverKey = (Option<[f32; 2]>, Camera, u64, u64, f32);
+
 /// CPU-side state of the map: scene, camera, band-filtered views, labels, hover.
 pub struct MapState {
     pub scene: Arc<Scene>,
     pub camera: Camera,
     pub bands: Bands,
-    change_points: ChangePoints,
-    /// Bumped whenever band contents change.
+    /// Bumped whenever some batch's band contents change.
     pub band_generation: u64,
     /// Bumped on [`Self::set_scene`].
     pub scene_generation: u64,
@@ -136,6 +141,8 @@ pub struct MapState {
     /// When set, every item is drawn regardless of LOD (stress worst case).
     pub force_all: bool,
     needs_fit: bool,
+    /// Inputs of the last hover hit test: (pointer, camera, band and scene generation, ppp).
+    hover_key: Option<HoverKey>,
     query: QueryScratch,
     hit_scratch: HitScratch,
     ranges: Vec<std::ops::Range<u32>>,
@@ -159,7 +166,6 @@ impl MapState {
             scene: Arc::new(Scene::default()),
             camera: Camera::default(),
             bands: Bands::default(),
-            change_points: ChangePoints::default(),
             band_generation: 0,
             scene_generation: 0,
             labels: Labels::default(),
@@ -169,6 +175,7 @@ impl MapState {
             pixels_per_point: 1.0,
             force_all: false,
             needs_fit: true,
+            hover_key: None,
             query: QueryScratch::default(),
             hit_scratch: HitScratch::default(),
             ranges: Vec::new(),
@@ -179,7 +186,6 @@ impl MapState {
 
     /// Replaces the scene; the camera fits it on the next update.
     pub fn set_scene(&mut self, scene: Arc<Scene>) {
-        self.change_points = scene.change_points();
         self.scene = scene;
         self.bands = Bands::default();
         self.labels.band = None;
@@ -206,19 +212,17 @@ impl MapState {
             self.needs_fit = false;
         }
         let mut rebuilt = false;
+        // Each batch is rebuilt (and re-uploaded) only if its own membership changes.
         let band = if self.force_all { None } else { Some(self.camera.band()) };
-        let built = self.bands.rects.band;
-        let need = match (built, band) {
-            (None, _) => true,
-            (Some(_), None) => built != Some(u8::MAX),
-            (Some(old), Some(new)) => old == u8::MAX || self.change_points.changes_between(old, new),
-        };
-        if need {
-            let t = Instant::now();
-            // `force_all` builds with the pseudo band u8::MAX, which `Lod::contains` would
-            // reject for unbounded items, so filter with an always-true LOD check instead.
-            let b = band.unwrap_or(u8::MAX);
-            rebuild_band(&mut self.bands, &self.scene, b);
+        let t = Instant::now();
+        let scene = &*self.scene;
+        let Bands { rects, lines, curves } = &mut self.bands;
+        // The batches are independent: filter them concurrently.
+        let ((r, l), c) = rayon::join(
+            || (rects.refresh(&scene.rects, band), lines.refresh(&scene.lines, band)),
+            || curves.refresh(&scene.curves, band),
+        );
+        if r || l || c {
             self.band_generation += 1;
             self.stats.band_rebuilds.record(t.elapsed());
             rebuilt = true;
@@ -301,6 +305,13 @@ impl MapState {
             let anchor = input.zoom_anchor.map_or([self.camera.viewport[0] * 0.5, self.camera.viewport[1] * 0.5], |a| [a[0] * ppp, a[1] * ppp]);
             self.camera.zoom_at(anchor, input.zoom);
         }
+        // Hit test only when something that affects the answer changed (frames are also
+        // drawn for unrelated reasons, e.g. panel animations).
+        let key = (input.hover, self.camera, self.band_generation, self.scene_generation, ppp);
+        if self.hover_key == Some(key) {
+            return false;
+        }
+        self.hover_key = Some(key);
         let hit = input.hover.and_then(|h| self.hit_test([h[0] * ppp, h[1] * ppp], HIT_TOLERANCE_POINTS * ppp));
         let changed = hit != self.hover;
         self.hover = hit;
@@ -330,30 +341,6 @@ impl MapState {
                 let _ = write!(out, "edge #{}", h.id);
             }
         }
-    }
-}
-
-/// Fills `bands` for `band` (`u8::MAX`: everything, ignoring LOD).
-fn rebuild_band(bands: &mut Bands, scene: &Scene, band: Band) {
-    if band == u8::MAX {
-        rebuild_all(&mut bands.rects, &scene.rects);
-        rebuild_all(&mut bands.lines, &scene.lines);
-        rebuild_all(&mut bands.curves, &scene.curves);
-    } else {
-        bands.rects.rebuild(&scene.rects, band);
-        bands.lines.rebuild(&scene.lines, band);
-        bands.curves.rebuild(&scene.curves, band);
-    }
-}
-
-fn rebuild_all<T>(b: &mut band::BandBatch, batch: &scene::Batch<T>) {
-    b.band = Some(u8::MAX);
-    b.slots.clear();
-    b.slots.extend(0..batch.len() as u32);
-    b.tables.resize_with(batch.layers.len(), Vec::new);
-    for (layer, table) in batch.layers.iter().zip(&mut b.tables) {
-        table.clear();
-        table.extend_from_slice(&layer.bin_start);
     }
 }
 

@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use super::band::{BandBatch, QueryScratch};
 use super::camera::Camera;
-use super::scene::{EdgeInstance, RectInstance, Scene, WorldRect};
+use super::scene::{Batch, EdgeInstance, RectInstance, Scene, WorldRect};
 
 /// Segments per curve, shared with the vertex shader (`CURVE_SEGMENTS` in map.wgsl). A
 /// power of two, so hit testing can reach exactly these segments by halving.
@@ -111,6 +111,22 @@ fn curve_dist2(c: &[[f32; 2]; 4], p: [f32; 2], depth: u32, best: &mut f32) {
     curve_dist2(&[m, bcd, cd, c[3]], p, depth - 1, best);
 }
 
+/// "Fat line" test: the cubic lies in the strip along its chord bounded by the control
+/// points' signed distances. True if `p` is more than `lim` outside that strip (so the
+/// edge cannot be within `lim`). Tighter than the bbox for long, bowed edges.
+pub fn fat_line_rejects(e: &EdgeInstance, p: [f32; 2], lim: f32) -> bool {
+    let (dx, dy) = (e.p1[0] - e.p0[0], e.p1[1] - e.p0[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len.is_nan() || len <= 0.0 {
+        return false;
+    }
+    let (nx, ny) = (-dy / len, dx / len);
+    let d = |q: [f32; 2]| (q[0] - e.p0[0]) * nx + (q[1] - e.p0[1]) * ny;
+    let (d1, d2) = (d(e.c0), d(e.c1));
+    let dp = d(p);
+    dp < d1.min(d2).min(0.0) - lim || dp > d1.max(d2).max(0.0) + lim
+}
+
 /// Squared distance from `p` to the edge as drawn (lines: one segment; curves:
 /// [`CURVE_SEGMENTS`] segments) if it is at most `lim2`, else `None`.
 pub fn edge_within(e: &EdgeInstance, p: [f32; 2], curve: bool, lim2: f32) -> Option<f32> {
@@ -124,11 +140,48 @@ pub fn edge_within(e: &EdgeInstance, p: [f32; 2], curve: bool, lim2: f32) -> Opt
     (best <= lim2).then_some(best)
 }
 
+/// Edge candidates above this count are scanned in parallel (dense edge scenes).
+const PAR_MIN: usize = 16_384;
+/// Slots per parallel task.
+const PAR_CHUNK: u32 = 4096;
+
 /// Reusable buffers for [`hit_test`].
 #[derive(Debug, Default)]
 pub struct HitScratch {
     query: QueryScratch,
     ranges: Vec<Range<u32>>,
+    chunks: Vec<Range<u32>>,
+    /// Number of candidate scans that took the parallel path (for tests and stats).
+    pub parallel_scans: u64,
+}
+
+/// The better of two (squared distance, slot) hits: nearer, then later (drawn on top).
+fn nearer(a: (f32, u32), b: (f32, u32)) -> (f32, u32) {
+    if a.0 < b.0 || (a.0 == b.0 && a.1 > b.1) { a } else { b }
+}
+
+/// Nearest edge within reach of `p` among the slots in `ranges`: (squared distance, slot).
+fn nearest_edge(batch: &Batch<EdgeInstance>, band: &BandBatch, ranges: &[Range<u32>], p: [f32; 2], tol: f32, zoom: f32, curve: bool) -> Option<(f32, u32)> {
+    let mut best: Option<(f32, u32)> = None;
+    for r in ranges {
+        for slot in r.clone() {
+            let e = &batch.inst[band.slots[slot as usize] as usize];
+            let lim = (e.width_px * 0.5 + tol) / zoom;
+            // Cheap rejects first: the edge lies inside its control-point bbox and its fat
+            // line. In dense scenes nearly all grid candidates fail here.
+            let x0 = e.p0[0].min(e.c0[0]).min(e.c1[0]).min(e.p1[0]) - lim;
+            let x1 = e.p0[0].max(e.c0[0]).max(e.c1[0]).max(e.p1[0]) + lim;
+            let y0 = e.p0[1].min(e.c0[1]).min(e.c1[1]).min(e.p1[1]) - lim;
+            let y1 = e.p0[1].max(e.c0[1]).max(e.c1[1]).max(e.p1[1]) + lim;
+            if p[0] < x0 || p[0] > x1 || p[1] < y0 || p[1] > y1 || (curve && fat_line_rejects(e, p, lim)) {
+                continue;
+            }
+            if let Some(d2) = edge_within(e, p, curve, lim * lim) {
+                best = Some(best.map_or((d2, slot), |b| nearer(b, (d2, slot))));
+            }
+        }
+    }
+    best
 }
 
 /// Topmost drawn item under screen point `screen` (canvas pixels): edges first (within
@@ -139,36 +192,40 @@ pub fn hit_test(scene: &Scene, bands: &Bands, cam: &Camera, screen: [f32; 2], to
         return None;
     }
     let tol = tol_px.max(0.0);
+    let reach = (scene.max_edge_px * 0.5 + tol) / cam.zoom;
+    let q = WorldRect { min: [p[0] - reach, p[1] - reach], max: [p[0] + reach, p[1] + reach] };
     for (kind, batch, band) in [(HitKind::Curve, &scene.curves, &bands.curves), (HitKind::Line, &scene.lines, &bands.lines)] {
-        let reach = (scene.max_edge_px * 0.5 + tol) / cam.zoom;
-        let q = WorldRect { min: [p[0] - reach, p[1] - reach], max: [p[0] + reach, p[1] + reach] };
+        let curve = kind == HitKind::Curve;
         let mut best: Option<(f32, u32)> = None;
-        for li in (0..batch.layers.len()).rev() {
+        for li in 0..batch.layers.len() {
             band.query(batch, li, &q, usize::MAX, &mut s.query, &mut s.ranges);
-            for r in &s.ranges {
-                for slot in r.clone() {
-                    let i = band.slots[slot as usize];
-                    let e = &batch.inst[i as usize];
-                    let lim = (e.width_px * 0.5 + tol) / cam.zoom;
-                    // Cheap reject first: the edge lies inside its control-point bbox. In
-                    // dense scenes nearly all grid candidates fail here.
-                    let x0 = e.p0[0].min(e.c0[0]).min(e.c1[0]).min(e.p1[0]) - lim;
-                    let x1 = e.p0[0].max(e.c0[0]).max(e.c1[0]).max(e.p1[0]) + lim;
-                    let y0 = e.p0[1].min(e.c0[1]).min(e.c1[1]).min(e.p1[1]) - lim;
-                    let y1 = e.p0[1].max(e.c0[1]).max(e.c1[1]).max(e.p1[1]) + lim;
-                    if p[0] < x0 || p[0] > x1 || p[1] < y0 || p[1] > y1 {
-                        continue;
-                    }
-                    // Later slots draw on top, so ties go to the later one.
-                    if let Some(d2) = edge_within(e, p, kind == HitKind::Curve, lim * lim)
-                        && best.is_none_or(|(bd, _)| d2 <= bd)
-                    {
-                        best = Some((d2, i));
+            let total: usize = s.ranges.iter().map(|r| r.len()).sum();
+            let found = if total < PAR_MIN {
+                nearest_edge(batch, band, &s.ranges, p, tol, cam.zoom, curve)
+            } else {
+                use rayon::prelude::*;
+                s.parallel_scans += 1;
+                s.chunks.clear();
+                for r in &s.ranges {
+                    let mut a = r.start;
+                    while a < r.end {
+                        let b = r.end.min(a + PAR_CHUNK);
+                        s.chunks.push(a..b);
+                        a = b;
                     }
                 }
+                s.chunks
+                    .par_iter()
+                    .filter_map(|r| nearest_edge(batch, band, std::slice::from_ref(r), p, tol, cam.zoom, curve))
+                    .reduce_with(nearer)
+            };
+            // Slots of later layers draw on top: compare by (distance, layer order).
+            if let Some(f) = found {
+                best = Some(best.map_or(f, |b| if f.0 <= b.0 { f } else { b }));
             }
         }
-        if let Some((_, i)) = best {
+        if let Some((_, slot)) = best {
+            let i = band.slots[slot as usize];
             return Some(Hit { kind, index: i, id: batch.id[i as usize] });
         }
     }

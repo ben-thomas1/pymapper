@@ -2235,6 +2235,7 @@ dependencies = [
  "glyphon",
  "libc",
  "pollster",
+ "rayon",
  "wgpu",
  "winit",
 ]
