@@ -325,6 +325,29 @@ def f():
                     pass
 ";
     assert_eq!(ccn(src), vec![(3, 2, 1), (2, 1, 1), (2, 1, 1), (2, 1, 1)]);
+    // A class-level `if` around a method nests the method's increments:
+    // if x +1, if y at nesting 2 (if x body + method body) +3 = 4.
+    // C (plain sums): cc 1 + 2, cog 1 + 1.
+    let src = "\
+def f():
+    class C:
+        if x:
+            def m(self):
+                if y:
+                    pass
+";
+    assert_eq!(ccn(src), vec![(4, 4, 2), (3, 2, 2), (2, 1, 1)]);
+    // Same through an inner class: the outer class's `if` still nests.
+    let src = "\
+def f():
+    class A:
+        if x:
+            class B:
+                def m(self):
+                    if y:
+                        pass
+";
+    assert_eq!(ccn(src), vec![(4, 4, 2), (3, 2, 2), (2, 1, 1), (2, 1, 1)]);
 }
 
 #[test]
@@ -371,6 +394,16 @@ def fact(n):
     assert_eq!(ccn(src), vec![(2, 1, 0), (1, 1, 0)]);
     // Recursion inside a lambda of the function.
     assert_eq!(ccn("def f(n):\n    g = lambda: f(n)\n"), vec![(1, 1, 0)]);
+    // Class scope is not an enclosing scope: a bare same-named call in a
+    // method is a global / builtin (wrapper methods), also for staticmethods.
+    let src = "class C:\n    def open(self, p):\n        return open(p)\n";
+    assert_eq!(ccn(src), vec![(1, 0, 0), (1, 0, 0)]);
+    let src = "class C:\n    @staticmethod\n    def s(x):\n        return s(x)\n";
+    assert_eq!(ccn(src), vec![(1, 0, 0), (1, 0, 0)]);
+    // ... but a function nested in a method calling its own bare name is
+    // recursion (its enclosing scope is the method): walk +1, m +1, C sums.
+    let src = "class C:\n    def m(self):\n        def walk(n):\n            return walk(n)\n";
+    assert_eq!(ccn(src), vec![(2, 1, 0), (2, 1, 0), (1, 1, 0)]);
 }
 
 #[test]
@@ -578,6 +611,27 @@ fn tee_and_scratch_reuse() {
     assert!(scratch.heap_bytes() > 0);
     table.clear();
     assert!(table.is_empty());
+}
+
+#[test]
+fn operand_map_grows_and_scratch_is_reused() {
+    // ~5 source bytes per distinct operand: far above the initial capacity
+    // (src_len / 32), so the last-seen map doubles several times mid-file.
+    let names: Vec<String> = (0..1000).map(|i| format!("a{i}")).collect();
+    let list = names.join(",");
+    let src = format!("def f():\n    return [{list}], [{list}]\n");
+    // Operands: f + a0..a999 distinct; N2 = 1 + 2 * 1000.
+    let m = one(&src);
+    assert_eq!((m.distinct_operands, m.operands), (1001, 2001));
+    // A second (smaller, then equal) file with the same scratch gives the
+    // same rows as a fresh one.
+    let mut scratch = MetricsScratch::new();
+    let mut table = MetricsTable::new();
+    for s in [src.as_str(), "def g(a, b):\n    return a + b\n", src.as_str()] {
+        parse(s.as_bytes(), MetricsVisitor::new(s.as_bytes(), &mut scratch, &mut table));
+        let fresh = compute(s.as_bytes());
+        assert_eq!(table.row(table.len() - 1), fresh.row(0));
+    }
 }
 
 /// Checks invariants of the metrics of `src` (any bytes).

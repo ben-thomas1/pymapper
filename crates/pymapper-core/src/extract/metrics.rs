@@ -17,15 +17,22 @@
 //! - `cognitive`: SonarSource cognitive complexity. `if`, ternary, `match`,
 //!   `for`, `while`, `except`: +1 + nesting. `elif` and every `else` (of `if`,
 //!   loops and `try`): +1. Each run of like boolean operators: +1. Direct
-//!   recursion (a call to the function's own name, or `self.name(...)` /
-//!   `cls.name(...)` in a method): +1 once. Nesting is increased by the bodies
+//!   recursion: +1 once, for a bare call to the function's own name in a
+//!   function whose enclosing scope is not a class, or `self.name(...)` /
+//!   `cls.name(...)` in a method. (Class scope is not an enclosing scope, so a
+//!   bare `name(...)` in a method is a global or builtin, e.g. a wrapper
+//!   method `open` calling `open(...)`.) Nesting is increased by the bodies
 //!   of `if`/`elif`/`else`, loops (and their `else`), `except`, `match`,
 //!   lambdas and nested functions; `try`, `finally`, `with` and classes add
-//!   nothing. Nested functions get their own score (nesting from 0) and count
-//!   towards the parent at the parent's nesting + 1. A class row holds the
-//!   plain sum of its methods' scores and its class-level statements.
-//!   Known approximation: the
-//!   parser has no end event for ternaries, so their operands are not nested
+//!   nothing. In particular a `try`-`else` body costs +1 but, unlike an
+//!   `if`/loop `else`, does not nest (it belongs to the `try`, which adds no
+//!   nesting). Nested functions get their own score (nesting from 0) and
+//!   count towards the parent at the parent's nesting + 1 (including any
+//!   class-level blocks around a method of a class nested in a function). A
+//!   class row holds the plain sum of its methods' scores and its
+//!   class-level statements.
+//!   Known approximation (tracked: needs a parser end event for ternaries,
+//!   see `branch`): ternary operands are not nested
 //!   (`a if (b if c else d) else e` scores 2, Sonar 3).
 //! - `max_nesting`: maximum number of simultaneously open compound-statement
 //!   bodies (`if`/`elif`/`else`, loops, `try`/`except`/`else`/`finally`,
@@ -34,7 +41,8 @@
 //! - `loc`: inclusive line span, from the definition's first line (first
 //!   decorator) to its last token.
 //! - Halstead counts from the tokens of the definition, from its `def` /
-//!   `class` keyword to its end (decorators belong to the enclosing scope).
+//!   `class` keyword to its end (decorators, and the `async` of an
+//!   `async def`, belong to the enclosing scope).
 //!   Operands: names (soft keywords included), numbers, strings, f/t-string
 //!   literal text, `True`/`False`/`None`/`...`. Ignored: closing brackets
 //!   (a bracket pair is one operator) and f/t-string ends. Operators:
@@ -341,8 +349,9 @@ struct Frame {
     cog: u32,
     /// Nesting-weighted cognitive increments inside (nested definitions included).
     nk: u32,
-    /// Classes: method-body nesting increments not included in `cog` (one
-    /// per nesting-weighted increment inside a method).
+    /// Classes: nesting increments of nested definitions not included in
+    /// `cog` (per nesting-weighted increment inside a method: 1 for the
+    /// method body plus the class-level blocks open around it).
     extra: u32,
     /// Current cognitive nesting.
     nest: u32,
@@ -369,6 +378,8 @@ struct LastSeen {
     cap: usize,
     shift: u32,
     len: usize,
+    /// Scratch for [`LastSeen::grow`].
+    tmp: Vec<(u64, u32)>,
 }
 
 impl LastSeen {
@@ -416,21 +427,29 @@ impl LastSeen {
     /// Doubles the logical capacity and reinserts (rare: amortised O(1)).
     #[cold]
     fn grow(&mut self) {
-        let old: Vec<(u64, u32)> = self.slots[..self.cap].iter().copied().filter(|s| s.0 != 0).collect();
+        // Reused scratch: no allocation once it has reached its high-water mark.
+        let mut old = std::mem::take(&mut self.tmp);
+        old.clear();
+        for &s in &self.slots[..self.cap] {
+            if s.0 != 0 {
+                old.push(s);
+            }
+        }
         self.set_cap(self.cap * 2);
         self.len = old.len();
         let mask = self.cap - 1;
-        for (key, val) in old {
+        for &(key, val) in &old {
             let mut i = (key >> self.shift) as usize;
             while self.slots[i].0 != 0 {
                 i = (i + 1) & mask;
             }
             self.slots[i] = (key, val);
         }
+        self.tmp = old;
     }
 
     fn heap_bytes(&self) -> usize {
-        self.slots.capacity() * size_of::<(u64, u32)>()
+        (self.slots.capacity() + self.tmp.capacity()) * size_of::<(u64, u32)>()
     }
 }
 
@@ -588,8 +607,11 @@ impl MetricsVisitor<'_> {
             // contents, so the method-body shifts it skips are kept in
             // `extra` and applied once the class reaches a function.
             if p.is_class {
+                // Shift: the class-level blocks open around `f` (classes add
+                // no nesting themselves) plus 1 for a method body.
+                let shift = p.nest + u32::from(!f.is_class);
                 p.cog = p.cog.saturating_add(cognitive);
-                p.extra = p.extra.saturating_add(f.extra).saturating_add(if f.is_class { 0 } else { f.nk });
+                p.extra = p.extra.saturating_add(f.extra).saturating_add(f.nk.saturating_mul(shift));
             } else {
                 let shift = p.nest + u32::from(!f.is_class);
                 let shifted = f.nk.saturating_mul(shift).saturating_add(f.extra);
@@ -737,6 +759,8 @@ impl Visitor for MetricsVisitor<'_> {
     #[inline]
     fn branch(&mut self, kind: BranchKind, _tok: Token) {
         if kind == BranchKind::Ternary {
+            // TODO(parser): with a ternary end event, nest its operands
+            // (Sonar) instead of scoring them at the current nesting.
             self.cog_nested();
         }
     }
@@ -769,10 +793,13 @@ impl Visitor for MetricsVisitor<'_> {
         }
         let src = self.src;
         let name = f.name.text(src);
+        let in_class = n >= 2 && self.s.frames[n - 2].is_class;
         let hit = match call.receiver {
-            Receiver::None => call.names.len() == 1 && call.names[0].text(src) == name,
+            // Class scope is not an enclosing scope: a bare `name(...)` in a
+            // method resolves to a global / builtin, never the method.
+            Receiver::None => !in_class && call.names.len() == 1 && call.names[0].text(src) == name,
             Receiver::SelfAttr | Receiver::ClsAttr => {
-                call.names.len() == 2 && call.names[1].text(src) == name && n >= 2 && self.s.frames[n - 2].is_class
+                in_class && call.names.len() == 2 && call.names[1].text(src) == name
             }
             _ => false,
         };
