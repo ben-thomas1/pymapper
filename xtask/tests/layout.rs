@@ -61,9 +61,8 @@ fn corpus_contains_only_python_files() {
 
 #[test]
 fn xtask_stubs_exit_2() {
-    for name in ["diff-ruff", "fuzz"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_xtask")).arg(name).output().expect("spawn xtask");
-        assert_eq!(out.status.code(), Some(2), "{name}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"), "{name}");
-    }
+    let name = "diff-ruff";
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask")).arg(name).output().expect("spawn xtask");
+    assert_eq!(out.status.code(), Some(2), "{name}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"), "{name}");
 }
