@@ -1,8 +1,7 @@
-//! Repository layout invariants that later steps rely on, plus xtask stub behaviour.
+//! Repository layout invariants that later steps rely on.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask has a parent dir").to_path_buf()
@@ -57,12 +56,4 @@ fn corpus_contains_only_python_files() {
             assert_eq!(f.extension().and_then(|e| e.to_str()), Some("py"), "non-Python file {}", f.display());
         }
     }
-}
-
-#[test]
-fn xtask_stubs_exit_2() {
-    let name = "diff-ruff";
-    let out = Command::new(env!("CARGO_BIN_EXE_xtask")).arg(name).output().expect("spawn xtask");
-    assert_eq!(out.status.code(), Some(2), "{name}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"), "{name}");
 }

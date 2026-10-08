@@ -4,6 +4,7 @@
 
 mod bench;
 mod build;
+mod diff_ruff;
 mod fuzz;
 
 use std::io::Write;
@@ -29,7 +30,7 @@ enum Command {
     #[command(hide = true)]
     BenchRun(bench::RunArgs),
     /// Compare extracted facts/metrics against ruff's parser.
-    DiffRuff,
+    DiffRuff(diff_ruff::Args),
     /// Mutation-fuzz the lexer/parser (docs/fuzz.md).
     Fuzz(fuzz::Args),
 }
@@ -39,7 +40,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Bench(args) => bench::run(args),
         Command::BenchRun(args) => bench::run_child(args),
-        Command::DiffRuff => not_implemented("diff-ruff"),
+        Command::DiffRuff(args) => diff_ruff::run(args),
         Command::Fuzz(args) => fuzz::run(args),
     };
     match result {
@@ -50,9 +51,4 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_ERROR)
         }
     }
-}
-
-fn not_implemented(name: &str) -> anyhow::Result<ExitCode> {
-    eprintln!("xtask {name}: not implemented");
-    Ok(ExitCode::from(EXIT_ERROR))
 }
