@@ -6,6 +6,7 @@ mod bench;
 mod build;
 mod diff_ruff;
 mod fuzz;
+mod lexdump;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -31,6 +32,9 @@ enum Command {
     BenchRun(bench::RunArgs),
     /// Compare extracted facts/metrics against ruff's parser.
     DiffRuff(diff_ruff::Args),
+    /// Dump lexer tokens in CPython tokenize categories (for xtask/scripts/lexdiff.py).
+    #[command(hide = true)]
+    LexDump(lexdump::Args),
     /// Mutation-fuzz the lexer/parser (docs/fuzz.md).
     Fuzz(fuzz::Args),
 }
@@ -41,6 +45,7 @@ fn main() -> ExitCode {
         Command::Bench(args) => bench::run(args),
         Command::BenchRun(args) => bench::run_child(args),
         Command::DiffRuff(args) => diff_ruff::run(args),
+        Command::LexDump(args) => lexdump::run(args),
         Command::Fuzz(args) => fuzz::run(args),
     };
     match result {
