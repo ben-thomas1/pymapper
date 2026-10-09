@@ -415,7 +415,8 @@ open Graph to see that package's structure.
 
 Packages and modules (plus third-party / stdlib ones and their distributions when
 "Third-party / stdlib modules" is on, and only the selection's subtree when "Only modules
-under the selection" is on). Cell `(r, c)` is marked when row `r` depends on column `c`
+under the selection" is on: the scope is the selection at the moment the box is ticked, so clicking rows of a scoped
+matrix does not rescope it). Cell `(r, c)` is marked when row `r` depends on column `c`
 (imports and/or calls rolled up with `Level::Module`). The order exposes layering:
 
 1. strongly connected components (core Tarjan) and their condensation;

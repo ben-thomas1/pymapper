@@ -946,6 +946,53 @@ fn views_switch_and_share_the_selection() {
     assert!(ms.scene.rects.is_empty());
 }
 
+#[test]
+fn matrix_scope_is_fixed_when_ticked() {
+    use super::ui::ViewsUi;
+    use super::{ViewKind, Views};
+    use crate::codemap::metrics::ColorMetric;
+    use crate::map::MapState;
+    use crate::map::hit::{Hit, HitKind};
+    let p = TempProject::new(PROJ);
+    let m = Arc::new(p.map());
+    let color = ColorMetric::Kind;
+    let mut ms = MapState::default();
+    let mut views = Views::new(Arc::new(|| {}));
+    let mut ui = ViewsUi::default();
+    let app = node(&m, "app");
+    views.on_click(Some(Hit { kind: HitKind::Rect, index: 0, id: app }), &mut ms, Some(&m), color);
+    ui.tab = Some(ViewKind::Matrix);
+    settle(&mut views, &mut ui, &mut ms, &m);
+    let all = views_dsm_len(&views);
+    ui.options.matrix.scope_to_selection = true;
+    ui.options_changed = true;
+    settle(&mut views, &mut ui, &mut ms, &m);
+    let scoped = views_dsm_len(&views);
+    assert!(scoped < all, "{scoped} of {all}");
+    assert!((0..scoped as u32).all(|r| ix(&m).is_descendant(app, views_dsm_node(&views, r))));
+    // Selecting a module inside does not rescope, not even after an option change.
+    let a = node(&m, "app.a");
+    let row = (0..scoped as u32).find(|&r| views_dsm_node(&views, r) == a).expect("row of app.a");
+    views.on_click(Some(Hit { kind: HitKind::Rect, index: 0, id: super::scene::matrix_id(super::scene::ID_ROW, row) }), &mut ms, Some(&m), color);
+    assert_eq!(views.selection, Some(a));
+    ui.options.matrix.weight = Weight::Imports;
+    ui.options_changed = true;
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert_eq!(views_dsm_len(&views), scoped);
+    // Unticking shows everything again.
+    ui.options.matrix.scope_to_selection = false;
+    ui.options_changed = true;
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert_eq!(views_dsm_len(&views), all);
+}
+
+fn views_dsm_len(v: &super::Views) -> usize {
+    match v.slots[1].content.as_ref() {
+        Some(super::worker::Content::Matrix { dsm, .. }) => dsm.nodes.len(),
+        _ => panic!("no matrix"),
+    }
+}
+
 fn views_dsm_node(v: &super::Views, row: u32) -> NodeId {
     match v.slots[1].content.as_ref() {
         Some(super::worker::Content::Matrix { dsm, .. }) => dsm.nodes[row as usize],

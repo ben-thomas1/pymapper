@@ -112,7 +112,9 @@ pub struct ViewOptions {
     pub focus: FocusParams,
 }
 
-/// What a view was (or is being) built from; the map is compared by pointer.
+/// What a view was (or is being) built from; the map is compared by pointer. The address
+/// cannot be reused by another map while a key holding it is live: the pending request (in
+/// the worker) or the published result (in the slot) keeps that map alive.
 #[derive(Clone, Debug, PartialEq)]
 enum Key {
     Graph { map: usize, band: Band, view: WorldRect, params: GraphParams },
@@ -157,6 +159,8 @@ pub struct Views {
     codemap_view: WorldRect,
     /// The selection changed while the code map was hidden: frame it when shown.
     reframe: bool,
+    /// Subtree the matrix is scoped to ("Only modules under the selection").
+    matrix_scope: Option<NodeId>,
     /// Texts and marks need refreshing.
     dirty: bool,
     error: Option<String>,
@@ -178,6 +182,7 @@ impl Views {
             codemap_band: 0,
             codemap_view: WorldRect::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY),
             reframe: false,
+            matrix_scope: None,
             dirty: true,
             error: None,
         }
@@ -217,6 +222,12 @@ impl Views {
         }
         if ui.options_changed {
             ui.options_changed = false;
+            // The matrix scope is the selection at the moment the box is ticked.
+            if ui.options.matrix.scope_to_selection && !self.options.matrix.scope_to_selection {
+                self.matrix_scope = self.selection;
+            } else if !ui.options.matrix.scope_to_selection {
+                self.matrix_scope = None;
+            }
             self.options = ui.options;
             self.ensure(map, codemap, color);
             self.dirty = true;
@@ -318,7 +329,7 @@ impl Views {
             ViewKind::Graph => Some(Key::Graph { map, band: self.codemap_band, view: self.codemap_view, params: GraphParams { color, ..self.options.graph } }),
             ViewKind::Matrix => {
                 let o = self.options.matrix;
-                let scope = if o.scope_to_selection { self.selection } else { None };
+                let scope = if o.scope_to_selection { self.matrix_scope } else { None };
                 Some(Key::Matrix { map, params: DsmParams { weight: o.weight, external: o.external, scope } })
             }
             ViewKind::Focus => self.selection.map(|node| Key::Focus { map, node, params: self.options.focus, color }),
