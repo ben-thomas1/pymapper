@@ -1090,3 +1090,29 @@ importable ones) and keeps test-code occurrences in a second slot per name group
 - `check --select PM4` on aiml-lectio (1,803 first-party files, 741 of them not importable,
   warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
   analysed files; peak RSS +1.5 MB.
+
+### Coverage evidence (S6.3)
+
+`deadcode` target with `XTASK_DEADCODE_COVERAGE=synthetic`, 14-core M4 Pro, release, warm, best
+of 3 (RSS worst), other worktrees benchmarking at the same time. The target generates a
+coverage.py JSON report for every file of the corpus (absolute paths; every line executed
+except the bodies of every third function, which are missing; lines stand in for statements,
+so the report is larger than a real one), maps it with `Coverage::parse` (`coverage.parse`),
+drops the report bytes (as `check` does) and runs the analysis with it.
+
+| corpus | report MB | files matched | `coverage.parse` | executed / not executed nodes | levels lowered | `deadcode.*` sum (without -> with) | peak RSS MB (without -> with) |
+|--------|-----------|---------------|------------------|-------------------------------|----------------|------------------------------------|-------------------------------|
+| stdlib | 2.4  | 1,043 / 1,043   | 1.82ms | 15,024 / 7,072    | 2,679  | 10.4ms -> 5.4ms | 34.1 -> 33.4 |
+| venv   | 97.8 | 52,122 / 60,529 | 86.2ms | 471,496 / 213,103 | 64,696 | 482ms -> 289ms  | 752.1 -> 751.4 |
+
+- **Time**: about 1.1-1.3 GB/s of report: one pass of the pull reader (no tree, reused
+  buffers), one hash lookup per file path, a binary search per def and line list. The 8,407
+  venv entries that match no analysed file (stubs, shadowed files) go through the suffix
+  fallback (one sorted basename table, built once) and stay unmatched. The analysis itself got
+  faster here because executed code is live: fewer name-fallback candidates (572k -> 163k on
+  the venv) mean a cheaper evidence scan. The synthetic split is arbitrary, so the finding
+  counts of these runs say nothing about precision.
+- **Memory**: the result is two bit sets over the nodes (`coverage_kb`: 249 KB for 1M nodes).
+  The report bytes are held only while they are mapped (`Coverage::load` reads, maps and drops
+  them), so they add to the peak only when the report is larger than what the analysis
+  allocates later; here the peak did not move.
