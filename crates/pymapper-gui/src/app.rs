@@ -10,7 +10,11 @@ use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::args::Options;
+use crate::args::{MeasureOpts, Options};
+use crate::codemap::load::LoadParams;
+use crate::codemap::worker::{MapWorker, Published, Status};
+use crate::codemap::{CodeMap, MapParams};
+use crate::map::hit::HitKind;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
 use crate::map::{MapState, stress};
@@ -36,8 +40,17 @@ pub struct App {
     sched: Scheduler,
     measure: Option<Measure>,
     map: MapState,
-    /// Time to build the scene (stress mode), for the measurement report.
+    /// Time to build the scene (stress mode, or the code map and its first scene), for the
+    /// measurement report.
     scene_build: Option<Duration>,
+    /// Background loader / scene builder of the code map (`None` in stress mode).
+    worker: Option<MapWorker>,
+    /// The code map of the scene shown (hover details).
+    codemap: Option<Arc<CodeMap>>,
+    /// Last status shown (the status line is rewritten only when it changes).
+    status: Option<Status>,
+    /// `--measure` with a project: measuring starts once the first scene is shown.
+    pending_measure: Option<MeasureOpts>,
     win: Option<WindowState>,
     error: Option<anyhow::Error>,
     report: Option<String>,
@@ -70,15 +83,40 @@ impl App {
         egui_ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint { delay: info.delay, pass_nr: info.current_cumulative_pass_nr });
         });
-        let measure = opts.measure.clone().map(|m| Measure::new(m, launched));
         let name = opts.path.file_name().map_or_else(|| project.clone(), |n| n.to_string_lossy().into_owned());
-        let (map, scene_build) = match opts.stress {
+        let (map, scene_build, worker) = match opts.stress {
             Some(n) => {
                 let t = Instant::now();
                 let scene = stress::scene(n as usize, n as usize, stress::SEED);
-                (MapState::new(Arc::new(scene)), Some(t.elapsed()))
+                (MapState::new(Arc::new(scene)), Some(t.elapsed()), None)
             }
-            None => (MapState::default(), None),
+            None => {
+                let load = LoadParams {
+                    path: opts.path.clone(),
+                    isolated: opts.isolated,
+                    deps: opts.deps,
+                    stdlib: opts.stdlib,
+                    cache_dir: opts.cache_dir.clone(),
+                    no_cache: opts.no_cache,
+                };
+                // The worker wakes the loop through egui's repaint callback.
+                let ctx = egui_ctx.clone();
+                let notify = Arc::new(move || ctx.request_repaint());
+                // A thread that cannot start leaves an empty map with the error as status.
+                let worker = MapWorker::spawn(load, MapParams::default(), Default::default(), notify);
+                (MapState::default(), None, Some(worker))
+            }
+        };
+        let (worker, status) = match worker {
+            Some(Ok(w)) => (Some(w), None),
+            Some(Err(e)) => (None, Some(Status::Failed(format!("cannot start the map thread: {e}")))),
+            None => (None, None),
+        };
+        // With a project, measuring starts once the map is shown (not during loading).
+        let (measure, pending_measure) = match (&opts.measure, &worker) {
+            (Some(m), Some(_)) => (None, Some(m.clone())),
+            (Some(m), None) => (Some(Measure::new(m.clone(), launched)), None),
+            (None, _) => (None, None),
         };
         Self {
             opts,
@@ -90,6 +128,10 @@ impl App {
             measure,
             map,
             scene_build,
+            worker,
+            codemap: None,
+            status,
+            pending_measure,
             win: None,
             error: None,
             report: None,
@@ -172,7 +214,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, map, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, status, pending_measure, scene_build, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -221,11 +263,33 @@ impl App {
         };
         let t1 = Instant::now();
 
+        if let Some(wk) = worker.as_ref() {
+            if let Some(p) = wk.take() {
+                apply_published(p, map, codemap, &mut w.ui, scene_build);
+                if let Some(m) = pending_measure.take() {
+                    *measure = Some(Measure::new(m, t1));
+                }
+            }
+            let st = wk.status();
+            if status.as_ref() != Some(&st) {
+                status_line(&st, map.scene.bounds.is_positive(), &mut w.ui.map_status);
+                *status = Some(st);
+            }
+        } else if let Some(st) = status.as_ref()
+            && w.ui.map_status.is_empty()
+        {
+            status_line(st, false, &mut w.ui.map_status);
+        }
         let raw = w.egui.take_egui_input(&w.window);
         w.ui.map_empty = !map.scene.bounds.is_positive();
         let mut full = egui_ctx.run_ui(raw, |ui| panels::show(ui, &mut w.ui));
         w.egui.handle_platform_output(&w.window, full.platform_output);
         let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
+        if w.ui.map_request_changed
+            && let (Some(wk), Some(req)) = (worker.as_ref(), w.ui.map_request)
+        {
+            wk.request(req);
+        }
         let hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
         if let Some(t) = measure.as_ref().and_then(Measure::progress)
             && map.scene.bounds.is_positive()
@@ -280,7 +344,11 @@ impl App {
         }
         if hover_changed {
             // The details panel was laid out before the hit test: show the new hover next frame.
-            map.describe_hover(&mut w.ui.hover_text);
+            match (codemap.as_ref(), map.hover) {
+                (Some(cm), Some(h)) if h.kind == HitKind::Rect => cm.describe_node(h.id, &mut w.ui.hover_text),
+                (Some(cm), Some(h)) if h.kind == HitKind::Curve => cm.describe_edge(h.id, &mut w.ui.hover_text),
+                _ => map.describe_hover(&mut w.ui.hover_text),
+            }
             sched.request(t3, Duration::ZERO);
         }
         if let Some(m) = measure.as_mut() {
@@ -289,6 +357,38 @@ impl App {
                 w.window.request_redraw();
             }
         }
+    }
+}
+
+/// Shows a published code map scene: keeps the camera when replacing a scene of the same
+/// world, and seeds the controls from the first request.
+fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, ui: &mut UiState, scene_build: &mut Option<Duration>) {
+    if map.scene.bounds.is_positive() {
+        map.replace_scene(p.scene);
+    } else {
+        map.set_scene(p.scene);
+    }
+    *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
+    *codemap = Some(p.map);
+    ui.legend = Some(p.legend);
+    ui.map_request.get_or_insert(p.request);
+    ui.hover_text.clear();
+}
+
+/// The canvas status line for a worker status (`has_scene`: a map is already shown).
+fn status_line(st: &Status, has_scene: bool, out: &mut String) {
+    out.clear();
+    match st {
+        Status::Loading(phase) => {
+            out.push_str("loading project: ");
+            out.push_str(phase);
+        }
+        Status::Building if !has_scene => out.push_str("laying out the map"),
+        Status::Failed(e) => {
+            out.push_str("cannot load the project: ");
+            out.push_str(e);
+        }
+        Status::Building | Status::Ready => {}
     }
 }
 
@@ -400,6 +500,13 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if self.pending_measure.is_some()
+            && let Some(Status::Failed(e)) = &self.status
+        {
+            let err = anyhow!("--measure: {e}");
+            self.fail(event_loop, err);
+            return;
+        }
         if self.measure.as_ref().is_some_and(|m| m.stalled(now)) {
             let err = anyhow!("--measure: no frame presented for {} s (window hidden or occluded?)", STALL.as_secs());
             self.fail(event_loop, err);
@@ -412,6 +519,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut report = m.report(&w.ui.renderer_info, [w.config.width, w.config.height], w.window.scale_factor() as f32);
                 if self.map.scene.bounds.is_positive() {
                     measure::map_report(&mut report, &self.map, w.renderer.canvas().map().memory(), self.scene_build);
+                }
+                if let Some(cm) = &self.codemap {
+                    measure::codemap_report(&mut report, cm);
                 }
                 self.report = Some(report);
             }

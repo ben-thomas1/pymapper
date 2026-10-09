@@ -13,7 +13,10 @@
 
 use egui::{Align2, Event, FontId, Key, MouseWheelUnit, PointerButton, Rect, Sense};
 
+use crate::codemap::scene::Legend;
+use crate::codemap::worker::Request;
 use crate::map::CanvasInput;
+use crate::mapui;
 
 pub const LEFT_ID: &str = "pm_left";
 pub const RIGHT_ID: &str = "pm_right";
@@ -41,6 +44,15 @@ pub struct UiState {
     pub hover_text: String,
     /// Input: renderer statistics line for the details panel.
     pub map_info: String,
+    /// In/out: the code map options (`None`: no code map, e.g. the stress scene). The
+    /// controls edit it in place.
+    pub map_request: Option<Request>,
+    /// Output: the user changed `map_request` this frame.
+    pub map_request_changed: bool,
+    /// Input: legend of the scene shown.
+    pub legend: Option<Legend>,
+    /// Input: code map status over the canvas (loading phase or error; empty: none).
+    pub map_status: String,
 }
 
 impl UiState {
@@ -54,6 +66,10 @@ impl UiState {
             map_empty: true,
             hover_text: String::new(),
             map_info: String::new(),
+            map_request: None,
+            map_request_changed: false,
+            legend: None,
+            map_status: String::new(),
         }
     }
 }
@@ -82,7 +98,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
         let rect = ui.max_rect();
         let response = ui.interact(rect, ui.id().with("pm_canvas"), Sense::click_and_drag());
         state.canvas_input = canvas_input(ui, &response, rect);
-        if state.map_empty {
+        if !state.map_status.is_empty() {
+            mapui::status(ui, rect, &state.map_status);
+        } else if state.map_empty {
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -90,6 +108,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
                 FontId::proportional(14.0),
                 ui.visuals().weak_text_color(),
             );
+        }
+        if let Some(l) = &state.legend {
+            mapui::legend(ui, rect, l);
         }
     });
     state.canvas_rect = central.response.rect;
@@ -149,8 +170,14 @@ fn left(ui: &mut egui::Ui, state: &mut UiState) {
     });
 }
 
-fn right(ui: &mut egui::Ui, state: &UiState) {
+fn right(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
+    state.map_request_changed = false;
+    if let Some(req) = state.map_request.as_mut() {
+        ui.strong("Code map");
+        state.map_request_changed = mapui::controls(ui, req);
+        ui.separator();
+    }
     ui.strong("Details");
     if state.hover_text.is_empty() {
         ui.weak("Nothing selected.");

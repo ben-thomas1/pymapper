@@ -25,8 +25,10 @@
 pub mod app;
 pub mod args;
 pub mod canvas;
+pub mod codemap;
 pub mod gpu;
 pub mod map;
+pub mod mapui;
 pub mod measure;
 pub mod panels;
 pub mod render;

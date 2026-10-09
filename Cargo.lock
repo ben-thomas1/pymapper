@@ -2239,6 +2239,7 @@ dependencies = [
  "glyphon",
  "libc",
  "pollster",
+ "pymapper-core",
  "rayon",
  "wgpu",
  "winit",
