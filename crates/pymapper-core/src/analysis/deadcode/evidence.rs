@@ -429,7 +429,7 @@ pub(super) fn scan(
                         let members = dg.group(g);
                         // `import mod` then `mod.name`, or `from pkg import mod`.
                         if ex.iter().any(|&i| group_of[i as usize] == g) {
-                            partial.push((g, f));
+                            partial.push((g, slot, f));
                             let link = |i: u32| {
                                 if ex.binary_search(&i).is_err() {
                                     lk.set(i);
@@ -469,28 +469,35 @@ pub(super) fn scan(
             },
         );
     hits.probes = probes;
+    // Sorted by (group, slot, file): each slot's events of a group are one run.
     partial.sort_unstable();
     let mut pi = 0;
     for g in 0..dg.len() {
-        let lo = pi;
-        while pi < partial.len() && partial[pi].0 == g {
-            pi += 1;
+        let mut runs = [&partial[..0]; 2];
+        for (slot, run) in runs.iter_mut().enumerate() {
+            let lo = pi;
+            while pi < partial.len() && partial[pi].0 == g && partial[pi].1 == slot as u32 {
+                pi += 1;
+            }
+            *run = &partial[lo..pi];
         }
-        let events = &partial[lo..pi];
         for m in dg.group(g) {
             let i = m[3];
             let own = ix.file(c.defs[i as usize]);
             for (slot, lk, out) in [(CODE_SLOT, &linked, &mut hits.defs), (TEST_SLOT, &test_linked, &mut hits.def_tests)] {
-                let in_slot = |f: FileId| u32::from(is_test(f)) == slot;
                 if lk.get(i as usize) {
                     out[i as usize] = level::LINKED;
                 } else if out[i as usize] < level::LINKED
                     && (dg.elsewhere(g, slot, own)
                         // Usually the first event qualifies; skipping one means `(i, f)` is
-                        // explained, `f` is the def's own file or of the other slot.
-                        || events.iter().any(|&(_, f)| Some(f) != own && in_slot(f) && !explained.contains(i, f)))
+                        // explained or `f` is the def's own file.
+                        || runs[slot as usize].iter().any(|&(_, _, f)| Some(f) != own && !explained.contains(i, f)))
                 {
                     out[i as usize] = level::EVIDENCE;
+                }
+                // Test evidence only matters below a production link.
+                if slot == CODE_SLOT && out[i as usize] == level::LINKED {
+                    break;
                 }
             }
         }
