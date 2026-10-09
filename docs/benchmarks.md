@@ -1321,9 +1321,9 @@ as two updates).
 
 | corpus | files | full load + resolve (`calls` total) | update median | best | worst | hot modules | files re-resolved (imports / calls, median) | tracking | peak RSS MB (`calls` / `incremental`) |
 |--------|-------|--------------------------------------|---------------|------|-------|-------------|----------------------------------------------|----------|----------------------------------------|
-| tests  | 29     | 1.67 ms | 0.35 ms | 0.18 ms | 0.46 ms | -       | 1 / 1 | 0 KB    | 5.2 / 6.0     |
-| stdlib | 1,043  | 47.2 ms | 2.10 ms | 1.39 ms | 3.71 ms | 2.90 ms | 1 / 6 | 34 KB   | 29.7 / 37.7   |
-| venv   | 60,529 | 3.19 s  | 29.7 ms | 28.7 ms | 47.0 ms | -       | 2 / 2 | 3.4 MB  | 596.5 / 671.0 |
+| tests  | 29     | 1.75 ms | 0.35 ms | 0.20 ms | 0.49 ms | -       | 1 / 1 | 0 KB    | 5.1 / 6.0     |
+| stdlib | 1,043  | 47.6 ms | 2.13 ms | 1.34 ms | 3.49 ms | 3.00 ms | 1 / 6 | 34 KB   | 29.7 / 37.2   |
+| venv   | 60,529 | 3.13 s  | 25.5 ms | 24.2 ms | 64.5 ms | -       | 2 / 2 | 3.4 MB  | 596.4 / 671.5 |
 
 The venv (650 MB) is not copied: its files are re-extracted with unchanged contents, which runs
 the whole pipeline (extraction, splice, hierarchy, node map, dependency check, carried
@@ -1334,19 +1334,20 @@ Phase medians per update (µs):
 
 | corpus | plan | extract | patch (splice + hierarchy + node map) | resolve imports | resolve calls | diff |
 |--------|------|---------|----------------------------------------|-----------------|---------------|------|
-| stdlib | 41   | 330     | 222                                    | 424             | 1,060         | 2    |
-| venv   | 3,336 | 185    | 10,067                                 | 2,193           | 13,883        | 39   |
+| stdlib | 38    | 330     | 214                                    | 383             | 1,129         | 2    |
+| venv   | 2,123 | 192     | 7,065                                  | 2,174           | 13,723        | 49   |
 
 - **What an update costs.** Reading and extracting, the bulk of a load, is paid for the changed
   file only. The splice of the fact columns is a memmove of the rows behind the file. The
   hierarchy is copied in runs with only the changed file's def block rebuilt (no sort, no
   hashing of other files). Per-file resolution runs for the files that read the changed file
   (median 1-6 on the stdlib, 2 on the venv), and every other file's results are translated in
-  place, in parallel. What remains is linear in the program with small constants: the old ->
-  new node map (4 bytes per node, part of the diff), the class table and C3 MROs and the method
-  index (rebuilt: on the venv `resolve.classes` + `resolve.mro` are about 11 ms of the 30 ms),
-  and the plan (path comparison of 60k files).
-- **Speedup**: 22x on the stdlib, 107x on the venv against a full load and resolution.
+  place, in parallel; the module trie and namespaces are patched. What remains is linear in
+  the program with small constants: the old -> new node map (4 bytes per node, part of the
+  diff, filled by offset), the hierarchy copy (`patch` on the venv is mostly that), the class
+  table, C3 MROs and method index (rebuilt: on the venv `resolve.classes` + `resolve.mro` are
+  about 11 ms of the 25 ms) and the plan (path comparison of 60k files).
+- **Speedup**: 22x on the stdlib, 123x on the venv against a full load and resolution.
 - **Dependency tracking** costs 4 bytes per (file, file read) pair: 384k import and 280k call
   pairs on the venv (3.4 MB, 0.7% of the program), 1.8k and 3.7k on the stdlib. The tracked
   resolution of the initial load costs 5-10% more than the plain one on the venv
