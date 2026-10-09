@@ -34,6 +34,7 @@ pymapper check --deps --stdlib       # link first-party code to the venv and the
 pymapper check --save-baseline .pymapper-baseline.json   # record today's findings
 pymapper check --baseline .pymapper-baseline.json        # report only new ones
 pymapper check --stats               # phase timings and peak RSS on stderr
+pymapper check --watch               # check again after every change (incremental update)
 pymapper deps --score                # third-party distributions: use by first-party code, grades (docs/deps.md)
 pymapper deps --check                # dependency hygiene: undeclared, unused, private imports (PM6xx)
 pymapper config                      # the effective configuration

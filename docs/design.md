@@ -13,7 +13,7 @@
 - Old v2 scan of stdlib (437k LOC): 13.3s single-threaded, dominated by malloc/format in linear-scan resolution.
 
 ## Crates
-- crates/pymapper-core  : library. Modules: lex, extract (parser + facts + metrics), intern, arena, walk (+ gitignore), roots, index, cache, resolve, graph, rollup, reach, incremental, config, rules, analysis/{hotspot,coupling,cycles,layers,deadcode,dupes}, output, query, deps.
+- crates/pymapper-core  : library. Modules: lex, extract (parser + facts + metrics), intern, arena, walk (+ gitignore), roots, index, cache, resolve, graph, rollup, reach, incremental, watch (own FSEvents / inotify watcher), config, rules, analysis/{hotspot,coupling,cycles,layers,deadcode,dupes}, output, query, deps.
 - crates/pymapper-cli   : "pymapper" binary.
 - crates/pymapper-gui   : "pymapper-gui" binary (created in P7). The CLI must not depend on GPU crates.
 - xtask                 : dev tooling only (bench, diff-ruff, fuzz). Never shipped.

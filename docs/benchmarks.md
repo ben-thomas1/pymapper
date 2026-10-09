@@ -72,6 +72,7 @@ entered, and symlinks are not followed.
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 | `incremental` | `walk`, `copy`, `load.*`, `resolve.*`, `incremental.update` | single-file edit latency of `pymapper_core::incremental::Program::update`: the corpus is copied to `$TMPDIR` (`copy`; corpora over 200 MB are not copied and their files are re-extracted with unchanged contents instead, counter `inplace`), loaded and resolved with dependency tracking (`load.*`, `resolve.*`), then 6 files across the size distribution (plus `typing.py`, `os.py`, `collections/__init__.py`, `functools.py`, `re/__init__.py` when present) are each edited and restored, one update per edit and per restore, 3 rounds; three kinds of edit: a function appended, a method added to the first class at column 0 (skipped for files without one), a module-level import appended (in-place corpora: one unchanged re-extraction per file and round). `incremental.update` is the sum of all updates. Counters: `updates`, `update_median_us` / `update_best_us` / `update_worst_us`, `hot_median_us` (the hot stdlib modules), `append_median_us` / `method_median_us` / `import_median_us` (per kind of edit), per-phase medians `plan_us`, `extract_us`, `patch_us` (splice + hierarchy + node map), `resolve_imports_us`, `resolve_calls_us`, `diff_us`, `reresolved_imports_median` / `reresolved_calls_median` (files resolved again per update), `deps_imports` / `deps_calls` (recorded (file, file read) pairs), `tracking_kb`, `heap_kb_before` / `heap_kb_after` (`Program::heap_bytes` before and after the updates) |
+| `watch`      | `walk`, `copy`, `load.*`, `resolve.*`, `watch.edits` | edit-to-update latency through the real watcher (`pymapper_core::watch`): the corpus is copied to `$TMPDIR` (corpora over 1 GB are refused; the corpus is never written), loaded and resolved with calls, watched with the default debounce (30 ms quiet), then 6 files across the size distribution get a function appended and are restored, 3 rounds, one write at a time, each timed from the write to its applied update; stray events are drained between writes. `watch.edits` is the sum of all totals. Counters: `edits`, `missed` (writes without an event in 10 s), `rewalks`, `quiet_ms`, `total_median_us` / `total_p90_us` / `total_worst_us` (write to update applied), `event_median_us` / `event_worst_us` (write to first event: OS delivery), `debounce_median_us` (first event to batch close), `update_median_us` / `update_worst_us` (classify + inputs + `Program::update`), `classify_median_us`, `inputs_us` (inputs rebuilt from the index, once) |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -1501,3 +1502,43 @@ Phase medians per update (µs):
   the changed files plus a full tracked resolution (the `resolve.*` phases of `calls`).
 - **Follow-ups**: patch the class table, MROs and method index per file (the largest remaining
   cost on 17M LOC); a fixed-size node map representation for the diff when only offsets move.
+
+### Watch mode (S7.7)
+
+`watch` target: edit-to-update latency through the file watcher (FSEvents) and
+`Program::update`, on a copy of each corpus. 14-core Apple M4 Pro, release (fat LTO), warm OS
+file cache, one measured run (36 writes each: medians over writes), default debounce (30 ms
+quiet, 300 ms max).
+
+| corpus | files  | write -> update applied: median / p90 / worst | OS delivery (median) | debounce (median) | classify + update (median / worst) | classify | inputs | peak RSS MB |
+|--------|--------|-----------------------------------------------|----------------------|-------------------|------------------------------------|----------|--------|-------------|
+| tests  | 29     | 47.7 / 48.8 / 49.3 ms                         | 11.7 ms              | 35.0 ms           | 1.5 / 2.8 ms                       | 68 µs    | 17 µs  | 10.5        |
+| stdlib | 1,043  | 52.4 / 54.6 / 126.2 ms                        | 11.6 ms              | 35.0 ms           | 6.2 / 76.7 ms                      | 71 µs    | 41 µs  | 40.4        |
+| venv   | 60,529 | 83.2 / 97.9 / 102.9 ms                        | 11.4 ms              | 35.0 ms           | 37.7 / 56.4 ms                     | 239 µs   | 2.0 ms | 735.3       |
+
+- **Where the time goes.** FSEvents delivers the first event about 11.5 ms after the write
+  whatever the stream latency (0 and 5 ms measured the same; `NoDefer` is set), and the batch
+  closes 30 ms after the last event (35 ms after the first: editors and the kernel report a
+  save as more than one event). The rest is the update, which matches the `incremental` target
+  plus a few hundred microseconds: classifying the batch (a scan of the loaded paths for small
+  batches, a hash set for large ones) and rebuilding the inputs from the index (O(files):
+  2 ms on the venv). The stdlib worst case is one update that re-resolved more readers.
+- **Memory.** The watcher holds the pending paths of one batch (bytes + 12 bytes each) and,
+  on Linux, one path per watched directory; the rest is the incremental program
+  (`incremental` target: +75 MB over a plain load on the venv, mostly dependency tracking and
+  carried resolution state).
+- **Linux (inotify)** compiles and passes clippy for `x86_64-unknown-linux-gnu` but was not
+  measured or run here (no Linux machine); its delivery is immediate (no daemon in between).
+
+End to end, `pymapper check --watch` (release build) on a copy of aiml-lectio's first-party
+code (1,850 files), 12 writes (6 files edited and restored), timed from the write to the status
+line after the report:
+
+| project                          | first check (no cache) | write -> report: median / worst | update (status line) |
+|----------------------------------|------------------------|----------------------------------|----------------------|
+| aiml-lectio first party          | 96 ms                  | 70.6 / 76.6 ms                   | 4-10 ms              |
+| aiml-lectio with its venv (`--deps`) | 2.72 s             | 252 / 263 ms                     | 36-53 ms             |
+
+Every cycle runs all enabled analyses again over the updated program (they are whole-program),
+which is most of the remaining time: about 17 ms on the first-party project, about 150 ms with
+the venv loaded. The GUI's edit-to-map numbers are in `docs/gui.md`, "Watch mode".

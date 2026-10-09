@@ -21,8 +21,9 @@
 //! third-party / stdlib files on disk are not picked up (their distributions are loaded
 //! from their `RECORD`s; reload to see a new install).
 //!
-//! Cost per batch: one hash set over the first-party paths (borrowed from the index, built
-//! only when the batch has Python paths) and one `lstat` per Python path.
+//! Cost per batch: one `lstat` per Python path, and membership tests against the loaded
+//! first-party paths: a scan per path for small batches (up to 8 Python paths: O(files) byte
+//! comparisons each), else one hash set over the paths (borrowed from the index).
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -71,7 +72,7 @@ pub fn classify<'b>(batch: &'b Batch, ix: &Index, root: &Path) -> Changes<'b> {
         out.all = true;
     }
     let root = root.as_os_str().as_bytes();
-    let mut known: Option<FxHashSet<&[u8]>> = None;
+    let known = Known::new(ix, batch);
     for i in 0..batch.len() {
         let p = batch.path_bytes(i);
         let rel = match p.strip_prefix(root) {
@@ -99,9 +100,8 @@ pub fn classify<'b>(batch: &'b Batch, ix: &Index, root: &Path) -> Changes<'b> {
         }
         let path = batch.path(i);
         if batch.flags(i) & FLAG_DIR == 0 && is_python(name) {
-            let set = known.get_or_insert_with(|| first_party_paths(ix));
             let exists = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
-            match (set.contains(p), exists) {
+            match (known.contains(p), exists) {
                 (true, true) => out.changed.push(path),
                 (true, false) => out.rewalk = true,
                 (false, true) if !hidden(rel) => out.rewalk = true,
@@ -125,14 +125,37 @@ fn hidden(rel: &[u8]) -> bool {
     rel.split(|&c| c == b'/').any(|c| c.first() == Some(&b'.') || c == b"__pycache__")
 }
 
-fn first_party_paths(ix: &Index) -> FxHashSet<&[u8]> {
-    let mut set = FxHashSet::default();
-    for f in 0..ix.file_count() {
-        if ix.file_origin(f) == Origin::FirstParty {
-            set.insert(ix.file_path(f).as_os_str().as_bytes());
+/// Batches with at most this many Python paths look them up by scanning the first-party
+/// paths (a few memcmps per file) instead of hashing every path first.
+const SCAN_MAX: usize = 8;
+
+/// Membership in the loaded first-party paths.
+enum Known<'a> {
+    Scan(&'a Index),
+    Set(FxHashSet<&'a [u8]>),
+}
+
+impl<'a> Known<'a> {
+    fn new(ix: &'a Index, batch: &Batch) -> Known<'a> {
+        let python = (0..batch.len()).filter(|&i| batch.flags(i) & FLAG_DIR == 0 && is_python(batch.path_bytes(i))).count();
+        if python <= SCAN_MAX {
+            return Known::Scan(ix);
+        }
+        let mut set = FxHashSet::default();
+        for f in 0..ix.file_count() {
+            if ix.file_origin(f) == Origin::FirstParty {
+                set.insert(ix.file_path(f).as_os_str().as_bytes());
+            }
+        }
+        Known::Set(set)
+    }
+
+    fn contains(&self, p: &[u8]) -> bool {
+        match self {
+            Known::Set(s) => s.contains(p),
+            Known::Scan(ix) => (0..ix.file_count()).any(|f| ix.file_origin(f) == Origin::FirstParty && ix.file_path(f).as_os_str().as_bytes() == p),
         }
     }
-    set
 }
 
 /// The inputs `ix` was loaded from (same files, order, groups, module names and statuses):

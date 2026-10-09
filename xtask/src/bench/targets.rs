@@ -22,6 +22,7 @@ use super::rusage;
 use super::walk::{PathStore, walk_python};
 
 mod incremental;
+mod watch;
 
 /// A named benchmark target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ValueEnum)]
@@ -148,6 +149,11 @@ pub enum Target {
     /// distribution (and the stdlib's hot modules) are edited and restored one at a time
     /// (phase `incremental.update` = all updates; per-update medians as counters).
     Incremental,
+    /// Edit-to-update latency through the real file watcher on a copy of the corpus (phase
+    /// `copy`; corpora over 1 GB are refused): files across the size distribution are edited
+    /// and restored one write at a time, each timed from the write to its applied update
+    /// (phase `watch.edits` = all of them; OS delivery, debounce and update medians as counters).
+    Watch,
 }
 
 impl Target {
@@ -181,6 +187,7 @@ impl Target {
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
             Target::Incremental => "incremental",
+            Target::Watch => "watch",
         }
     }
 }
@@ -517,6 +524,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Query => super::query::query_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Incremental => incremental::incremental_target(root)?,
+        Target::Watch => watch::watch_target(root)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -1499,6 +1507,7 @@ mod tests {
             Target::LoadCold,
             Target::LoadWarm,
             Target::Incremental,
+            Target::Watch,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -1593,6 +1602,10 @@ mod tests {
                 Target::Incremental => &[
                     "walk", "copy", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "incremental.update",
+                ],
+                Target::Watch => &[
+                    "walk", "copy", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "watch.edits",
                 ],
                 Target::Roots => unreachable!("checked below"),
             };
@@ -1733,6 +1746,14 @@ mod tests {
                 assert!(updates > 0 && updates % 6 == 0, "{updates}");
                 assert!(counter("update_best_us") <= counter("update_median_us"));
                 assert!(counter("update_median_us") <= counter("update_worst_us"));
+            } else if target == Target::Watch {
+                // Every picked file is edited and restored once per round, each write seen.
+                assert_eq!(counter("missed"), Some(0));
+                let edits = counter("edits").unwrap();
+                assert!(edits > 0 && edits % 6 == 0, "{edits}");
+                assert!(counter("update_median_us") <= counter("total_median_us"));
+                assert!(counter("debounce_median_us") > Some(0));
+                assert!(counter("total_median_us") <= counter("total_worst_us"));
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }

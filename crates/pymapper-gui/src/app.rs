@@ -612,6 +612,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(cm) = &self.codemap {
                     measure::codemap_report(&mut report, cm);
                 }
+                if self.opts.watch {
+                    report.push_str("watch: ");
+                    report.push_str(&w.ui.watch_info.replace('\n', "; "));
+                    report.push('\n');
+                }
                 self.report = Some(report);
             }
             event_loop.exit();

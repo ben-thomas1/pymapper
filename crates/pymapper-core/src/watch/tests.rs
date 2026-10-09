@@ -196,6 +196,17 @@ fn classify_sorts_paths_into_changed_rewalk_reload() {
     assert_eq!(c.changed, [a.as_path()]);
     assert!(!c.rewalk && !c.reload && !c.all);
 
+    // Large batches hash the loaded paths instead of scanning them: same answer.
+    let gone_many: Vec<Vec<u8>> = (0..12).map(|i| bytes(&root.join(format!("pkg/tmp_{i}.py")))).collect();
+    let mut many: Vec<(&[u8], u8)> = gone_many.iter().map(|p| (p.as_slice(), 0)).collect();
+    let a_bytes = bytes(&a);
+    many.push((&a_bytes, 0));
+    let bt = batch_of(&many);
+    let c = classify(&bt, ix, root);
+    assert_eq!(c.changed, [a.as_path()]);
+    assert_eq!(c.ignored, 12);
+    assert!(!c.rewalk);
+
     // Unrelated files, caches, hidden directories, files that came and went.
     let tmp = d.write("pkg/a.py.swp", "");
     let pyc = d.write("pkg/__pycache__/a.cpython-313.pyc", "");

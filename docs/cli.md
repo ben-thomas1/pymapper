@@ -121,6 +121,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--baseline FILE` | `baseline` | report only findings not in the baseline |
 | `--save-baseline FILE` | | record every reported finding, write no report, exit 0 |
 | `--stats` | | phase timings, counters and peak RSS on stderr |
+| `--watch` | | keep running and check again after every change (see [Watch mode](#watch-mode)) |
 
 A selector that matches no known rule (`--select PM999`, or in `rules.select`, `extend-select`,
 `ignore` or `per-file-ignores`) is a usage error (exit 2) with a "did you mean" suggestion when
@@ -271,6 +272,48 @@ the selected rules that ran / could not run, followed by one `skipped CODES: rea
 reason. `deadcode.units` counts the project units with
 analysed files, split into the library / application modes they resolved to. Measured numbers are in
 [`benchmarks.md`](benchmarks.md#check-s45).
+
+## Watch mode
+
+`pymapper check --watch` checks once, then keeps the loaded program in memory and checks again
+whenever a file of the project changes, like `ruff check --watch`. Each cycle prints a full
+report (on a terminal the screen is cleared first) and one status line on stderr:
+
+```
+$ pymapper check --watch
+pkg/a.py:4:5: PM401 function `pkg.a:unused` is never used
+Found 1 finding in 1 file (3 files checked).
+pymapper: watching /path/to/project for changes (Ctrl-C to stop); checked in 96 ms
+...
+pymapper: 1 file(s) changed; updated in 6 ms, reported 58 ms after the first event. Watching for changes
+```
+
+```
+  edit ──> FSEvents / inotify ──> debounce (30 ms quiet, 300 ms max) ──> classify
+       ──> incremental update (re-extract changed files, re-resolve their readers)
+       ──> analyses + report        (pyproject.toml / pymapper.toml changed: load again)
+```
+
+- Changes are found by pymapper's own watcher (`pymapper_core::watch`: FSEvents on macOS,
+  inotify on Linux) on the project root. Saved Python files are re-extracted; new, deleted and
+  renamed files and directories (and `.gitignore` changes) walk the project again; a changed
+  `pyproject.toml` or `pymapper.toml` reloads everything, configuration included. A changed
+  baseline, coverage report or config-evidence file is read again.
+- Every analysis runs again on the updated program (they are whole-program: one edit can make
+  code elsewhere dead or close a cycle); only loading and resolution are incremental.
+- Not watched: third-party and stdlib files (reload by touching `pyproject.toml` after an
+  install). Duplication (`PM501`, `analysis.dupes`) is not run in watch mode (warned at
+  start): the update does not maintain duplication fingerprints. Changing `threads` needs a
+  restart.
+- A configuration error after a change is printed and the next change retried; errors of the
+  first load exit 2 as usual. `--watch` conflicts with `--save-baseline`. The process ends on
+  Ctrl-C, or when stdout is closed (`check --watch | head`), with the exit code of the last check.
+- `--stats` prints the stats block per cycle plus one `update:` line (files re-extracted,
+  added, removed, files re-resolved, phase times).
+
+Cost: memory is that of a `check` run plus the dependency tracking of the incremental
+resolution (4 bytes per (file, file read) pair; 3.4 MB on a 17M-line venv). Latency is
+measured by `cargo xtask bench -t watch` ([benchmarks.md](benchmarks.md#watch-mode-s77)).
 
 # Query subcommands
 

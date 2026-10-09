@@ -10,7 +10,8 @@
 //!   edges.rs    cut edges of every band with all edge metrics, pruned per source
 //!   bundle.rs   hierarchical edge bundling: control polygon -> B-spline -> Bezier segments
 //!   scene.rs    CodeMap -> map::Scene (rect and curve LODs from the reveal bands) + Legend
-//!   worker.rs   background thread: load -> layout -> edges -> scenes on request
+//!   worker.rs   background thread: load -> layout -> edges -> scenes on request; watch mode
+//!   transition.rs  overlay animation of a watch-mode update (moved / changed / added / removed)
 //! ```
 //!
 //! Data flow: [`load::load`] once, then [`CodeMap::build`] per size metric (layout, reveal

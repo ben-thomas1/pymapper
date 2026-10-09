@@ -9,6 +9,10 @@
 //!
 //! The walk step mirrors `pymapper-cli/src/pipeline.rs` (the GUI cannot depend on the CLI
 //! crate); warnings are collected for the UI instead of printed.
+//!
+//! Watch mode ([`LoadParams::watch`]) resolves through [`Program`] instead (imports and
+//! calls with dependency tracking, 4 bytes per (file, file read) pair) and keeps the config
+//! and import roots for walks, so [`Analysis::update`] can apply file changes in place.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
