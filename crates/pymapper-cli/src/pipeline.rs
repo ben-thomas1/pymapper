@@ -239,7 +239,13 @@ fn flush_walk(
 /// Inline `# pymapper: ignore[...]` and F401 `# noqa` suppressions of every file, from the facts.
 /// Malformed codes suppress nothing; they, unknown codes and empty lists (`ignore[]`) are passed
 /// to `bad(file, line, code, kind)` (`code` is empty for an empty list), in file and line order.
-pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+pub fn suppressions(ix: &Index, bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+    suppressions_builder(ix, bad).build()
+}
+
+/// [`suppressions`] before `build`, so callers can add entries for files beyond the index
+/// (`pyproject.toml` files, with ids above every index file).
+pub fn suppressions_builder(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> SuppressionsBuilder {
     let mut b = SuppressionsBuilder::new();
     let st = &ix.facts().suppressions;
     let mut entries = Vec::new();
@@ -270,5 +276,5 @@ pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind
         }
         b.push_file(rules::FileId(f), &entries);
     }
-    b.build()
+    b
 }

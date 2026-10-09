@@ -18,7 +18,7 @@
 //! Analyses run only when one of their rules is enabled (`RuleEngine::should_run`), and call
 //! resolution only when an enabled rule needs it (dead code, god classes).
 
-mod plan;
+pub(crate) mod plan;
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -242,7 +242,7 @@ impl std::fmt::Display for DisplayPaths<'_> {
 
 /// Per file: whether it lies under one of the positional paths (`None`: no paths, everything
 /// is in scope). Component-wise prefix tests on first-party files only; O(files * paths).
-fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
+pub(crate) fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
     if scope.is_empty() {
         return None;
     }
@@ -258,7 +258,7 @@ fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
 }
 
 /// First-party files loaded: `(in scope, total)`.
-fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
+pub(crate) fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
     let mut checked = 0;
     let mut total = 0;
     for f in 0..ix.file_count() {
@@ -273,7 +273,7 @@ fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
 }
 
 /// `path` relative to the project root when below it, else as is.
-fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
+pub(crate) fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
     match path.strip_prefix(root) {
         Ok(rel) if !rel.as_os_str().is_empty() => rel.display(),
         _ => path.display(),
@@ -283,7 +283,11 @@ fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
 /// Warns about one malformed or unknown code of an inline suppression (`code` empty: an empty
 /// list). Never fatal: the directive just suppresses less than intended.
 fn warn_bad_suppression(ix: &Index, root: &Path, f: u32, line: u32, code: &[u8], kind: BadCodeKind) {
-    let path = display_rel(ix.file_path(f), root);
+    warn_bad_code(display_rel(ix.file_path(f), root), line, code, kind);
+}
+
+/// [`warn_bad_suppression`] for a display path.
+pub(crate) fn warn_bad_code(path: impl std::fmt::Display, line: u32, code: &[u8], kind: BadCodeKind) {
     let code = String::from_utf8_lossy(code);
     match kind {
         BadCodeKind::Malformed if code.is_empty() => warn(format_args!(
@@ -395,7 +399,7 @@ fn warn_no_entry_points(dc: &DeadCode, units: &ProjectUnits, scope: &[PathBuf]) 
 
 /// `per-file-ignores` patterns compiled once each (gitignore syntax, relative to the project
 /// root). An invalid pattern is a configuration error.
-fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
+pub(crate) fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
     let mut out = Vec::with_capacity(config.rules.per_file_ignores.len());
     for e in &config.rules.per_file_ignores {
         Gitignore::check_pattern(e.pattern.as_bytes())
@@ -408,11 +412,16 @@ fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
 /// Whether a `per-file-ignores` pattern matches file `f`: its path relative to the project
 /// root, or one of its parent directories (as an excluded directory excludes its contents).
 /// Files outside the root are matched by their absolute path without the leading `/`.
-fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool {
+pub(crate) fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool {
     if f.0 >= ix.file_count() {
         return false;
     }
-    let p = ix.file_path(f.0).as_os_str().as_bytes();
+    per_file_path_matches(ix.file_path(f.0), root, gi)
+}
+
+/// [`per_file_matches`] for a path (absolute).
+pub(crate) fn per_file_path_matches(path: &Path, root: &Path, gi: &Gitignore) -> bool {
+    let p = path.as_os_str().as_bytes();
     let rel = match p.strip_prefix(root.as_os_str().as_bytes()) {
         Some([b'/', rest @ ..]) => rest,
         _ => p.strip_prefix(b"/").unwrap_or(p),
@@ -426,7 +435,7 @@ fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool 
     gi.matched(rel, false) == Match::Ignore
 }
 
-fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
+pub(crate) fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
     let text = std::fs::read(path).with_context(|| {
         format!("cannot read baseline {} (create it with `pymapper check --save-baseline FILE`)", path.display())
     })?;
@@ -434,7 +443,7 @@ fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
 }
 
 /// Writes the baseline of `report` to `path` atomically (temporary file + rename).
-fn save_baseline(report: &Report<'_>, path: &Path) -> anyhow::Result<()> {
+pub(crate) fn save_baseline(report: &Report<'_>, path: &Path) -> anyhow::Result<()> {
     // Per-process temp name: concurrent saves to the same baseline must not share it.
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
