@@ -52,7 +52,7 @@ fn row_sizes_match_the_documented_layout() {
     assert_eq!(Decls::ROW_BYTES, 9);
     assert_eq!(Diags::ROW_BYTES, 9);
     assert_eq!(Suppressions::ROW_BYTES, 13);
-    assert_eq!(std::mem::size_of::<FileFacts>(), 112);
+    assert_eq!(std::mem::size_of::<FileFacts>(), 120);
     assert_eq!(std::mem::size_of::<Option<Sym>>(), 4);
 }
 
@@ -620,11 +620,11 @@ w = '''triple_name'''
 def defined_only(param_only): pass
 ";
     with_view(src, |v| {
-        for yes in ["handler_ref", "registry", "obj", "method_attr", "getattr", "string_name", "pkg", "mod", "dotted_fn", "bytes_name", "triple_name"] {
+        for yes in ["handler_ref", "registry", "obj", "method_attr", "getattr", "string_name", "pkg", "mod", "dotted_fn", "pkg.mod", "pkg.mod.dotted_fn", "bytes_name", "triple_name"] {
             assert!(v.has_evidence(yes.as_bytes()), "{yes}");
         }
         // Def and param names are definitions, not references; f-strings are not plain strings.
-        for no in ["defined_only", "param_only", "not an identifier", "1digit", "fstr_name", "pkg.mod.dotted_fn"] {
+        for no in ["defined_only", "param_only", "not an identifier", "1digit", "fstr_name", "mod.dotted_fn"] {
             assert!(!v.has_evidence(no.as_bytes()), "{no}");
         }
         let ev = v.evidence();
@@ -925,4 +925,87 @@ fn decorator_and_base_rows_are_grouped_by_owner() {
     assert_eq!(v1.decorators(5), 3..4);
     assert!(v1.decorators(4).is_empty(), "no decorators");
     assert_eq!(v1.bases(3), 2..3);
+}
+
+#[test]
+fn getattr_name_shapes() {
+    // Constant names are plain evidence: no flag, no prefix row.
+    let constant = "getattr(x, 'a')\nhasattr(x, \"b\")\ngetattr(x, 'c', None)\ngetattr(x, f'd')\n";
+    assert!(!header(constant).contains("dynamic_getattr"), "{}", header(constant));
+    assert_eq!(lines(constant, "decl"), "");
+    // Constant prefixes: f-string literal head or `"pre" + x`, in the enclosing scope.
+    let prefix = "\
+def f(self, x):
+    getattr(self, f'_dt_{x}')
+    return getattr(self, '_print_' + x)(1)
+hasattr(o, f'visit_{type(n).__name__}')
+";
+    assert!(!header(prefix).contains("dynamic_getattr"));
+    check_lines(prefix, "decl", "
+        decl 1:f getattr_prefix _dt_
+        decl 1:f getattr_prefix _print_
+        decl 0:<module> getattr_prefix visit_
+    ");
+    // Fully variable names: module-wide dynamic access (getattr only).
+    for src in ["getattr(x, name)\n", "getattr(x, f'{a}_b')\n", "getattr(x, n + 'suffix')\n", "getattr(*args)\n", "getattr(x, (name))\n"] {
+        assert!(header(src).contains("dynamic_getattr"), "{src}");
+        assert_eq!(lines(src, "decl"), "", "{src}");
+    }
+    assert!(!header("hasattr(x, name)\n").contains("dynamic_getattr"));
+    // Not the builtin: method calls and other names.
+    assert!(!header("obj.getattr(x, name)\nmy_getattr(x, name)\n").contains("dynamic_getattr"));
+    // Nested call in the object argument; the outer name is still classified.
+    assert_eq!(lines("getattr(getattr(a, 'b'), 'c')\n", "decl"), "");
+    assert!(!header("getattr(getattr(a, 'b'), 'c')\n").contains("dynamic_getattr"));
+    // getattr prefix rows are not global/nonlocal declarations for resolution.
+    check_lines("def g():\n    global G\n    getattr(m, 'x' + y)\n", "decl", "
+        decl 1:g global G
+        decl 1:g getattr_prefix x
+    ");
+}
+
+#[test]
+fn string_paths_and_quoted_types_give_evidence() {
+    let src = "\
+run('tests.system.fixture:create_app')
+cast('CursorResult[Any]', x)
+y: 'Optional[Dict[str, Foo]]'
+z = 'Bar | None'
+w = 'a sentence, with [brackets] and words!'
+p = 'a:b:c'
+";
+    with_view(src, |v| {
+        for yes in [
+            "tests",
+            "system",
+            "fixture",
+            "create_app",
+            "tests.system",
+            "tests.system.fixture",
+            "tests.system.fixture.create_app",
+            "CursorResult",
+            "Any",
+            "Optional",
+            "Dict",
+            "Foo",
+            "Bar",
+        ] {
+            assert!(v.has_evidence(yes.as_bytes()), "{yes}");
+        }
+        // Prose with punctuation is not a type expression; two colons are not a path.
+        for no in ["sentence", "brackets", "words", "a.b", "a.b.c", "tests.system.fixture:create_app", "system.fixture"] {
+            assert!(!v.has_evidence(no.as_bytes()), "{no}");
+        }
+    });
+}
+
+#[test]
+fn main_guard_line_is_recorded() {
+    let src = "import x\n\ndef f(): pass\n\nif __name__ == '__main__':\n    f()\nif __name__ == '__main__':\n    pass\n";
+    let mut st = FactStore::new();
+    let mut spans = SpanStrs::new();
+    let ff = extract(src.as_bytes(), &mut st, &mut spans);
+    assert_eq!(ff.main_line, 5);
+    let ff = extract(b"def f():\n    if __name__ == '__main__':\n        pass\n", &mut st, &mut spans);
+    assert_eq!(ff.main_line, 0);
 }

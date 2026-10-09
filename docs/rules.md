@@ -10,16 +10,44 @@ one hundred.
 Rules are chosen in `[rules]` (or with `--select`, `--extend-select`, `--ignore`) by code
 prefix: `ALL`, `PM`, `PM1`, `PM10`, `PM101`. Without `select`, the rules marked "on" below
 run. When a rule matches both a select and an ignore selector, the more specific selector wins;
-on a tie, ignore wins. `per-file-ignores` disables rules in files matching a glob.
+on a tie, ignore wins. `per-file-ignores` disables rules in files matching a glob. A selector
+that matches no rule (`PM999`, anywhere in the rule options) is a usage error (exit 2) with a
+"did you mean" suggestion when one is close.
 
 Expensive rules also need their `[analysis]` toggle ("needs ..." below): turning the toggle on
-enables them unless they are ignored, and selecting them without the toggle runs nothing (pymapper
-prints a note). Analyses whose rules are all disabled do not run at all.
+enables them unless they are ignored. `pymapper check` does not run the dependency rules (PM6xx,
+they belong to `pymapper deps`) or the contract rules PM302-PM304 without `[[contracts]]`. If
+none of the selected rules can run, `check` fails with exit 2 and says why; if some can, it warns
+about the skipped rules selected by code or category (`PM501`, `PM6`) and, whenever rules were
+selected explicitly (`ALL` included), its footer says how many rules ran and which were skipped
+("25 rules ran, 8 skipped (PM501: needs ...; ...)"). Analyses whose rules
+are all disabled do not run at all.
 
 ## Thresholds
 
 Metric rules read a limit from `[thresholds]` and report values strictly above a `max-*` limit
 (strictly below a `min-*` limit).
+
+## Test code
+
+By default the complexity (PM1xx), coupling (PM2xx) and duplication (PM5xx) rules skip test code:
+files whose dotted module name has a `tests`, `test` or `testing` component (a directory so named
+below the import root, at any depth), or whose name is `test_*.py`, `*_test.py` or `conftest.py`.
+Long test functions, large test classes and repeated test setup are normal and would drown the
+findings about the code under test. Set `analysis.include-tests-in-metrics = true` to report them
+too. Dead code (PM4xx) and import cycles / contracts (PM3xx) always cover tests.
+
+## Symbols
+
+A finding's `symbol` is the stable qualified id of what it is about: `pkg.mod` for a module,
+`pkg.mod:Class.method` for a definition. Baselines key on it. Same-named siblings (a property
+and its setter, conditional definitions) are told apart by a `#N` suffix in source order: the
+first is `name`, the next `name#2`, and so on. In a group with `@overload` signatures, the
+implementation (the last definition of the group that is not an `@overload`) is the plain `name`
+and the signatures are `name#2`, `name#3`, ... in source order, so adding an overload does not
+change the id metric findings and baselines use (overload signatures themselves are never
+reported by the metric rules). Unused imports (PM405) are shown as `pkg.mod:<bound name>` in
+JSON and SARIF output.
 
 ## Confidence
 
@@ -27,14 +55,19 @@ Every finding has a confidence from 0 to 100. Measured facts (metrics, contract 
 always have 100; heuristic rules (dead code, dependency mapping) score each finding as described
 per rule. `pymapper check` reports findings with confidence at or above `min-confidence`
 (default 80, `--confidence`) and exits 1 if there are any.
+Dead-code findings below 100 name the evidence that lowered the confidence: concise output
+appends `(confidence 50: name-elsewhere)`, JSON a `reasons` array (absent when there are none).
 
 ## Suppressing findings
 
 Add `# pymapper: ignore[CODES]` to the line a finding is reported on (the `def` / `class` line,
 the import line, or line 1 for module-level findings). Codes are comma-separated selectors, so
 `# pymapper: ignore[PM101, PM4]` suppresses PM101 and every dead-code rule on that line; a bare
-`# pymapper: ignore` suppresses every rule. Malformed codes (`E501`, `pm101`) are reported as
-diagnostics and ignored.
+`# pymapper: ignore` suppresses every rule. `pymapper check` warns on stderr
+(`pymapper: warning: path:line: ...`) about codes that are not pymapper selectors (`E501`), wrong
+case (`pm101`, with a suggestion), codes that match no rule (`PM999`) and empty lists
+(`ignore[]`); such codes suppress nothing, and the warnings never change the exit code. Only
+files in the reported paths are diagnosed.
 
 Ruff's `# noqa` is honoured for unused imports only: a bare `# noqa` or a `# noqa` listing F401
 (`# noqa: F401`, `# noqa:F401,E501`, any case) suppresses PM405 on its line, or on every name of
@@ -60,10 +93,10 @@ Codes PM000-PM099 and PM700-PM999 are unassigned.
 | [PM101](#pm101-complex-function) | `complex-function` | warning | on | O(n) | 100 | Function with a McCabe cyclomatic complexity above `max-mccabe` |
 | [PM102](#pm102-cognitive-complexity) | `cognitive-complexity` | warning | on | O(n) | 100 | Function with a cognitive complexity above `max-cognitive` |
 | [PM103](#pm103-deep-nesting) | `deep-nesting` | warning | on | O(n) | 100 | Function whose blocks nest deeper than `max-nesting` |
-| [PM104](#pm104-long-function) | `long-function` | warning | on | O(n) | 100 | Function longer than `max-function-loc` lines |
+| [PM104](#pm104-long-function) | `long-function` | warning | on | O(n) | 100 | Function longer than `max-function-loc` lines, docstrings excluded |
 | [PM105](#pm105-too-many-parameters) | `too-many-parameters` | warning | on | O(n) | 100 | Function with more than `max-params` parameters |
 | [PM106](#pm106-low-maintainability) | `low-maintainability` | info | off | O(n) | 100 | Function with a maintainability index below `min-maintainability` |
-| [PM107](#pm107-long-module) | `long-module` | info | on | O(n) | 100 | Module longer than `max-module-loc` lines |
+| [PM107](#pm107-long-module) | `long-module` | info | on | O(n) | 100 | Module longer than `max-module-loc` lines, docstrings excluded |
 | [PM201](#pm201-high-fan-out) | `high-fan-out` | warning | on | O(V+E) | 100 | Module importing more than `max-fan-out` distinct first-party modules |
 | [PM202](#pm202-main-sequence-distance) | `main-sequence-distance` | info | off | O(V+E) | 100 | Coupled module far from the main sequence (distance above `max-distance`) |
 | [PM203](#pm203-god-module) | `god-module` | warning | on | O(V+E) | 100 | Module that is both large (`max-module-symbols`) and highly coupled (`max-module-coupling`) |
@@ -138,16 +171,16 @@ Suppress on a line with `# pymapper: ignore[PM103]`.
 
 ### PM104 long-function
 
-Function longer than `max-function-loc` lines.
+Function longer than `max-function-loc` lines, docstrings excluded.
 
-- Message: `<symbol> is <int> lines long (> <int>)`
+- Message: `<symbol> is <int> lines long without docstrings (> <int>)`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(n)
 - Threshold: `thresholds.max-function-loc` (reported above; default 100)
 - Confidence: always 100
 
-Lines of the function's inclusive span, from its first decorator or `def` to its last line, including blank lines and comments. Long functions tend to do several things.
+Lines of the function's inclusive span, from its first decorator or `def` to its last line, minus the lines of its docstring and of the docstrings of functions and classes nested in it (a long numpydoc docstring is documentation, not code). Blank lines and comments count. A docstring is the first statement of a body when it is a plain string literal (not an f-string or bytes) on its own line(s). Long functions tend to do several things.
 
 Fix: split the function along its steps.
 
@@ -189,16 +222,16 @@ Suppress on a line with `# pymapper: ignore[PM106]`.
 
 ### PM107 long-module
 
-Module longer than `max-module-loc` lines.
+Module longer than `max-module-loc` lines, docstrings excluded.
 
-- Message: `module <symbol> is <int> lines long (> <int>)`
+- Message: `module <symbol> is <int> lines long without docstrings (> <int>)`
 - Severity: info
 - Enabled by default: yes
 - Cost: O(n)
 - Threshold: `thresholds.max-module-loc` (reported above; default 1000)
 - Confidence: always 100
 
-Total lines of the module file. Very long modules are hard to navigate and usually hold several unrelated concerns.
+Lines of the module file minus the lines of every docstring in it (the module's, and those of its classes and functions, as for PM104). Blank lines and comments count. Very long modules are hard to navigate and usually hold several unrelated concerns.
 
 Fix: split the module into a package of focused modules.
 
@@ -285,13 +318,13 @@ Suppress on a line with `# pymapper: ignore[PM204]`.
 
 Modules that import each other, directly or indirectly.
 
-- Message: `import cycle: <symbol> -> <symbol> -> ...`
+- Message: `import cycle (<int> [module | modules]): <symbol> -> <symbol> -> ...`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: always 100
 
-One finding per strongly connected component of the first-party module import graph, reported at an import that closes a short witness cycle (the message lists it, ending at the first module again). Cycles make import order matter, cause `ImportError`s on partially initialised modules and prevent splitting code into independent parts. Imports under `if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level imports count, stub files (`.pyi`) do not.
+One finding per strongly connected component of the first-party module import graph, reported at an import that closes a short witness cycle. The message gives the number of modules in the component and the witness, ending at the first module again; JSON output adds a `cycle` object with the component's `size`, every `member` and the `witness`. Cycles make import order matter, cause `ImportError`s on partially initialised modules and prevent splitting code into independent parts. Imports under `if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level imports count, stub files (`.pyi`) do not.
 
 Fix: move the shared code into a lower-level module both can import, or invert the dependency.
 
@@ -352,7 +385,7 @@ Suppress on a line with `# pymapper: ignore[PM304]`.
 
 Module-level or nested function that is never used.
 
-- Message: `function <symbol> [is never used | is only used by unused code]`
+- Message: `function <symbol> [is never used | is only used by unused code | is only used by code that may be unused | has no resolved callers (name appears elsewhere) | has no resolved callers (name appears in its own file) | has no resolved callers (name appears in a file that imports it) | has only possible callers (unique method name, unresolved receiver) | has no resolved callers (an unknown decorator may register it) | has no resolved callers (may override a method of an unloaded base class) | has no resolved callers (dynamic attribute access may reach it) | has no resolved callers (matches a dynamic `getattr` prefix) | is only exported (`__all__` or a re-export), never used | is never used (public name outside the public API) | is never used (public method; instances may reach callers) | has no resolved callers (name appears in a config file) | has no resolved callers (named with its module in a config file)]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -368,7 +401,7 @@ Suppress on a line with `# pymapper: ignore[PM401]`.
 
 Class that is never instantiated, subclassed or referenced.
 
-- Message: `class <symbol> [is never used | is only used by unused code]`
+- Message: `class <symbol> [is never used | is only used by unused code | is only used by code that may be unused | has no resolved callers (name appears elsewhere) | has no resolved callers (name appears in its own file) | has no resolved callers (name appears in a file that imports it) | has only possible callers (unique method name, unresolved receiver) | has no resolved callers (an unknown decorator may register it) | has no resolved callers (may override a method of an unloaded base class) | has no resolved callers (dynamic attribute access may reach it) | has no resolved callers (matches a dynamic `getattr` prefix) | is only exported (`__all__` or a re-export), never used | is never used (public name outside the public API) | is never used (public method; instances may reach callers) | has no resolved callers (name appears in a config file) | has no resolved callers (named with its module in a config file)]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -384,7 +417,7 @@ Suppress on a line with `# pymapper: ignore[PM402]`.
 
 Method of a live class that is never called.
 
-- Message: `method <symbol> [is never used | is only used by unused code]`
+- Message: `method <symbol> [is never used | is only used by unused code | is only used by code that may be unused | has no resolved callers (name appears elsewhere) | has no resolved callers (name appears in its own file) | has no resolved callers (name appears in a file that imports it) | has only possible callers (unique method name, unresolved receiver) | has no resolved callers (an unknown decorator may register it) | has no resolved callers (may override a method of an unloaded base class) | has no resolved callers (dynamic attribute access may reach it) | has no resolved callers (matches a dynamic `getattr` prefix) | is only exported (`__all__` or a re-export), never used | is never used (public name outside the public API) | is never used (public method; instances may reach callers) | has no resolved callers (name appears in a config file) | has no resolved callers (named with its module in a config file)]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -400,7 +433,7 @@ Suppress on a line with `# pymapper: ignore[PM403]`.
 
 First-party module that nothing imports and that is not an entry point.
 
-- Message: `module <symbol> [is never imported | is only imported by unused modules]`
+- Message: `module <symbol> [is never imported | is only imported by unused modules | is only imported by modules that may be unused | is not imported (name appears elsewhere) | is only reached through possible calls | is not imported (may be run as a script) | is not imported (name appears in a config file)]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -443,7 +476,7 @@ Block of code duplicated elsewhere (token-based clone).
 - Threshold: `thresholds.dupes-min-lines` (parameter; default 6)
 - Confidence: Similarity of the two copies: 100 when their tokens are identical, lower when they only match after normalising identifiers and literals.
 
-Token sequences of at least `dupes-min-tokens` tokens spanning at least `dupes-min-lines` lines that occur more than once, after normalising identifiers and literals (so renamed copies match). Reported at each copy, pointing at another copy. Duplicates must be kept in sync by hand and drift apart.
+Token sequences of at least `dupes-min-tokens` tokens spanning at least `dupes-min-lines` lines that occur more than once, after normalising identifiers and literals (so renamed copies match). Reported at each copy, pointing at another copy; JSON output adds the copy's `end_line`, its `symbol` (the innermost class or function containing the whole copy, if any) and an `other` object with the other copy's `path`, `line`, `end_line` and `symbol`. Import statements are ignored, stub files (`.pyi`) are skipped, and a copy never starts or ends on an `@overload` signature or a docstring (it is trimmed to the code in between, and dropped if too little is left), so runs of overloads are not reported. Duplicates must be kept in sync by hand and drift apart.
 
 Fix: extract the shared code into a function or base class.
 

@@ -213,7 +213,7 @@ fn external_bases_and_dynamic_modules() {
              def main():\n    Worker().start()\n    dyn.entry()\n\n\
              if __name__ == '__main__':\n    main()\n",
         ),
-        ("dyn.py", "def entry():\n    return getattr(dyn_self, 'x')()\n\ndef handler_a():\n    pass\n"),
+        ("dyn.py", "def entry(name='x'):\n    return getattr(dyn_self, name)()\n\ndef handler_a():\n    pass\n"),
     ]);
     let (dc, lines) = f.app();
     assert_eq!(lines, [
@@ -233,7 +233,95 @@ fn external_bases_and_dynamic_modules() {
     ]);
     let (dc, _) = f.app();
     let v = f.node("mathml:MathML._print_Add");
-    assert_eq!((dc.level(v), dc.why(v)), (level::DYNAMIC, Why::Dynamic));
+    assert_eq!((dc.level(v), dc.why(v)), (level::DYNAMIC, Why::DynamicPrefix));
+}
+
+#[test]
+fn getattr_shapes_narrow_the_dynamic_penalty() {
+    let main = ("main.py", "import a, b, c, d
+
+if __name__ == '__main__':
+    a.run(); b.run(); c.run(1); d.run(1)
+");
+    // A constant name is a plain reference: no penalty for the module's other defs.
+    let f = fx(&[
+        main,
+        ("a.py", "def run():
+    return getattr(emitter, 'enqueue_event', None)
+
+def inject_text():
+    pass
+"),
+        ("b.py", "def run():
+    return hasattr(x, 'y')
+
+def dead_b():
+    pass
+"),
+        // A constant prefix: only defs whose name starts with it, in any file.
+        (
+            "c.py",
+            "class Arr:
+    def run(self, n):
+        return getattr(self, f'_dt_{n}')()
+    def _dt_year(self):
+        pass
+    def _other(self):
+        pass
+
+             def run(n):
+    Arr().run(n)
+",
+        ),
+        ("e.py", "def _dt_month():
+    pass
+"),
+        // A fully variable name: the whole module, as before.
+        ("d.py", "def run(n):
+    return getattr(obj, n)
+
+def dead_d():
+    pass
+"),
+    ]);
+    let (dc, lines) = f.app();
+    assert!(lines.contains(&"PM401 a:inject_text 100".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"PM401 b:dead_b 100".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"PM403 c:Arr._other 100".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"PM401 d:dead_d 70".to_owned()), "{lines:?}");
+    let y = f.node("c:Arr._dt_year");
+    assert_eq!((dc.level(y), dc.why(y)), (level::DYNAMIC, Why::DynamicPrefix));
+    // Global prefix: a module-level def elsewhere (its module is unused, so it is contained).
+    assert_eq!(dc.why(f.node("e:_dt_month")), Why::DynamicPrefix);
+    assert_eq!(dc.why(f.node("d:dead_d")), Why::Dynamic);
+
+    // A short prefix (`f"_{x}"`) applies only to its own file.
+    let f = fx(&[
+        ("main.py", "import a, b
+
+if __name__ == '__main__':
+    a.run(1); b.go()
+"),
+        ("a.py", "def run(n):
+    return getattr(obj, f'_{n}')
+
+def _hidden():
+    pass
+
+def plain():
+    pass
+"),
+        ("b.py", "def go():
+    pass
+
+def _private():
+    pass
+"),
+    ]);
+    let (dc, lines) = f.app();
+    assert_eq!(dc.why(f.node("a:_hidden")), Why::DynamicPrefix);
+    assert!(lines.contains(&"PM401 a:plain 100".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"PM401 b:_private 100".to_owned()), "{lines:?}");
 }
 
 const LIB: &[(&str, &str)] = &[
@@ -299,7 +387,7 @@ fn application_mode_lowers_exported_names() {
     let f = fx(&[("mod.py", "__all__ = ['exported']\n\ndef exported():\n    pass\n")]);
     let (dc, _) = f.app();
     // The `__all__` string is name evidence in the def's own file.
-    assert_eq!((dc.level(f.node("mod:exported")), dc.why(f.node("mod:exported"))), (level::LINKED, Why::Linked));
+    assert_eq!((dc.level(f.node("mod:exported")), dc.why(f.node("mod:exported"))), (level::LINKED, Why::LinkedSame));
     // A re-export (`import x as x`); the import statement itself is not name evidence.
     let f = fx(&[("pkg/__init__.py", "from .core import thing as thing\n"), ("pkg/core.py", "def thing():\n    pass\n")]);
     let (dc, lines) = f.app();
@@ -322,10 +410,11 @@ fn name_fallback_levels() {
     ]);
     let (dc, lines) = f.app();
     let lvl = |q: &str| (dc.level(f.node(q)), dc.why(f.node(q)));
-    assert_eq!(lvl("main:callback"), (level::LINKED, Why::Linked));
+    assert_eq!(lvl("main:callback"), (level::LINKED, Why::LinkedSame));
     assert_eq!(lvl("lib:aliased"), (level::LINKED, Why::Linked));
     assert_eq!(lvl("lib:by_attr"), (level::LINKED, Why::Linked));
-    assert_eq!(lvl("lib:by_string"), (level::EVIDENCE, Why::Evidence));
+    // The full dotted path in a string is a reference by name.
+    assert_eq!(lvl("lib:by_string"), (level::REFERENCED, Why::StringRef));
     // A dead call chain is reported in full: `chained`'s name is explained by the dead call.
     assert_eq!(lvl("main:chained"), (0, Why::Dead));
     assert!(lines.contains(&"PM401 lib:nothing 100".to_owned()), "{lines:?}");
@@ -377,7 +466,6 @@ fn unused_modules() {
     assert_eq!(modules, [
         "PM404 app.loader 100",
         "PM404 app.orphan 100",
-        "PM404 app.plugins.loaded 50",
         "PM404 script 40",
     ]);
     let ml = |q: &str| (dc.module_level(f.node(q)).unwrap(), dc.module_why(f.node(q)).unwrap());
@@ -391,7 +479,8 @@ fn unused_modules() {
     assert_eq!(ml("app.hints"), (level::LIVE, Why::Import));
     assert_eq!(ml("setup"), (level::LIVE, Why::Root));
     assert_eq!(ml("script"), (level::SCRIPT_LIKE, Why::ScriptLike));
-    assert_eq!(ml("app.plugins.loaded"), (level::EVIDENCE, Why::Evidence));
+    // `importlib.import_module("app.plugins.loaded")`: the module's dotted path in a string.
+    assert_eq!(ml("app.plugins.loaded"), (level::REFERENCED, Why::StringRef));
     // The defs of an unused module are covered by its finding.
     assert!(!lines.iter().any(|l| l.contains("app.orphan:")), "{lines:?}");
 }

@@ -55,8 +55,11 @@
 //! `pkg.mod:Class.method`: the dotted module (or package) name, `:`, then the def path. Stable
 //! across runs and edits elsewhere (no byte offsets). Disambiguation, deterministic:
 //!
-//! - Defs: siblings with the same name get `#2`, `#3`, ... in source order (`@overload`s,
-//!   property setters, conditional definitions).
+//! - Defs: siblings with the same name get `#2`, `#3`, ... in source order (property setters,
+//!   conditional definitions). Exception: in a group with `@overload` signatures, the
+//!   implementation (the last def of the group that is not an `@overload`) is the unsuffixed
+//!   id and the other defs get `#2`, `#3`, ... in source order, so adding an overload does not
+//!   change the implementation's id (findings and baselines key on it).
 //! - Modules and packages: the same dotted name in several files or distributions (a `.py`
 //!   next to its `.pyi`, a module in two roots, a namespace package spread over
 //!   distributions) gets `#2`, ... The implementation (`.py`) comes first, then stubs, then

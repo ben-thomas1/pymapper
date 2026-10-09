@@ -24,11 +24,12 @@ pub(super) const RULES: &[RuleDef] = &[
         code: codes::IMPORT_CYCLE.0,
         name: "import-cycle",
         summary: "Modules that import each other, directly or indirectly",
-        message: "import cycle: {0.. -> }",
-        args: &[ArgKind::Symbol],
+        message: "import cycle ({0} {1}): {2.. -> }",
+        args: &[ArgKind::U32, ArgKind::Phrase(&["module", "modules"]), ArgKind::Symbol],
         explanation: "One finding per strongly connected component of the first-party module import \
-graph, reported at an import that closes a short witness cycle (the message lists it, ending at \
-the first module again). Cycles make import order matter, cause `ImportError`s on partially \
+graph, reported at an import that closes a short witness cycle. The message gives the number of \
+modules in the component and the witness, ending at the first module again; JSON output adds a \
+`cycle` object with the component's `size`, every `member` and the `witness`. Cycles make import order matter, cause `ImportError`s on partially \
 initialised modules and prevent splitting code into independent parts. Imports under \
 `if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level \
 imports count, stub files (`.pyi`) do not.\n\n\

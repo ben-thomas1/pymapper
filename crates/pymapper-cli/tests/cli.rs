@@ -25,12 +25,22 @@ fn unimplemented_subcommands_are_stubs_that_exit_2() {
 }
 
 #[test]
-fn help_lists_every_subcommand() {
+fn help_lists_only_implemented_subcommands() {
     let out = pymapper(&["--help"]);
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for name in SUBCOMMANDS {
-        assert!(stdout.contains(name), "--help is missing {name}: {stdout}");
+    let commands = stdout.split("Commands:").nth(1).expect("commands section");
+    let commands = commands.split("Options:").next().expect("commands");
+    let listed: Vec<&str> = commands.lines().filter_map(|l| l.split_whitespace().next()).collect();
+    assert_eq!(listed, ["check", "config", "help"], "{stdout}");
+}
+
+#[test]
+fn unimplemented_subcommands_accept_config_flags() {
+    for name in SUBCOMMANDS.into_iter().filter(|&n| n != "check") {
+        let out = pymapper(&[name, "some.symbol", "--isolated", "--deps", "--select", "PM1"]);
+        assert_eq!(out.status.code(), Some(2), "{name}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"), "{name}");
     }
 }
 

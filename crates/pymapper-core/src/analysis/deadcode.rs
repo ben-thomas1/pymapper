@@ -23,8 +23,15 @@
 //! Library vs application mode (design (e)) is decided per file through its project unit
 //! ([`ProjectUnits`]: the root and every directory below it with a `pyproject.toml`; a file
 //! belongs to its nearest unit). `mode = "auto"` resolves each unit on its own ([`FileModes`]):
-//! application when its `pyproject.toml` declares script targets or one of its files is a
-//! `__main__` module or has a `__main__` guard. A forced mode applies to every unit. Everything
+//! application when its `pyproject.toml` declares commands (`[project.scripts]` /
+//! `gui-scripts`; plugin entry-point groups are roots but libraries declare them too) or one of
+//! its files is a *plausible* entry point: a `__main__` module or `__main__` guard outside test
+//! paths (`tests`, `test`, `testing`, `test_*`, `conftest.py`), private paths (a segment with a
+//! leading `_`) and helper directories (`scripts`, `tools`, `examples`, `docs`, `benchmarks`)
+//! ([`crate::reach::plausible_entry`]). Ignored guards are still roots (code under a real guard
+//! runs). The deciding evidence is kept per unit ([`crate::reach::ModeReason`],
+//! [`FileModes::describe`]; `check --stats` prints one line per unit). A forced mode applies to
+//! every unit. Everything
 //! that differs between the modes (public-API roots, library-public / API-method / star-export
 //! seeds, application-mode exported seeds, the `__init__` re-export rule of PM405) looks at the
 //! mode of the file at hand: one unit id per file and one flag per unit, no per-def lookup.
@@ -51,14 +58,30 @@
 //! | def -> same-name siblings (property setters, conditional redefinitions, overloads) | level of the def |
 //! | scope -> child with an unknown decorator (may register it) | min(scope, [`level::DECORATED`]) |
 //! | class with an unloaded base -> its methods (may override a framework method) | min(class, [`level::EXTERNAL_BASE`]) |
-//! | module -> its defs when the module uses dynamic access (`getattr`, `globals()`, `vars()`, `locals()`, `__getattr__`, `__dict__`) | min(module, [`level::DYNAMIC`]) |
+//! | module -> its defs when the module uses dynamic access (`getattr` with a variable name, `globals()`, `vars()`, `locals()`, `__getattr__`, `__dict__`) | min(module, [`level::DYNAMIC`]) |
 //! | class -> its methods when a loaded ancestor's module uses dynamic access (name-based dispatch in a base printer / visitor) | min(class, [`level::DYNAMIC`]) |
+//! | scope -> defs whose name starts with the constant prefix of a `getattr(x, f"pre_{y}")` / `getattr(x, "pre_" + y)` anywhere (prefixes under 3 bytes: in the same file only) | min(scope, [`level::DYNAMIC`]) |
+//! | class -> a method overriding a method of a third-party / stdlib class in some first-party class's MRO (framework hook; mixins included) | level of the class |
+//! | class -> a method matching an entrypoint `members` rule (pydantic validators) | level of the class |
 //! | application mode: module -> defs listed in `__all__` or re-exported | min(module, [`level::EXPORTED`]) |
 //! | library mode: scope -> public defs that are not roots (private modules, outside `__all__`) | min(scope, [`level::LIBRARY_PUBLIC`]) |
 //! | library mode: class -> its public methods (instances returned by the API reach callers) | min(class, [`level::API_METHOD`]) |
 //! | library mode: module -> public defs a public module re-exports with `from m import *` | level of the module |
+//! | name fallback: its full dotted path (`pkg.mod.f`, `pkg.mod:f`, prefixes included) is a string literal of a first-party file, or occurs in a config file | [`level::REFERENCED`] |
 //! | name fallback: the def's name occurs in its own file or in a file that imports it or its module | [`level::LINKED`] |
-//! | name fallback: the name occurs anywhere else (attribute, identifier, string) | [`level::EVIDENCE`] |
+//! | name fallback: its name and its module's dotted path occur in the same config file | [`level::LINKED`] |
+//! | name fallback: the name occurs anywhere else (attribute, identifier, string, quoted type, config file) | [`level::EVIDENCE`] |
+//!
+//! A `getattr(x, "name")` / `hasattr(x, "name")` with a constant name is not dynamic access:
+//! the string is name evidence like any other. The extractor classifies the name argument
+//! ([`crate::extract::facts::file_flags::DYNAMIC_GETATTR`],
+//! [`crate::extract::facts::DECL_GETATTR_PREFIX`]).
+//!
+//! Each node also records the *origin* of its level ([`DeadCode::origin`]): the seed, evidence
+//! or capped step its best path is due to. Findings carry it as machine-readable reasons
+//! ([`crate::rules::dead_code::reason`]: `no-references`, `only-used-by-unused-code`,
+//! `name-elsewhere`, `possible-call-only`, `module-dynamic-access`, ...), and the message
+//! names the strongest one: "is never used" only when nothing refers to the node at all.
 //!
 //! So, at the default gate, a def is reported when nothing reaches it, or when only a
 //! library-mode public name keeps it (confidence 80). A function reached only through a
@@ -106,9 +129,9 @@
 //! the name and the module's name occur in another file that does not import the module
 //! (string references such as `mock.patch("pkg.mod.name")`), 30 for an application-mode
 //! `__init__` re-export, 20 in an `__init__` file plus 20 more for a submodule import there
-//! (often for side effects), 50 under `if TYPE_CHECKING:` (such names are mostly used in quoted
-//! annotations, and evidence only sees strings that are plain dotted names such as `"Foo"`, not
-//! `"Dict[str, Foo]"`), 10 for another conditional import.
+//! (often for side effects), 50 under `if TYPE_CHECKING:`, 10 for another conditional import.
+//! Quoted type expressions (`"Dict[str, Foo]"`, `cast("Foo | None", x)`) are name evidence, so
+//! names used only in them count as used.
 //!
 //! # What is reported
 //!
@@ -122,9 +145,11 @@
 //! containers whose rule is enabled count, so with PM404 or PM402 turned off their contents are
 //! reported. Defs are reported at their name; PM404 at line 1, column 1; PM405 at the imported
 //! name. The message says "is never used" (PM404: "is never imported") when nothing refers to
-//! the node at all, and "is only used by unused code" ("is only imported by unused modules")
+//! the node at all, "is only used by unused code" ("is only imported by unused modules")
 //! when a `certain` / `likely` call or decorator edge, an import or a loaded subclass (PM404:
-//! an import edge) refers to it from code that is itself not live. Suppressions, baselines and `per-file-ignores` apply afterwards through
+//! an import edge) refers to it from code that is itself not live ("... code that may be
+//! unused" when its level is inherited from doubtful code), and otherwise names the evidence
+//! its confidence is due to ("has no resolved callers (name appears elsewhere)", ...). Suppressions, baselines and `per-file-ignores` apply afterwards through
 //! [`RuleEngine::filter`](crate::rules::RuleEngine::filter) (design (i)), so suppressing a
 //! container finding also hides what it contains; entrypoint `names` globs are the whitelist.
 //!
@@ -138,13 +163,17 @@
 //!   improvement; levels only rise and take at most a dozen distinct values, so each node and
 //!   edge is visited a bounded number of times. Per expansion: its call edges, its children
 //!   with a seed, and for classes their loaded bases and overriding methods.
-//! - Evidence: candidates (defs and modules still below [`level::LINKED`], unused imports) are
+//! - Evidence: candidates (defs still below [`level::LINKED`], modules below
+//!   [`level::REFERENCED`], unused imports) are
 //!   grouped by name behind one hash map; every hash of every first-party file's evidence is
 //!   probed once (O(evidence)), in parallel over files with idempotent atomic updates (results
 //!   do not depend on scheduling). Work per hit is bounded by the smaller side of each
 //!   intersection (see `evidence`), so common names stay linear. Explanations come from one
 //!   parallel pass over call edges, classes, call rows and import rows, plus an SCC over the
-//!   call edges between candidates (recursion).
+//!   call edges between candidates (recursion). Dotted paths of the candidates (one qualified
+//!   name built per candidate) are a fourth group kind probed in the same pass; first-party
+//!   files that are not analysed (outside packages) are probed for paths only; config files
+//!   (few) are probed sequentially afterwards.
 //! - Memory: two bytes per node (level and why), a labelled call graph without override edges
 //!   (`10` bytes per edge plus `8` per node), the override edges (`8` bytes each), one seed
 //!   byte per node, the module graphs, and during the evidence pass 4 bytes per node (candidate
@@ -160,17 +189,21 @@ mod prop;
 mod seeds;
 
 #[cfg(test)]
+mod evidence_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::config::{EntrypointMatcher, Mode};
+use crate::extract::config::ConfigEvidence;
 use crate::extract::facts::{DefKind, def_flags, evidence_hash};
 use crate::index::{FileId, Index, NONE, NodeId, NodeKind};
 use crate::reach::{BitSet, FileModes, RootOptions, RootSet, is_library, root_kind, roots};
 use crate::roots::ProjectUnits;
 use crate::resolve::{Confidence, Imports, ResolvedCalls};
 use crate::rules::codes::{UNUSED_CLASS, UNUSED_FUNCTION, UNUSED_IMPORT, UNUSED_METHOD, UNUSED_MODULE};
-use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId, USE_NEVER, USE_ONLY_UNUSED};
+use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId};
 use crate::timing;
+use evidence::extra;
 use modules::ModuleProp;
 use prop::{DefGraph, Levels};
 
@@ -180,6 +213,9 @@ pub use modules::SCRIPT_NAMES;
 pub mod level {
     /// Certainly live: a root, or reached from one through sure steps.
     pub const LIVE: u8 = 100;
+    /// Its full dotted path (`pkg.mod.func`, `pkg.mod:func`) occurs in a string literal or a
+    /// config file: a reference by name, almost certainly used (not reported).
+    pub const REFERENCED: u8 = 95;
     /// Name fallback: the name occurs in the def's file or in a file importing it or its module.
     pub const LINKED: u8 = 90;
     /// Application mode: listed in `__all__` or re-exported.
@@ -254,10 +290,26 @@ pub enum Why {
     ApiMethod = 19,
     /// Library mode: re-exported by a star import of a public module.
     StarExport = 20,
+    /// Name evidence in its own file.
+    LinkedSame = 21,
+    /// Its dotted path occurs in a string literal.
+    StringRef = 22,
+    /// Its dotted path occurs in a config file.
+    ConfigRef = 23,
+    /// Its name occurs in a config file.
+    ConfigName = 24,
+    /// Its name and its module's dotted path occur in the same config file.
+    ConfigLinked = 25,
+    /// Overrides a method of a third-party / stdlib base class (framework hook).
+    ExternalOverride = 26,
+    /// Its name starts with the constant prefix of a dynamic `getattr`.
+    DynamicPrefix = 27,
+    /// Method of a class whose loaded ancestor's module uses dynamic access.
+    DynamicBase = 28,
 }
 
 impl Why {
-    const ALL: [Why; 21] = [
+    const ALL: [Why; 29] = [
         Why::Dead,
         Why::Root,
         Why::Call,
@@ -279,6 +331,14 @@ impl Why {
         Why::ScriptLike,
         Why::ApiMethod,
         Why::StarExport,
+        Why::LinkedSame,
+        Why::StringRef,
+        Why::ConfigRef,
+        Why::ConfigName,
+        Why::ConfigLinked,
+        Why::ExternalOverride,
+        Why::DynamicPrefix,
+        Why::DynamicBase,
     ];
 
     #[inline]
@@ -290,12 +350,12 @@ impl Why {
     #[inline]
     pub(crate) fn seed_strength(self) -> u8 {
         match self {
-            Why::Member | Why::StarExport => level::LIVE,
+            Why::Member | Why::StarExport | Why::ExternalOverride => level::LIVE,
             Why::ApiMethod => level::API_METHOD,
             Why::Exported => level::EXPORTED,
             Why::Decorated => level::DECORATED,
             Why::ExternalBase => level::EXTERNAL_BASE,
-            Why::Dynamic => level::DYNAMIC,
+            Why::Dynamic | Why::DynamicPrefix | Why::DynamicBase => level::DYNAMIC,
             Why::LibraryPublic => level::LIBRARY_PUBLIC,
             _ => 0,
         }
@@ -324,6 +384,14 @@ impl Why {
             Why::ScriptLike => "script-like",
             Why::ApiMethod => "api-method",
             Why::StarExport => "star-export",
+            Why::LinkedSame => "linked-same-file",
+            Why::StringRef => "string-reference",
+            Why::ConfigRef => "config-reference",
+            Why::ConfigName => "config-name",
+            Why::ConfigLinked => "config-linked",
+            Why::ExternalOverride => "external-override",
+            Why::DynamicPrefix => "dynamic-prefix",
+            Why::DynamicBase => "dynamic-base",
         }
     }
 }
@@ -343,11 +411,13 @@ pub struct DeadCodeOptions<'a> {
     pub entrypoints: Option<&'a EntrypointMatcher>,
     /// `[project.scripts]` / `entry_points.txt` targets (see [`RootOptions::scripts`]).
     pub scripts: &'a [&'a [u8]],
+    /// Config-file evidence (`analysis.config-evidence`; see [`crate::extract::config`]).
+    pub config: Option<&'a ConfigEvidence>,
 }
 
 impl Default for DeadCodeOptions<'_> {
     fn default() -> Self {
-        DeadCodeOptions { mode: Mode::Auto, units: None, name_fallback: true, entrypoints: None, scripts: &[] }
+        DeadCodeOptions { mode: Mode::Auto, units: None, name_fallback: true, entrypoints: None, scripts: &[], config: None }
     }
 }
 
@@ -367,7 +437,14 @@ impl<'a> DeadCodeOptions<'a> {
             name_fallback: config.analysis.name_fallback,
             entrypoints: Some(entrypoints),
             scripts,
+            config: None,
         }
+    }
+
+    /// These options with config-file evidence (dropped when `analysis.config-evidence` is
+    /// off or the name fallback is).
+    pub fn with_config_evidence(self, config: Option<&'a ConfigEvidence>) -> DeadCodeOptions<'a> {
+        DeadCodeOptions { config, ..self }
     }
 }
 
@@ -399,6 +476,8 @@ pub struct DeadCodeStats {
 pub struct DeadCode {
     level: Vec<u8>,
     why: Vec<u8>,
+    /// Per node: the [`Why`] its level is due to (see [`DeadCode::origin`]).
+    origin: Vec<u8>,
     modules: modules::ModuleLevels,
     roots: RootSet,
     modes: FileModes,
@@ -433,6 +512,14 @@ impl DeadCode {
     #[inline]
     pub fn why(&self, v: NodeId) -> Why {
         Why::from_u8(self.why[v as usize])
+    }
+
+    /// What `v`'s level is due to: the seed, evidence or weakest step that capped its best
+    /// path from a root (equal to [`DeadCode::why`] unless the level was inherited through
+    /// calls, members, overrides, ...).
+    #[inline]
+    pub fn origin(&self, v: NodeId) -> Why {
+        Why::from_u8(self.origin[v as usize])
     }
 
     /// Module level of package/module node `v` (`None` for other nodes).
@@ -474,6 +561,7 @@ impl DeadCode {
     pub fn heap_bytes(&self) -> usize {
         self.level.capacity()
             + self.why.capacity()
+            + self.origin.capacity()
             + self.modules.heap_bytes()
             + self.roots.heap_bytes()
             + self.modes.heap_bytes()
@@ -544,7 +632,8 @@ pub(crate) fn run(
     let use_scripts = !opts.scripts.is_empty();
     let modes = match opts.units {
         Some(u) => FileModes::resolve(ix, opts.mode, u, use_scripts),
-        None => FileModes::uniform(is_library(ix, opts.mode, use_scripts), opts.mode != Mode::Auto),
+        None if opts.mode == Mode::Auto => FileModes::auto_single(ix, use_scripts),
+        None => FileModes::uniform(is_library(ix, opts.mode, use_scripts), true),
     };
     let library_units = modes.library_units();
     let base = if library_units > 0 { RootOptions::library() } else { RootOptions::application() };
@@ -552,7 +641,7 @@ pub(crate) fn run(
     let roots = timing::time("deadcode.roots", || roots(ix, Some(imp), Some(calls), &ropts));
     let (g, info) = timing::time("deadcode.graph", || {
         let mut g = DefGraph::new(ix, calls);
-        let info = seeds::fill(ix, imp, &mut g, &modes, |f| analysed_file(ix, f));
+        let info = seeds::fill(ix, imp, &mut g, &modes, opts.entrypoints, |f| analysed_file(ix, f));
         (g, info)
     });
     let mut lv = Levels::new(ix.node_count());
@@ -583,20 +672,45 @@ pub(crate) fn run(
         };
         let keys: Vec<(u32, FileId)> = icands.iter().map(|c| (evidence_hash(ix.str(c.name)), c.file)).collect();
         {
-            let cands = evidence::Candidates { defs: &defs, modules: &mods, imports: &keys };
+            let config = if opts.name_fallback { opts.config } else { None };
+            let cands = evidence::Candidates { defs: &defs, modules: &mods, imports: &keys, config };
             let hits = evidence::scan(ix, imp, calls, &g.over, &info.included, &cands);
             stats.candidates = (defs.len() + mods.len() + keys.len()) as u64;
             stats.probes = hits.probes;
             for (i, &d) in defs.iter().enumerate() {
+                let x = hits.def_extra[i];
+                if x & extra::STRING_REF != 0 {
+                    lv.raise(d, level::REFERENCED, Why::StringRef);
+                }
+                if x & extra::CONFIG_REF != 0 {
+                    lv.raise(d, level::REFERENCED, Why::ConfigRef);
+                }
                 match hits.defs[i] {
                     0 => {}
+                    level::LINKED if x & extra::SAME_FILE != 0 => lv.raise(d, level::LINKED, Why::LinkedSame),
                     level::LINKED => lv.raise(d, level::LINKED, Why::Linked),
                     l => lv.raise(d, l, Why::Evidence),
                 }
+                if x & extra::CONFIG_LINKED != 0 {
+                    lv.raise(d, level::LINKED, Why::ConfigLinked);
+                }
+                if x & extra::CONFIG_NAME != 0 {
+                    lv.raise(d, level::EVIDENCE, Why::ConfigName);
+                }
             }
             for (i, &m) in mods.iter().enumerate() {
+                let x = hits.mod_extra[i];
+                if x & extra::STRING_REF != 0 {
+                    mp.raise(m, level::REFERENCED, Why::StringRef);
+                }
+                if x & extra::CONFIG_REF != 0 {
+                    mp.raise(m, level::REFERENCED, Why::ConfigRef);
+                }
                 if hits.modules[i] {
                     mp.raise(m, level::EVIDENCE, Why::Evidence);
+                }
+                if x & extra::CONFIG_NAME != 0 {
+                    mp.raise(m, level::EVIDENCE, Why::ConfigName);
                 }
             }
             lv.run(&g);
@@ -609,7 +723,7 @@ pub(crate) fn run(
     drop(g);
     stats.expansions = lv.expansions + mexp;
     stats.live = lv.live_count();
-    let mut dc = DeadCode { level: lv.level, why: lv.why, modules, roots, modes, unit_flags: uflags, stats };
+    let mut dc = DeadCode { level: lv.level, why: lv.why, origin: lv.origin, modules, roots, modes, unit_flags: uflags, stats };
     timing::time("deadcode.findings", || {
         findings(ix, &info, &referenced, &mut dc, emit, out);
         if emit.import {
@@ -699,12 +813,14 @@ fn def_candidates(ix: &Index, included: &[bool], level: &[u8]) -> Vec<NodeId> {
     out
 }
 
-/// Modules of included files below [`level::EVIDENCE`], ascending.
+/// Modules of included files below [`level::REFERENCED`], ascending (name evidence only matters
+/// below [`level::EVIDENCE`], but a string or config reference by dotted path also lifts a
+/// script-like module).
 fn module_candidates(ix: &Index, included: &[bool], mp: &ModuleProp<'_>) -> Vec<NodeId> {
     let mut out = Vec::new();
     for f in 0..ix.file_count() {
         let m = ix.file_node(f);
-        if included[f as usize] && ix.kind(m) == NodeKind::Module && mp.level(m).is_some_and(|l| l < level::EVIDENCE) {
+        if included[f as usize] && ix.kind(m) == NodeKind::Module && mp.level(m).is_some_and(|l| l < level::REFERENCED) {
             out.push(m);
         }
     }
@@ -724,6 +840,84 @@ fn module_confidence(ix: &Index, dc: &DeadCode, f: FileId) -> u8 {
     }
 }
 
+/// Reason bit and PM401-PM403 phrase of an origin ([`DeadCode::origin`]).
+fn origin_reason(o: Why) -> (u32, u32) {
+    use crate::rules::dead_code::{reason as r, *};
+    match o {
+        Why::Evidence => (r::NAME_ELSEWHERE, USE_NAME_ELSEWHERE),
+        Why::Linked => (r::NAME_IN_IMPORTER, USE_NAME_IMPORTER),
+        Why::LinkedSame => (r::NAME_IN_SAME_FILE, USE_NAME_SAME_FILE),
+        Why::PossibleCall => (r::POSSIBLE_CALL_ONLY, USE_POSSIBLE),
+        Why::Decorated => (r::UNKNOWN_DECORATOR, USE_DECORATED),
+        Why::ExternalBase => (r::EXTERNAL_BASE, USE_EXTERNAL_BASE),
+        Why::Dynamic => (r::MODULE_DYNAMIC_ACCESS, USE_DYNAMIC),
+        Why::DynamicBase => (r::DYNAMIC_BASE, USE_DYNAMIC),
+        Why::DynamicPrefix => (r::GETATTR_PREFIX, USE_DYNAMIC_PREFIX),
+        Why::Exported => (r::EXPORTED, USE_EXPORTED),
+        Why::LibraryPublic => (r::LIBRARY_PUBLIC_NOT_IN_ALL, USE_LIBRARY_PUBLIC),
+        Why::ApiMethod => (r::LIBRARY_API_METHOD, USE_API_METHOD),
+        Why::ConfigName => (r::CONFIG_REFERENCE, USE_CONFIG_NAME),
+        Why::ConfigLinked | Why::ConfigRef => (r::CONFIG_REFERENCE, USE_CONFIG_LINKED),
+        Why::StringRef => (r::STRING_REFERENCE, USE_MAYBE_UNUSED),
+        Why::ExternalOverride => (r::EXTERNAL_OVERRIDE, USE_MAYBE_UNUSED),
+        Why::ScriptLike => (r::SCRIPT_LIKE, USE_MAYBE_UNUSED),
+        _ => (0, USE_NEVER),
+    }
+}
+
+/// Phrase and reasons of a PM401-PM403 finding for def `v` (`referenced`: see
+/// [`referenced_defs`]). The reasons carry every fact; the phrase states the strongest one:
+/// "is never used" only when nothing refers to it at all, "is only used by unused code" when
+/// something refers to it from code that is not live (or "... code that may be unused" when its
+/// level is inherited from doubtful callers), else the evidence its confidence is due to.
+fn def_wording(dc: &DeadCode, v: NodeId, referenced: bool) -> (u32, u32) {
+    use crate::rules::dead_code::{reason as r, *};
+    let used = if referenced { r::ONLY_USED_BY_UNUSED_CODE } else { 0 };
+    if dc.level(v) == level::DEAD {
+        return if referenced { (USE_ONLY_UNUSED, used) } else { (USE_NEVER, r::NO_REFERENCES) };
+    }
+    let origin = dc.origin(v);
+    let (bit, phrase) = origin_reason(origin);
+    let inherited = dc.why(v) != origin;
+    let phrase = match (referenced, inherited) {
+        (true, true) => USE_MAYBE_UNUSED,
+        (true, false) => USE_ONLY_UNUSED,
+        (false, _) if bit == 0 => USE_NEVER,
+        (false, _) => phrase,
+    };
+    let bits = bit | used;
+    (phrase, if bits == 0 { r::NO_REFERENCES } else { bits })
+}
+
+/// Phrase and reasons of the PM404 finding of module `m` (same rules as [`def_wording`], with
+/// imports as the references).
+fn module_wording(dc: &DeadCode, m: NodeId) -> (u32, u32) {
+    use crate::rules::dead_code::{reason as r, *};
+    let imported = dc.modules.imported(m);
+    let used = if imported { r::ONLY_USED_BY_UNUSED_CODE } else { 0 };
+    if dc.modules.level(m).unwrap_or(0) == level::DEAD {
+        return if imported { (IMP_ONLY_UNUSED, used) } else { (IMP_NEVER, r::NO_REFERENCES) };
+    }
+    let origin = dc.modules.origin(m).unwrap_or(Why::Dead);
+    let (bit, phrase) = match origin {
+        Why::Evidence => (r::NAME_ELSEWHERE, IMP_NAME_ELSEWHERE),
+        Why::PossibleCall => (r::POSSIBLE_CALL_ONLY, IMP_POSSIBLE),
+        Why::ScriptLike => (r::SCRIPT_LIKE, IMP_SCRIPT_LIKE),
+        Why::ConfigName => (r::CONFIG_REFERENCE, IMP_CONFIG_NAME),
+        Why::StringRef => (r::STRING_REFERENCE, IMP_MAYBE_UNUSED),
+        Why::ConfigRef => (r::CONFIG_REFERENCE, IMP_MAYBE_UNUSED),
+        _ => (0, IMP_NEVER),
+    };
+    let inherited = dc.modules.why(m) != Some(origin);
+    let phrase = match (imported, inherited) {
+        (true, true) => IMP_MAYBE_UNUSED,
+        (true, false) => IMP_ONLY_UNUSED,
+        (false, _) => phrase,
+    };
+    let bits = bit | used;
+    (phrase, if bits == 0 { r::NO_REFERENCES } else { bits })
+}
+
 /// PM401-PM404 findings, files in FileId order (module first, then defs in source order).
 /// `referenced`: see [`referenced_defs`] (the wording of PM401-PM403).
 fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut DeadCode, emit: Emit, out: &mut Findings) {
@@ -739,8 +933,9 @@ fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut De
         // A PM404 finding contains the module's defs and imports only when PM404 is emitted.
         let mconf = if emit.module { module_confidence(ix, dc, f) } else { 0 };
         if mconf > 0 {
-            let phrase = if dc.modules.imported(m) { USE_ONLY_UNUSED } else { USE_NEVER };
-            out.push(UNUSED_MODULE, Location::new(file, 1, 1), SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m)), Arg::Phrase(phrase)]);
+            let (phrase, reasons) = module_wording(dc, m);
+            let at = Location::new(file, 1, 1);
+            out.push_with_reasons(UNUSED_MODULE, at, SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m)), Arg::Phrase(phrase)], reasons);
             dc.stats.findings[3] += 1;
         }
         let ff = ix.file_facts(f);
@@ -768,8 +963,8 @@ fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut De
             if on {
                 stack.push((ix.subtree(v).end, conf));
                 let at = Location::new(file, defs.name_line[row], defs.name_col[row] + 1);
-                let phrase = if referenced.contains(v) { USE_ONLY_UNUSED } else { USE_NEVER };
-                out.push(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)]);
+                let (phrase, reasons) = def_wording(dc, v, referenced.contains(v));
+                out.push_with_reasons(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)], reasons);
                 dc.stats.findings[slot] += 1;
             }
         }
@@ -787,13 +982,13 @@ fn import_findings(
 ) {
     let st = &ix.facts().imports;
     for (c, &hit) in cands.iter().zip(hits) {
-        let Some(conf) = imports::confidence(c, hit) else { continue };
+        let Some((conf, reasons)) = imports::confidence(c, hit) else { continue };
         if conf < MIN_EMIT || (module_on && module_confidence(ix, dc, c.file) >= conf) {
             continue;
         }
         let row = c.row as usize;
         let at = Location::new(rules::FileId(c.file), st.line[row], st.col[row] + 1);
-        out.push(UNUSED_IMPORT, at, SymbolId(ix.file_node(c.file)), conf, &[Arg::Name(c.name.to_raw())]);
+        out.push_with_reasons(UNUSED_IMPORT, at, SymbolId(ix.file_node(c.file)), conf, &[Arg::Name(c.name.to_raw())], reasons);
         dc.stats.findings[4] += 1;
     }
 }

@@ -265,11 +265,16 @@ impl Worker {
             match opts.dupes {
                 Some(p) if inputs.groups[g as usize].origin == Origin::FirstParty => {
                     let fv = FingerprintVisitor::new(src, &mut self.fp_scratch);
-                    let (ff, Tee(_, fv)) = extract_with(src, &mut self.store, &mut self.interner, Tee(m, fv));
+                    let (mut ff, Tee(mut m, fv)) = extract_with(src, &mut self.store, &mut self.interner, Tee(m, fv));
+                    ff.doc_lines = m.file_doc_lines();
                     fv.finish(f as FileId, &p, &mut self.fps);
                     files.push(ff);
                 }
-                _ => files.push(extract_with(src, &mut self.store, &mut self.interner, m).0),
+                _ => {
+                    let (mut ff, mut m) = extract_with(src, &mut self.store, &mut self.interner, m);
+                    ff.doc_lines = m.file_doc_lines();
+                    files.push(ff);
+                }
             }
             if let Some(c) = cache {
                 c.done(g);

@@ -41,17 +41,147 @@ reached only through `possible` calls or when its name occurs in another file (f
 `importlib.import_module(\"pkg.plugins.x\")`); 40 for a module outside any regular package (it \
 may be run as a script) and for modules imported only from such modules.";
 
-/// Wordings of PM401-PM403 ([`USE_NEVER`], [`USE_ONLY_UNUSED`]).
-const USE: &[&str] = &["is never used", "is only used by unused code"];
-/// Wordings of PM404 ([`USE_NEVER`]: no import of the module at all, [`USE_ONLY_UNUSED`]:
-/// imported, but only by unused modules).
-const IMPORTED: &[&str] = &["is never imported", "is only imported by unused modules"];
+/// Wordings of PM401-PM403, indexed by the `USE_*` phrase constants. "is never used" only when
+/// nothing refers to the definition at all; otherwise the wording names the strongest evidence
+/// that keeps the confidence below 100 (the `reasons` of the finding carry the full set).
+const USE: &[&str] = &[
+    "is never used",
+    "is only used by unused code",
+    "is only used by code that may be unused",
+    "has no resolved callers (name appears elsewhere)",
+    "has no resolved callers (name appears in its own file)",
+    "has no resolved callers (name appears in a file that imports it)",
+    "has only possible callers (unique method name, unresolved receiver)",
+    "has no resolved callers (an unknown decorator may register it)",
+    "has no resolved callers (may override a method of an unloaded base class)",
+    "has no resolved callers (dynamic attribute access may reach it)",
+    "has no resolved callers (matches a dynamic `getattr` prefix)",
+    "is only exported (`__all__` or a re-export), never used",
+    "is never used (public name outside the public API)",
+    "is never used (public method; instances may reach callers)",
+    "has no resolved callers (name appears in a config file)",
+    "has no resolved callers (named with its module in a config file)",
+];
+/// Wordings of PM404, indexed by the `IMP_*` phrase constants.
+const IMPORTED: &[&str] = &[
+    "is never imported",
+    "is only imported by unused modules",
+    "is only imported by modules that may be unused",
+    "is not imported (name appears elsewhere)",
+    "is only reached through possible calls",
+    "is not imported (may be run as a script)",
+    "is not imported (name appears in a config file)",
+];
 
 /// Phrase argument: nothing refers to the definition (no call, decorator, import or subclass;
 /// no import for a module).
 pub const USE_NEVER: u32 = 0;
 /// Phrase argument: something refers to it, but only from code that is itself unused.
 pub const USE_ONLY_UNUSED: u32 = 1;
+/// Phrase argument: only reached from code that is itself in doubt (confidence below 100).
+pub const USE_MAYBE_UNUSED: u32 = 2;
+pub const USE_NAME_ELSEWHERE: u32 = 3;
+pub const USE_NAME_SAME_FILE: u32 = 4;
+pub const USE_NAME_IMPORTER: u32 = 5;
+pub const USE_POSSIBLE: u32 = 6;
+pub const USE_DECORATED: u32 = 7;
+pub const USE_EXTERNAL_BASE: u32 = 8;
+pub const USE_DYNAMIC: u32 = 9;
+pub const USE_DYNAMIC_PREFIX: u32 = 10;
+pub const USE_EXPORTED: u32 = 11;
+pub const USE_LIBRARY_PUBLIC: u32 = 12;
+pub const USE_API_METHOD: u32 = 13;
+pub const USE_CONFIG_NAME: u32 = 14;
+pub const USE_CONFIG_LINKED: u32 = 15;
+
+/// PM404 phrases (see [`IMPORTED`]).
+pub const IMP_NEVER: u32 = 0;
+pub const IMP_ONLY_UNUSED: u32 = 1;
+pub const IMP_MAYBE_UNUSED: u32 = 2;
+pub const IMP_NAME_ELSEWHERE: u32 = 3;
+pub const IMP_POSSIBLE: u32 = 4;
+pub const IMP_SCRIPT_LIKE: u32 = 5;
+pub const IMP_CONFIG_NAME: u32 = 6;
+
+/// Confidence reasons of PM401-PM405 findings ([`super::Finding::reasons`] bits).
+pub mod reason {
+    /// Nothing refers to it at all.
+    pub const NO_REFERENCES: u32 = 1 << 0;
+    /// Referenced (call, decorator, import, subclass) only from code that is itself in doubt.
+    pub const ONLY_USED_BY_UNUSED_CODE: u32 = 1 << 1;
+    /// Its name occurs in its own file.
+    pub const NAME_IN_SAME_FILE: u32 = 1 << 2;
+    /// Its name occurs in a file that imports it or its module.
+    pub const NAME_IN_IMPORTER: u32 = 1 << 3;
+    /// Its name occurs in some other file.
+    pub const NAME_ELSEWHERE: u32 = 1 << 4;
+    /// Reached only through `possible` calls (unique-method fallback).
+    pub const POSSIBLE_CALL_ONLY: u32 = 1 << 5;
+    /// Its module uses dynamic access (variable `getattr`, `globals()`, `__getattr__`, ...).
+    pub const MODULE_DYNAMIC_ACCESS: u32 = 1 << 6;
+    /// A loaded base class's module uses dynamic access (name-based dispatch).
+    pub const DYNAMIC_BASE: u32 = 1 << 7;
+    /// Its name starts with the constant prefix of a dynamic `getattr` (`f"_dt_{x}"`).
+    pub const GETATTR_PREFIX: u32 = 1 << 8;
+    /// Carries a decorator that may register it.
+    pub const UNKNOWN_DECORATOR: u32 = 1 << 9;
+    /// Method of a class with a base that is not loaded.
+    pub const EXTERNAL_BASE: u32 = 1 << 10;
+    /// Application mode: listed in `__all__` or re-exported.
+    pub const EXPORTED: u32 = 1 << 11;
+    /// Library mode: a public name outside the public API (not in `__all__`, private module).
+    pub const LIBRARY_PUBLIC_NOT_IN_ALL: u32 = 1 << 12;
+    /// Library mode: a public method of a class outside the public API.
+    pub const LIBRARY_API_METHOD: u32 = 1 << 13;
+    /// Named in a non-Python config file (YAML, TOML, JSON, ...).
+    pub const CONFIG_REFERENCE: u32 = 1 << 14;
+    /// Its dotted path occurs in a string literal.
+    pub const STRING_REFERENCE: u32 = 1 << 15;
+    /// A module outside any regular package (may be run as a script).
+    pub const SCRIPT_LIKE: u32 = 1 << 16;
+    /// PM405: another module star-imports the file.
+    pub const STAR_IMPORTED: u32 = 1 << 17;
+    /// PM405: an application-mode `__init__.py` re-export.
+    pub const INIT_REEXPORT: u32 = 1 << 18;
+    /// PM405: in an `__init__.py`.
+    pub const PACKAGE_INIT: u32 = 1 << 19;
+    /// PM405: a submodule import in an `__init__.py` (often for side effects).
+    pub const INIT_SUBMODULE: u32 = 1 << 20;
+    /// PM405: under `if TYPE_CHECKING:`.
+    pub const TYPE_CHECKING_IMPORT: u32 = 1 << 21;
+    /// PM405: another conditional import.
+    pub const CONDITIONAL_IMPORT: u32 = 1 << 22;
+    /// Overrides a method of a third-party or stdlib base class (a framework hook).
+    pub const EXTERNAL_OVERRIDE: u32 = 1 << 23;
+
+    /// Names of the bits, lowest first (as rendered in output).
+    pub const NAMES: &[&str] = &[
+        "no-references",
+        "only-used-by-unused-code",
+        "name-in-same-file",
+        "name-in-importer",
+        "name-elsewhere",
+        "possible-call-only",
+        "module-dynamic-access",
+        "dynamic-base",
+        "getattr-prefix",
+        "unknown-decorator",
+        "external-base",
+        "exported",
+        "library-public-not-in-all",
+        "library-api-method",
+        "config-reference",
+        "string-reference",
+        "script-like",
+        "star-imported",
+        "init-reexport",
+        "package-init",
+        "init-submodule",
+        "type-checking-import",
+        "conditional-import",
+        "external-override",
+    ];
+}
 
 const SYMBOL_USE: &[ArgKind] = &[ArgKind::Symbol, ArgKind::Phrase(USE)];
 

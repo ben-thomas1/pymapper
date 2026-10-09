@@ -873,3 +873,33 @@ fn superseded_segments_are_removed_but_used_ones_kept() {
     ];
     assert_eq!(pmc_files(t.path()), want);
 }
+
+#[test]
+fn config_evidence_is_cached_by_size_and_mtime() {
+    use crate::extract::facts::evidence_hash;
+    let t = TempDir::new("cfgev");
+    t.file("proj/a.yaml", "module_name: pkg.tools\n").file("proj/b.toml", "x = \"first_name\"\n");
+    let cache = Cache::new(t.path().join("cache"));
+    let mut paths = crate::walk::PathList::default();
+    for f in ["proj/a.yaml", "proj/b.toml"] {
+        paths.push(t.path().join(f).as_os_str().as_encoded_bytes()).expect("push");
+    }
+    let cold = config_evidence(&paths, Some(&cache));
+    assert_eq!((cold.stats.files, cold.stats.cached), (2, 0));
+    assert!(t.path().join("cache").join(CONFIG_EVIDENCE_FILE).exists());
+    let warm = config_evidence(&paths, Some(&cache));
+    assert_eq!((warm.stats.files, warm.stats.cached), (2, 2));
+    assert_eq!(warm.file(0), cold.file(0));
+    assert!(warm.contains(evidence_hash(b"pkg.tools")) && warm.contains(evidence_hash(b"first_name")));
+    // A changed file is re-read; the other stays cached.
+    t.file("proj/b.toml", "x = \"second_name_longer\"\n");
+    let again = config_evidence(&paths, Some(&cache));
+    assert_eq!((again.stats.files, again.stats.cached), (2, 1));
+    assert!(again.contains(evidence_hash(b"second_name_longer")) && !again.contains(evidence_hash(b"first_name")));
+    // A corrupt cache file is ignored.
+    fs::write(t.path().join("cache").join(CONFIG_EVIDENCE_FILE), b"garbage").expect("write");
+    let fresh = config_evidence(&paths, Some(&cache));
+    assert_eq!((fresh.stats.files, fresh.stats.cached), (2, 0));
+    // Without a cache: the same evidence.
+    assert_eq!(config_evidence(&paths, None).file(0), cold.file(0));
+}

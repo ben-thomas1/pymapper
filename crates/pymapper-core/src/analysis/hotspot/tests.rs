@@ -210,8 +210,9 @@ fn stubs_overloads_and_third_party_are_not_reported() {
     let stub = "def h(a, b, c) -> int: ...\n\n\n\n";
     let ix = fx(&[("m.py", COMPLEX), ("s.pyi", stub)]);
     let (report, got) = run(&ix, &cfg);
-    // Only the implementation of `h` (the overloads are `h` and `h#2`, it is `h#3`).
-    assert_eq!(got, ["PM101 7:5 m:h#3 3 2", "PM105 7:5 m:h#3 3 2", "PM107 1:1 m 12 3"]);
+    // Only the implementation of `h`, which takes the unsuffixed id (the overloads are `h#2`
+    // and `h#3`).
+    assert_eq!(got, ["PM101 7:5 m:h 3 2", "PM105 7:5 m:h 3 2", "PM107 1:1 m 12 3"]);
     assert_eq!(report.stats.functions, 2, "overloads are not counted");
     // Aggregates still cover the stub.
     assert_eq!(report.modules.get(file_of(&ix, "s.pyi")).functions, 1);
@@ -384,4 +385,130 @@ fn corpus_aggregates_match_node_reference() {
         assert_eq!(report.stats.flagged, total_flagged);
         assert!(!got.is_empty(), "{sub}: low thresholds find something");
     }
+}
+
+// ----- docstrings (PM104 / PM107 lengths) -----
+
+/// `doc_lines` per definition row of `src` (def_enter order) and the file's total.
+fn doc_lines(src: &str) -> (Vec<u32>, u32) {
+    use crate::extract::{MetricsScratch, MetricsTable, MetricsVisitor, parse};
+    let mut scratch = MetricsScratch::new();
+    let mut table = MetricsTable::new();
+    let v = MetricsVisitor::new(src.as_bytes(), &mut scratch, &mut table);
+    let total = parse(src.as_bytes(), v).file_doc_lines();
+    (table.doc_lines.clone(), total)
+}
+
+#[test]
+fn docstrings_are_detected() {
+    let cases: &[(&str, &[u32], u32)] = &[
+        // Multi-line triple-quoted.
+        ("def f():\n    \"\"\"Doc.\n\n    More.\n    \"\"\"\n    return 1\n", &[4], 4),
+        // Single line, single quotes.
+        ("def f():\n    'doc'\n    return 1\n", &[1], 1),
+        // Raw and unicode prefixes.
+        ("def f():\n    r\"\"\"a\\d\n    b\"\"\"\n    return 1\n", &[2], 2),
+        ("def f():\n    u'doc'\n    return 1\n", &[1], 1),
+        // Implicit concatenation on one line.
+        ("def f():\n    'a' 'b'\n    return 1\n", &[1], 1),
+        // `;` ends the docstring statement.
+        ("def f():\n    'doc'; x = 1\n    return x\n", &[1], 1),
+        // A body that is only a docstring.
+        ("def f():\n    \"\"\"Only\n    a docstring.\"\"\"\n", &[2], 2),
+        // No docstring.
+        ("def f():\n    return 1\n", &[0], 0),
+        // Bytes and f-strings are not docstrings.
+        ("def f():\n    b'doc'\n    return 1\n", &[0], 0),
+        ("def f():\n    f'doc {x}'\n    return 1\n", &[0], 0),
+        // A string expression that is not a statement on its own.
+        ("def f():\n    '-'.join(x)\n    return 1\n", &[0], 0),
+        ("def f():\n    'a %s' % x\n", &[0], 0),
+        // A string statement after the first statement is not a docstring.
+        ("def f():\n    x = 1\n    \"\"\"Not a\n    docstring.\"\"\"\n    return x\n", &[0], 0),
+        // On the header's line: not counted (the line holds code).
+        ("def f(): 'doc'\n", &[0], 0),
+        // Classes, nested definitions (counted into their parents) and the module docstring.
+        (
+            "\"\"\"Module\ndoc.\"\"\"\nclass C:\n    'Class doc.'\n    def m(self):\n        \"\"\"M\n        doc.\"\"\"\n        def inner():\n            'i'\n        return inner\n",
+            &[4, 3, 1],
+            6,
+        ),
+        // A comment before the docstring does not matter; decorators neither.
+        ("@dec\ndef f(a,\n      b):\n    # comment\n    'doc'\n    return a\n", &[1], 1),
+        // A module whose first statement is code has no docstring.
+        ("import os\n'not a docstring'\n", &[], 0),
+    ];
+    for (src, rows, total) in cases {
+        let (got, t) = doc_lines(src);
+        assert_eq!((got.as_slice(), t), (*rows, *total), "{src:?}");
+    }
+}
+
+/// A function of 1 (def) + 12 (docstring) + 3 (code) lines.
+const DOCUMENTED: &str = "\
+\"\"\"Module docstring
+on two lines.\"\"\"
+
+
+def f(a):
+    \"\"\"Summary.
+
+    Parameters
+    ----------
+    a : int
+        The input.
+
+    Returns
+    -------
+    int
+    \"\"\"
+    b = a + 1
+    c = b * 2
+    return c
+";
+
+#[test]
+fn function_and_module_length_exclude_docstrings() {
+    let ix = fx(&[("m.py", DOCUMENTED)]);
+    let mut cfg = config();
+    // f spans 15 lines, 11 of them docstring: 4 lines of code.
+    cfg.thresholds.max_function_loc = 3;
+    cfg.thresholds.max_module_loc = 5;
+    let (_, got) = run(&ix, &cfg);
+    // The file has 19 lines, 13 of them docstrings: 6 lines.
+    assert_eq!(got, ["PM104 5:5 m:f 4 3", "PM107 1:1 m 6 5"]);
+    cfg.thresholds.max_module_loc = 6;
+    cfg.thresholds.max_function_loc = 4;
+    let (_, got) = run(&ix, &cfg);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(top_functions(&ix, Metric::Loc, 1, |_| true)[0].1, 4);
+}
+
+// ----- test code -----
+
+const LONG_PARAMS: &str = "def f(a, b, c):\n    return a\n";
+
+#[test]
+fn test_code_is_skipped_unless_included() {
+    let files = [
+        ("app/core.py", LONG_PARAMS),
+        ("app/latest.py", LONG_PARAMS),
+        ("tests/test_core.py", LONG_PARAMS),
+        ("tests/helpers.py", LONG_PARAMS),
+        ("app/sub/tests/deep/util.py", LONG_PARAMS),
+        ("app/testing/fixtures.py", LONG_PARAMS),
+        ("app/core_test.py", LONG_PARAMS),
+        ("conftest.py", LONG_PARAMS),
+        ("app/conftest.py", LONG_PARAMS),
+    ];
+    let ix = fx(&files);
+    let mut cfg = config();
+    cfg.thresholds.max_params = 2;
+    let (report, got) = run(&ix, &cfg);
+    assert_eq!(got, ["PM105 1:5 app.core:f 3 2", "PM105 1:5 app.latest:f 3 2"]);
+    // Aggregates still cover test files.
+    assert_eq!(report.stats.functions, files.len() as u64);
+    cfg.analysis.include_tests_in_metrics = true;
+    let (_, got) = run(&ix, &cfg);
+    assert_eq!(got.len(), files.len(), "{got:?}");
 }

@@ -1,6 +1,7 @@
 //! Root sets: the nodes that are live without being called.
 
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use crate::config::{EntrypointMatcher, Mode};
 use crate::extract::facts::{DefKind, FileView, def_flags, file_flags, import_flags};
@@ -91,8 +92,9 @@ impl RootOptions<'_> {
 }
 
 /// Whether `mode` means library mode. `Auto` is application when the project declares script
-/// targets (`has_scripts`) or a first-party file has a `__main__` guard or is a `__main__`
-/// module; library otherwise. O(files).
+/// targets (`has_scripts`) or a first-party file is a plausible entry point
+/// ([`plausible_entry`]: a `__main__` guard or `__main__` module outside test, private and
+/// helper directories); library otherwise. O(files).
 pub fn is_library(ix: &Index, mode: Mode, has_scripts: bool) -> bool {
     match mode {
         Mode::Application => false,
@@ -101,17 +103,70 @@ pub fn is_library(ix: &Index, mode: Mode, has_scripts: bool) -> bool {
             if has_scripts {
                 return false;
             }
-            !(0..ix.file_count()).any(|f| is_main_file(ix, f))
+            !(0..ix.file_count()).any(|f| is_main_file(ix, f) && plausible_entry(ix, f, None))
         }
     }
 }
 
-/// Whether first-party file `f` makes `mode = "auto"` pick application mode: it has a
-/// `__main__` guard or is a `__main__` module.
+/// Whether first-party file `f` has a `__main__` guard or is a `__main__` module (the guard
+/// is a root either way: code under a real guard runs).
 #[inline]
 fn is_main_file(ix: &Index, f: FileId) -> bool {
     ix.file_origin(f) == Origin::FirstParty
         && (ix.file_facts(f).has(file_flags::MAIN_GUARD) || ix.name(ix.file_node(f)) == b"__main__")
+}
+
+/// Directories whose `__main__` guards are helpers, not the entry points of a package.
+const HELPER_DIRS: &[&[u8]] = &[b"scripts", b"tools", b"examples", b"docs", b"benchmarks"];
+
+/// Whether the `__main__` guard / module of file `f` is a plausible entry point for
+/// `mode = "auto"`: no segment of its path below `unit_dir` (the module path without a unit
+/// directory) is a test directory or file (`tests`, `test`, `testing`, `test_*`,
+/// `conftest.py`) or private (leading `_`, dunders such as `__main__` excepted), and no
+/// directory is a helper directory (`scripts`, `tools`, `examples`, `docs`, `benchmarks`).
+pub fn plausible_entry(ix: &Index, f: FileId, unit_dir: Option<&[u8]>) -> bool {
+    let bad_seg = |seg: &[u8], dir: bool| {
+        let private = seg.starts_with(b"_") && !(seg.len() > 4 && seg.starts_with(b"__") && seg.ends_with(b"__"));
+        private
+            || matches!(seg, b"tests" | b"test" | b"testing" | b"conftest")
+            || seg.starts_with(b"test_")
+            || (dir && HELPER_DIRS.contains(&seg))
+    };
+    match unit_dir {
+        Some(dir) => {
+            let path = ix.file_path(f).as_os_str().as_bytes();
+            let rel = path.strip_prefix(dir).map_or(path, |r| r.strip_prefix(b"/").unwrap_or(r));
+            let mut segs = rel.split(|&c| c == b'/').filter(|s| !s.is_empty()).peekable();
+            while let Some(seg) = segs.next() {
+                let last = segs.peek().is_none();
+                let seg = if last { seg.strip_suffix(b".pyi").or_else(|| seg.strip_suffix(b".py")).unwrap_or(seg) } else { seg };
+                if bad_seg(seg, !last) {
+                    return false;
+                }
+            }
+            true
+        }
+        None => {
+            let m = ix.file_node(f);
+            let d = ix.depth(m);
+            (1..=d).all(|k| !bad_seg(ix.name(ix.ancestor_at(m, k)), k < d))
+        }
+    }
+}
+
+/// Why a unit got its mode ([`FileModes::reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeReason {
+    /// The mode was forced (`mode = "application"` / `"library"`, `--mode`).
+    Forced,
+    /// Its `pyproject.toml` declares script targets (`[project.scripts]`, entry points).
+    Scripts,
+    /// A plausible `__main__` guard (file, line).
+    MainGuard(FileId, u32),
+    /// A plausible `__main__` module.
+    MainModule(FileId),
+    /// No entry point: library.
+    NoEntryPoints,
 }
 
 /// Library or application mode of each file (dead code (e)), decided per project unit
@@ -122,6 +177,11 @@ pub struct FileModes {
     unit: Vec<u32>,
     /// Library mode, per unit.
     library: Vec<bool>,
+    /// Why, per unit.
+    reason: Vec<ModeReason>,
+    /// Per unit: `__main__` guards / modules ignored by `auto` (tests, private, helpers), and
+    /// the first such file.
+    ignored: Vec<(u32, FileId)>,
     /// Whether the mode was forced (`application` / `library`) rather than resolved per unit.
     forced: bool,
 }
@@ -129,15 +189,41 @@ pub struct FileModes {
 impl FileModes {
     /// The same mode for every file (one unit); `forced`: see [`FileModes::forced`].
     pub fn uniform(library: bool, forced: bool) -> FileModes {
-        FileModes { unit: Vec::new(), library: vec![library], forced }
+        let reason = if forced { ModeReason::Forced } else if library { ModeReason::NoEntryPoints } else { ModeReason::Scripts };
+        FileModes { unit: Vec::new(), library: vec![library], reason: vec![reason], ignored: vec![(0, 0)], forced }
+    }
+
+    /// `mode = "auto"` for the whole index as one unit (no [`ProjectUnits`]): the rules of
+    /// [`is_library`], with the deciding evidence recorded.
+    pub fn auto_single(ix: &Index, has_scripts: bool) -> FileModes {
+        let mut reason = if has_scripts { ModeReason::Scripts } else { ModeReason::NoEntryPoints };
+        let mut ignored = (0u32, 0 as FileId);
+        for f in 0..ix.file_count() {
+            if !is_main_file(ix, f) {
+                continue;
+            }
+            if !plausible_entry(ix, f, None) {
+                if ignored.0 == 0 {
+                    ignored.1 = f;
+                }
+                ignored.0 += 1;
+            } else if reason == ModeReason::NoEntryPoints {
+                let ff = ix.file_facts(f);
+                reason = if ff.has(file_flags::MAIN_GUARD) { ModeReason::MainGuard(f, ff.main_line) } else { ModeReason::MainModule(f) };
+            }
+        }
+        let library = reason == ModeReason::NoEntryPoints;
+        FileModes { unit: Vec::new(), library: vec![library], reason: vec![reason], ignored: vec![ignored], forced: false }
     }
 
     /// Resolves `mode` for each unit of `units`. A forced mode applies to every unit. `Auto`
     /// applies the rules of [`is_library`] to each unit on its own: application when its
-    /// `pyproject.toml` declares script targets (only if `use_scripts`, i.e.
-    /// `entrypoints.project-scripts`) or one of its first-party files has a `__main__` guard or
-    /// is a `__main__` module; library otherwise. O(files) plus one directory lookup per run
-    /// of first-party files in the same directory.
+    /// `pyproject.toml` declares commands (`[project.scripts]` / `gui-scripts`; plugin
+    /// entry-point groups are roots but not application evidence) (only if `use_scripts`, i.e.
+    /// `entrypoints.project-scripts`) or one of its first-party files is a plausible entry
+    /// point ([`plausible_entry`]); library otherwise. Records the deciding evidence per unit
+    /// ([`FileModes::reason`]). O(files) plus one directory lookup per run of first-party files
+    /// in the same directory.
     pub fn resolve(ix: &Index, mode: Mode, units: &ProjectUnits, use_scripts: bool) -> FileModes {
         let n = units.len() as usize;
         let mut unit = Vec::with_capacity(ix.file_count() as usize);
@@ -156,21 +242,80 @@ impl FileModes {
             last = Some((dir, u));
             unit.push(u);
         }
-        let library = match mode {
-            Mode::Application => vec![false; n],
-            Mode::Library => vec![true; n],
+        let mut ignored = vec![(0u32, 0 as FileId); n];
+        let (library, reason) = match mode {
+            Mode::Application => (vec![false; n], vec![ModeReason::Forced; n]),
+            Mode::Library => (vec![true; n], vec![ModeReason::Forced; n]),
             Mode::Auto => {
-                let mut lib: Vec<bool> = (0..n as u32).map(|u| !(use_scripts && !units.scripts(u).is_empty())).collect();
+                let mut reason: Vec<ModeReason> = (0..n as u32)
+                    .map(|u| if use_scripts && units.app_scripts(u) > 0 { ModeReason::Scripts } else { ModeReason::NoEntryPoints })
+                    .collect();
                 for f in 0..ix.file_count() {
                     let u = unit[f as usize] as usize;
-                    if lib[u] && is_main_file(ix, f) {
-                        lib[u] = false;
+                    if !is_main_file(ix, f) {
+                        continue;
+                    }
+                    if !plausible_entry(ix, f, Some(units.dir(u as u32).as_os_str().as_bytes())) {
+                        let ig = &mut ignored[u];
+                        if ig.0 == 0 {
+                            ig.1 = f;
+                        }
+                        ig.0 += 1;
+                        continue;
+                    }
+                    if reason[u] == ModeReason::NoEntryPoints {
+                        let ff = ix.file_facts(f);
+                        reason[u] = if ff.has(file_flags::MAIN_GUARD) {
+                            ModeReason::MainGuard(f, ff.main_line)
+                        } else {
+                            ModeReason::MainModule(f)
+                        };
                     }
                 }
-                lib
+                (reason.iter().map(|&r| r == ModeReason::NoEntryPoints).collect(), reason)
             }
         };
-        FileModes { unit, library, forced: mode != Mode::Auto }
+        FileModes { unit, library, reason, ignored, forced: mode != Mode::Auto }
+    }
+
+    /// Why unit `u` got its mode.
+    pub fn reason(&self, u: u32) -> ModeReason {
+        self.reason.get(u as usize).copied().unwrap_or(ModeReason::NoEntryPoints)
+    }
+
+    /// `__main__` guards / modules of unit `u` that `auto` ignored, and the first such file.
+    pub fn ignored_guards(&self, u: u32) -> (u32, FileId) {
+        self.ignored.get(u as usize).copied().unwrap_or((0, 0))
+    }
+
+    /// Writes one line describing unit `u`'s mode and its deciding evidence, e.g.
+    /// `library (no [project.scripts] and no plausible __main__ guard; ignored 2 __main__
+    /// guards in test/private/helper files, first pkg/tests/gen.py)` or `application (__main__ guard at app/cli.py:40)`. Paths are relative
+    /// to `root` when below it.
+    pub fn describe(&self, ix: &Index, units: &ProjectUnits, root: &Path, u: u32, out: &mut String) {
+        use std::fmt::Write;
+        let rel = |p: &Path| -> String {
+            let p = p.strip_prefix(root).unwrap_or(p);
+            p.display().to_string()
+        };
+        let mode = if self.unit_is_library(u) { "library" } else { "application" };
+        let _ = match self.reason(u) {
+            ModeReason::Forced => write!(out, "{mode} (forced by `mode`)"),
+            ModeReason::Scripts => write!(out, "{mode} ([project.scripts] in {})", rel(&units.dir(u).join("pyproject.toml"))),
+            ModeReason::MainGuard(f, line) => write!(out, "{mode} (__main__ guard at {}:{line})", rel(ix.file_path(f))),
+            ModeReason::MainModule(f) => write!(out, "{mode} (__main__ module {})", rel(ix.file_path(f))),
+            ModeReason::NoEntryPoints => write!(out, "{mode} (no [project.scripts] and no plausible __main__ guard)"),
+        };
+        let (n, first) = self.ignored_guards(u);
+        if n > 0 && !self.forced {
+            out.pop();
+            let _ = write!(
+                out,
+                "; ignored {n} __main__ guard{} in test/private/helper files, first {})",
+                if n == 1 { "" } else { "s" },
+                rel(ix.file_path(first))
+            );
+        }
     }
 
     /// Whether file `f` is analysed in library mode.
@@ -207,7 +352,10 @@ impl FileModes {
 
     /// Heap bytes (capacity).
     pub fn heap_bytes(&self) -> usize {
-        self.unit.capacity() * 4 + self.library.capacity()
+        self.unit.capacity() * 4
+            + self.library.capacity()
+            + self.reason.capacity() * std::mem::size_of::<ModeReason>()
+            + self.ignored.capacity() * 8
     }
 }
 
@@ -538,13 +686,15 @@ fn file_roots(
                     }
                 }
             }
-            let by_name = mt.simple_name(name)
-                || (mt.has_qualified_names() && {
-                    sc.buf.clear();
-                    ix.qid(v, &mut sc.buf);
-                    mt.qualified_name(&sc.buf)
-                });
-            if by_name {
+            // Both sides run (no short circuit) so the matcher records every user pattern
+            // that matches, for its "matches nothing" warnings.
+            let by_simple = mt.simple_name(name);
+            let by_qualified = mt.has_qualified_names() && {
+                sc.buf.clear();
+                ix.qid(v, &mut sc.buf);
+                mt.qualified_name(&sc.buf)
+            };
+            if by_simple || by_qualified {
                 set.add(v, root_kind::NAME);
             }
         }

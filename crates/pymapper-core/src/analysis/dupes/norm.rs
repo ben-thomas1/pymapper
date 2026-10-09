@@ -62,6 +62,14 @@ impl Normaliser {
         if self.skipping { None } else { Some(code(tok.kind)) }
     }
 
+    /// [`push`](Self::push) that also tells whether the token starts a statement (for
+    /// trimming reported regions; slower, so not used while fingerprinting).
+    #[inline]
+    pub(crate) fn push_stmt(&mut self, src: &[u8], tok: Token) -> Option<(u8, bool)> {
+        let starts = tok.start >= self.prev_end && self.at_stmt_start(src, tok.start);
+        self.push(src, tok).map(|c| (c, starts))
+    }
+
     /// A token starting at `start` begins a statement: first token, or outside brackets after
     /// `;`, `:` or a line break.
     #[inline]

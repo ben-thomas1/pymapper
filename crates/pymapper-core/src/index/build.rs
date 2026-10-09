@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use super::inputs::is_init;
 use super::{Files, Index, Inputs, LoadStats, NONE, NodeId, NodeKind, Nodes, ReadError};
 use crate::extract::MetricsTable;
-use crate::extract::facts::{DefKind, FactStore, FileFacts};
+use crate::extract::facts::{DefKind, FactStore, FileFacts, def_flags};
 use crate::intern::{FxHashMap, Interner, Sym};
 use crate::roots::FileStatus;
 
@@ -57,6 +57,9 @@ struct Builder<'a> {
     modules: FxHashMap<(Sym, u16), NodeId>,
     /// Duplicate ordinals of defs of the current file, by (parent, name).
     def_dups: FxHashMap<(u32, Sym), u16>,
+    /// Files with `@overload`s: the implementation row (last non-`@overload` def) of each
+    /// (parent, name) group that has overloads (`NONE`: none yet).
+    impl_rows: FxHashMap<(u32, Sym), (u32, bool)>,
     anonymous: Sym,
     /// Open packages/modules below the distribution node (`stack[0]` = depth 1).
     stack: Vec<Open>,
@@ -116,6 +119,7 @@ pub(super) fn build(
         module_dups: FxHashMap::default(),
         modules: FxHashMap::default(),
         def_dups: FxHashMap::default(),
+        impl_rows: FxHashMap::default(),
         anonymous,
         stack: Vec::new(),
         pending: Vec::new(),
@@ -264,15 +268,39 @@ impl Builder<'_> {
         if dedupe {
             self.def_dups.clear();
         }
+        // A group of same-named siblings with `@overload` signatures: the implementation (the
+        // last non-overload def) is the unsuffixed id, the signatures get `#2`, `#3`, ... in
+        // source order. Only files with overloads pay for the extra pass.
+        self.impl_rows.clear();
+        let overloads = dedupe && (r.start + 1..r.end).any(|row| defs.flags[row] & def_flags::OVERLOAD != 0);
+        if overloads {
+            for row in r.start + 1..r.end {
+                let key = (m + defs.parent[row], defs.name[row].unwrap_or(self.anonymous));
+                let e = self.impl_rows.entry(key).or_insert((NONE, false));
+                if defs.flags[row] & def_flags::OVERLOAD != 0 {
+                    e.1 = true;
+                } else {
+                    e.0 = row as u32;
+                }
+            }
+        }
         for row in r.start + 1..r.end {
             let parent = m + defs.parent[row];
             let kind = if defs.kind[row] == DefKind::Class as u8 { NodeKind::Class } else { NodeKind::Function };
             let name = defs.name[row].unwrap_or(self.anonymous);
             let dup = if dedupe {
-                let d = self.def_dups.entry((parent, name)).or_insert(0);
-                let dup = *d;
-                *d = d.saturating_add(1);
-                dup
+                let imp = match self.impl_rows.get(&(parent, name)) {
+                    Some(&(i, true)) if i != NONE => Some(i),
+                    _ => None,
+                };
+                if imp == Some(row as u32) {
+                    0
+                } else {
+                    let d = self.def_dups.entry((parent, name)).or_insert(u16::from(imp.is_some()));
+                    let dup = *d;
+                    *d = d.saturating_add(1);
+                    dup
+                }
             } else {
                 0
             };

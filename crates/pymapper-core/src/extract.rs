@@ -7,6 +7,7 @@
 
 mod compound;
 mod defs;
+pub mod config;
 pub mod events;
 mod expr;
 pub mod facts;

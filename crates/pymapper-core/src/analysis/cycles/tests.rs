@@ -163,13 +163,13 @@ fn import_cycle_finding_and_type_checking() {
     assert_eq!(c.len(), 1);
     let members: Vec<String> = c.members(0).iter().map(|&v| f.qid(v)).collect();
     assert_eq!(members, ["pkg.a", "pkg.b", "pkg.c"]);
-    assert_eq!(lines, ["pkg/c.py:2:19: PM301 import cycle: pkg.c -> pkg.a -> pkg.b -> pkg.c"]);
+    assert_eq!(lines, ["pkg/c.py:2:19: PM301 import cycle (3 modules): pkg.c -> pkg.a -> pkg.b -> pkg.c"]);
 
     // With type-only edges, d <-> e is a cycle too.
     let opts = CycleOptions { exclude: 0, ..CycleOptions::default() };
     let (c, lines) = f.cycles(&opts);
     assert_eq!(c.len(), 2);
-    assert!(lines.contains(&"pkg/e.py:1:19: PM301 import cycle: pkg.e -> pkg.d -> pkg.e".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"pkg/e.py:1:19: PM301 import cycle (2 modules): pkg.e -> pkg.d -> pkg.e".to_owned()), "{lines:?}");
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn closing_import_prefers_runtime_row() {
         ("b.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import a\nimport a\n"),
     ]);
     let (_, lines) = f.cycles(&CycleOptions::default());
-    assert_eq!(lines, ["b.py:4:8: PM301 import cycle: b -> a -> b"]);
+    assert_eq!(lines, ["b.py:4:8: PM301 import cycle (2 modules): b -> a -> b"]);
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn lazy_imports_count_and_stubs_do_not() {
     ]);
     let (c, lines) = f.cycles(&CycleOptions::default());
     assert_eq!(c.len(), 1, "{lines:?}");
-    assert_eq!(lines, ["b.py:1:8: PM301 import cycle: b -> a -> b"]);
+    assert_eq!(lines, ["b.py:1:8: PM301 import cycle (2 modules): b -> a -> b"]);
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn package_init_cycles() {
         ("pkg/sub.py", "from pkg import thing\n"),
     ]);
     let (_, lines) = f.cycles(&CycleOptions::default());
-    assert_eq!(lines, ["pkg/sub.py:1:17: PM301 import cycle: pkg.sub -> pkg -> pkg.sub"]);
+    assert_eq!(lines, ["pkg/sub.py:1:17: PM301 import cycle (2 modules): pkg.sub -> pkg -> pkg.sub"]);
 }
 
 #[test]
@@ -279,4 +279,34 @@ fn deterministic_across_runs() {
     let b = fx(&files).cycles(&CycleOptions::default()).1;
     assert_eq!(a, b);
     assert_eq!(a.len(), 2);
+}
+
+#[test]
+fn findings_carry_size_and_members() {
+    // A component of four modules whose shortest witness through `pkg.a` has two.
+    let f = fx(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/a.py", "from pkg import b\nfrom pkg import c\n"),
+        ("pkg/b.py", "from pkg import a\n"),
+        ("pkg/c.py", "from pkg import d\n"),
+        ("pkg/d.py", "from pkg import a\n"),
+    ]);
+    let mut out = Findings::new();
+    analyse(&f.ix, &f.imp, &CycleOptions::default(), &mut out);
+    assert_eq!(out.len(), 1);
+    let (x, args) = out.iter().next().expect("one finding");
+    assert_eq!(args[..2], [Arg::U32(4), Arg::Phrase(1)]);
+    let qids = |a: &[Arg]| -> Vec<String> {
+        a.iter()
+            .map(|a| match *a {
+                Arg::Symbol(s) => f.qid(s.0),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(qids(out.extra(x)), ["pkg.a", "pkg.b", "pkg.c", "pkg.d"]);
+    assert_eq!(qids(&args[2..]).len(), 3, "witness of two plus the closing module");
+    assert_eq!(x.end_line, x.loc.line);
+    let lines = f.render(&out, &[]);
+    assert!(lines[0].contains("PM301 import cycle (4 modules): "), "{lines:?}");
 }

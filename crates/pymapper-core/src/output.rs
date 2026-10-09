@@ -73,10 +73,12 @@ pub use buf::{Out, Outcome, is_broken_pipe};
 pub use context::{Context, IndexContext};
 
 pub use crate::config::OutputFormat;
-use crate::rules::{FileId, FilterStats, Finding, Findings, SymbolId};
+use crate::rules::codes::UNUSED_IMPORT;
+use crate::rules::{Arg, FileId, FilterStats, Finding, Findings, SymbolId};
 
-/// Version of the JSON output schema (bumped on incompatible changes).
-pub const JSON_VERSION: u32 = 1;
+/// Version of the JSON output schema (bumped on incompatible changes; see [`json`] for the
+/// history).
+pub const JSON_VERSION: u32 = 2;
 
 /// Initial capacity of the reused per-line scratch buffers (messages, ids, keys), so typical
 /// lines never grow them.
@@ -333,12 +335,40 @@ impl<'a> Report<'a> {
     }
 
     /// Stable id of a finding's symbol rendered into `buf` (cleared first; empty without one).
+    /// An unused import (PM405) is shown as `pkg.mod:<bound name>`: its symbol is the importing
+    /// module and the bound name its first argument. (Baseline keys are unchanged: module id
+    /// plus the name as detail.)
     pub(crate) fn symbol_id(&self, f: &Finding, buf: &mut Vec<u8>) {
         buf.clear();
         if f.symbol != SymbolId::NONE {
             self.ctx.write_symbol_id(f.symbol, buf);
+            if f.rule == UNUSED_IMPORT
+                && let Some(&Arg::Name(n)) = self.findings.args(f).first()
+            {
+                buf.push(b':');
+                let mark = buf.len();
+                if self.ctx.write_name(n, &mut VecWriter(buf)).is_err() {
+                    buf.truncate(mark - 1);
+                }
+            }
             lossy_tail(buf, 0);
         }
+    }
+
+    /// Last line of a finding's span: the one the analysis recorded, else the end of its
+    /// symbol's definition when the finding is about a class or function, else its line (0 =
+    /// unknown).
+    pub(crate) fn end_line(&self, f: &Finding) -> u32 {
+        if f.end_line != 0 {
+            return f.end_line.max(f.loc.line);
+        }
+        if f.symbol != SymbolId::NONE && f.loc.line != 0 {
+            let end = self.ctx.def_end_line(f.symbol);
+            if end >= f.loc.line {
+                return end;
+            }
+        }
+        f.loc.line
     }
 
     pub(crate) fn findings(&self) -> &'a Findings {
@@ -353,6 +383,16 @@ impl<'a> Report<'a> {
     pub fn retain(&mut self, mut keep: impl FnMut(&Finding) -> bool) {
         let items = self.findings.as_slice();
         self.order.retain(|&i| keep(&items[i as usize]));
+    }
+}
+
+/// `fmt::Write` into a byte buffer (no intermediate `String`).
+struct VecWriter<'a>(&'a mut Vec<u8>);
+
+impl std::fmt::Write for VecWriter<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
     }
 }
 

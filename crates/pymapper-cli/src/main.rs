@@ -21,23 +21,32 @@ struct Cli {
     command: Command,
 }
 
+/// Subcommands. The query and `deps` / `cycles` / `summary` subcommands are hidden from
+/// `--help` until they are implemented; running them reports "not implemented" (exit 2).
 #[derive(Subcommand)]
 enum Command {
     /// Run rule checks and report findings.
     Check(Box<cmd::check::Args>),
     /// List callers of a symbol.
+    #[command(hide = true)]
     Callers(cmd::callers::Args),
     /// List callees of a symbol.
+    #[command(hide = true)]
     Callees(cmd::callees::Args),
     /// Show everything transitively affected by changing a symbol.
+    #[command(hide = true)]
     Impact(cmd::impact::Args),
     /// Find a call/import path between two symbols.
+    #[command(hide = true)]
     Path(cmd::path::Args),
     /// Analyse third-party dependencies.
+    #[command(hide = true)]
     Deps(cmd::deps::Args),
     /// Report import cycles.
+    #[command(hide = true)]
     Cycles(cmd::cycles::Args),
     /// Summarise the codebase.
+    #[command(hide = true)]
     Summary(cmd::summary::Args),
     /// Show the effective configuration, or print the commented template.
     Config(Box<cmd::config::Args>),

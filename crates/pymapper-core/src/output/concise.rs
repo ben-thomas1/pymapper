@@ -2,7 +2,7 @@
 
 use super::buf::{Out, push_code};
 use super::{Options, Report, Summary};
-use crate::rules::{FileId, Finding};
+use crate::rules::{FileId, Finding, reason_names};
 
 pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut Out<'_>) {
     let mut msg = String::with_capacity(super::SCRATCH);
@@ -22,6 +22,10 @@ pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut
         if f.confidence < 100 {
             out.str(" (confidence ");
             out.u32(u32::from(f.confidence));
+            for (i, name) in reason_names(f).enumerate() {
+                out.str(if i == 0 { ": " } else { ", " });
+                out.str(name);
+            }
             out.byte(b')');
         }
         out.byte(b'\n');

@@ -476,6 +476,33 @@ fn entrypoint_matcher_merges_presets() {
     assert!(cfg.entrypoint_matcher().is_empty());
 }
 
+/// The matcher records which user patterns matched (presets excluded); a dotted name without
+/// `:` covers the module and everything in it.
+#[test]
+fn entrypoint_matcher_tracks_unmatched_patterns() {
+    let cfg = ok("presets = [\"pytest\"]\n[entrypoints]\ndecorators = [\"celery.task\", \"never.*\"]\nbases = [\"my.Base\"]\nmembers = [\"on_*\"]\nnames = [\"main\", \"pkg.cli\", \"*.views\", \"pkg.mod:Class.*\", \"nope\"]\n");
+    let m = cfg.entrypoint_matcher();
+    let unmatched = |m: &EntrypointMatcher| m.unmatched().map(|(k, g)| format!("{k}={g}")).collect::<Vec<_>>();
+    assert_eq!(unmatched(&m).len(), 9);
+    // Preset hits do not count for user patterns.
+    assert!(m.decorator(b"pytest.fixture"));
+    assert!(m.name(b"test_x", b"t:test_x"));
+    assert_eq!(unmatched(&m).len(), 9);
+    assert!(m.decorator(b"celery.task") && m.base(b"my.Base") && m.member(b"on_save"));
+    // Module patterns: the module itself and its members.
+    assert!(m.qualified_name(b"pkg.cli:main.inner"));
+    assert!(m.qualified_name(b"app.views:index"));
+    assert!(m.qualified_name(b"app.views"));
+    assert!(!m.qualified_name(b"pkg.client:x"));
+    // Both sides of `name` are evaluated: `main` (simple) and `pkg.mod:Class.*` both match.
+    assert!(m.name(b"main", b"pkg.mod:Class.main"));
+    assert_eq!(unmatched(&m), ["decorators=never.*", "names=nope"]);
+    let copy = m.clone();
+    assert!(m.decorator(b"never.x") && m.simple_name(b"nope"));
+    assert!(unmatched(&m).is_empty());
+    assert_eq!(unmatched(&copy).len(), 2);
+}
+
 /// Entrypoint patterns are `Glob`s, so code that edits a `Config` directly cannot smuggle in
 /// an invalid pattern, and building the matcher never panics.
 #[test]
@@ -509,8 +536,10 @@ fn every_preset_compiles_into_a_matcher() {
     let mut cfg = Config::new(&base());
     cfg.presets = Preset::ALL.to_vec();
     let m = cfg.entrypoint_matcher();
-    assert!(m.decorator(b"router.get") && m.decorator(b"click.group") && m.decorator(b"field_validator"));
-    assert!(m.base(b"pydantic.BaseModel"));
+    assert!(m.decorator(b"router.get") && m.decorator(b"click.group"));
+    // Pydantic: validators and hooks are members (live with their model); models are not roots.
+    assert!(m.member(b"field_validator") && m.member(b"pydantic.model_validator") && m.member(b"model_post_init"));
+    assert!(!m.decorator(b"field_validator") && !m.base(b"pydantic.BaseModel"));
 }
 
 // ----- misc -----
@@ -640,8 +669,45 @@ fn start_from_first_path_and_files() {
     let l = load_in(&t.0, &o);
     assert_eq!(l.config.threads, 7);
     assert_eq!(l.project.root, t.0.join("proj"));
-    // CLI paths are relative to the cwd and replace `paths`.
-    assert_eq!(l.config.paths, vec![file, t.0.join("other")]);
+    // CLI paths are relative to the cwd and become the report scope; the configured `paths`
+    // (the project root) stay. A path outside the project root is not loaded.
+    assert_eq!(l.scope, vec![file.clone(), t.0.join("other")]);
+    assert_eq!(l.config.paths, vec![t.0.join("proj")]);
+    // A path inside the root that the configured `paths` do not cover is loaded too.
+    t.write("proj/pymapper.toml", "paths = [\"pkg\"]\n");
+    let l = load_in(&t.0, &Overrides { paths: vec!["proj/tests".into(), "proj/pkg/mod.py".into()], ..Overrides::default() });
+    assert_eq!(l.config.paths, vec![t.0.join("proj/pkg"), t.0.join("proj/tests")]);
+    t.write("proj/pymapper.toml", "threads = 7\n");
+    // Duplicates are dropped; covered paths are not added again.
+    let o = Overrides { paths: vec!["proj/pkg".into(), "proj/pkg/./".into(), "proj/pkg/mod.py".into()], ..Overrides::default() };
+    let l = load_in(&t.0, &o);
+    assert_eq!(l.scope, vec![t.0.join("proj/pkg"), file]);
+    assert_eq!(l.config.paths, vec![t.0.join("proj")]);
+}
+
+#[test]
+fn project_root_does_not_depend_on_the_start_depth() {
+    let t = TempDir::new();
+    t.write("pyproject.toml", "[project]\nname = \"mono\"\n[tool.uv.workspace]\nmembers = [\"libs/*\"]\n");
+    t.write("libs/a/pyproject.toml", "[project]\nname = \"a\"\n");
+    let file = t.write("libs/a/ns/a/mod.py", "x = 1\n");
+    for start in [PathBuf::from("."), PathBuf::from("libs/a"), PathBuf::from("libs/a/ns/a/mod.py")] {
+        let l = load_in(&t.0, &Overrides { paths: vec![start.clone()], ..Overrides::default() });
+        assert_eq!(l.project.root, t.0, "{start:?}");
+        assert_eq!(l.config.paths, vec![t.0.clone()], "{start:?}");
+        assert_eq!(l.config.cache_dir, t.0.join(".pymapper_cache"), "{start:?}");
+    }
+    let l = load_in(&t.0.join("libs/a/ns"), &Overrides::default());
+    assert_eq!(l.project.root, t.0);
+    assert!(l.scope.is_empty());
+    // A discovered config file still pins the root to its directory.
+    t.write("libs/a/pymapper.toml", "threads = 2\n");
+    let l = load_in(&t.0, &Overrides { paths: vec![file], ..Overrides::default() });
+    assert_eq!(l.project.root, t.0.join("libs/a"));
+    assert_eq!(l.config.threads, 2);
+    // ... unless config files are ignored.
+    let l = load_in(&t.0.join("libs/a"), &Overrides { isolated: true, ..Overrides::default() });
+    assert_eq!(l.project.root, t.0);
 }
 
 #[test]

@@ -106,6 +106,44 @@ struct ChainKey {
     col: ChainCol,
 }
 
+/// Shape of the attribute-name argument of a `getattr` / `hasattr` call so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NameShape {
+    /// No token of the argument yet.
+    #[default]
+    Start,
+    /// A plain string literal (content span).
+    Const(u32, u32),
+    /// An f-string start.
+    FStart,
+    /// An f-string start then a literal part (span).
+    FMid(u32, u32),
+    /// A constant prefix (span) followed by something variable.
+    Prefix(u32, u32),
+    /// Anything else.
+    Variable,
+}
+
+/// An open `getattr` / `hasattr` call whose attribute-name argument is being classified.
+#[derive(Clone, Copy, Debug, Default)]
+struct Getattr {
+    /// 0 = none, [`GA_GETATTR`] or [`GA_HASATTR`].
+    func: u8,
+    /// End of the call's `(`: earlier tokens are not arguments.
+    after: u32,
+    /// Bracket depth inside the call's parentheses.
+    depth: u32,
+    /// Top-level argument index (0 = object, 1 = name).
+    arg: u8,
+    shape: NameShape,
+}
+
+const GA_GETATTR: u8 = 1;
+const GA_HASATTR: u8 = 2;
+/// Most nested `getattr` / `hasattr` calls tracked at once (deeper nesting ends the outermost
+/// one conservatively).
+const GA_NEST: usize = 4;
+
 struct Builder<'a, S: StrSink> {
     src: &'a [u8],
     st: &'a mut FactStore,
@@ -127,6 +165,11 @@ struct Builder<'a, S: StrSink> {
     cache: [ChainKey; 2],
     /// Slot of `cache` to overwrite next.
     cache_next: usize,
+    /// Line of the first module-level `__main__` guard (0 = none).
+    main_line: u32,
+    /// Open `getattr` / `hasattr` calls, outermost first (`ga_len` of them).
+    ga: [Getattr; GA_NEST],
+    ga_len: usize,
 }
 
 pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, strs: &mut S, extra: V) -> (FileFacts, V) {
@@ -172,6 +215,9 @@ pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, st
         last_try: None,
         cache: [ChainKey::default(); 2],
         cache_next: 0,
+        main_line: 0,
+        ga: [Getattr::default(); GA_NEST],
+        ga_len: 0,
     };
     let mut p = Parser::new(src, Tee(b, extra));
     p.parse_file();
@@ -320,6 +366,8 @@ impl<S: StrSink> Builder<'_, S> {
             suppressions: run(b.suppressions, now.suppressions),
             lines,
             flags: self.file_flags,
+            doc_lines: 0,
+            main_line: self.main_line,
         };
         self.st.scratch = std::mem::take(&mut self.sc);
         ff
@@ -443,6 +491,9 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
                     IfCond::TypeChecking => flags |= B_TC,
                     IfCond::MainGuard if self.scope() == 0 => {
                         flags |= B_MAIN;
+                        if self.file_flags & file_flags::MAIN_GUARD == 0 {
+                            self.main_line = b.pos.line;
+                        }
                         self.file_flags |= file_flags::MAIN_GUARD;
                     }
                     _ => {}
@@ -537,6 +588,23 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
             self.file_flags |= file_flags::ALL_DYNAMIC;
         }
         self.st.calls.push(scope, chain.c, chain.len, flags, c.pos.line, c.pos.col);
+        if c.receiver == Receiver::None && c.names.len() == 1 {
+            let func = match self.text(c.names[0]) {
+                b"getattr" => GA_GETATTR,
+                b"hasattr" => GA_HASATTR,
+                _ => 0,
+            };
+            if func != 0 {
+                if self.ga_len == GA_NEST {
+                    let outer = self.ga[0];
+                    self.ga.copy_within(1.., 0);
+                    self.ga_len -= 1;
+                    self.getattr_end(outer);
+                }
+                self.ga[self.ga_len] = Getattr { func, after: c.lpar.start + c.lpar.len, ..Getattr::default() };
+                self.ga_len += 1;
+            }
+        }
     }
 
     fn import(&mut self, i: &Import<'_>) {
@@ -630,12 +698,22 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         let Some((s, l)) = string_content(self.src, tok) else { return };
         let src = self.src;
         let (ev, out) = (&mut self.sc.evidence, &mut self.st.evidence);
-        ident_segments(&src[s as usize..(s + l) as usize], |seg| {
-            let h = evidence_hash(seg);
+        let text = &src[s as usize..(s + l) as usize];
+        let mut push = |h: u32| {
             if ev.fresh(h) {
                 out.push(h);
             }
-        });
+        };
+        if !path_evidence(text, &mut push) {
+            type_expr_idents(text, |seg| push(evidence_hash(seg)));
+        }
+    }
+
+    #[inline(always)]
+    fn token(&mut self, tok: Token) {
+        if self.ga_len > 0 {
+            self.getattr_token(tok);
+        }
     }
 
     fn diagnostic(&mut self, d: &Diagnostic) {
@@ -644,6 +722,38 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
 }
 
 impl<S: StrSink> Builder<'_, S> {
+    /// Feeds a token to the open `getattr` / `hasattr` calls (see [`NameShape`]), innermost
+    /// first, and ends those it closes.
+    fn getattr_token(&mut self, t: Token) {
+        let mut i = self.ga_len;
+        while i > 0 {
+            i -= 1;
+            if t.start >= self.ga[i].after && step_getattr(&mut self.ga[i], self.src, t) {
+                let done = self.ga[i];
+                self.ga.copy_within(i + 1..self.ga_len, i);
+                self.ga_len -= 1;
+                self.getattr_end(done);
+            }
+        }
+    }
+
+    /// Ends a `getattr` / `hasattr` call: a variable name sets
+    /// [`file_flags::DYNAMIC_GETATTR`] (`getattr` only), a constant prefix records a
+    /// [`DECL_GETATTR_PREFIX`] row, a constant name nothing (its string is evidence already).
+    fn getattr_end(&mut self, ga: Getattr) {
+        let shape = if ga.arg == 0 { NameShape::Variable } else { ga.shape };
+        match shape {
+            NameShape::Const(..) => {}
+            NameShape::Prefix(s, l) if l > 0 => {
+                let sym = self.strs.sym(self.src, s, l);
+                let scope = self.scope();
+                self.st.decls.push(scope, DECL_GETATTR_PREFIX, sym);
+            }
+            _ if ga.func == GA_GETATTR => self.file_flags |= file_flags::DYNAMIC_GETATTR,
+            _ => {}
+        }
+    }
+
     /// At `def_enter`: gives the def about to be pushed the last `decorators` / `bases` rows
     /// pushed since the previous def (at most `u8::MAX` each: the rows nearest the def) and
     /// drops the others (left by malformed input), so each table stays grouped by def in row
@@ -794,19 +904,98 @@ fn is_ident_byte(b: u8) -> bool {
 /// Longest string literal considered as name evidence.
 const MAX_EVIDENCE_STR: usize = 200;
 
-/// Calls `f` with each segment when `s` looks like an identifier or dotted
-/// path (`name`, `pkg.mod.func`); does nothing otherwise.
-fn ident_segments(s: &[u8], mut f: impl FnMut(&[u8])) {
-    if s.is_empty() || s.len() > MAX_EVIDENCE_STR {
-        return;
+/// Advances `ga` by token `t`; returns whether the call ended (its closing bracket, or the
+/// comma after the name argument).
+fn step_getattr(ga: &mut Getattr, src: &[u8], t: Token) -> bool {
+    use crate::lex::TokenKind as K;
+    match t.kind {
+        K::RPar | K::RSqb | K::RBrace if ga.depth == 0 => return true,
+        K::Comma if ga.depth == 0 => {
+            ga.arg += 1;
+            return ga.arg >= 2;
+        }
+        _ => {}
     }
-    for seg in s.split(|&b| b == b'.') {
+    if ga.arg == 1 && ga.depth == 0 {
+        ga.shape = match (ga.shape, t.kind) {
+            (NameShape::Start, K::String) => match string_content(src, t) {
+                Some((s, l)) => NameShape::Const(s, l),
+                None => NameShape::Variable,
+            },
+            (NameShape::Start, K::FStringStart | K::TStringStart) => NameShape::FStart,
+            (NameShape::Const(s, l), K::Plus) => NameShape::Prefix(s, l),
+            (c @ NameShape::Const(..), K::String) => c,
+            (NameShape::FStart, K::FStringMiddle | K::TStringMiddle) => NameShape::FMid(t.start, t.len),
+            (NameShape::FStart | NameShape::FMid(..), K::FStringEnd | K::TStringEnd) => NameShape::Const(0, 0),
+            (NameShape::FMid(s, l), K::LBrace) => NameShape::Prefix(s, l),
+            (p @ NameShape::Prefix(..), _) => p,
+            _ => NameShape::Variable,
+        };
+    }
+    match t.kind {
+        K::LPar | K::LSqb | K::LBrace => ga.depth += 1,
+        K::RPar | K::RSqb | K::RBrace => ga.depth -= 1,
+        _ => {}
+    }
+    false
+}
+
+/// Most segments of a dotted path whose prefixes get a path hash.
+const MAX_PATH_SEGS: usize = 8;
+
+/// When `s` looks like an identifier or a dotted path (`name`, `pkg.mod.func`, `pkg.mod:attr`
+/// with at most one `:`), calls `push` with the evidence hash of each segment and, for paths,
+/// of each prefix of two segments or more with `:` read as `.` (`pkg.mod`, `pkg.mod.attr`):
+/// string references to modules and definitions by dotted path. Returns whether it did.
+pub(crate) fn path_evidence(s: &[u8], mut push: impl FnMut(u32)) -> bool {
+    if s.is_empty() || s.len() > MAX_EVIDENCE_STR {
+        return false;
+    }
+    if s.iter().filter(|&&b| b == b':').count() > 1 {
+        return false;
+    }
+    for seg in s.split(|&b| b == b'.' || b == b':') {
         if seg.is_empty() || seg[0].is_ascii_digit() || !seg.iter().all(|&b| is_ident_byte(b)) {
-            return;
+            return false;
         }
     }
-    for seg in s.split(|&b| b == b'.') {
-        f(seg);
+    let mut buf = [0u8; MAX_EVIDENCE_STR];
+    let mut segs = 0;
+    let mut start = 0;
+    for (i, &b) in s.iter().enumerate() {
+        let sep = b == b'.' || b == b':';
+        buf[i] = if sep { b'.' } else { b };
+        if sep {
+            push(evidence_hash(&s[start..i]));
+            segs += 1;
+            if (2..=MAX_PATH_SEGS).contains(&segs) {
+                push(evidence_hash(&buf[..i]));
+            }
+            start = i + 1;
+        }
+    }
+    push(evidence_hash(&s[start..]));
+    segs += 1;
+    if (2..=MAX_PATH_SEGS).contains(&segs) {
+        push(evidence_hash(&buf[..s.len()]));
+    }
+    true
+}
+
+/// Calls `f` with each identifier of `s` when `s` looks like a quoted type expression
+/// (`"Dict[str, Foo]"`, `"Foo | None"`): only identifier bytes, `.`, `[`, `]`, `,`, `|`, `'`
+/// and spaces, with at least one `[` or `|`. Prose never qualifies.
+fn type_expr_idents(s: &[u8], mut f: impl FnMut(&[u8])) {
+    if s.is_empty() || s.len() > MAX_EVIDENCE_STR || !s.iter().any(|&b| b == b'[' || b == b'|') {
+        return;
+    }
+    if !s.iter().all(|&b| is_ident_byte(b) || matches!(b, b'.' | b'[' | b']' | b',' | b'|' | b'\'' | b' ')) {
+        return;
+    }
+    for seg in s.split(|&b| !is_ident_byte(b)) {
+        if !seg.is_empty() && !seg[0].is_ascii_digit() {
+            f(seg);
+        }
     }
 }
 

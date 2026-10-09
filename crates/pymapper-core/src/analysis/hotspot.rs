@@ -23,6 +23,11 @@
 //! - Functions (methods and nested functions included, each with its own score) of first-party
 //!   `.py` files. Stub files (`.pyi`) and `@overload` signatures are skipped: their bodies are
 //!   `...` and their parameters repeat the implementation's.
+//! - Lengths exclude docstrings: PM104 checks a function's inclusive line span minus the lines
+//!   of the docstrings inside it (its own and those of nested definitions), PM107 the module's
+//!   lines minus every docstring of the file (module, classes, functions). Blank and
+//!   comment-only lines still count. See "Docstrings" in [`crate::extract::metrics`].
+//! - Test code (see [`testfiles`]) is skipped unless `analysis.include-tests-in-metrics`.
 //! - Parameters exclude the leading `self` / `cls` of a method (a function defined directly in a
 //!   class body that is not a `@staticmethod`, when its first parameter is positional).
 //! - Function findings are at the function's name; PM107 is at line 1, column 1 of the module.
@@ -44,6 +49,7 @@ use std::collections::BinaryHeap;
 use crate::config::Thresholds;
 use crate::extract::facts::{DefKind, def_flags, param_kind};
 use crate::extract::events::ParamKind;
+use crate::analysis::testfiles;
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::roots::Origin;
 use crate::rules::codes::{
@@ -235,6 +241,10 @@ impl Emit {
         }
     }
 
+    fn any(&self) -> bool {
+        self.mccabe || self.cognitive || self.nesting || self.loc || self.params || self.mi || self.module_loc
+    }
+
     const NONE: Emit =
         Emit { mccabe: false, cognitive: false, nesting: false, loc: false, params: false, mi: false, module_loc: false };
 }
@@ -249,13 +259,14 @@ fn is_stub(ix: &Index, f: FileId) -> bool {
 /// are built even when no rule is enabled (they cost the same scan).
 pub fn analyse(ix: &Index, engine: &RuleEngine, out: &mut Findings) -> HotspotReport {
     let emit = if engine.should_run(Pass::Hotspot) { Emit::of(engine) } else { Emit::NONE };
-    scan(ix, engine.thresholds(), emit, out)
+    let excluded = if emit.any() { testfiles::excluded_files(ix, engine.include_tests_in_metrics()) } else { Vec::new() };
+    scan(ix, engine.thresholds(), emit, &excluded, out)
 }
 
 /// The per-file aggregates only (no findings), with the given thresholds for
 /// [`ModuleHotspot::flagged`].
 pub fn aggregates(ix: &Index, thresholds: &Thresholds) -> HotspotReport {
-    scan(ix, thresholds, Emit::NONE, &mut Findings::new())
+    scan(ix, thresholds, Emit::NONE, &[], &mut Findings::new())
 }
 
 /// A per-function metric to rank by ([`top_functions`]).
@@ -301,7 +312,7 @@ pub fn top_functions(ix: &Index, metric: Metric, k: usize, include: impl Fn(File
                 Metric::Mccabe => u32::from(mx.cyclomatic[m]),
                 Metric::Cognitive => u32::from(mx.cognitive[m]),
                 Metric::Nesting => u32::from(mx.max_nesting[m]),
-                Metric::Loc => mx.loc[m],
+                Metric::Loc => mx.code_lines(m),
                 Metric::Params => effective_params(ix, f, g, flags),
                 // Lower is worse: rank by 10000 - 100 * MI.
                 Metric::Maintainability => 10_000 - (mx.mi(m) * 100.0) as u32,
@@ -339,7 +350,16 @@ fn effective_params(ix: &Index, f: FileId, g: usize, flags: u16) -> u32 {
     }
 }
 
-fn scan(ix: &Index, t: &Thresholds, emit: Emit, out: &mut Findings) -> HotspotReport {
+/// `excluded`: files whose findings are skipped (test code, see [`testfiles`]); aggregates
+/// still cover them.
+/// Lines of a module without its docstrings (module docstring and every definition's), at
+/// least 1 for a non-empty file: the length PM107 checks.
+#[inline]
+pub fn module_code_lines(lines: u32, doc_lines: u32) -> u32 {
+    if lines == 0 { 0 } else { lines.saturating_sub(doc_lines).max(1) }
+}
+
+fn scan(ix: &Index, t: &Thresholds, emit: Emit, excluded: &[bool], out: &mut Findings) -> HotspotReport {
     let n = ix.file_count() as usize;
     let defs = &ix.facts().defs;
     let mx = ix.metrics();
@@ -351,7 +371,10 @@ fn scan(ix: &Index, t: &Thresholds, emit: Emit, out: &mut Findings) -> HotspotRe
     for f in 0..n as FileId {
         let ff = ix.file_facts(f);
         let node = ix.file_node(f);
-        let report = node != NONE && ix.file_origin(f) == Origin::FirstParty && !is_stub(ix, f);
+        let report = node != NONE
+            && ix.file_origin(f) == Origin::FirstParty
+            && !is_stub(ix, f)
+            && !testfiles::is_excluded(excluded, f);
         let file = crate::rules::FileId(f);
         let mut row = ModuleHotspot {
             functions: 0,
@@ -389,7 +412,8 @@ fn scan(ix: &Index, t: &Thresholds, emit: Emit, out: &mut Findings) -> HotspotRe
             let cc = mx.cyclomatic[m];
             let cog = mx.cognitive[m];
             let nest = mx.max_nesting[m];
-            let loc = mx.loc[m];
+            // PM104 and `flagged` measure lines without docstrings; MI keeps the full span.
+            let loc = mx.code_lines(m);
             let mi = mx.mi(m);
             let np = effective_params(ix, f, g, flags);
             let v = node.wrapping_add(d as u32);
@@ -439,10 +463,11 @@ fn scan(ix: &Index, t: &Thresholds, emit: Emit, out: &mut Findings) -> HotspotRe
                 out.push(LOW_MAINTAINABILITY, at, sym, 100, &[a, Arg::F32(mi as f32), Arg::F32(limit)]);
             }
         }
-        if emit.module_loc && report && ff.lines > t.max_module_loc {
+        let module_lines = module_code_lines(ff.lines, ff.doc_lines);
+        if emit.module_loc && report && module_lines > t.max_module_loc {
             let sym = SymbolId(node);
-            let args = [Arg::Symbol(sym), Arg::U32(ff.lines), Arg::U32(t.max_module_loc)];
-            out.push(LONG_MODULE, Location::new(file, 1, 1), sym, 100, &args);
+            let args = [Arg::Symbol(sym), Arg::U32(module_lines), Arg::U32(t.max_module_loc)];
+            out.push_ext(LONG_MODULE, Location::new(file, 1, 1), ff.lines.max(1), sym, 100, &args, &[]);
         }
         stats.functions += u64::from(row.functions);
         stats.classes += u64::from(row.classes);

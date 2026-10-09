@@ -19,12 +19,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rayon::prelude::*;
 
 use super::level;
+use crate::extract::config::ConfigEvidence;
 use crate::extract::facts::evidence_hash;
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::graph::{Graph, Scc};
 use crate::intern::{FxHashMap, Sym};
 use crate::reach::BitSet;
 use crate::resolve::{Confidence, Imports, Reason, ResolvedCalls};
+use crate::roots::Origin;
 
 /// What the scan found for an import candidate.
 pub(super) mod import_hit {
@@ -37,12 +39,28 @@ pub(super) mod import_hit {
     pub const USED: u8 = 2;
 }
 
+/// Extra facts about a def or module candidate ([`Hits::def_extra`], [`Hits::mod_extra`]).
+pub(super) mod extra {
+    /// Defs: the [`super::level::LINKED`] hit came from the def's own file.
+    pub const SAME_FILE: u8 = 1;
+    /// Its dotted path occurs in a string literal of an included file.
+    pub const STRING_REF: u8 = 2;
+    /// Its dotted path occurs in a config file.
+    pub const CONFIG_REF: u8 = 4;
+    /// Its name occurs in a config file.
+    pub const CONFIG_NAME: u8 = 8;
+    /// Defs: its name and its module's dotted path occur in the same config file.
+    pub const CONFIG_LINKED: u8 = 16;
+}
+
 /// Candidates of the scan. Defs and modules are node ids, ascending.
 pub(super) struct Candidates<'a> {
     pub defs: &'a [NodeId],
     pub modules: &'a [NodeId],
     /// `(name hash, file)` of each import candidate.
     pub imports: &'a [(u32, FileId)],
+    /// Config-file evidence, if collected.
+    pub config: Option<&'a ConfigEvidence>,
 }
 
 /// Results, aligned with the candidate slices.
@@ -53,6 +71,10 @@ pub(super) struct Hits {
     pub modules: Vec<bool>,
     /// Per import candidate: an [`import_hit`] value.
     pub imports: Vec<u8>,
+    /// Per def candidate: [`extra`] bits.
+    pub def_extra: Vec<u8>,
+    /// Per module candidate: [`extra`] bits.
+    pub mod_extra: Vec<u8>,
     pub probes: u64,
 }
 
@@ -76,9 +98,13 @@ impl Explained {
     }
 }
 
-/// Group ranges of each kind for one name hash: `[defs, modules, imports]` as `(start, end)`
-/// group indices.
-type Ranges = [(u32, u32); 3];
+/// Group ranges of each kind for one hash: `[defs, modules, imports, paths]` as
+/// `(start, end)` group indices. Path groups hold the dotted paths of def and module
+/// candidates ([`MOD_BIT`] marks modules).
+type Ranges = [(u32, u32); 4];
+
+/// In path groups: the candidate is a module (index into the module candidates).
+const MOD_BIT: u32 = 1 << 31;
 
 /// Members `(hash, name, key, candidate)` sorted, cut into groups of equal `(hash, name)`;
 /// within a group members are sorted by `key`.
@@ -127,7 +153,7 @@ impl Groups {
             if i == 0 || members[i - 1][..2] != m[..2] {
                 let g = start.len() as u32;
                 start.push(i as u32);
-                let r = &mut map.entry(m[0]).or_insert([(0, 0); 3])[kind];
+                let r = &mut map.entry(m[0]).or_insert([(0, 0); 4])[kind];
                 if r.0 == r.1 {
                     *r = (g, g + 1);
                 } else {
@@ -217,7 +243,14 @@ pub(super) fn scan(
     c: &Candidates<'_>,
 ) -> Hits {
     let (nd, nm, ni) = (c.defs.len(), c.modules.len(), c.imports.len());
-    let mut hits = Hits { defs: vec![0; nd], modules: vec![false; nm], imports: vec![import_hit::NONE; ni], probes: 0 };
+    let mut hits = Hits {
+        defs: vec![0; nd],
+        modules: vec![false; nm],
+        imports: vec![import_hit::NONE; ni],
+        def_extra: vec![0; nd],
+        mod_extra: vec![0; nm],
+        probes: 0,
+    };
     if nd + nm + ni == 0 {
         return hits;
     }
@@ -240,6 +273,7 @@ pub(super) fn scan(
         let Some(fd) = ix.file(d) else { continue };
         if included[fd as usize] && has(fd, name_hash(d)) && !explained.contains(i as u32, fd) {
             hits.defs[i] = level::LINKED;
+            hits.def_extra[i] |= extra::SAME_FILE;
         }
     }
     // Occurrences in files importing the def directly.
@@ -267,6 +301,31 @@ pub(super) fn scan(
     // Same hashes, so the same group indices as `ig`; keyed by the module's name hash.
     let by_name = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, name_hash(ix.file_node(f)), i as u32]).collect();
     let ig2 = Groups::new(by_name, &mut FxHashMap::default(), 2);
+    // Dotted paths of the candidates (`pkg.mod.Class.method`, `pkg.mod`) and of each def's
+    // module: string and config references by path.
+    let mut buf = Vec::new();
+    let mut path_hash = |v: NodeId| {
+        buf.clear();
+        ix.qid(v, &mut buf);
+        for c in &mut buf {
+            if *c == b':' {
+                *c = b'.';
+            }
+        }
+        evidence_hash(&buf)
+    };
+    let mut paths: Vec<[u32; 4]> = Vec::with_capacity(nd + nm);
+    let mut def_module_path = Vec::with_capacity(nd);
+    for (i, &d) in c.defs.iter().enumerate() {
+        paths.push([path_hash(d), 0, 0, i as u32]);
+        def_module_path.push(ix.file(d).map_or(0, |f| path_hash(ix.file_node(f))));
+    }
+    for (i, &m) in c.modules.iter().enumerate() {
+        paths.push([path_hash(m), 0, 0, MOD_BIT | i as u32]);
+    }
+    let pg = Groups::new(paths, &mut map, 3);
+    let def_string = AtomicBits::new(nd);
+    let mod_string = AtomicBits::new(nm);
     let linked = AtomicBits::new(nd);
     let used = AtomicBits::new(ni);
     let elsewhere = AtomicBits::new(ni);
@@ -280,6 +339,24 @@ pub(super) fn scan(
             || (0u64, Vec::new()),
             |(mut probes, mut partial), f| {
                 if !included[f as usize] {
+                    // Other first-party files (tests or scripts outside any package, stubs):
+                    // their string references by dotted path still count.
+                    if ix.file_origin(f) == Origin::FirstParty {
+                        let ev = ix.file_view(f).evidence();
+                        probes += ev.len() as u64;
+                        for &h in ev {
+                            let Some(r) = map.get(&h) else { continue };
+                            for g in r[3].0..r[3].1 {
+                                for m in pg.group(g) {
+                                    if m[3] & MOD_BIT != 0 {
+                                        mod_string.set(m[3] & !MOD_BIT);
+                                    } else {
+                                        def_string.set(m[3]);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return (probes, partial);
                 }
                 let ev = ix.file_view(f).evidence();
@@ -312,6 +389,15 @@ pub(super) fn scan(
                     for g in r[2].0..r[2].1 {
                         intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used.set(i));
                         intersect(ig2.group(g), ev.iter().copied(), in_ev, |i| elsewhere.set(i));
+                    }
+                    for g in r[3].0..r[3].1 {
+                        for m in pg.group(g) {
+                            if m[3] & MOD_BIT != 0 {
+                                mod_string.set(m[3] & !MOD_BIT);
+                            } else {
+                                def_string.set(m[3]);
+                            }
+                        }
                     }
                 }
                 (probes, partial)
@@ -352,6 +438,50 @@ pub(super) fn scan(
         for m in mg.group(g) {
             let i = m[3] as usize;
             hits.modules[i] = mg.elsewhere(g, ix.file(c.modules[i]));
+        }
+    }
+    for i in 0..nd {
+        if def_string.get(i) {
+            hits.def_extra[i] |= extra::STRING_REF;
+        }
+    }
+    for i in 0..nm {
+        if mod_string.get(i) {
+            hits.mod_extra[i] |= extra::STRING_REF;
+        }
+    }
+    if let Some(cfg) = c.config {
+        // Few files: sequential. Paths, bare names of defs (with their module's path in the
+        // same file: linked) and of modules.
+        for k in 0..cfg.files() {
+            let ev = cfg.file(k);
+            hits.probes += ev.len() as u64;
+            for &h in ev {
+                let Some(r) = map.get(&h) else { continue };
+                for g in r[3].0..r[3].1 {
+                    for m in pg.group(g) {
+                        if m[3] & MOD_BIT != 0 {
+                            hits.mod_extra[(m[3] & !MOD_BIT) as usize] |= extra::CONFIG_REF;
+                        } else {
+                            hits.def_extra[m[3] as usize] |= extra::CONFIG_REF;
+                        }
+                    }
+                }
+                for g in r[0].0..r[0].1 {
+                    for m in dg.group(g) {
+                        let i = m[3] as usize;
+                        hits.def_extra[i] |= extra::CONFIG_NAME;
+                        if def_module_path[i] != 0 && ev.binary_search(&def_module_path[i]).is_ok() {
+                            hits.def_extra[i] |= extra::CONFIG_LINKED;
+                        }
+                    }
+                }
+                for g in r[1].0..r[1].1 {
+                    for m in mg.group(g) {
+                        hits.mod_extra[m[3] as usize] |= extra::CONFIG_NAME;
+                    }
+                }
+            }
         }
     }
     for i in 0..ni {

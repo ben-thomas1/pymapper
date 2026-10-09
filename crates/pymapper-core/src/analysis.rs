@@ -6,3 +6,4 @@ pub mod deadcode;
 pub mod dupes;
 pub mod hotspot;
 pub mod layers;
+pub mod testfiles;

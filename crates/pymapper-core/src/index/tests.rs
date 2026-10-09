@@ -528,3 +528,31 @@ fn inputs_from_discovered_roots() {
     assert_eq!(ix.file_origin(x), Origin::ThirdParty);
     assert!(ix.groups()[ix.file_group(x) as usize].dist.is_some());
 }
+
+#[test]
+fn overload_implementations_have_no_suffix() {
+    let t = TempDir::new("overloads");
+    t.file(
+        "m.py",
+        "from typing import overload\n\
+         @overload\ndef f(a: int) -> int: ...\n\
+         @overload\ndef f(a: str) -> str: ...\n\
+         def f(a):\n    return a\n\
+         class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n\
+         \x20   @overload\n    def g(self) -> int: ...\n    def g(self, a=0): ...\n    def g(self): ...\n",
+    )
+    .file("s.pyi", "from typing import overload\n@overload\ndef h(a: int) -> int: ...\n@overload\ndef h(a: str) -> str: ...\n");
+    let ix = load_dir(t.path());
+    let all: Vec<String> = (0..ix.node_count()).map(|v| qid(&ix, v)).collect();
+    // `f`: the implementation is `f`, the overloads `f#2`, `f#3` (source order). Property
+    // pairs keep source order. In `C.g` the implementation is the last non-overload def.
+    // A stub with only overloads keeps source order.
+    for q in ["m:f", "m:f#2", "m:f#3", "m:C.x", "m:C.x#2", "m:C.g", "m:C.g#2", "m:C.g#3", "s:h", "s:h#2"] {
+        assert!(all.iter().any(|a| a == q), "{q} not in {all:?}");
+    }
+    let line = |q: &str| ix.facts().defs.name_line[ix.def_row(find(&ix, q)).expect("row")];
+    assert_eq!([line("m:f#2"), line("m:f#3"), line("m:f")], [3, 5, 6]);
+    assert_eq!([line("m:C.g#2"), line("m:C.g#3"), line("m:C.g")], [14, 15, 16]);
+    assert_eq!([line("m:C.x"), line("m:C.x#2")], [10, 12]);
+    check_invariants(&ix);
+}

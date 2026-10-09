@@ -155,16 +155,44 @@ one hundred.
 Rules are chosen in `[rules]` (or with `--select`, `--extend-select`, `--ignore`) by code
 prefix: `ALL`, `PM`, `PM1`, `PM10`, `PM101`. Without `select`, the rules marked \"on\" below
 run. When a rule matches both a select and an ignore selector, the more specific selector wins;
-on a tie, ignore wins. `per-file-ignores` disables rules in files matching a glob.
+on a tie, ignore wins. `per-file-ignores` disables rules in files matching a glob. A selector
+that matches no rule (`PM999`, anywhere in the rule options) is a usage error (exit 2) with a
+\"did you mean\" suggestion when one is close.
 
 Expensive rules also need their `[analysis]` toggle (\"needs ...\" below): turning the toggle on
-enables them unless they are ignored, and selecting them without the toggle runs nothing (pymapper
-prints a note). Analyses whose rules are all disabled do not run at all.
+enables them unless they are ignored. `pymapper check` does not run the dependency rules (PM6xx,
+they belong to `pymapper deps`) or the contract rules PM302-PM304 without `[[contracts]]`. If
+none of the selected rules can run, `check` fails with exit 2 and says why; if some can, it warns
+about the skipped rules selected by code or category (`PM501`, `PM6`) and, whenever rules were
+selected explicitly (`ALL` included), its footer says how many rules ran and which were skipped
+(\"25 rules ran, 8 skipped (PM501: needs ...; ...)\"). Analyses whose rules
+are all disabled do not run at all.
 
 ## Thresholds
 
 Metric rules read a limit from `[thresholds]` and report values strictly above a `max-*` limit
 (strictly below a `min-*` limit).
+
+## Test code
+
+By default the complexity (PM1xx), coupling (PM2xx) and duplication (PM5xx) rules skip test code:
+files whose dotted module name has a `tests`, `test` or `testing` component (a directory so named
+below the import root, at any depth), or whose name is `test_*.py`, `*_test.py` or `conftest.py`.
+Long test functions, large test classes and repeated test setup are normal and would drown the
+findings about the code under test. Set `analysis.include-tests-in-metrics = true` to report them
+too. Dead code (PM4xx) and import cycles / contracts (PM3xx) always cover tests.
+
+## Symbols
+
+A finding's `symbol` is the stable qualified id of what it is about: `pkg.mod` for a module,
+`pkg.mod:Class.method` for a definition. Baselines key on it. Same-named siblings (a property
+and its setter, conditional definitions) are told apart by a `#N` suffix in source order: the
+first is `name`, the next `name#2`, and so on. In a group with `@overload` signatures, the
+implementation (the last definition of the group that is not an `@overload`) is the plain `name`
+and the signatures are `name#2`, `name#3`, ... in source order, so adding an overload does not
+change the id metric findings and baselines use (overload signatures themselves are never
+reported by the metric rules). Unused imports (PM405) are shown as `pkg.mod:<bound name>` in
+JSON and SARIF output.
 
 ## Confidence
 
@@ -172,14 +200,19 @@ Every finding has a confidence from 0 to 100. Measured facts (metrics, contract 
 always have 100; heuristic rules (dead code, dependency mapping) score each finding as described
 per rule. `pymapper check` reports findings with confidence at or above `min-confidence`
 (default 80, `--confidence`) and exits 1 if there are any.
+Dead-code findings below 100 name the evidence that lowered the confidence: concise output
+appends `(confidence 50: name-elsewhere)`, JSON a `reasons` array (absent when there are none).
 
 ## Suppressing findings
 
 Add `# pymapper: ignore[CODES]` to the line a finding is reported on (the `def` / `class` line,
 the import line, or line 1 for module-level findings). Codes are comma-separated selectors, so
 `# pymapper: ignore[PM101, PM4]` suppresses PM101 and every dead-code rule on that line; a bare
-`# pymapper: ignore` suppresses every rule. Malformed codes (`E501`, `pm101`) are reported as
-diagnostics and ignored.
+`# pymapper: ignore` suppresses every rule. `pymapper check` warns on stderr
+(`pymapper: warning: path:line: ...`) about codes that are not pymapper selectors (`E501`), wrong
+case (`pm101`, with a suggestion), codes that match no rule (`PM999`) and empty lists
+(`ignore[]`); such codes suppress nothing, and the warnings never change the exit code. Only
+files in the reported paths are diagnosed.
 
 Ruff's `# noqa` is honoured for unused imports only: a bare `# noqa` or a `# noqa` listing F401
 (`# noqa: F401`, `# noqa:F401,E501`, any case) suppresses PM405 on its line, or on every name of

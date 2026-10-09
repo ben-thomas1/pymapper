@@ -19,6 +19,11 @@ pub trait Context: ArgResolver {
     fn write_path(&self, file: FileId, out: &mut Vec<u8>);
     /// Appends the stable qualified id of `sym` (`pkg.mod:Class.method`), as used by baselines.
     fn write_symbol_id(&self, sym: SymbolId, out: &mut Vec<u8>);
+    /// Last line of `sym`'s definition when it is a class or function, else 0 (for the JSON
+    /// `end_line` of findings whose analysis did not record one).
+    fn def_end_line(&self, _sym: SymbolId) -> u32 {
+        0
+    }
 }
 
 /// Writes bytes to a `fmt::Write`, replacing invalid UTF-8 with U+FFFD.
@@ -87,6 +92,13 @@ impl Context for IndexContext<'_> {
         } else {
             out.push(b'?');
         }
+    }
+
+    fn def_end_line(&self, sym: SymbolId) -> u32 {
+        if !self.valid_node(sym) || !self.index.kind(sym.0).is_def() {
+            return 0;
+        }
+        self.index.def_row(sym.0).map_or(0, |row| self.index.facts().defs.end_line[row])
     }
 }
 

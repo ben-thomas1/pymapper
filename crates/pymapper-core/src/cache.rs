@@ -45,9 +45,12 @@
 //! version: any of them changing invalidates every segment. Bump [`FACTS_VERSION`] whenever
 //! extraction changes what it produces.
 
+mod config;
 mod format;
 mod mmap;
 mod segment;
+
+pub use config::{CONFIG_EVIDENCE_FILE, config_evidence};
 
 #[cfg(test)]
 mod tests;
@@ -77,7 +80,7 @@ use crate::intern::{FxHashSet, FxHasher, Interner, hash_bytes};
 use crate::roots::{Origin, Roots};
 
 /// Bump whenever the extractor changes the facts or metrics it produces for some input.
-pub const FACTS_VERSION: u32 = 2;
+pub const FACTS_VERSION: u32 = 4;
 
 /// Kind of a facts segment in the container header.
 const KIND_FACTS: u32 = 1;

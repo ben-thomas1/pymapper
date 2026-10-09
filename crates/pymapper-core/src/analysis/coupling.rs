@@ -42,6 +42,8 @@
 //!   when a base's last name is `ABC` or `Protocol` (`abc.ABC`, `typing.Protocol[T]`, ...), its
 //!   `metaclass=` keyword's last name is `ABCMeta`, or one of its methods is an
 //!   `@abstractmethod`. Distance from the main sequence `D = |A + I - 1|`.
+//! - Findings skip test code (see [`testfiles`]) unless `analysis.include-tests-in-metrics`;
+//!   imports made by test files still count towards the coupling of the modules they import.
 //! - Symbols: the classes and functions of the file (methods and nested functions included).
 //! - Class WMC: the McCabe value of the class row (its methods' scores plus class-level
 //!   statements, see [`crate::extract::metrics`]). Class fan-out: distinct classes, other than
@@ -52,6 +54,7 @@
 //! - Findings are for first-party `.py` files only, at line 1, column 1 of the module, and
 //!   for a god class at its name. Every value is a measured fact: confidence 100.
 
+use crate::analysis::testfiles;
 use crate::config::Thresholds;
 use crate::extract::facts::{DefKind, FileView, def_flags};
 use crate::graph::Graph;
@@ -351,7 +354,8 @@ pub fn analyse(ix: &Index, imp: &Imports, calls: Option<&Graph>, engine: &RuleEn
             god_module: engine.is_enabled(GOD_MODULE),
             god_class: engine.is_enabled(GOD_CLASS) && calls.is_some(),
         };
-        stats.class_candidates = findings(ix, &modules, calls, engine.thresholds(), emit, out);
+        let excluded = testfiles::excluded_files(ix, engine.include_tests_in_metrics());
+        stats.class_candidates = findings(ix, &modules, calls, engine.thresholds(), emit, &excluded, out);
     }
     stats.findings = (out.len() - before) as u64;
     CouplingReport { modules, stats }
@@ -366,24 +370,35 @@ struct Emit {
     god_class: bool,
 }
 
-/// Pushes the findings of first-party `.py` files; returns the number of god-class candidates.
-fn findings(ix: &Index, mc: &ModuleCoupling, calls: Option<&Graph>, t: &Thresholds, emit: Emit, out: &mut Findings) -> u64 {
+/// Pushes the findings of first-party `.py` files not in `excluded` (test code, see
+/// [`testfiles`]); returns the number of god-class candidates. Module findings span the whole
+/// file (`end_line` = its last line).
+fn findings(
+    ix: &Index,
+    mc: &ModuleCoupling,
+    calls: Option<&Graph>,
+    t: &Thresholds,
+    emit: Emit,
+    excluded: &[bool],
+    out: &mut Findings,
+) -> u64 {
     let defs = &ix.facts().defs;
     let mx = ix.metrics();
     let mut scratch: Vec<NodeId> = Vec::new();
     let mut candidates = 0u64;
     for f in 0..ix.file_count() {
         let node = ix.file_node(f);
-        if node == NONE || ix.file_origin(f) != Origin::FirstParty || is_stub(ix, f) {
+        if node == NONE || ix.file_origin(f) != Origin::FirstParty || is_stub(ix, f) || testfiles::is_excluded(excluded, f) {
             continue;
         }
         let file = crate::rules::FileId(f);
         let sym = SymbolId(node);
         let at = Location::new(file, 1, 1);
+        let last = ix.file_facts(f).lines.max(1);
         let (ca, ce) = (mc.ca(f), mc.ce(f));
         let coupling = ca.saturating_add(ce);
         if emit.fan_out && ce > t.max_fan_out {
-            out.push(HIGH_FAN_OUT, at, sym, 100, &[Arg::Symbol(sym), Arg::U32(ce), Arg::U32(t.max_fan_out)]);
+            out.push_ext(HIGH_FAN_OUT, at, last, sym, 100, &[Arg::Symbol(sym), Arg::U32(ce), Arg::U32(t.max_fan_out)], &[]);
         }
         if emit.distance
             && coupling >= t.distance_min_coupling
@@ -397,7 +412,7 @@ fn findings(ix: &Index, mc: &ModuleCoupling, calls: Option<&Graph>, t: &Threshol
                 Arg::F32(mc.abstractness(f)),
                 Arg::F32(i),
             ];
-            out.push(MAIN_SEQUENCE_DISTANCE, at, sym, 100, &args);
+            out.push_ext(MAIN_SEQUENCE_DISTANCE, at, last, sym, 100, &args, &[]);
         }
         let symbols = mc.symbols(f);
         if emit.god_module && symbols > t.max_module_symbols && coupling > t.max_module_coupling {
@@ -408,7 +423,7 @@ fn findings(ix: &Index, mc: &ModuleCoupling, calls: Option<&Graph>, t: &Threshol
                 Arg::U32(coupling),
                 Arg::U32(t.max_module_coupling),
             ];
-            out.push(GOD_MODULE, at, sym, 100, &args);
+            out.push_ext(GOD_MODULE, at, last, sym, 100, &args, &[]);
         }
         let (Some(cg), true) = (calls, emit.god_class) else { continue };
         let ff = ix.file_facts(f);

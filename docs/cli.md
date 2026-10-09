@@ -4,6 +4,12 @@
 reports findings, ruff-style. It is meant to run in CI and in agent loops next to pytest, ruff
 and ty.
 
+The analysis is always whole-program. `PATHS` (files or directories) only filter the report: a
+finding is reported when its file lies under one of them (component-wise, lexically; symlinks
+are not followed). `pymapper check src/pkg` therefore prints exactly the findings of the
+whole-project run that lie under `src/pkg`, with the same module names and confidences. Without
+`PATHS` everything is reported.
+
 ## Pipeline
 
 ```
@@ -23,6 +29,7 @@ pymapper check [paths]
   │    ├─ coupling     PM201-PM204  (call graph only when PM204 is enabled)     O(V+E)
   │    ├─ dead code    PM401-PM405  reachability + name evidence               O(V+E)
   │    └─ dupes        PM501        token clones, gated by analysis.dupes      expensive
+  ├─ scope         keep findings under the positional PATHS (if any)
   ├─ filter        selection, per-file-ignores, # pymapper: ignore[...], confidence gate
   ├─ report        deterministic order (path, line, col, rule, symbol)
   ├─ baseline      drop findings recorded in --baseline / `baseline`
@@ -33,7 +40,40 @@ Third-party (`--deps`) and stdlib (`--stdlib`) code is loaded so first-party cod
 (imports, base classes, calls), but it is never reported by `check` and never affects the exit
 code. Only first-party importable `.py` files are analysed for findings.
 
-The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them yet.
+The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them (see
+"Rules that cannot run" below).
+
+The other subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are
+not implemented yet: they are hidden from `pymapper --help`, accept any operands and the
+configuration flags, and exit 2 with "not implemented".
+
+## Project root
+
+Config discovery walks up from the first path (default: the working directory); in each
+directory `pymapper.toml` wins over a `pyproject.toml` with `[tool.pymapper]`. The project root
+is then, in order of precedence:
+
+1. the directory of the config file applied (found, or given with `--config`; `--isolated`
+   skips this step);
+2. walking up from the first path: the outermost directory whose `pyproject.toml` has a
+   `[tool.uv.workspace]` table;
+3. the top of the git repository: the nearest ancestor holding `.git` (a directory, or the file
+   of a worktree / submodule); the walk never goes past it;
+4. the outermost directory with a `pyproject.toml` or `pymapper.toml`;
+5. the first path itself (its directory, for a file).
+
+Steps 2-4 never consider `$HOME` or its parents when the first path is below `$HOME`. The root
+does not depend on how deep the first path is, so `check src/pkg/mod.py` and `check` agree on the
+root, the module names, the venv (`.venv` / `venv` in the root unless `venv` or `$VIRTUAL_ENV`
+is set) and the cache. Module names come from the import roots of the whole project: `src`
+config, build-backend source dirs and `src/` layouts of the root and of every project unit (a
+directory below the root with a `pyproject.toml`, e.g. a uv workspace member), editable installs
+in the venv, then the root itself. A `pyproject.toml` inside a package directory (with
+`__init__.py`, as pandas ships in its wheel) is not a unit root and adds no import root.
+
+What is loaded is the configured `paths` (default: the project root), plus positional paths
+inside the root that `paths` does not cover. A positional path outside the project root is not
+checked (warning); run pymapper on that project separately.
 
 ## Exit codes
 
@@ -41,7 +81,7 @@ The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not r
 |------|---------|
 | 0 | no finding at or above the confidence gate (or `--save-baseline` succeeded) |
 | 1 | at least one finding at or above the gate |
-| 2 | usage error (including a path to check that does not exist), invalid configuration, unreadable or invalid baseline, cannot write output |
+| 2 | usage error (including a path to check that does not exist, an unknown rule selector, or a selection of which no rule can run), invalid configuration, unreadable or invalid baseline, cannot write output |
 
 A path that does not exist, whether given on the command line or listed in the configured
 `paths`, is a usage error (`pymapper: error: path `X` does not exist`, exit 2): a mistyped or
@@ -52,8 +92,8 @@ quietly; the exit code still reflects the findings.
 
 ## Flags
 
-Positional `PATHS` replace the configured `paths`; config discovery starts at the first one
-(default: the working directory). Every configuration flag is shared with the other
+Positional `PATHS` filter the report (see above); config and root discovery start at the
+first one (default: the working directory). Every configuration flag is shared with the other
 subcommands (`pymapper check --help` lists them all):
 
 | flag | config key | notes |
@@ -75,28 +115,80 @@ subcommands (`pymapper check --help` lists them all):
 | `--save-baseline FILE` | | record every reported finding, write no report, exit 0 |
 | `--stats` | | phase timings, counters and peak RSS on stderr |
 
-Selecting a gated rule by code or category (`--select PM501`) without its toggle prints a
-warning naming the toggle (`analysis.dupes`). A selector that matches no known rule
-(`--select PM999`) prints a warning. An application-mode unit (a directory with a
+A selector that matches no known rule (`--select PM999`, or in `rules.select`, `extend-select`,
+`ignore` or `per-file-ignores`) is a usage error (exit 2) with a "did you mean" suggestion when
+one is close (`PM409` -> `PM401`). A user entrypoint pattern (`entrypoints.decorators`, `bases`, `members`,
+`names`) that matches nothing in the project prints one warning per pattern after the dead-code
+pass; a `names` pattern with a `.` but no `:` (`pkg.cli`) names a module and means `pkg.cli:*`
+plus the module itself. Malformed inline suppressions (`ignore[E501]`, `ignore[pm405]`,
+`ignore[]`, `ignore[PM999]`) print `pymapper: warning: path:line: ...` for files in the reported
+paths and suppress nothing; they never change the exit code. An application-mode unit (a directory with a
 `pyproject.toml`, see "Choosing a dead-code mode" in the README) without any entry point
 (`__main__` guard, scripts, entrypoint rules, tests) prints one warning per unit, or one for
 the project when `--mode application` is forced and no unit has one.
 
-The default cache directory is `.pymapper_cache` in the project root: the config file's
-directory, else the nearest ancestor of the first path with a `pyproject.toml`, else the first
-path itself (its directory, for a file). So `pymapper check /some/dir` with no config writes `/some/dir/.pymapper_cache`,
-even from another working directory (pointing it at an interpreter's stdlib would write into
+The default cache directory is `.pymapper_cache` in the project root (see "Project root").
+So `pymapper check /some/dir` with no config and no marker above it writes
+`/some/dir/.pymapper_cache`, even from another working directory (pointing it at an interpreter's stdlib would write into
 the Python installation). Use `--cache-dir DIR` or `--no-cache` for directories you do not
 own; a cache that cannot be written is only a warning.
+
+## Rules that cannot run
+
+A selected rule does not run in `check` when its `[analysis]` toggle is off (PM501 needs
+`analysis.dupes = true`), when it is a dependency rule (PM6xx, owned by `pymapper deps`), or when
+it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
+
+- If none of the selected rules can run (`--select PM6`, `--select PM601`, `--select PM501`
+  without the toggle, `--select PM302` without contracts), `check` exits 2 and lists the rules
+  with the reason and how to enable them. Selecting nothing at all (`--select PM1 --ignore PM1`)
+  is an error too.
+- If some can run, skipped rules selected by code or category (`PM501`, `PM5`, `PM6`; contract
+  rules only by exact code) get a warning, and whenever rules were selected explicitly
+  (`select` / `extend-select`, `ALL` included) the footer says how many ran and which were
+  skipped:
+
+  ```
+  $ pymapper check --select ALL
+  All checks passed! (128 files checked)
+  17 rules ran, 8 skipped (PM302-PM304: no [[contracts]]; PM501: needs `analysis.dupes = true`; PM601-PM604: run by `pymapper deps`, not `check`).
+  ```
+
+- The default selection skips these rules silently (that is what the defaults mean); `--stats`
+  always prints `rules_run`, `rules_skipped` and one `skipped ...` line per reason.
 
 ## Output formats
 
 - `concise`: `path:line:col: CODE message`, confidence appended when below 100, then a footer
   (`Found N findings in M files (K files checked).`, counts of suppressed / baselined /
-  below-gate findings). Paths are relative to the project root; columns are 1-based bytes.
-- `json`: one document (`version`, `tool`, `min_confidence`, `findings[]`, `summary`); every
-  finding has `code`, `name`, `severity`, `confidence`, `path`, `line`, `col`, `symbol` (the
-  stable qualified id `pkg.mod:Class.method`) and `message`.
+  below-gate findings). With positional paths (other than one covering the project root, such
+  as `check .` at the root), `K` counts the first-party files under them and
+  a line `Filtered to PATHS (K of T first-party files); the whole project was analysed.`
+  follows; with an explicit selection that skipped rules, the rules line above follows. Paths
+  are relative to the project root; columns are 1-based bytes. Below 100 the confidence comes
+  with its reasons for dead-code rules: `(confidence 50: only-used-by-unused-code,
+  name-elsewhere)`. The `github` format prints the same footer lines; `json` and `sarif`
+  contain the filtered findings only (`files_checked` is `K`).
+- `json`: one document (`version` 2, `tool`, `min_confidence`, `findings[]`, `summary`); every
+  finding has `code`, `name`, `severity`, `confidence`, `path`, `line`, `col`, `end_line` (last
+  line of the reported span: the definition, the whole file for module metrics, the copy for
+  PM501, else `line`), `symbol` (the stable qualified id `pkg.mod:Class.method`; for PM405
+  `pkg.mod:<bound name>`) and `message`. Rule-specific fields:
+  - PM1xx, PM2xx: `value` and `threshold` (the measured value and its limit; for PM203 / PM204,
+    which check two limits, the first pair of the message).
+  - PM301: `"cycle": {"size": N, "members": [...], "witness": [...]}`: the number of modules in
+    the strongly connected component, all of them, and the cycle of the message (without
+    repeating its first module).
+  - PM501: `"other": {"path", "line", "end_line", "symbol"}`: the other copy of the pair;
+    `symbol` (of either copy) is the innermost class or function containing the whole copy,
+    else `null`.
+  - Dead-code rules (PM4xx): `reasons`, the machine-readable reasons for the confidence
+    (`["only-used-by-unused-code", "name-elsewhere"]`); absent when the finding has none.
+
+  Fields are only ever added within a version; version 2 changed the PM405 `symbol` (was the
+  module), removed the `#N` suffix from overload implementations (see below) and made PM104 /
+  PM107 values exclude docstrings and PM1 / PM2 / PM5 skip test code by default
+  (`analysis.include-tests-in-metrics`).
 - `sarif`: SARIF 2.1.0 with rule metadata, for code-scanning uploads.
 - `github`: GitHub Actions workflow commands (`::warning file=...,line=...::message`).
 
@@ -114,6 +206,15 @@ own; a cache that cannot be written is only a warning.
   so editing a function does not resurface its finding. Then `--baseline FILE` (or
   `baseline = "FILE"` in the config) reports only new findings. The file is JSON, sorted,
   and written atomically; commit it.
+- Symbol ids: same-named siblings (a property and its setter, conditional definitions) get a
+  `#N` suffix in source order (`name`, `name#2`, ...). In a group with `@overload` signatures
+  the implementation (the last non-overload definition) is the plain `name` and the signatures
+  are `name#2`, `name#3`, ..., so adding an overload does not change the implementation's id.
+  Baselines saved by earlier versions still load; an entry recorded under an old id
+  (`Frame.reset_index#4`) no longer matches and its finding is reported as new once: re-save
+  the baseline. PM405 baseline entries keep the module id with the name as detail. PM501
+  findings inside one definition now key on that definition instead of the file path, so
+  baselined duplicates resurface once too.
 
 ## `--stats`
 
@@ -128,6 +229,9 @@ pymapper: stats
   total                      61.4 ms
   files                       630
   first_party_files           630
+  files_checked               630
+  ...
+  rules_run                    17
   loc                      304805
   ...
   deadcode.units                1
@@ -140,6 +244,9 @@ pymapper: stats
 
 Phases are wall time on the coordinating thread, in first-recorded order, with sub-phases
 recorded by the core library (`load.*`, `resolve.*`, `deadcode.*`, `dupes.*`). `peak_rss` is
-`getrusage` `ru_maxrss` of the whole process. `deadcode.units` counts the project units with
+`getrusage` `ru_maxrss` of the whole process. `first_party_files` counts every first-party file
+analysed, `files_checked` those under the positional paths; `rules_run` / `rules_skipped` count
+the selected rules that ran / could not run, followed by one `skipped CODES: reason` line per
+reason. `deadcode.units` counts the project units with
 analysed files, split into the library / application modes they resolved to. Measured numbers are in
 [`benchmarks.md`](benchmarks.md#check-s45).

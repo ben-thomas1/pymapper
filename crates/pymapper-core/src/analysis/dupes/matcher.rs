@@ -3,9 +3,9 @@
 
 use rayon::prelude::*;
 
-use super::norm::{Normaliser, exact};
+use super::norm::{Normaliser, code, exact};
 use super::winnow::{Fingerprints, for_each_token};
-use super::{ClonePair, DupesParams, Region};
+use super::{ClonePair, DupesParams, LineMask, Region};
 use crate::lex::TokenKind;
 use crate::timing;
 
@@ -217,6 +217,17 @@ pub fn find_clones<R>(fps: Fingerprints, params: &DupesParams, read: R) -> Dupes
 where
     R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
 {
+    find_clones_masked(fps, params, read, &LineMask::default())
+}
+
+/// [`find_clones`] with masked lines: a copy's leading and trailing tokens on lines of `mask`
+/// (`@overload` signatures) and leading and trailing string statements (docstrings) are
+/// trimmed off, and a pair is kept only if both trimmed copies still have `min_tokens` tokens
+/// and `min_lines` lines.
+pub fn find_clones_masked<R>(fps: Fingerprints, params: &DupesParams, read: R, mask: &LineMask) -> DupesReport
+where
+    R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
+{
     let mut stats = DupesStats { fingerprints: fps.len() as u64, ..DupesStats::default() };
     let nfiles = fps.iter().map(|f| f.file as usize + 1).max().unwrap_or(0);
     let seeds = timing::time("dupes.seeds", || {
@@ -253,7 +264,7 @@ where
     });
     drop(cache);
     drop(seeds);
-    let mut pairs = timing::time("dupes.locate", || locate(&cands, params, &read, &mut stats));
+    let mut pairs = timing::time("dupes.locate", || locate(&cands, params, &read, mask, &mut stats));
     drop(cands);
     timing::time("dupes.group", || {
         pairs.sort_unstable_by_key(|p| (p.a.file, p.a.start_tok, p.b.file, p.b.start_tok, p.a.end_tok));
@@ -521,6 +532,9 @@ struct LocScratch {
     /// Byte span per kept token.
     start: Vec<u32>,
     end: Vec<u32>,
+    /// Normalised code per kept token, and whether it starts a statement.
+    code: Vec<u8>,
+    stmt: Vec<bool>,
     /// Byte offset of every line start (line 1 at index 0).
     line_starts: Vec<u32>,
 }
@@ -528,10 +542,12 @@ struct LocScratch {
 impl LocScratch {
     /// Re-reads and re-lexes `file`; false when it cannot be read.
     fn load<R: Fn(u32, &mut Vec<u8>) -> bool>(&mut self, file: u32, read: &R) -> bool {
-        let LocScratch { buf, start, end, line_starts } = self;
+        let LocScratch { buf, start, end, code, stmt, line_starts } = self;
         buf.clear();
         start.clear();
         end.clear();
+        code.clear();
+        stmt.clear();
         line_starts.clear();
         line_starts.push(0);
         if !read(file, buf) {
@@ -540,9 +556,11 @@ impl LocScratch {
         let src = &buf[..];
         let mut norm = Normaliser::default();
         for_each_token(src, |t| {
-            if norm.push(src, t).is_some() {
+            if let Some((c, s)) = norm.push_stmt(src, t) {
                 start.push(t.start);
                 end.push(t.end());
+                code.push(c);
+                stmt.push(s);
             }
         });
         for (i, &b) in src.iter().enumerate() {
@@ -559,12 +577,78 @@ impl LocScratch {
         self.line_starts.partition_point(|&s| s <= off) as u32
     }
 
-    /// The region of tokens `t0..t1` of `file`, or `None` if the file has fewer tokens (it
-    /// changed since extraction).
-    fn region(&self, file: u32, t0: u32, t1: u32) -> Option<Region> {
+    /// End (exclusive) of the string statement starting at token `t`, if one does: string
+    /// literals only (adjacent ones concatenate), from a statement start to the next.
+    fn string_stmt(&self, t: usize, limit: usize) -> Option<usize> {
+        let string = code(TokenKind::String);
+        if t >= limit || self.code[t] != string || !self.stmt[t] {
+            return None;
+        }
+        let mut u = t + 1;
+        while u < limit && self.code[u] == string && !self.stmt[u] {
+            u += 1;
+        }
+        (u == self.stmt.len() || self.stmt[u]).then_some(u)
+    }
+
+    /// Whether token `t` sits on a masked line of `file`.
+    fn masked(&self, mask: &LineMask, file: u32, t: usize) -> bool {
+        !mask.is_empty() && mask.contains(file, self.line(self.start[t]))
+    }
+
+    /// Trims `t0..t1`: the rest of a statement the copy starts in the middle of (on its first
+    /// line only), leading / trailing tokens on masked lines and leading / trailing string
+    /// statements (docstrings).
+    fn trim(&self, mask: &LineMask, file: u32, mut t0: usize, mut t1: usize) -> (usize, usize) {
+        // A copy starting mid-statement (at the `):` of a header whose signatures differ):
+        // skip the rest of that line up to the next statement start, so a docstring after it
+        // is trimmed too.
+        let first = self.line(self.start[t0]);
+        let mut s = t0;
+        while s < t1 && !self.stmt[s] && self.line(self.start[s]) == first {
+            s += 1;
+        }
+        if s < t1 && self.stmt[s] {
+            t0 = s;
+        }
+        loop {
+            if t0 < t1 && self.masked(mask, file, t0) {
+                t0 += 1;
+            } else if let Some(u) = self.string_stmt(t0, t1) {
+                t0 = u;
+            } else {
+                break;
+            }
+        }
+        while t0 < t1 {
+            if self.masked(mask, file, t1 - 1) {
+                t1 -= 1;
+                continue;
+            }
+            // A trailing string statement: back to its first literal.
+            let mut v = t1;
+            while v > t0 && self.code[v - 1] == code(TokenKind::String) && !self.stmt[v - 1] {
+                v -= 1;
+            }
+            match v.checked_sub(1) {
+                Some(s) if s >= t0 && self.string_stmt(s, t1) == Some(t1) => t1 = s,
+                _ => break,
+            }
+        }
+        (t0, t1)
+    }
+
+    /// The region of tokens `t0..t1` of `file`, trimmed by [`trim`](Self::trim), or `None` if
+    /// nothing is left or the file has fewer tokens (it changed since extraction).
+    fn region(&self, file: u32, t0: u32, t1: u32, mask: &LineMask) -> Option<Region> {
         if t0 >= t1 || t1 as usize > self.start.len() {
             return None;
         }
+        let (a, b) = self.trim(mask, file, t0 as usize, t1 as usize);
+        if a >= b {
+            return None;
+        }
+        let (t0, t1) = (a as u32, b as u32);
         let off = self.start[t0 as usize];
         let start_line = self.line(off);
         let col = off - self.line_starts[start_line as usize - 1] + 1;
@@ -575,7 +659,7 @@ impl LocScratch {
 
 /// Resolves the line ranges of both copies of every candidate (each file is re-read once) and
 /// keeps those spanning at least `min_lines` lines in both copies.
-fn locate<R>(cands: &[Cand], params: &DupesParams, read: &R, stats: &mut DupesStats) -> Vec<ClonePair>
+fn locate<R>(cands: &[Cand], params: &DupesParams, read: &R, mask: &LineMask, stats: &mut DupesStats) -> Vec<ClonePair>
 where
     R: Fn(u32, &mut Vec<u8>) -> bool + Sync,
 {
@@ -595,7 +679,7 @@ where
             let mut out = Vec::new();
             if sc.load(file, read) {
                 for &(_, t0, t1, id) in rs.iter() {
-                    if let Some(r) = sc.region(file, t0, t1) {
+                    if let Some(r) = sc.region(file, t0, t1, mask) {
                         out.push((id, r));
                     }
                 }
@@ -621,6 +705,8 @@ where
         if let (Some(a), Some(b)) = (regions[i * 2], regions[i * 2 + 1])
             && a.lines() >= params.min_lines
             && b.lines() >= params.min_lines
+            && a.tokens() >= params.min_tokens
+            && b.tokens() >= params.min_tokens
         {
             pairs.push(ClonePair { a, b, similarity: c.similarity });
         }

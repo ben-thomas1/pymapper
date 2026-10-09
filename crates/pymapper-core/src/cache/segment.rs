@@ -6,8 +6,8 @@
 //!   STR_BYTES        u8     -
 //!   PATH_OFFS        u32    files + 1     paths relative to the segment base (or absolute)
 //!   PATH_BYTES       u8     -
-//!   FILE_HDR         u32    files * 30    FileFacts (13 segment-absolute runs, lines, flags),
-//!                                         first metrics row, reserved
+//!   FILE_HDR         u32    files * 31    FileFacts (13 segment-absolute runs, lines, flags),
+//!                                         first metrics row, docstring lines, main guard line
 //!   FILE_STAMP       u64    files * 3     size, mtime (ns), content hash
 //!   FP_KEY           u32    3             optional: duplication fingerprints were taken
 //!                                         with (version, k, w); absent = none stored
@@ -42,7 +42,7 @@ pub(crate) const FP_KEY: u32 = 6;
 pub(crate) const FP_OFFS: u32 = 7;
 pub(crate) const FP_ROWS: u32 = 8;
 /// `u32`s per file in `FILE_HDR`.
-const HDR: usize = 30;
+const HDR: usize = 31;
 
 /// What the loader knows about a source file when it was cached: enough to tell, without
 /// reading it, that it is unchanged (size + mtime), and failing that, by content.
@@ -177,6 +177,7 @@ macro_rules! metric_columns {
             134: operators,
             135: operands,
             136: params,
+            137: doc_lines,
         )
     };
 }
@@ -188,7 +189,7 @@ macro_rules! metric_columns {
 /// be silently dropped by the cache and leave copied tables ragged.
 #[allow(dead_code)]
 fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
-    const _: () = assert!(HDR == 13 * 2 + 4, "FILE_HDR: 13 runs, lines, flags, metrics row, reserved");
+    const _: () = assert!(HDR == 13 * 2 + 5, "FILE_HDR: 13 runs, lines, flags, metrics row, docstring lines, main guard line");
     use crate::extract::facts::{Bases, Bindings, Calls, Decls, Decorators, Defs, Diags, Imports, Params, Suppressions};
     let FactStore {
         defs:
@@ -256,6 +257,8 @@ fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
         suppressions: _,
         lines: _,
         flags: _,
+        doc_lines: _,
+        main_line: _,
     } = FileFacts::default();
     let MetricsTable {
         cyclomatic: _,
@@ -267,6 +270,7 @@ fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
         operators: _,
         operands: _,
         params: _,
+        doc_lines: _,
     } = m;
 }
 
@@ -318,7 +322,7 @@ fn put_hdr(ff: &FileFacts, metrics: u32, out: &mut Vec<u32>) {
         };
     }
     for_runs!(put);
-    out.extend_from_slice(&[ff.lines, u32::from(ff.flags), metrics, 0]);
+    out.extend_from_slice(&[ff.lines, u32::from(ff.flags), metrics, ff.doc_lines, ff.main_line]);
 }
 
 /// Header and first metrics row of a file from its `HDR` words.
@@ -334,6 +338,8 @@ fn get_hdr(h: &[u32]) -> (FileFacts, u32) {
     for_runs!(get);
     ff.lines = h[i];
     ff.flags = h[i + 1] as u8;
+    ff.doc_lines = h[i + 3];
+    ff.main_line = h[i + 4];
     (ff, h[i + 2])
 }
 

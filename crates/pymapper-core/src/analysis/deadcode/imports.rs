@@ -7,6 +7,7 @@ use crate::index::{FileId, Index, NONE, NodeKind};
 use crate::intern::Sym;
 use crate::reach::{BitSet, FileModes};
 use crate::resolve::{Imports, res_flags};
+use crate::rules::dead_code::reason;
 
 /// An import that its own file does not use (yet to be checked against other files).
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +19,8 @@ pub(super) struct ImportCand {
     pub name: Sym,
     /// Confidence lost so far.
     pub penalty: u8,
+    /// Reasons for the penalties ([`crate::rules::dead_code::reason`] bits).
+    pub reasons: u32,
 }
 
 /// Confidence lost for each circumstance (see the module docs of `deadcode`).
@@ -80,47 +83,60 @@ pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, modes: &Fil
             let alias = st.alias[row];
             let Some(name) = alias.or(if from { st.name[row] } else { module.first().copied() }) else { continue };
             let mut pen = 0u8;
+            let mut why = 0u32;
             if rflags & res_flags::EXPORTED != 0 {
                 let idiom = alias.is_some() && alias == if from { st.name[row] } else { module.last().copied() };
                 if library || idiom || imp.in_all(f, name) {
                     continue;
                 }
                 pen += penalty::INIT_EXPORT;
+                why |= reason::INIT_REEXPORT;
             }
             if reexported.contains(row as u32) || ev.binary_search(&evidence_hash(ix.str(name))).is_ok() {
                 continue;
             }
             if info.dynamic[f as usize] {
                 pen += penalty::DYNAMIC;
+                why |= reason::MODULE_DYNAMIC_ACCESS;
             }
             if starred.contains(f) && !ix.str(name).starts_with(b"_") {
                 pen += penalty::STAR_IMPORTED;
+                why |= reason::STAR_IMPORTED;
             }
             if init {
                 pen += penalty::INIT;
+                why |= reason::PACKAGE_INIT;
                 if from && imp.target(row).is_some_and(|t| matches!(ix.kind(t), NodeKind::Package | NodeKind::Module)) {
                     pen += penalty::INIT_SUBMODULE;
+                    why |= reason::INIT_SUBMODULE;
                 }
             }
             if flags & import_flags::TYPE_CHECKING != 0 {
                 pen += penalty::TYPE_ONLY;
+                why |= reason::TYPE_CHECKING_IMPORT;
             } else if flags & import_flags::CONDITIONAL != 0 {
                 pen += penalty::CONDITIONAL;
+                why |= reason::CONDITIONAL_IMPORT;
             }
-            out.push(ImportCand { row: row as u32, file: f, name, penalty: pen });
+            out.push(ImportCand { row: row as u32, file: f, name, penalty: pen, reasons: why });
         }
     }
     out
 }
 
-/// Confidence of a candidate after the evidence scan; `None` when the scan found a use.
+/// Confidence and reasons of a candidate after the evidence scan; `None` when the scan found a
+/// use.
 #[inline]
-pub(super) fn confidence(c: &ImportCand, hit: u8) -> Option<u8> {
+pub(super) fn confidence(c: &ImportCand, hit: u8) -> Option<(u8, u32)> {
     let mut pen = u32::from(c.penalty);
+    let mut why = c.reasons;
     match hit {
         import_hit::USED => return None,
-        import_hit::ELSEWHERE => pen += u32::from(penalty::ELSEWHERE),
-        _ => {}
+        import_hit::ELSEWHERE => {
+            pen += u32::from(penalty::ELSEWHERE);
+            why |= reason::NAME_ELSEWHERE;
+        }
+        _ => why |= reason::NO_REFERENCES,
     }
-    Some(100u32.saturating_sub(pen) as u8)
+    Some((100u32.saturating_sub(pen) as u8, why))
 }

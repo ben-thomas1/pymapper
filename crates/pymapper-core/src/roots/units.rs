@@ -1,11 +1,15 @@
 //! Project units: the project root and every directory below it that holds a `pyproject.toml`
 //! (nested ones included). A monorepo is one project made of several units; dead-code
 //! `mode = "auto"` picks library or application mode per unit (see `reach::FileModes`).
+//!
+//! Units also contribute first-party import roots ([`ProjectUnits::import_dirs`]): a uv
+//! workspace member `src/lib-a/` with `src/lib-a/pkg/` is imported as `pkg`, not as
+//! `src.lib-a.pkg`, whether or not a venv with editable installs exists.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::project::read_pyproject;
+use super::project::{is_src_layout, read_pyproject};
 use super::{Diagnostic, DiagnosticKind, PyprojectInfo, is_under};
 use crate::config::{PYPROJECT_FILE, normalize};
 use crate::intern::FxHashMap;
@@ -24,6 +28,12 @@ pub struct ProjectUnits {
     /// grouped by unit: unit `u` owns `scripts[starts[u]..starts[u + 1]]`.
     scripts: Vec<String>,
     starts: Vec<u32>,
+    /// First-party import roots of the units below the root, in discovery order, and the unit
+    /// of each.
+    import_dirs: Vec<PathBuf>,
+    import_unit: Vec<u32>,
+    /// Per unit: how many of its scripts are commands ([`PyprojectInfo::app_scripts`]).
+    app_scripts: Vec<u32>,
 }
 
 impl ProjectUnits {
@@ -31,7 +41,16 @@ impl ProjectUnits {
     pub fn single(root: &Path, pyproject: Option<&PyprojectInfo>) -> ProjectUnits {
         let scripts = pyproject.map(|p| p.scripts.clone()).unwrap_or_default();
         let starts = vec![0, scripts.len() as u32];
-        ProjectUnits { dirs: vec![normalize(root)], by_dir: FxHashMap::default(), scripts, starts }
+        let app_scripts = vec![pyproject.map_or(0, |p| p.app_scripts)];
+        ProjectUnits {
+            dirs: vec![normalize(root)],
+            by_dir: FxHashMap::default(),
+            scripts,
+            starts,
+            import_dirs: Vec::new(),
+            import_unit: Vec::new(),
+            app_scripts,
+        }
     }
 
     /// The units of the project at `root`: the root, with its already parsed `pyproject`
@@ -46,15 +65,41 @@ impl ProjectUnits {
             if dir == units.dirs[0] || !is_under(&dir, &units.dirs[0]) || units.by_dir.contains_key(dir.as_os_str().as_bytes()) {
                 continue;
             }
+            let before = units.import_dirs.len();
+            let mut app = 0;
             match read_pyproject(&dir) {
-                Ok(info) => units.scripts.extend(info.into_iter().flat_map(|i| i.scripts)),
-                Err(message) => diags.push(Diagnostic { kind: DiagnosticKind::Pyproject, path: dir.join(PYPROJECT_FILE), message }),
+                Ok(info) => {
+                    unit_import_dirs(&dir, info.as_ref(), &mut units.import_dirs);
+                    app = info.as_ref().map_or(0, |i| i.app_scripts);
+                    units.scripts.extend(info.into_iter().flat_map(|i| i.scripts));
+                }
+                Err(message) => {
+                    unit_import_dirs(&dir, None, &mut units.import_dirs);
+                    diags.push(Diagnostic { kind: DiagnosticKind::Pyproject, path: dir.join(PYPROJECT_FILE), message });
+                }
             }
+            let unit = units.dirs.len() as u32;
+            units.import_unit.resize(units.import_dirs.len().max(before), unit);
+            units.app_scripts.push(app);
             units.starts.push(units.scripts.len() as u32);
             units.by_dir.insert(dir.as_os_str().as_bytes().into(), units.dirs.len() as u32);
             units.dirs.push(dir);
         }
         (units, diags)
+    }
+
+    /// First-party import roots contributed by the units below the root: per unit, its
+    /// build-backend source directories, its `src/` layout, then the unit directory itself, as
+    /// for the project root ([`discover`](super::discover)). A unit directory that is itself a
+    /// package (`__init__.py`, e.g. the `pyproject.toml` shipped inside a wheel's package) adds
+    /// nothing: its files keep the names the enclosing root gives them.
+    pub fn import_dirs(&self) -> &[PathBuf] {
+        &self.import_dirs
+    }
+
+    /// The unit each of [`import_dirs`](Self::import_dirs) belongs to.
+    pub fn import_dir_units(&self) -> &[u32] {
+        &self.import_unit
     }
 
     /// Number of units (at least 1).
@@ -79,6 +124,12 @@ impl ProjectUnits {
         &self.scripts[self.starts[u as usize] as usize..self.starts[u as usize + 1] as usize]
     }
 
+    /// How many of unit `u`'s script targets are commands (`[project.scripts]`,
+    /// `[project.gui-scripts]`) rather than plugin entry points.
+    pub fn app_scripts(&self, u: u32) -> u32 {
+        self.app_scripts.get(u as usize).copied().unwrap_or(0)
+    }
+
     /// Script targets of every unit.
     pub fn all_scripts(&self) -> &[String] {
         &self.scripts
@@ -101,4 +152,27 @@ impl ProjectUnits {
             }
         }
     }
+}
+
+/// Appends the import roots of the unit at `dir` (see [`ProjectUnits::import_dirs`]).
+fn unit_import_dirs(dir: &Path, info: Option<&PyprojectInfo>, out: &mut Vec<PathBuf>) {
+    if dir.join("__init__.py").exists() || dir.join("__init__.pyi").exists() {
+        return;
+    }
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for d in info.map_or(&[][..], |i| &i.source_dirs[..]) {
+        let p = normalize(&dir.join(d));
+        if p != dir && is_under(&p, dir) && p.is_dir() {
+            push(p);
+        }
+    }
+    let src = dir.join("src");
+    if is_src_layout(&src) {
+        push(src);
+    }
+    push(dir.to_path_buf());
 }

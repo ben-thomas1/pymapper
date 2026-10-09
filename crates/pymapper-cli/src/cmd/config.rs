@@ -128,7 +128,8 @@ pub struct Args {
     /// Print the fully commented configuration template (every option, its default and cost).
     #[arg(long, conflicts_with_all = ["paths", "config", "isolated", "set"])]
     template: bool,
-    /// Paths to analyse; config discovery starts at the first (default: working directory).
+    /// Paths to report on (as for `check`); config and project-root discovery start at the
+    /// first (default: working directory).
     paths: Vec<PathBuf>,
     #[command(flatten)]
     config: ConfigArgs,

@@ -10,6 +10,7 @@
     {"code": "PM401", "id": "odd:f", "count": 1},
     {"code": "PM405", "id": "pkg.alpha", "detail": ["os.path"], "count": 1},
     {"code": "PM405", "id": "pkg.alpha", "detail": ["yaml"], "count": 1},
+    {"code": "PM501", "id": "pkg.zeta:handle", "detail": ["pkg/alpha.py"], "count": 1},
     {"code": "PM601", "id": "pkg/café/�.py", "detail": ["yaml", "PyYAML"], "count": 1},
     {"code": "PM602", "id": "", "detail": ["requests"], "count": 1}
   ]

@@ -58,7 +58,7 @@
 //!   ├── evidence    u32           sorted unique name hashes per file            4 B/row
 //!   ├── diags       kind u8 | line,col u32                                      9 B/row
 //!   └── suppressions line u32 | codes Run | kind u8                            13 B/row
-//!   FileFacts (one per file): a Run per table + line count + flags            112 B
+//!   FileFacts (one per file): a Run per table + line count + flags + guard line 116 B
 //! ```
 //!
 //! Chains are also deduplicated by token position: `from m.n import a, b` stores
@@ -372,7 +372,7 @@ pub(crate) fn decl_kind_u8(k: DeclKind) -> u8 {
     }
 }
 
-/// Inverse of the decl `kind` column.
+/// Inverse of the decl `kind` column (rows of kind [`DECL_GETATTR_PREFIX`] excluded).
 #[inline]
 pub fn decl_kind(v: u8) -> DeclKind {
     if v == 1 { DeclKind::Nonlocal } else { DeclKind::Global }
@@ -421,7 +421,17 @@ pub mod file_flags {
     pub const ALL_DYNAMIC: u8 = 1 << 2;
     /// The source exceeded `lex::MAX_SOURCE_LEN` and was truncated.
     pub const TRUNCATED: u8 = 1 << 3;
+    /// Has a `getattr(x, name)` call whose attribute name is not a constant string or a string
+    /// with a constant prefix (fully variable dynamic access). `getattr(x, "lit")` sets
+    /// nothing; `getattr(x, f"pre_{y}")` / `getattr(x, "pre_" + y)` record a
+    /// [`super::DECL_GETATTR_PREFIX`] row instead.
+    pub const DYNAMIC_GETATTR: u8 = 1 << 4;
 }
+
+/// Raw value of the decl `kind` column for a `getattr` with a constant attribute-name prefix
+/// (`getattr(x, f"_dt_{y}")`, `getattr(x, "visit_" + y)`): `name` is the prefix, `scope` the
+/// enclosing def. Not a `global` / `nonlocal` declaration ([`decl_kind`] must not be applied).
+pub const DECL_GETATTR_PREFIX: u8 = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Tables
@@ -650,7 +660,8 @@ impl Bindings {
 }
 
 soa! {
-    /// `global` / `nonlocal` names, one row per name.
+    /// `global` / `nonlocal` names, one row per name, plus constant `getattr` name prefixes
+    /// ([`DECL_GETATTR_PREFIX`]).
     Decls {
         scope: Scope,
         /// [`DeclKind`] as `u8` (see [`decl_kind`]).
@@ -787,6 +798,12 @@ pub struct FileFacts {
     pub lines: u32,
     /// [`file_flags`].
     pub flags: u8,
+    /// Docstring lines of the file (module docstring plus every definition's), set by the
+    /// loader from [`MetricsVisitor::file_doc_lines`](super::MetricsVisitor::file_doc_lines);
+    /// 0 when extracted without metrics.
+    pub doc_lines: u32,
+    /// Line of the first module-level `if __name__ == "__main__":` (0 = none).
+    pub main_line: u32,
 }
 
 /// The `n` rows of `file` (store-absolute) whose owner is `d`; `owner` is non-decreasing

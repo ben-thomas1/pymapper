@@ -22,6 +22,8 @@ pub struct RuleEngine {
     per_file: Vec<RuleSet>,
     /// Union of `per_file`: findings of other rules skip path matching entirely.
     per_file_any: RuleSet,
+    /// `analysis.include-tests-in-metrics`.
+    include_tests_in_metrics: bool,
 }
 
 /// What [`RuleEngine::filter`] does with a finding.
@@ -98,6 +100,7 @@ impl RuleEngine {
             min_confidence: min_confidence.min(100),
             per_file,
             per_file_any,
+            include_tests_in_metrics: analysis.include_tests_in_metrics,
         }
     }
 
@@ -141,6 +144,13 @@ impl RuleEngine {
     #[inline]
     pub fn violates(&self, key: ThresholdKey, value: f64) -> bool {
         key.violated_by(&self.thresholds, value)
+    }
+
+    /// Whether the metric analyses (PM1xx, PM2xx, PM5xx) also report test code
+    /// (`analysis.include-tests-in-metrics`; see [`crate::analysis::testfiles`]).
+    #[inline]
+    pub fn include_tests_in_metrics(&self) -> bool {
+        self.include_tests_in_metrics
     }
 
     /// Minimum confidence (0-100) for a finding to be reported.

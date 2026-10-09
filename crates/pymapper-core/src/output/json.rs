@@ -1,13 +1,18 @@
 //! JSON output and string escaping.
 //!
-//! # Schema (version 1)
+//! # Schema (version 2)
 //!
 //! One document; one finding object per line so the output diffs and streams well:
 //!
 //! ```text
-//! {"version":1,"tool":{"name":"pymapper","version":"0.3.0"},"min_confidence":80,"findings":[
+//! {"version":2,"tool":{"name":"pymapper","version":"0.3.0"},"min_confidence":80,"findings":[
 //!   {"code":"PM101","name":"complex-function","severity":"warning","confidence":100,
-//!    "path":"pkg/mod.py","line":3,"col":5,"symbol":"pkg.mod:f","message":"..."},
+//!    "path":"pkg/mod.py","line":3,"col":5,"end_line":40,"symbol":"pkg.mod:f","message":"...",
+//!    "value":14,"threshold":10},
+//!   {"code":"PM301",...,"message":"import cycle (3 modules): a -> b -> a",
+//!    "cycle":{"size":3,"members":["a","b","c"],"witness":["a","b"]}},
+//!   {"code":"PM501",...,"end_line":21,"symbol":"pkg.mod:g","message":"8 lines duplicated in ...",
+//!    "other":{"path":"pkg/other.py","line":40,"end_line":47,"symbol":"pkg.other:h"}},
 //!   ...
 //! ],"summary":{"findings":1,"gated":1,"files":1,"files_checked":10,"suppressed":0,
 //!   "baselined":0,"file_ignored":0,"below_confidence_hidden":0}}
@@ -17,17 +22,36 @@
 //!
 //! - `path` is relative to the project root (`null` for project-level findings); `line` and
 //!   `col` are 1-based (`null` when unknown; `col` counts bytes); `symbol` is the stable
-//!   qualified id (`null` when the finding is not about a symbol).
+//!   qualified id (`null` when the finding is not about a symbol); for PM405 it is
+//!   `pkg.mod:<bound name>`.
+//! - `end_line`: last line of the reported span (the definition for function / class
+//!   findings, the whole file for module metrics, the copy for PM501, else `line`).
+//! - `value` / `threshold` (PM1xx, PM2xx): the measured value and its limit (the first pair of
+//!   the message for PM203 / PM204, which check two limits); reals have at most two decimals.
+//! - `cycle` (PM301): `size` (modules in the strongly connected component), `members` (all of
+//!   them) and `witness` (the cycle in the message, without repeating its first module).
+//! - `other` (PM501): the other copy of the reported pair.
 //! - `severity` is `info`, `warning` or `error`; `confidence` is 0-100.
+//! - `reasons` (optional, dead-code rules): machine-readable reasons for the confidence, e.g.
+//!   `["name-elsewhere"]`; absent when the finding has none.
 //! - `gated` counts findings with `confidence >= min_confidence` (these make the exit status 1).
 //! - Strings are UTF-8; invalid bytes in paths or names are replaced with U+FFFD.
 //!
 //! New fields may be added without a version bump; removals and meaning changes bump
-//! [`JSON_VERSION`].
+//! [`JSON_VERSION`]. History:
+//!
+//! - 2: PM405 `symbol` is `pkg.mod:<name>` (was the module); overload implementations have no
+//!   `#N` suffix (see the index docs); PM104 / PM107 values exclude docstrings and test code is
+//!   skipped by default (`analysis.include-tests-in-metrics`). Added `end_line`, `value`,
+//!   `threshold`, `cycle`, `other`.
+//! - 1: initial.
+
+use std::io::Write as _;
 
 use super::buf::{Out, push_u32};
 use super::{JSON_VERSION, Options, Report, Summary};
-use crate::rules::{FileId, SymbolId};
+use crate::rules::codes::{DUPLICATE_CODE, IMPORT_CYCLE};
+use crate::rules::{Arg, FileId, Finding, SymbolId, reason_names};
 
 /// Appends `s` as a JSON string literal (with quotes). Invalid UTF-8 becomes `�`.
 pub fn push_str(out: &mut Vec<u8>, s: &[u8]) {
@@ -112,6 +136,85 @@ fn u32_or_null(out: &mut Vec<u8>, v: u32) {
     }
 }
 
+/// A message argument as a JSON number (`null` for non-numbers). Reals get at most two
+/// decimals.
+fn push_number(out: &mut Vec<u8>, a: Option<&Arg>) {
+    match a {
+        Some(&Arg::U32(v)) => push_u32(out, v),
+        Some(&Arg::F32(v)) if v.is_finite() => {
+            let _ = write!(out, "{}", (f64::from(v) * 100.0).round() / 100.0);
+        }
+        _ => out.extend_from_slice(b"null"),
+    }
+}
+
+/// A symbol's stable id as a JSON string (`null` for [`SymbolId::NONE`]).
+fn push_symbol(r: &Report<'_>, out: &mut Vec<u8>, s: SymbolId, scratch: &mut Vec<u8>) {
+    if s == SymbolId::NONE {
+        out.extend_from_slice(b"null");
+        return;
+    }
+    scratch.clear();
+    r.ctx().write_symbol_id(s, scratch);
+    push_str(out, scratch);
+}
+
+/// Symbols as a JSON array.
+fn push_symbols(r: &Report<'_>, out: &mut Vec<u8>, args: &[Arg], scratch: &mut Vec<u8>) {
+    out.push(b'[');
+    let mut first = true;
+    for a in args {
+        if let Arg::Symbol(s) = *a {
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            push_symbol(r, out, s, scratch);
+        }
+    }
+    out.push(b']');
+}
+
+/// Rule-specific structured fields (see the module docs): `value` / `threshold` for metric
+/// rules (PM1xx, PM2xx), `cycle` for PM301, `other` for PM501.
+fn write_details(r: &Report<'_>, f: &Finding, b: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+    let args = r.findings().args(f);
+    let code = f.rule.code();
+    if (100..300).contains(&code) && args.len() >= 3 {
+        key(b, "value", false);
+        push_number(b, args.get(1));
+        key(b, "threshold", false);
+        push_number(b, args.get(2));
+    } else if f.rule == IMPORT_CYCLE && args.len() >= 3 {
+        let extra = r.findings().extra(f);
+        key(b, "cycle", false);
+        b.push(b'{');
+        key(b, "size", true);
+        push_number(b, args.first());
+        key(b, "members", false);
+        push_symbols(r, b, extra, scratch);
+        key(b, "witness", false);
+        // The message repeats the first module at the end; the witness does not.
+        push_symbols(r, b, &args[2..args.len() - 1], scratch);
+        b.push(b'}');
+    } else if f.rule == DUPLICATE_CODE {
+        let extra = r.findings().extra(f);
+        if let [Arg::File(file), Arg::U32(line), Arg::U32(end), Arg::Symbol(sym)] = *extra {
+            key(b, "other", false);
+            b.push(b'{');
+            key(b, "path", true);
+            scratch.clear();
+            r.ctx().write_path(file, scratch);
+            push_str(b, scratch);
+            key_u32(b, "line", line);
+            key_u32(b, "end_line", end);
+            key(b, "symbol", false);
+            push_symbol(r, b, sym, scratch);
+            b.push(b'}');
+        }
+    }
+}
+
 pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut Out<'_>) {
     let mut msg = String::with_capacity(super::SCRATCH);
     let mut sym = Vec::with_capacity(super::SCRATCH);
@@ -149,6 +252,8 @@ pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, ou
         u32_or_null(b, f.loc.line);
         key(b, "col", false);
         u32_or_null(b, f.loc.col);
+        key(b, "end_line", false);
+        u32_or_null(b, r.end_line(f));
         key(b, "symbol", false);
         if f.symbol == SymbolId::NONE {
             b.extend_from_slice(b"null");
@@ -157,6 +262,18 @@ pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, ou
         }
         key(b, "message", false);
         push_str(b, msg.as_bytes());
+        write_details(r, f, b, &mut sym);
+        if f.reasons != 0 {
+            key(b, "reasons", false);
+            b.push(b'[');
+            for (k, name) in reason_names(f).enumerate() {
+                if k > 0 {
+                    b.push(b',');
+                }
+                push_str(b, name.as_bytes());
+            }
+            b.push(b']');
+        }
         b.push(b'}');
         out.maybe_flush();
     }
