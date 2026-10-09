@@ -49,6 +49,8 @@ crates/pymapper-gui/src/
   map/          instanced code-map renderer (see "Canvas renderer")
   codemap/      the code map: in-process analysis, semantic zoom, bundled edges, scenes
                 (see "Code map")
+  interact/     hover neighbourhood, selection, search, path, overlays, findings,
+                details and source pane (see "Interaction")
   mapui.rs      code map controls (details panel) and legend (canvas overlay)
   panels.rs     egui panel layout (left search/tree, right details, bottom findings),
                 canvas input (pan / zoom / hover)
@@ -60,6 +62,8 @@ crates/pymapper-gui/tests/offscreen.rs
                 renders the UI and the map into an offscreen texture and checks pixels
 crates/pymapper-gui/examples/canvas_bench.rs
                 offscreen frame-time benchmark of the map on the stress scene
+crates/pymapper-gui/examples/interact_bench.rs
+                interaction benchmark (search, highlights, marks, paths, source reads)
 ```
 
 ## Canvas renderer
@@ -291,8 +295,8 @@ at 60% alpha.
 
 ### Panels, legend, hover
 
-The details panel has the code map controls (size, colour, edge metric, bundling, edge
-toggles). The legend sits at the canvas's bottom-left: size metric, colour swatches or ramp
+The details panel has the code map controls (size, colour, edge metric, call confidence,
+bundling, edge toggles, origins; see [Interaction](#interaction) for the filters). The legend sits at the canvas's bottom-left: size metric, colour swatches or ramp
 with its scale, the muted swatch when external code is shown, and the edge metric with a
 width scale from 1 to the heaviest weight drawn. Hovering a cell shows its qualified id,
 kind, lines, symbols and complexity; hovering an edge shows both endpoints and every edge
@@ -342,6 +346,143 @@ Windowed (`pymapper-gui --measure --frames 600 --isolated --deps PATH`, same pro
 120.0 fps vsync-bound, CPU work p50 0.38 ms, p99 4.4 ms, max 6.7 ms; idle 5 s: 0.4 ms CPU,
 0 frames; launch to the first frame with the map: 1.15 s; peak RSS 1.05 GiB. With a
 project, `--measure` starts timing once the map is shown.
+
+## Interaction
+
+`src/interact/` makes the code map explorable. Everything except `panel.rs` is free of
+egui and unit-tested on a temp project.
+
+```
+interact/
+  sceneindex.rs  per published scene: node -> cell, edge -> Bezier segments, edges by endpoint
+  highlight.rs   hover neighbourhood / selection / path as an overlay scene
+  marks.rs       import cycles, contract violations, finding badges as an overlay scene
+  fuzzy.rs       own fuzzy matcher (fzf v1 style scoring, ASCII case folding, bytes)
+  search.rs      search over distinct node names, qualified prefixes, exact ids first
+  findings.rs    the check analyses run once in the background, findings -> nodes -> badges
+  source.rs      re-reads one symbol's byte span, colours it with core's lexer
+  worker.rs      background thread: core Query (call graph), search, path, neighbours, source
+  state.rs       UI-thread state machine: hover, selection, path, toggles, dirty overlays
+  panel.rs       egui: search results, overlay toggles, details, findings list, source pane
+```
+
+```
+  map worker ── Published { scene, SceneIndex } ──> Interaction::set_scene (first one spawns
+                                                    the interaction worker over the analysis)
+  interaction worker:  Query::new + SearchIndex ─> serve jobs (newest per kind)
+                       └ scoped thread: findings::analyse ─> Insights (findings, badges)
+  UI thread per frame: poll results ─> panels ─> canvas input (hover / click / keys)
+                       ─> sync_overlays (rebuild only the dirty overlay scene) ─> render
+```
+
+### Controls
+
+| input                         | action                                                        |
+|-------------------------------|---------------------------------------------------------------|
+| hover a cell                  | highlight its neighbourhood (toggle in the left panel)        |
+| hover an edge                 | outline both endpoints, show every edge metric                |
+| click a cell                  | select: details, callers / callees, findings, source          |
+| double click a cell           | select and zoom to it (60% of the canvas)                     |
+| double click empty canvas, Home | fit the map                                                 |
+| Shift-click a cell            | shortest path from the selection (calls or imports)           |
+| Escape / click empty canvas   | clear the selection and the path                              |
+| type in the search box        | fuzzy search; click a result or Enter: select and zoom to it  |
+
+Search forms: `tngl` (fuzzy name), `core.models:Base` (fuzzy qualified prefix: the part before
+the last `.`/`:` is matched against the parent's qualified id), `app.low:` (children of an
+exact id), an exact qualified id (always first). Ranking: name score, prefix score, then
+first-party before third-party before stdlib, definitions before packages, shallower first.
+
+### Overlays (no CPU work while navigating)
+
+The renderer gained overlay slots (`map::OVERLAYS`): small `Scene`s in the map's world with
+their own band filter, grid culling and GPU buffers, drawn over the labels and under the hover
+outline: first the marks (`OVERLAY_MARKS`), then the highlight (`OVERLAY_HIGHLIGHT`). Every
+overlay item carries a LOD band range, so panning and zooming never rebuild them; they are
+rebuilt only when the hovered / selected item, the path, a toggle or the scene changes.
+
+- Hover neighbourhood: a veil dims the map; every drawn edge with an endpoint in the focused
+  node's subtree (pre-order range: two binary searches over the edges sorted by source and by
+  destination) is re-drawn on top in its own bands, orange for callees, blue for callers, grey
+  inside the subtree; the cell at the far end is outlined in the same colour and bands. At most
+  20 000 edges are re-drawn (the rest are counted).
+- Selection and path: outlines plus screen-size markers. A marker is one ring per band in which
+  the cell is smaller than 14 px, sized for that band, so a selected function stays visible at
+  any zoom. Path nodes are joined by arcs.
+- Marks: import cycles (members outlined red, the witness cycle as arcs), contract violations
+  (importer and imported module outlined orange, an arc between them), finding badges (a dot in
+  a cell's top-right corner, coloured by the worst severity, while the cell is collapsed; once it
+  opens, its children carry their own badges and the cell's own findings move to its header).
+
+### Filters
+
+- Call confidence (map controls): draw a call edge only if at least one call behind it is that
+  sure (`MapEdge` now keeps the surest call confidence next to the least sure one, in two spare
+  bits of `flags`, so the edge table stays 36 bytes per edge). Import edges are not filtered.
+- Origin (map controls): hide first-party, third-party or stdlib cells and their edges. The
+  layout is kept (stable geography), so hidden code leaves its region empty.
+- Finding confidence (left panel): the findings list and the badges count only findings at or
+  above it (default: the configured `min-confidence`; badges are recounted on the worker).
+
+Both map filters rebuild the scene on the map worker (the scene build time, see Results (S7.4)).
+
+### Findings
+
+`findings::analyse` runs the analyses of `pymapper check` once, in the background, with the
+project's configuration: complexity, import cycles, contracts, coupling (with the call graph
+for god classes) and dead code (with config-file evidence), then the inline suppressions and
+`per-file-ignores`. Below-confidence findings are kept for the confidence slider. Each finding
+is attached to its symbol, else to the innermost def at its line. Duplication (PM501) is not
+run: its fingerprints are only taken by an index load that asks for them, and the GUI's load
+does not (it would cost every start); use `pymapper check` for it.
+
+### Details and source
+
+The details panel shows the selected node's qualified id, kind, origin, file and line, lines,
+symbols, cyclomatic / cognitive sum and max, and for classes and functions nesting, Halstead
+volume, maintainability index, parameters and doc lines; then its findings, its direct callers
+and callees (from the core query, clickable) and the path controls. The source pane reads only
+the symbol's byte span from disk (from the start of its first line, at most 256 KiB), lexes it
+with `pymapper_core::lex` in trivia mode (comments kept) and colours keywords, defined names,
+builtins, decorators, strings (f/t-strings included), numbers, comments and operators. The
+laid-out text is cached per selection, so an idle source pane costs nothing per frame.
+
+### Memory
+
+Per published scene, the scene index holds 4 bytes per node, 16 bytes per drawn edge and 4
+bytes per segment (6.4 MiB on the venv map). The interaction worker holds the core query's
+call graph and name index plus one `Sym` per distinct name (27 MiB on the venv), and the
+findings (40 bytes each plus arguments) with their badges. Overlay scenes hold only what is
+highlighted or marked.
+
+### Results (S7.5)
+
+Release build, Apple M4 Pro, `cargo run --release -p pymapper-gui --example interact_bench --
+PATH [--deps] --isolated` (no GPU; warm index cache). Times per action:
+
+| action                                   | stdlib 3.13 (18 755 nodes) | aiml-lectio (24 866 nodes) | aiml-lectio + venv (1 023 762 nodes) |
+|------------------------------------------|----------------------|----------------------|----------------------|
+| scene index build                        | 3.7 ms (1.1 MiB)     | 6.7 ms (2.2 MiB)     | 11.5 ms (6.4 MiB)    |
+| query state (call graph + search names)  | 0.7 ms               | 0.8 ms               | 40 ms (27 MiB, 422k names) |
+| findings pass (background)               | 9 ms (8 668)         | 8 ms (5 306)         | 163 ms (5 014)       |
+| search, half a real name (p50 / p95)     | 0.21 / 0.37 ms       | 0.26 / 0.51 ms       | 2.5 / 5.3 ms         |
+| hover highlight, first-party cell (p50 / p95 / max) | 0.003 / 0.010 / 0.12 ms | 0.003 / 0.009 / 0.40 ms | 0.005 / 0.014 / 0.51 ms |
+| hover highlight, 20 largest subtrees (p50 / max) | 0.14 / 2.5 ms | 1.2 / 4.1 ms         | 1.6 / 4.8 ms         |
+| selection highlight with markers (p50)   | 0.004 ms             | 0.005 ms             | 0.002 ms             |
+| marks: cycles + violations + badges      | 0.09 ms              | 0.05 ms              | 0.06 ms              |
+| badge recount                            | 0.03 ms              | 0.03 ms              | 0.07 ms              |
+| shortest path, random function pairs (p95) | 0.001 ms           | 0.001 ms             | 0.002 ms             |
+| source read + highlight, function (p50)  | 0.02 ms              | 0.34 ms              | 0.35 ms              |
+| source read + highlight, module (p50)    | 0.11 ms              | 0.38 ms              | 0.34 ms              |
+| peak RSS of the bench                    | 58 MiB               | 133 MiB              | 1004 MiB             |
+
+- The largest hover highlights re-draw up to 119k segments (the 20 000-edge cap); the first
+  search after start includes spinning up rayon's pool (23 ms once on the venv).
+- Random function pairs are almost never connected, so the path row mostly measures the
+  early exit; the bidirectional BFS costs O(visited) on the smaller side otherwise.
+- Windowed (`pymapper-gui --measure --frames 240 --isolated` on aiml-lectio first party):
+  119.8 fps vsync-bound, CPU work p50 0.42 ms, idle 5 s: 0.6 ms CPU and 0 frames with the
+  interaction worker started; peak RSS 189 MiB. GPU cost of a large highlight: not measured.
 
 ## Render on demand
 

@@ -57,9 +57,8 @@ impl SearchIndex {
     pub fn search(&self, q: &Query<'_>, text: &str, limit: usize) -> Vec<SearchHit> {
         let ix = q.index();
         let text = text.trim();
-        let mut out = Vec::new();
         if text.is_empty() || limit == 0 {
-            return out;
+            return Vec::new();
         }
         let exact = ix.find(text.as_bytes());
         let cut = text.rfind(['.', ':']);
@@ -123,8 +122,7 @@ impl SearchIndex {
             hits.truncate(limit);
         }
         hits.sort_unstable_by_key(key);
-        out = hits;
-        out
+        hits
     }
 }
 
