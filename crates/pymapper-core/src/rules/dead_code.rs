@@ -27,7 +27,8 @@ reaches it; 50 when reached only through a `possible` call (e.g. the unique-meth
 when it carries an unknown decorator that may register it; 50 for a method of a class with a base \
 that is not loaded (it may override a framework method); 70 when the defining module uses \
 dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`); in application mode 30 when \
-listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API. \
+listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API \
+and 50 for a public method of a class that is not part of it (its instances may reach callers). \
 With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports \
 it or its module, 50 when it occurs anywhere else (attribute, identifier, string). Callees inherit \
 the confidence of such callers. `check` reports findings at or above `min-confidence` (default \

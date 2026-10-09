@@ -248,6 +248,26 @@ fn library_mode_keeps_the_public_api() {
 }
 
 #[test]
+fn library_mode_star_exports_and_api_methods() {
+    let f = fx(&[
+        ("lib/__init__.py", "from ._impl import *\nfrom ._feat import make\n__all__ = ['Path', 'make']\n"),
+        ("lib/_impl.py", "__all__ = ['Path']\n\nclass Path:\n    def parts(self):\n        pass\n\nclass Other:\n    pass\n"),
+        (
+            "lib/_feat.py",
+            "class _Feature:\n    def release(self):\n        pass\n    def _internal(self):\n        pass\n\n\
+             def make():\n    return _Feature()\n",
+        ),
+    ]);
+    let (dc, lines) = f.run_with(&DeadCodeOptions { mode: Mode::Library, ..DeadCodeOptions::default() });
+    assert_eq!((dc.level(f.node("lib._impl:Path")), dc.why(f.node("lib._impl:Path"))), (level::LIVE, Why::StarExport));
+    // Not in the star-imported module's `__all__`.
+    assert_eq!(dc.confidence(f.node("lib._impl:Other")), 80);
+    // A public method of a private class whose instances the API returns.
+    assert_eq!((dc.level(f.node("lib._feat:_Feature.release")), dc.why(f.node("lib._feat:_Feature.release"))), (level::API_METHOD, Why::ApiMethod));
+    assert!(lines.contains(&"PM403 lib._feat:_Feature._internal 100".to_owned()), "{lines:?}");
+}
+
+#[test]
 fn application_mode_lowers_exported_names() {
     let mut files = LIB.to_vec();
     files.push(("main.py", "import pkg\n\nif __name__ == '__main__':\n    pkg.api()\n"));
@@ -262,8 +282,13 @@ fn application_mode_lowers_exported_names() {
     assert!(!lines.iter().any(|l| l.contains("pkg._impl:")), "{lines:?}");
     let f = fx(&[("mod.py", "__all__ = ['exported']\n\ndef exported():\n    pass\n")]);
     let (dc, _) = f.app();
-    // The def's own `__all__` entry is not name evidence.
-    assert_eq!((dc.level(f.node("mod:exported")), dc.why(f.node("mod:exported"))), (level::EXPORTED, Why::Exported));
+    // The `__all__` string is name evidence in the def's own file.
+    assert_eq!((dc.level(f.node("mod:exported")), dc.why(f.node("mod:exported"))), (level::LINKED, Why::Linked));
+    // A re-export (`import x as x`); the import statement itself is not name evidence.
+    let f = fx(&[("pkg/__init__.py", "from .core import thing as thing\n"), ("pkg/core.py", "def thing():\n    pass\n")]);
+    let (dc, lines) = f.app();
+    assert_eq!((dc.level(f.node("pkg.core:thing")), dc.why(f.node("pkg.core:thing"))), (level::EXPORTED, Why::Exported));
+    assert!(lines.contains(&"PM401 pkg.core:thing 30".to_owned()) || lines.iter().any(|l| l.starts_with("PM404 pkg.core")), "{lines:?}");
 }
 
 #[test]

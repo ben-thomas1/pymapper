@@ -2,7 +2,7 @@
 
 use super::Why;
 use super::prop::DefGraph;
-use crate::extract::facts::{DefKind, def_flags, evidence_hash, file_flags};
+use crate::extract::facts::{DefKind, def_flags, evidence_hash, file_flags, import_flags};
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::intern::Sym;
 use crate::resolve::{Imports, class_flags, res_flags};
@@ -103,7 +103,9 @@ pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, library: boo
             file_seeds(ix, imp, g, f, library, dynamic, &names, &mut sc);
         }
     }
-    if !library {
+    if library {
+        star_exports(ix, imp, g, &info.included);
+    } else {
         // Re-export targets, wherever they are defined.
         let st = ix.facts();
         for f in 0..files {
@@ -122,6 +124,53 @@ pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, library: boo
         }
     }
     info
+}
+
+/// No package/module on the path of module node `m` is private (dunders such as `__main__`
+/// excepted), as for the library-mode roots.
+fn module_is_public(ix: &Index, m: NodeId) -> bool {
+    (1..=ix.depth(m)).all(|k| {
+        let name = ix.name(ix.ancestor_at(m, k));
+        !name.starts_with(b"_") || (name.len() > 4 && name.ends_with(b"__"))
+    })
+}
+
+/// Library mode: the module-level defs that a public module re-exports through a module-level
+/// `from m import *` of a loaded module (its `__all__` when static, else its public names).
+fn star_exports(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, included: &[bool]) {
+    let st = ix.facts();
+    for f in 0..ix.file_count() {
+        if !included[f as usize] || !module_is_public(ix, ix.file_node(f)) {
+            continue;
+        }
+        for row in ix.file_facts(f).imports.range() {
+            if st.imports.flags[row] & import_flags::STAR == 0 || st.imports.scope[row] != 0 {
+                continue;
+            }
+            let m = imp.module_node(row);
+            let Some(src) = (m != NONE).then(|| ix.file(m)).flatten() else { continue };
+            if !included[src as usize] || ix.file_node(src) != m {
+                continue;
+            }
+            let ff = ix.file_facts(src);
+            let restrict = ff.has(file_flags::ALL_DEFINED) && !ff.has(file_flags::ALL_DYNAMIC);
+            let base = ff.defs.start as usize;
+            for d in 1..ff.defs.len as usize {
+                let r = base + d;
+                if st.defs.parent[r] != 0 {
+                    continue;
+                }
+                let exported = match st.defs.name[r] {
+                    Some(s) if restrict => imp.in_all(src, s),
+                    Some(_) => st.defs.flags[r] & (def_flags::PRIVATE | def_flags::DUNDER) == 0,
+                    None => false,
+                };
+                if exported {
+                    put(&mut g.seed[m as usize + d], Why::StarExport);
+                }
+            }
+        }
+    }
 }
 
 /// Whether file `f` uses dynamic access.
@@ -216,6 +265,9 @@ fn file_seeds(
         if library {
             if mark & PUBLIC != 0 {
                 put(seed, Why::LibraryPublic);
+            }
+            if in_class && kind == DefKind::Function && flags & (def_flags::PRIVATE | def_flags::DUNDER) == 0 {
+                put(seed, Why::ApiMethod);
             }
         } else if parent == 0
             && exports_static

@@ -42,6 +42,8 @@
 //! | module -> its defs when the module uses dynamic access (`getattr`, `globals()`, `vars()`, `locals()`, `__getattr__`, `__dict__`) | min(module, [`level::DYNAMIC`]) |
 //! | application mode: module -> defs listed in `__all__` or re-exported | min(module, [`level::EXPORTED`]) |
 //! | library mode: scope -> public defs that are not roots (private modules, outside `__all__`) | min(scope, [`level::LIBRARY_PUBLIC`]) |
+//! | library mode: class -> its public methods (instances returned by the API reach callers) | min(class, [`level::API_METHOD`]) |
+//! | library mode: module -> public defs a public module re-exports with `from m import *` | level of the module |
 //! | name fallback: the def's name occurs in its own file or in a file that imports it or its module | [`level::LINKED`] |
 //! | name fallback: the name occurs anywhere else (attribute, identifier, string) | [`level::EVIDENCE`] |
 //!
@@ -51,13 +53,22 @@
 //! with confidence 50, 40 or 50 (visible with `--confidence 40`, JSON output, the GUI).
 //!
 //! Name evidence ([`crate::extract::facts`]: identifiers, attribute names and identifier-like
-//! string segments of a file, as 32-bit hashes) cannot tell a call from a reference. An
-//! occurrence in file `F` is therefore *explained* (ignored) when `F` holds a resolved
-//! (`certain` / `likely`) call or decorator edge to the def, or a class whose resolved base is
-//! the def: since the def is not live, that call comes from dead code and must not keep it
-//! alive (dead call chains are reported in full). The def's own `__all__` entry is explained the
-//! same way. A file that both calls a def from dead code and references it from live code is
-//! the one case this misses.
+//! string segments of a file, as 32-bit hashes, without counts) cannot tell a call from a
+//! reference. An occurrence of a def's name in file `F` is therefore *explained* (ignored) when
+//! `F` holds a call or decorator edge with a target to the def or to a base method it overrides
+//! (dynamic dispatch), or a class whose resolved base is the def: since the def is not live,
+//! that call comes from dead code and must not keep it alive, so dead call chains are reported
+//! in full. Three exceptions keep this from hiding real references:
+//!
+//! - calls from candidates in the def's own call cycle (recursion) explain nothing: a recursive
+//!   closure that is returned (`return walk`) stays referenced. The price: a dead recursive
+//!   function looks referenced too (confidence 10);
+//! - a file that also has an unresolved call of the name (ambiguous receiver, parameter, ...)
+//!   explains nothing for it;
+//! - the def's own `__all__` entry is evidence like any other string.
+//!
+//! A file that both calls a def from dead code and references it from live code without a
+//! call (`register(f)`) is the case this misses.
 //!
 //! # Modules (PM404)
 //!
@@ -154,6 +165,9 @@ pub mod level {
     pub const SCRIPT_LIKE: u8 = 60;
     /// Reached through a `possible` call edge (unique-method fallback).
     pub const POSSIBLE: u8 = 50;
+    /// Library mode: a public method of a class that is not part of the public API roots; its
+    /// instances may still reach callers.
+    pub const API_METHOD: u8 = 50;
     /// Method of a class with a base that is not loaded: may override a framework method.
     pub const EXTERNAL_BASE: u8 = 50;
     /// Name fallback: the name occurs in some other file.
@@ -211,10 +225,14 @@ pub enum Why {
     Submodule = 17,
     /// Modules: outside any regular package.
     ScriptLike = 18,
+    /// Library mode: a public method of a class (instances may reach callers).
+    ApiMethod = 19,
+    /// Library mode: re-exported by a star import of a public module.
+    StarExport = 20,
 }
 
 impl Why {
-    const ALL: [Why; 19] = [
+    const ALL: [Why; 21] = [
         Why::Dead,
         Why::Root,
         Why::Call,
@@ -234,6 +252,8 @@ impl Why {
         Why::Import,
         Why::Submodule,
         Why::ScriptLike,
+        Why::ApiMethod,
+        Why::StarExport,
     ];
 
     #[inline]
@@ -245,7 +265,8 @@ impl Why {
     #[inline]
     pub(crate) fn seed_strength(self) -> u8 {
         match self {
-            Why::Member => level::LIVE,
+            Why::Member | Why::StarExport => level::LIVE,
+            Why::ApiMethod => level::API_METHOD,
             Why::Exported => level::EXPORTED,
             Why::Decorated => level::DECORATED,
             Why::ExternalBase => level::EXTERNAL_BASE,
@@ -276,6 +297,8 @@ impl Why {
             Why::Import => "import",
             Why::Submodule => "submodule",
             Why::ScriptLike => "script-like",
+            Why::ApiMethod => "api-method",
+            Why::StarExport => "star-export",
         }
     }
 }

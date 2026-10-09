@@ -234,16 +234,11 @@ pub(super) fn scan(
     let (explained, importers) = explained_and_importers(ix, imp, calls, over, included, c.defs, &def_idx);
     let name_hash = |d: NodeId| evidence_hash(ix.name(d));
     let has = |f: FileId, h: u32| ix.file_view(f).evidence().binary_search(&h).is_ok();
-    // Occurrences in the def's own file (its own `__all__` entry is not a use).
+    // Occurrences in the def's own file. Its own `__all__` entry counts too: evidence cannot
+    // tell that string from a reference such as `TABLE = {"q": decode_q}`.
     for (i, &d) in c.defs.iter().enumerate() {
         let Some(fd) = ix.file(d) else { continue };
-        let s = ix.name_sym(d);
-        let module_level = ix.parent(d) == Some(ix.file_node(fd));
-        if included[fd as usize]
-            && has(fd, name_hash(d))
-            && !explained.contains(i as u32, fd)
-            && !(module_level && imp.in_all(fd, s))
-        {
+        if included[fd as usize] && has(fd, name_hash(d)) && !explained.contains(i as u32, fd) {
             hits.defs[i] = level::LINKED;
         }
     }
