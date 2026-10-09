@@ -15,6 +15,8 @@ use egui::{Align2, Event, FontId, Key, MouseWheelUnit, PointerButton, Rect, Sens
 
 use crate::codemap::scene::Legend;
 use crate::codemap::worker::Request;
+use crate::interact::panel::{self, PanelState};
+use crate::interact::state::Interaction;
 use crate::map::CanvasInput;
 use crate::mapui;
 use crate::views::ViewKind;
@@ -29,9 +31,7 @@ pub const RIGHT_DEFAULT: f32 = 300.0;
 pub const BOTTOM_DEFAULT: f32 = 170.0;
 
 /// Per-window UI state. Built once; nothing here is reallocated per frame.
-#[derive(Debug)]
 pub struct UiState {
-    pub search: String,
     /// Project root as displayed (computed once).
     pub project: String,
     /// GPU adapter / backend summary (computed once).
@@ -55,14 +55,23 @@ pub struct UiState {
     pub legend: Option<Legend>,
     /// Input: code map status over the canvas (loading phase or error; empty: none).
     pub map_status: String,
+    /// In/out: hover, selection, search, path, overlays (see [`crate::interact`]).
+    pub interact: Interaction,
+    /// egui caches of the interaction panels.
+    pub panel: PanelState,
     /// The secondary views' tabs, options and texts.
     pub views: ViewsUi,
+}
+
+impl std::fmt::Debug for UiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiState").field("canvas_rect", &self.canvas_rect).field("map_empty", &self.map_empty).finish_non_exhaustive()
+    }
 }
 
 impl UiState {
     pub fn new(project: String, renderer_info: String) -> Self {
         Self {
-            search: String::new(),
             project,
             renderer_info,
             canvas_rect: Rect::NOTHING,
@@ -74,6 +83,8 @@ impl UiState {
             map_request_changed: false,
             legend: None,
             map_status: String::new(),
+            interact: Interaction::default(),
+            panel: PanelState::default(),
             views: ViewsUi::default(),
         }
     }
@@ -97,7 +108,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
         .resizable(true)
         .default_size(BOTTOM_DEFAULT)
         .size_range(60.0..=600.0)
-        .show(ui, bottom);
+        .show(ui, |ui| bottom(ui, state));
 
     let central = egui::CentralPanel::no_frame().show(ui, |ui| {
         let rect = ui.max_rect();
@@ -130,7 +141,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
 }
 
 /// Mouse wheel (line/page units) zooms about the pointer; trackpad scrolling (point units)
-/// pans; pinch and Cmd/Ctrl+scroll zoom; dragging pans; double click or Home fits.
+/// pans; pinch and Cmd/Ctrl+scroll zoom; dragging pans; Home fits. Clicks, double clicks
+/// (Shift held or not) and Escape are reported for the interaction (select, zoom to, path).
 fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasInput {
     let mut input = CanvasInput::NONE;
     let rel = |p: egui::Pos2| [p.x - rect.min.x, p.y - rect.min.y];
@@ -139,8 +151,11 @@ fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasI
         input.drag = [d.x, d.y];
     }
     input.hover = response.hover_pos().map(rel);
-    input.fit = response.double_clicked();
     input.click = response.clicked();
+    input.double_click = response.double_clicked();
+    input.shift = ui.input(|i| i.modifiers.shift);
+    // Escape clears the selection unless a text field has the focus.
+    input.escape = ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(Key::Escape));
     if !response.hovered() {
         return input;
     }
@@ -170,17 +185,13 @@ fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasI
 
 fn left(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
-    ui.add(
-        egui::TextEdit::singleline(&mut state.search)
-            .hint_text("Search symbols")
-            .desired_width(f32::INFINITY),
-    );
+    panel::search(ui, &mut state.interact, &mut state.panel);
     ui.separator();
     ui.strong("Project");
     ui.weak(&state.project);
-    ui.add_space(4.0);
-    egui::ScrollArea::vertical().id_salt("pm_tree").auto_shrink([false, false]).show(ui, |ui| {
-        ui.weak("No project loaded.");
+    ui.separator();
+    egui::CollapsingHeader::new("Overlays").id_salt("pm_overlays").default_open(true).show(ui, |ui| {
+        panel::overlays(ui, &mut state.interact);
     });
 }
 
@@ -194,11 +205,19 @@ fn right(ui: &mut egui::Ui, state: &mut UiState) {
     }
     views_ui::controls(ui, &mut state.views);
     ui.strong("Details");
-    if state.hover_text.is_empty() {
-        ui.weak("Nothing selected.");
-    } else {
-        ui.label(&state.hover_text);
-    }
+    // Bar always shown: wrapped details would otherwise toggle it (and re-wrap) every frame.
+    egui::ScrollArea::vertical()
+        .id_salt("pm_details")
+        .max_height(ui.available_height() * 0.8)
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(ui, |ui| {
+        if state.interact.selected.is_some() && !state.hover_text.is_empty() {
+            ui.weak(&state.hover_text);
+            ui.separator();
+        }
+        panel::details(ui, &mut state.interact, &mut state.panel, &state.hover_text);
+    });
     ui.separator();
     if !state.map_info.is_empty() {
         ui.collapsing("Map", |ui| {
@@ -210,12 +229,9 @@ fn right(ui: &mut egui::Ui, state: &mut UiState) {
     });
 }
 
-fn bottom(ui: &mut egui::Ui) {
+fn bottom(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
-    ui.strong("Findings");
-    egui::ScrollArea::vertical().id_salt("pm_findings").auto_shrink([false, false]).show(ui, |ui| {
-        ui.weak("No findings.");
-    });
+    panel::bottom(ui, &mut state.interact, &mut state.panel);
 }
 
 #[cfg(test)]

@@ -661,7 +661,7 @@ fn cut_edges_match_the_reference_in_every_band() {
         assert!(m.edges.iter().any(|e| e.weight(metric) > 0), "{metric:?} never positive");
     }
     assert!(m.edges.iter().any(|e| e.flags & SRC_OPEN != 0), "no edge from an open node's own code");
-    assert!(m.edges.iter().any(|e| e.flags == 0), "no edge between collapsed nodes");
+    assert!(m.edges.iter().any(|e| e.flags & (SRC_OPEN | DST_OPEN) == 0), "no edge between collapsed nodes");
 }
 
 #[test]

@@ -148,6 +148,9 @@ pub struct Views {
     pub active: ViewKind,
     pub selection: Option<NodeId>,
     pub options: ViewOptions,
+    /// Outline the selection on the code map too (off when the interaction's highlight
+    /// overlay draws it).
+    pub codemap_marks: bool,
     notify: Notify,
     worker: Option<ViewWorker>,
     slots: [Slot; 3],
@@ -174,6 +177,7 @@ impl Views {
             active: ViewKind::CodeMap,
             selection: None,
             options: ViewOptions::default(),
+            codemap_marks: true,
             notify,
             worker: None,
             slots: Default::default(),
@@ -408,6 +412,15 @@ impl Views {
         self.dirty = true;
         if self.active == ViewKind::Focus && sel.is_some() {
             self.ensure(map, codemap, color);
+        }
+    }
+
+    /// Sets the selection from outside the views (the code map's interaction: click, search,
+    /// findings). Unlike [`Self::on_click`] it never reframes or refocuses.
+    pub fn set_selection(&mut self, sel: Option<NodeId>) {
+        if sel != self.selection {
+            self.selection = sel;
+            self.dirty = true;
         }
     }
 

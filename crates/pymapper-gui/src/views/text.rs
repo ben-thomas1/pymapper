@@ -80,7 +80,9 @@ impl Views {
         out.clear();
         let Some(v) = self.selection else { return };
         let Some(i) = self.active.slot() else {
-            out.extend(codemap.and_then(|cm| scene::codemap_mark(cm, v)));
+            if self.codemap_marks {
+                out.extend(codemap.and_then(|cm| scene::codemap_mark(cm, v)));
+            }
             return;
         };
         let slot = &self.slots[i];

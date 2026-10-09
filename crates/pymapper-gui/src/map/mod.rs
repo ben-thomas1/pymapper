@@ -66,14 +66,19 @@ pub struct CanvasInput {
     /// Multiplicative zoom factor (1.0 = none) about `zoom_anchor` (or the canvas centre).
     pub zoom: f32,
     pub zoom_anchor: Option<[f32; 2]>,
-    /// Fit the whole scene (Home key / double click).
+    /// Fit the whole scene (Home key, or a double click on empty canvas).
     pub fit: bool,
-    /// Primary click (press and release without a drag) at `hover`.
+    /// Primary click / double click on the canvas, Shift held, Escape pressed (interaction;
+    /// [`MapState::apply_input`] ignores them).
     pub click: bool,
+    pub double_click: bool,
+    pub shift: bool,
+    pub escape: bool,
 }
 
 impl CanvasInput {
-    pub const NONE: Self = Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false, click: false };
+    pub const NONE: Self =
+        Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false, click: false, double_click: false, shift: false, escape: false };
 }
 
 /// Duration counters for one kind of rebuild.
@@ -125,6 +130,25 @@ pub struct Labels {
 
 type HoverKey = (Option<[f32; 2]>, Camera, u64, u64, f32);
 
+/// Overlay slots, drawn in this order over the scene and its labels (and under the hover
+/// outline). Overlays are never hit-tested.
+pub const OVERLAYS: usize = 2;
+/// Persistent overlays (cycles, layer violations, finding badges): rebuilt on toggle.
+pub const OVERLAY_MARKS: usize = 0;
+/// Interaction highlight (hover neighbourhood, selection, path, search hit): rebuilt when the
+/// hovered or selected item changes.
+pub const OVERLAY_HIGHLIGHT: usize = 1;
+
+/// A small scene drawn over the main one, in the same world, with its own LOD band filter and
+/// grid culling (so overlays cost nothing while panning and are band-filtered like the map).
+#[derive(Debug, Default)]
+pub struct Overlay {
+    pub scene: Arc<Scene>,
+    pub bands: Bands,
+    /// Bumped on every [`MapState::set_overlay`].
+    pub generation: u64,
+}
+
 /// CPU-side state of the map: scene, camera, band-filtered views, labels, hover.
 pub struct MapState {
     pub scene: Arc<Scene>,
@@ -137,6 +161,7 @@ pub struct MapState {
     pub labels: Labels,
     pub text: Option<TextSystem>,
     pub hover: Option<Hit>,
+    pub overlays: [Overlay; OVERLAYS],
     pub stats: MapStats,
     /// Pixels per point of the last update (label size, hit tolerance).
     pub pixels_per_point: f32,
@@ -178,6 +203,7 @@ impl MapState {
             labels: Labels::default(),
             text: None,
             hover: None,
+            overlays: Default::default(),
             stats: MapStats::default(),
             pixels_per_point: 1.0,
             force_all: false,
@@ -201,6 +227,17 @@ impl MapState {
         self.hover = None;
         self.scene_generation += 1;
         self.needs_fit = true;
+        for slot in 0..OVERLAYS {
+            self.set_overlay(slot, Arc::new(Scene::default()));
+        }
+    }
+
+    /// Replaces overlay `slot` (see [`OVERLAYS`]); its band view is rebuilt on the next update.
+    pub fn set_overlay(&mut self, slot: usize, scene: Arc<Scene>) {
+        let o = &mut self.overlays[slot];
+        o.scene = scene;
+        o.bands = Bands::default();
+        o.generation += 1;
     }
 
     /// Replaces the scene but keeps the camera where it is (same world, other metrics), unless
@@ -288,6 +325,12 @@ impl MapState {
             self.band_generation += 1;
             self.stats.band_rebuilds.record(t.elapsed());
             rebuilt = true;
+        }
+        for o in &mut self.overlays {
+            let sc = &*o.scene;
+            let b = &mut o.bands;
+            // Small: no need to filter concurrently.
+            rebuilt |= b.rects.refresh(&sc.rects, band) | b.lines.refresh(&sc.lines, band) | b.curves.refresh(&sc.curves, band);
         }
         let px = (LABEL_POINTS * self.pixels_per_point).round();
         let view = self.camera.visible();

@@ -7,6 +7,8 @@ use crate::codemap::metrics::{self, ColorLegend, ColorMetric, EdgeMetric, KIND_C
 use crate::codemap::scene::{CALL_HEAD, CALL_TAIL, EDGE_MAX_PT, EDGE_MIN_PT, IMPORT_HEAD, IMPORT_TAIL, Legend};
 use crate::codemap::worker::Request;
 use crate::map::scene::Rgba;
+use pymapper_core::layout::Region;
+use pymapper_core::resolve::Confidence;
 
 /// Shows the controls for `req`; returns true if the user changed something.
 pub fn controls(ui: &mut egui::Ui, req: &mut Request) -> bool {
@@ -33,6 +35,15 @@ pub fn controls(ui: &mut egui::Ui, req: &mut Request) -> bool {
             }
         });
         ui.end_row();
+        ui.label("Calls");
+        egui::ComboBox::from_id_salt("pm_conf").selected_text(conf_label(req.scene.min_conf)).show_ui(ui, |ui| {
+            for c in [Confidence::Unresolved, Confidence::Possible, Confidence::Likely, Confidence::Certain] {
+                changed |= ui.selectable_value(&mut req.scene.min_conf, c as u8, conf_label(c as u8)).changed();
+            }
+        })
+        .response
+        .on_hover_text("Draw a call edge only if at least one call behind it is this sure");
+        ui.end_row();
         ui.label("Bundling");
         let r = ui.add(egui::Slider::new(&mut req.scene.beta, 0.0..=1.0).fixed_decimals(2));
         // A drag reports every step: rebuild once it ends (clicks and typing commit at once).
@@ -41,7 +52,28 @@ pub fn controls(ui: &mut egui::Ui, req: &mut Request) -> bool {
     });
     changed |= ui.checkbox(&mut req.scene.show_edges, "Show edges").changed();
     changed |= ui.checkbox(&mut req.scene.external_edges, "Edges inside third-party / stdlib").changed();
+    ui.horizontal(|ui| {
+        ui.label("Show");
+        for (region, label) in [(Region::Main, "first-party"), (Region::ThirdParty, "third-party"), (Region::Stdlib, "stdlib")] {
+            let bit = 1u8 << region as u8;
+            let mut on = req.scene.origins & bit != 0;
+            if ui.checkbox(&mut on, label).changed() {
+                req.scene.origins ^= bit;
+                changed = true;
+            }
+        }
+    });
     changed
+}
+
+/// Label of a call confidence filter value.
+pub fn conf_label(c: u8) -> &'static str {
+    match Confidence::from_u8(c) {
+        Confidence::Certain => "certain only",
+        Confidence::Likely => "likely or surer",
+        Confidence::Possible => "possible or surer",
+        Confidence::Unresolved => "any",
+    }
 }
 
 fn c32(c: Rgba) -> Color32 {

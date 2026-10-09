@@ -34,7 +34,8 @@ pub struct MapEdge {
     pub dst: NodeId,
     pub lod: Lod,
     /// [`SRC_OPEN`] / [`DST_OPEN`]: the endpoint is shown open (it stands for its own code
-    /// and is anchored at its header).
+    /// and is anchored at its header). Bits [`BEST_SHIFT`].. hold the surest call confidence
+    /// (see [`MapEdge::best`]).
     pub flags: u8,
     /// Least sure call confidence (`Confidence as u8`), or [`NO_CALLS`].
     pub worst: u8,
@@ -45,11 +46,20 @@ pub const SRC_OPEN: u8 = 1;
 pub const DST_OPEN: u8 = 2;
 /// [`MapEdge::worst`] of an import-only edge.
 pub const NO_CALLS: u8 = u8::MAX;
+/// [`MapEdge::flags`] bits 2-3: the surest call confidence (`Confidence as u8`; valid when
+/// the edge has calls).
+pub const BEST_SHIFT: u8 = 2;
 
 impl MapEdge {
     #[inline]
     pub fn weight(&self, m: EdgeMetric) -> u32 {
         self.w[m.column()]
+    }
+
+    /// Surest call confidence (`Confidence as u8`), or [`NO_CALLS`] for an import-only edge.
+    #[inline]
+    pub fn best(&self) -> u8 {
+        if self.worst == NO_CALLS { NO_CALLS } else { (self.flags >> BEST_SHIFT) & 3 }
     }
 }
 
@@ -198,7 +208,8 @@ fn band_edges(ix: &Index, rollup: &Rollup, reveal: &Reveal, callee: &Callee<'_>,
         if w.iter().all(|&x| x == 0) {
             continue;
         }
-        let flags = if ea.open { SRC_OPEN } else { 0 } | if eb.open { DST_OPEN } else { 0 };
+        let best = e.best().map_or(0, |c| c as u8);
+        let flags = if ea.open { SRC_OPEN } else { 0 } | if eb.open { DST_OPEN } else { 0 } | (best << BEST_SHIFT);
         out.push(MapEdge {
             src: e.src,
             dst: e.dst,
