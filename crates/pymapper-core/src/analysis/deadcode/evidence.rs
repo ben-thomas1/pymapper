@@ -1,5 +1,5 @@
 //! Name-reference fallback (design: dead code (f)): one scan over the evidence hashes of every
-//! included file, probing the names of the defs, modules and imports still in doubt.
+//! first-party file, probing the names of the defs, modules and imports still in doubt.
 //!
 //! Candidates are grouped by name, and one hash map from name hash to the groups of each kind
 //! answers every probe with one lookup. A probe that hits a group costs O(1) for the group-level
@@ -13,12 +13,21 @@
 //! that explains some member of a hit group is set aside and its members are settled after the
 //! scan (the first such file usually decides, so this stays linear in members plus explained
 //! pairs).
+//!
+//! Every first-party Python file is an evidence source ([`source`]), whether or not it is
+//! analysed: tests in directories that are not importable (`tests/my-service/pkg/test_x.py`)
+//! or whose dotted path is shadowed by a real module read attributes of production code like
+//! any other file. Test code ([`crate::analysis::testfiles::is_test_file`]) is tracked apart, so
+//! a name used only by tests is told from one used by production code; stubs only contribute
+//! dotted-path string references (a `.pyi` repeats every name of its module).
 
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
 use super::level;
+use crate::analysis::testfiles::is_test_file;
 use crate::extract::config::ConfigEvidence;
 use crate::extract::facts::evidence_hash;
 use crate::index::{FileId, Index, NONE, NodeId};
@@ -27,6 +36,35 @@ use crate::intern::{FxHashMap, Sym};
 use crate::reach::BitSet;
 use crate::resolve::{Confidence, Imports, Reason, ResolvedCalls};
 use crate::roots::Origin;
+
+/// What a file contributes to the scan ([`sources`]).
+pub(super) mod source {
+    /// Nothing (third-party, stdlib).
+    pub const NONE: u8 = 0;
+    /// Only string references by dotted path (first-party stubs).
+    pub const PATHS: u8 = 1;
+    /// All its evidence (first-party `.py`, importable or not).
+    pub const CODE: u8 = 2;
+    /// All its evidence, as test code.
+    pub const TEST: u8 = 3;
+}
+
+/// Per file of `ix`: its [`source`] kind. One pass over the file table.
+pub(super) fn sources(ix: &Index) -> Vec<u8> {
+    (0..ix.file_count())
+        .map(|f| {
+            if ix.file_origin(f) != Origin::FirstParty {
+                source::NONE
+            } else if ix.file_path(f).as_os_str().as_bytes().ends_with(b".pyi") {
+                source::PATHS
+            } else if is_test_file(ix, f) {
+                source::TEST
+            } else {
+                source::CODE
+            }
+        })
+        .collect()
+}
 
 /// What the scan found for an import candidate.
 pub(super) mod import_hit {
@@ -43,7 +81,7 @@ pub(super) mod import_hit {
 pub(super) mod extra {
     /// Defs: the [`super::level::LINKED`] hit came from the def's own file.
     pub const SAME_FILE: u8 = 1;
-    /// Its dotted path occurs in a string literal of an included file.
+    /// Its dotted path occurs in a string literal of a first-party file.
     pub const STRING_REF: u8 = 2;
     /// Its dotted path occurs in a config file.
     pub const CONFIG_REF: u8 = 4;
@@ -65,10 +103,14 @@ pub(super) struct Candidates<'a> {
 
 /// Results, aligned with the candidate slices.
 pub(super) struct Hits {
-    /// Per def candidate: [`level::LINKED`], [`level::EVIDENCE`] or 0.
+    /// Per def candidate: [`level::LINKED`], [`level::EVIDENCE`] or 0, from non-test files.
     pub defs: Vec<u8>,
-    /// Per module candidate: the name occurs in another file.
+    /// Per def candidate: the same from test files ([`source::TEST`]).
+    pub def_tests: Vec<u8>,
+    /// Per module candidate: the name occurs in another non-test file.
     pub modules: Vec<bool>,
+    /// Per module candidate: the name occurs in another test file.
+    pub mod_tests: Vec<bool>,
     /// Per import candidate: an [`import_hit`] value.
     pub imports: Vec<u8>,
     /// Per def candidate: [`extra`] bits.
@@ -112,9 +154,17 @@ struct Groups {
     members: Vec<[u32; 4]>,
     /// `start` of each group, plus `members.len()` at the end.
     start: Vec<u32>,
-    /// Per group: [`UNSEEN`], the one file with an unexplained occurrence, or [`MANY`].
+    /// Per group and slot (`seen[g * slots + k]`): [`UNSEEN`], the one file with an
+    /// unexplained occurrence, or [`MANY`]. Slot [`CODE_SLOT`] counts non-test files,
+    /// [`TEST_SLOT`] test files (groups built with two slots).
     seen: Vec<AtomicU32>,
+    slots: u32,
 }
+
+/// [`Groups`] occurrence slot of non-test files.
+const CODE_SLOT: u32 = 0;
+/// [`Groups`] occurrence slot of test files.
+const TEST_SLOT: u32 = 1;
 
 /// No unexplained occurrence yet.
 const UNSEEN: u32 = u32::MAX;
@@ -145,8 +195,9 @@ impl AtomicBits {
 }
 
 impl Groups {
-    /// Groups `members` and records their ranges in slot `kind` of `map`.
-    fn new(mut members: Vec<[u32; 4]>, map: &mut FxHashMap<u32, Ranges>, kind: usize) -> Groups {
+    /// Groups `members` and records their ranges in slot `kind` of `map`; `slots` occurrence
+    /// trackers per group (0 when [`Groups::see`] is never called).
+    fn new(mut members: Vec<[u32; 4]>, map: &mut FxHashMap<u32, Ranges>, kind: usize, slots: u32) -> Groups {
         members.sort_unstable();
         let mut start = Vec::new();
         for (i, m) in members.iter().enumerate() {
@@ -163,7 +214,7 @@ impl Groups {
         }
         let n = start.len();
         start.push(members.len() as u32);
-        Groups { members, start, seen: (0..n).map(|_| AtomicU32::new(UNSEEN)).collect() }
+        Groups { members, start, seen: (0..n * slots as usize).map(|_| AtomicU32::new(UNSEEN)).collect(), slots }
     }
 
     #[inline]
@@ -171,11 +222,11 @@ impl Groups {
         &self.members[self.start[g as usize] as usize..self.start[g as usize + 1] as usize]
     }
 
-    /// Records an unexplained occurrence of group `g` in file `f`. Concurrent calls agree on
-    /// the result whatever their order: unseen, one file, or many.
+    /// Records an unexplained occurrence of group `g` in file `f`, in occurrence slot `k`.
+    /// Concurrent calls agree on the result whatever their order: unseen, one file, or many.
     #[inline]
-    fn see(&self, g: u32, f: FileId) {
-        let s = &self.seen[g as usize];
+    fn see(&self, g: u32, k: u32, f: FileId) {
+        let s = &self.seen[(g * self.slots + k) as usize];
         let mut cur = s.load(Ordering::Relaxed);
         loop {
             let next = if cur == UNSEEN {
@@ -192,15 +243,15 @@ impl Groups {
         }
     }
 
-    /// Whether group `g` occurs, unexplained, in a file other than `own`.
+    /// Whether group `g` occurs, unexplained, in a file other than `own` (slot `k`).
     #[inline]
-    fn elsewhere(&self, g: u32, own: Option<FileId>) -> bool {
-        let v = self.seen[g as usize].load(Ordering::Relaxed);
+    fn elsewhere(&self, g: u32, k: u32, own: Option<FileId>) -> bool {
+        let v = self.seen[(g * self.slots + k) as usize].load(Ordering::Relaxed);
         v == MANY || (v != UNSEEN && Some(v) != own)
     }
 
     fn len(&self) -> u32 {
-        self.seen.len() as u32
+        self.start.len() as u32 - 1
     }
 }
 
@@ -232,20 +283,23 @@ fn intersect(
     }
 }
 
-/// Runs the scan over the files `included` selects (see the module docs of `deadcode`). `over`
-/// is the override graph (base method -> overriding method).
+/// Runs the scan over the evidence of the files as `sources` ([`sources`]) classifies them
+/// (see the module docs of `deadcode`). `over` is the override graph (base method ->
+/// overriding method).
 pub(super) fn scan(
     ix: &Index,
     imp: &Imports,
     calls: &ResolvedCalls,
     over: &Graph,
-    included: &[bool],
+    sources: &[u8],
     c: &Candidates<'_>,
 ) -> Hits {
     let (nd, nm, ni) = (c.defs.len(), c.modules.len(), c.imports.len());
     let mut hits = Hits {
         defs: vec![0; nd],
+        def_tests: vec![0; nd],
         modules: vec![false; nm],
+        mod_tests: vec![false; nm],
         imports: vec![import_hit::NONE; ni],
         def_extra: vec![0; nd],
         mod_extra: vec![0; nm],
@@ -264,14 +318,15 @@ pub(super) fn scan(
         let i = cand_of[v as usize];
         (i != NONE).then_some(i)
     };
-    let (explained, importers) = explained_and_importers(ix, imp, calls, over, included, c.defs, &def_idx);
+    let (explained, importers) = explained_and_importers(ix, imp, calls, over, sources, c.defs, &def_idx);
+    let is_test = |f: FileId| sources[f as usize] == source::TEST;
     let name_hash = |d: NodeId| evidence_hash(ix.name(d));
     let has = |f: FileId, h: u32| ix.file_view(f).evidence().binary_search(&h).is_ok();
     // Occurrences in the def's own file. Its own `__all__` entry counts too: evidence cannot
     // tell that string from a reference such as `TABLE = {"q": decode_q}`.
     for (i, &d) in c.defs.iter().enumerate() {
         let Some(fd) = ix.file(d) else { continue };
-        if included[fd as usize] && has(fd, name_hash(d)) && !explained.contains(i as u32, fd) {
+        if sources[fd as usize] >= source::CODE && has(fd, name_hash(d)) && !explained.contains(i as u32, fd) {
             hits.defs[i] = level::LINKED;
             hits.def_extra[i] |= extra::SAME_FILE;
         }
@@ -279,28 +334,29 @@ pub(super) fn scan(
     // Occurrences in files importing the def directly.
     for &(i, f) in &importers {
         if has(f, name_hash(c.defs[i as usize])) && !explained.contains(i, f) {
-            hits.defs[i as usize] = level::LINKED;
+            let out = if is_test(f) { &mut hits.def_tests } else { &mut hits.defs };
+            out[i as usize] = level::LINKED;
         }
     }
     drop(importers);
-    aliased_imports(ix, imp, included, &def_idx, &explained, &mut hits.defs);
+    aliased_imports(ix, imp, sources, &def_idx, &explained, &mut hits.defs, &mut hits.def_tests);
     let mut map: FxHashMap<u32, Ranges> = FxHashMap::default();
     let module_of = |d: NodeId| ix.file(d).map_or(u32::MAX, |f| ix.file_node(f));
     let defs: Vec<[u32; 4]> =
         c.defs.iter().enumerate().map(|(i, &d)| [name_hash(d), ix.name_sym(d).to_raw(), module_of(d), i as u32]).collect();
-    let dg = Groups::new(defs, &mut map, 0);
+    let dg = Groups::new(defs, &mut map, 0, 2);
     let mut group_of = vec![0u32; nd];
     for g in 0..dg.len() {
         for m in dg.group(g) {
             group_of[m[3] as usize] = g;
         }
     }
-    let mg = Groups::new(c.modules.iter().enumerate().map(|(i, &m)| [name_hash(m), 0, 0, i as u32]).collect(), &mut map, 1);
+    let mg = Groups::new(c.modules.iter().enumerate().map(|(i, &m)| [name_hash(m), 0, 0, i as u32]).collect(), &mut map, 1, 2);
     let by_module = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, ix.file_node(f), i as u32]).collect();
-    let ig = Groups::new(by_module, &mut map, 2);
+    let ig = Groups::new(by_module, &mut map, 2, 0);
     // Same hashes, so the same group indices as `ig`; keyed by the module's name hash.
     let by_name = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, name_hash(ix.file_node(f)), i as u32]).collect();
-    let ig2 = Groups::new(by_name, &mut FxHashMap::default(), 2);
+    let ig2 = Groups::new(by_name, &mut FxHashMap::default(), 2, 0);
     // Dotted paths of the candidates (`pkg.mod.Class.method`, `pkg.mod`) and of each def's
     // module: string and config references by path.
     let mut buf = Vec::new();
@@ -323,10 +379,11 @@ pub(super) fn scan(
     for (i, &m) in c.modules.iter().enumerate() {
         paths.push([path_hash(m), 0, 0, MOD_BIT | i as u32]);
     }
-    let pg = Groups::new(paths, &mut map, 3);
+    let pg = Groups::new(paths, &mut map, 3, 0);
     let def_string = AtomicBits::new(nd);
     let mod_string = AtomicBits::new(nm);
     let linked = AtomicBits::new(nd);
+    let test_linked = AtomicBits::new(nd);
     let used = AtomicBits::new(ni);
     let elsewhere = AtomicBits::new(ni);
     // Parallel over files: every write is an idempotent atomic update (see `Groups::see`), so
@@ -338,10 +395,10 @@ pub(super) fn scan(
         .fold(
             || (0u64, Vec::new()),
             |(mut probes, mut partial), f| {
-                if !included[f as usize] {
-                    // Other first-party files (tests or scripts outside any package, stubs):
-                    // their string references by dotted path still count.
-                    if ix.file_origin(f) == Origin::FirstParty {
+                let src = sources[f as usize];
+                if src < source::CODE {
+                    // Stubs: their string references by dotted path still count.
+                    if src == source::PATHS {
                         let ev = ix.file_view(f).evidence();
                         probes += ev.len() as u64;
                         for &h in ev {
@@ -359,6 +416,7 @@ pub(super) fn scan(
                     }
                     return (probes, partial);
                 }
+                let (slot, lk) = if src == source::TEST { (TEST_SLOT, &test_linked) } else { (CODE_SLOT, &linked) };
                 let ev = ix.file_view(f).evidence();
                 let edges = imp.module_edges(f);
                 let ex = explained.run(f);
@@ -374,17 +432,17 @@ pub(super) fn scan(
                             partial.push((g, f));
                             let link = |i: u32| {
                                 if ex.binary_search(&i).is_err() {
-                                    linked.set(i);
+                                    lk.set(i);
                                 }
                             };
                             intersect(members, edges.iter().map(|e| e.dst), imports_module, link);
                         } else {
-                            intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| linked.set(i));
-                            dg.see(g, f);
+                            intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| lk.set(i));
+                            dg.see(g, slot, f);
                         }
                     }
                     for g in r[1].0..r[1].1 {
-                        mg.see(g, f);
+                        mg.see(g, slot, f);
                     }
                     for g in r[2].0..r[2].1 {
                         intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used.set(i));
@@ -422,22 +480,27 @@ pub(super) fn scan(
         for m in dg.group(g) {
             let i = m[3];
             let own = ix.file(c.defs[i as usize]);
-            if linked.get(i as usize) {
-                hits.defs[i as usize] = level::LINKED;
-            } else if hits.defs[i as usize] < level::LINKED
-                && (dg.elsewhere(g, own)
-                    // Usually the first event qualifies; skipping one means `(i, f)` is
-                    // explained or `f` is the def's own file.
-                    || events.iter().any(|&(_, f)| Some(f) != own && !explained.contains(i, f)))
-            {
-                hits.defs[i as usize] = level::EVIDENCE;
+            for (slot, lk, out) in [(CODE_SLOT, &linked, &mut hits.defs), (TEST_SLOT, &test_linked, &mut hits.def_tests)] {
+                let in_slot = |f: FileId| u32::from(is_test(f)) == slot;
+                if lk.get(i as usize) {
+                    out[i as usize] = level::LINKED;
+                } else if out[i as usize] < level::LINKED
+                    && (dg.elsewhere(g, slot, own)
+                        // Usually the first event qualifies; skipping one means `(i, f)` is
+                        // explained, `f` is the def's own file or of the other slot.
+                        || events.iter().any(|&(_, f)| Some(f) != own && in_slot(f) && !explained.contains(i, f)))
+                {
+                    out[i as usize] = level::EVIDENCE;
+                }
             }
         }
     }
     for g in 0..mg.len() {
         for m in mg.group(g) {
             let i = m[3] as usize;
-            hits.modules[i] = mg.elsewhere(g, ix.file(c.modules[i]));
+            let own = ix.file(c.modules[i]);
+            hits.modules[i] = mg.elsewhere(g, CODE_SLOT, own);
+            hits.mod_tests[i] = mg.elsewhere(g, TEST_SLOT, own);
         }
     }
     for i in 0..nd {
@@ -496,7 +559,8 @@ pub(super) fn scan(
     hits
 }
 
-/// Per included file, the def candidates whose name occurrences there are explained by call
+/// Per evidence file ([`source::CODE`] or [`source::TEST`]), the def candidates whose name
+/// occurrences there are explained by call
 /// sites: a call or decorator edge of the file to the def, or to a base method the def
 /// overrides (dynamic dispatch), unless the caller is a candidate in the def's own call cycle
 /// (recursion does not explain a reference made elsewhere in the file); and a class of the
@@ -508,7 +572,7 @@ fn explained_and_importers(
     imp: &Imports,
     calls: &ResolvedCalls,
     over: &Graph,
-    included: &[bool],
+    sources: &[u8],
     defs: &[NodeId],
     def_idx: &(impl Fn(NodeId) -> Option<u32> + Sync),
 ) -> (Explained, Vec<(u32, FileId)>) {
@@ -532,14 +596,14 @@ fn explained_and_importers(
     let cx = FileCx { ix, imp, calls, defs, def_idx, scc: &scc, bases: &bases, is_base: &is_base };
     // Chunks of consecutive files in parallel, concatenated in file order.
     let files = ix.file_count() as usize;
-    let chunks: Vec<ChunkOut> = included
+    let chunks: Vec<ChunkOut> = sources
         .par_chunks(CHUNK)
         .enumerate()
-        .map(|(c, inc)| {
+        .map(|(c, src)| {
             let (mut cands, mut lens, mut importers, mut unresolved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for (k, &on) in inc.iter().enumerate() {
+            for (k, &kind) in src.iter().enumerate() {
                 let at = cands.len();
-                if on {
+                if kind >= source::CODE {
                     cx.file((c * CHUNK + k) as FileId, &mut cands, &mut unresolved, &mut importers);
                 }
                 lens.push((cands.len() - at) as u32);
@@ -662,20 +726,24 @@ impl<F: Fn(NodeId) -> Option<u32>> FileCx<'_, F> {
 }
 
 /// Aliased imports of a candidate (`from m import f as g` then `register(g)`): the alias in the
-/// importing file's evidence links the def.
+/// importing file's evidence links the def (in `tests` when the file is test code, else in
+/// `out`).
 fn aliased_imports(
     ix: &Index,
     imp: &Imports,
-    included: &[bool],
+    sources: &[u8],
     def_idx: &impl Fn(NodeId) -> Option<u32>,
     explained: &Explained,
     out: &mut [u8],
+    tests: &mut [u8],
 ) {
     let st = ix.facts();
     for f in 0..ix.file_count() {
-        if !included[f as usize] {
+        let src = sources[f as usize];
+        if src < source::CODE {
             continue;
         }
+        let out = if src == source::TEST { &mut *tests } else { &mut *out };
         let view = ix.file_view(f);
         for row in ix.file_facts(f).imports.range() {
             let (Some(alias), Some(t)) = (st.imports.alias[row], imp.target(row)) else { continue };

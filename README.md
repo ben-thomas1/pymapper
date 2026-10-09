@@ -180,7 +180,9 @@ route pymapper knows; lower values mean only weak evidence (a matching attribute
 string elsewhere, dynamic dispatch) keeps it possibly alive. `check` reports findings at or
 above `min-confidence`. Each finding names its evidence: the message says "is never used"
 only when nothing refers to the symbol, and the reasons are listed, e.g.
-`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON.
+`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON. Every
+first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
+is test-only API, reported below the gate as `used-only-in-tests`.
 
 ## Performance
 

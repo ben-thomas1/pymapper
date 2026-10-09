@@ -71,6 +71,15 @@
 //! | name fallback: the def's name occurs in its own file or in a file that imports it or its module | [`level::LINKED`] |
 //! | name fallback: its name and its module's dotted path occur in the same config file | [`level::LINKED`] |
 //! | name fallback: the name occurs anywhere else (attribute, identifier, string, quoted type, config file) | [`level::EVIDENCE`] |
+//! | name fallback, test code only (no production file or config file mentions the name): as above, linked or elsewhere | [`level::LINKED`] / [`level::EVIDENCE`], reason `used-only-in-tests` |
+//!
+//! Name evidence comes from every first-party `.py` file, importable or not: tests in
+//! directories that are not package names (`tests/my-service/pkg/test_x.py`, run by pytest's
+//! `importlib` mode), files whose dotted path is shadowed by another file, scripts. Test code
+//! ([`crate::analysis::testfiles::is_test_file`]: `tests` / `test` / `testing` / `_tests` /
+//! `_testing` components, `test_*.py`, `*_test.py`, `conftest.py`) is tracked apart: a def or
+//! module that only tests mention is test-only API, not dead, and its finding says so
+//! ([`Why::TestLinked`], [`Why::TestEvidence`]). Stubs contribute only dotted-path strings.
 //!
 //! A `getattr(x, "name")` / `hasattr(x, "name")` with a constant name is not dynamic access:
 //! the string is name evidence like any other. The extractor classifies the name argument
@@ -135,8 +144,9 @@
 //!
 //! # What is reported
 //!
-//! Defs, modules and imports of first-party `.py` files (stubs, shadowed and non-importable
-//! files are skipped) with confidence at least [`MIN_EMIT`]. Not reported: `@overload`
+//! Defs, modules and imports of first-party `.py` files, importable or not ([`analysed_file`]:
+//! stubs and shadowed files are skipped; a module that cannot be imported never gets a PM404
+//! finding, something runs it) with confidence at least [`MIN_EMIT`]. Not reported: `@overload`
 //! signatures, defs under `if TYPE_CHECKING:`, dunder methods (live with their class) and
 //! module-level dunder functions (`__getattr__`, `__dir__`: always live). Packages
 //! (`__init__.py`) never get a PM404 finding. A finding is dropped when an enclosing def or the
@@ -172,8 +182,9 @@
 //!   parallel pass over call edges, classes, call rows and import rows, plus an SCC over the
 //!   call edges between candidates (recursion). Dotted paths of the candidates (one qualified
 //!   name built per candidate) are a fourth group kind probed in the same pass; first-party
-//!   files that are not analysed (outside packages) are probed for paths only; config files
-//!   (few) are probed sequentially afterwards.
+//!   stubs are probed for paths only; config files (few) are probed sequentially afterwards.
+//!   Test files write to a second occurrence slot per name group (4 bytes per def and module
+//!   group) and a second bit set, so telling test-only use apart costs no extra pass.
 //! - Memory: two bytes per node (level and why), a labelled call graph without override edges
 //!   (`10` bytes per edge plus `8` per node), the override edges (`8` bytes each), one seed
 //!   byte per node, the module graphs, and during the evidence pass 4 bytes per node (candidate
@@ -191,14 +202,18 @@ mod seeds;
 #[cfg(test)]
 mod evidence_tests;
 #[cfg(test)]
+mod test_code_tests;
+#[cfg(test)]
 mod tests;
+
+use std::os::unix::ffi::OsStrExt;
 
 use crate::config::{EntrypointMatcher, Mode};
 use crate::extract::config::ConfigEvidence;
 use crate::extract::facts::{DefKind, def_flags, evidence_hash};
 use crate::index::{FileId, Index, NONE, NodeId, NodeKind};
 use crate::reach::{BitSet, FileModes, RootOptions, RootSet, is_library, root_kind, roots};
-use crate::roots::ProjectUnits;
+use crate::roots::{FileStatus, Origin, ProjectUnits};
 use crate::resolve::{Confidence, Imports, ResolvedCalls};
 use crate::rules::codes::{UNUSED_CLASS, UNUSED_FUNCTION, UNUSED_IMPORT, UNUSED_METHOD, UNUSED_MODULE};
 use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId};
@@ -306,10 +321,14 @@ pub enum Why {
     DynamicPrefix = 27,
     /// Method of a class whose loaded ancestor's module uses dynamic access.
     DynamicBase = 28,
+    /// Name evidence only from test code, in a test file importing it or its module.
+    TestLinked = 29,
+    /// Name evidence only from test code, elsewhere.
+    TestEvidence = 30,
 }
 
 impl Why {
-    const ALL: [Why; 29] = [
+    const ALL: [Why; 31] = [
         Why::Dead,
         Why::Root,
         Why::Call,
@@ -339,6 +358,8 @@ impl Why {
         Why::ExternalOverride,
         Why::DynamicPrefix,
         Why::DynamicBase,
+        Why::TestLinked,
+        Why::TestEvidence,
     ];
 
     #[inline]
@@ -392,6 +413,8 @@ impl Why {
             Why::ExternalOverride => "external-override",
             Why::DynamicPrefix => "dynamic-prefix",
             Why::DynamicBase => "dynamic-base",
+            Why::TestLinked => "test-linked",
+            Why::TestEvidence => "test-evidence",
         }
     }
 }
@@ -569,9 +592,15 @@ impl DeadCode {
     }
 }
 
-/// Whether file `f` is analysed: first-party, an importable runtime `.py` file.
+/// Whether file `f` is analysed: a first-party runtime `.py` file, importable or not (tests
+/// in a directory that is not a package name, such as `tests/my-service/test_x.py`, and
+/// scripts named `0-seed.py` still run). Stubs and files shadowed by another file of the same
+/// module are not.
 pub fn analysed_file(ix: &Index, f: FileId) -> bool {
-    ix.file_node(f) != NONE && crate::analysis::cycles::runtime_file(ix, f, true)
+    ix.file_node(f) != NONE
+        && ix.file_origin(f) == Origin::FirstParty
+        && matches!(ix.file_status(f), FileStatus::Active | FileStatus::StubShadowed | FileStatus::NotImportable)
+        && !ix.file_path(f).as_os_str().as_bytes().ends_with(b".pyi")
 }
 
 /// Def `v` (row `row` of file `f`) can be reported: not `@overload`, not under
@@ -674,7 +703,7 @@ pub(crate) fn run(
         {
             let config = if opts.name_fallback { opts.config } else { None };
             let cands = evidence::Candidates { defs: &defs, modules: &mods, imports: &keys, config };
-            let hits = evidence::scan(ix, imp, calls, &g.over, &info.included, &cands);
+            let hits = evidence::scan(ix, imp, calls, &g.over, &evidence::sources(ix), &cands);
             stats.candidates = (defs.len() + mods.len() + keys.len()) as u64;
             stats.probes = hits.probes;
             for (i, &d) in defs.iter().enumerate() {
@@ -697,6 +726,16 @@ pub(crate) fn run(
                 if x & extra::CONFIG_NAME != 0 {
                     lv.raise(d, level::EVIDENCE, Why::ConfigName);
                 }
+                // Test code: the same levels, named as test-only use unless production code
+                // or a config file mentions the name too (raised last: ties keep those).
+                let only_tests = hits.defs[i] == 0 && x & (extra::CONFIG_NAME | extra::CONFIG_LINKED) == 0;
+                match (hits.def_tests[i], only_tests) {
+                    (0, _) => {}
+                    (level::LINKED, true) => lv.raise(d, level::LINKED, Why::TestLinked),
+                    (level::LINKED, false) => lv.raise(d, level::LINKED, Why::Linked),
+                    (l, true) => lv.raise(d, l, Why::TestEvidence),
+                    (l, false) => lv.raise(d, l, Why::Evidence),
+                }
             }
             for (i, &m) in mods.iter().enumerate() {
                 let x = hits.mod_extra[i];
@@ -711,6 +750,9 @@ pub(crate) fn run(
                 }
                 if x & extra::CONFIG_NAME != 0 {
                     mp.raise(m, level::EVIDENCE, Why::ConfigName);
+                }
+                if hits.mod_tests[i] {
+                    mp.raise(m, level::EVIDENCE, Why::TestEvidence);
                 }
             }
             lv.run(&g);
@@ -831,7 +873,8 @@ fn module_candidates(ix: &Index, included: &[bool], mp: &ModuleProp<'_>) -> Vec<
 /// Confidence of the PM404 finding of file `f`'s module (0 if it has none).
 fn module_confidence(ix: &Index, dc: &DeadCode, f: FileId) -> u8 {
     let m = ix.file_node(f);
-    if ix.kind(m) != NodeKind::Module {
+    // A module that cannot be imported is run (by a test runner, as a script), never imported.
+    if ix.kind(m) != NodeKind::Module || ix.file_status(f) == FileStatus::NotImportable {
         return 0;
     }
     match dc.modules.level(m) {
@@ -861,6 +904,7 @@ fn origin_reason(o: Why) -> (u32, u32) {
         Why::StringRef => (r::STRING_REFERENCE, USE_MAYBE_UNUSED),
         Why::ExternalOverride => (r::EXTERNAL_OVERRIDE, USE_MAYBE_UNUSED),
         Why::ScriptLike => (r::SCRIPT_LIKE, USE_MAYBE_UNUSED),
+        Why::TestLinked | Why::TestEvidence => (r::USED_ONLY_IN_TESTS, USE_TESTS),
         _ => (0, USE_NEVER),
     }
 }
@@ -906,6 +950,7 @@ fn module_wording(dc: &DeadCode, m: NodeId) -> (u32, u32) {
         Why::ConfigName => (r::CONFIG_REFERENCE, IMP_CONFIG_NAME),
         Why::StringRef => (r::STRING_REFERENCE, IMP_MAYBE_UNUSED),
         Why::ConfigRef => (r::CONFIG_REFERENCE, IMP_MAYBE_UNUSED),
+        Why::TestEvidence => (r::USED_ONLY_IN_TESTS, IMP_TESTS),
         _ => (0, IMP_NEVER),
     };
     let inherited = dc.modules.why(m) != Some(origin);
