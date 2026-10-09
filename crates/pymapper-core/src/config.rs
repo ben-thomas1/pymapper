@@ -978,6 +978,10 @@ pub struct Overrides {
     pub mode: Option<Mode>,
     /// Replaces `threads` (0-4096; larger values are rejected by [`load`]).
     pub threads: Option<u32>,
+    /// Replaces `analysis.coverage`.
+    pub coverage: Option<PathBuf>,
+    /// Clears `analysis.coverage` (after `coverage`: wins over it).
+    pub no_coverage: bool,
 }
 
 /// One validation problem, located in its source.
@@ -1187,6 +1191,12 @@ fn apply_typed(config: &mut Config, root: &Path, cwd: &Path, o: &Overrides) {
     }
     if let Some(v) = o.threads {
         config.threads = v;
+    }
+    if let Some(v) = &o.coverage {
+        config.analysis.coverage = Some(normalize(&cwd.join(v)));
+    }
+    if o.no_coverage {
+        config.analysis.coverage = None;
     }
 }
 
