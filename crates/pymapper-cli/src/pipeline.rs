@@ -65,7 +65,7 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, walk_errors) = timing::time("files", || collect_files(&roots, config, project_root));
+    let (files, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
     let inputs = Inputs::from_roots(&roots, &files);
     drop(files);
     let opts = LoadOptions { dupes };
