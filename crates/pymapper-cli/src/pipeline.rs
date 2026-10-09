@@ -84,6 +84,8 @@ pub struct Project {
     pub walk_errors: usize,
     /// Dead-code evidence from config files (`analysis.config-evidence`).
     pub config_evidence: Option<ConfigEvidence>,
+    /// The import roots and distributions the project was loaded with.
+    pub roots: Roots,
 }
 
 /// Loads the project described by `config` (rooted at `project_root`).
@@ -131,7 +133,7 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
     let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
         .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
-    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence }
+    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).

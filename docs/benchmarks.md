@@ -668,6 +668,34 @@ Per level on the venv (edges, time with a warm scratch):
 - Correctness: `stdlib_rollup_matches_reference` (ignored test) checks every level, under three
   call/import filters, against a hash-set brute force, and the aggregates against subtree walks.
 
+### Treemap layout (S7.3)
+
+`cargo bench -p pymapper-core --bench layout -- [--third DIR] [--stdlib DIR] [--first DIR]
+[--synthetic NODES] [--reps R]`. `--third` makes every top-level entry of a `site-packages`
+one distribution. Loading is not part of the layout numbers. Times are best of R, release
+build, Apple M4 Pro (14 cores).
+
+| input                                        | nodes     | levels | tree build | all levels | per node | rects   | tree    | cache save / load  |
+|----------------------------------------------|-----------|--------|------------|------------|----------|---------|---------|--------------------|
+| stdlib 3.13 (631 files, 305k LOC)            | 18 779    | 7      | 0.31 ms    | 0.43 ms    | 22.7 ns  | 0.3 MB  | 0.3 MB  | 0.71 / 0.10 ms     |
+| venv + stdlib + crates/ (55k files, 16.9M LOC, 482 groups) | 912 128 | 25 | 25.8 ms | 5.8 ms | 6.4 ns | 14.6 MB | 16.4 MB | 7.4 / 4.5 ms |
+| synthetic venv-like, 14 threads              | 2 001 421 | 5      | 24.3 ms    | 6.9 ms     | 3.4 ns   | 32.0 MB | 36.0 MB | 16.1 / 11.7 ms     |
+| synthetic venv-like, 1 thread                | 2 001 421 | 5      | 23.9 ms    | 42.0 ms    | 21.0 ns  | 32.0 MB | 36.0 MB |                    |
+
+Observations:
+
+- The layout itself is a few milliseconds even for the whole venv; the deepest level a
+  semantic zoom asks for is computed on the layout thread in well under a frame. The
+  largest venv level (226k nodes at depth 5) takes about 1 ms.
+- `LayoutTree::from_index` (25.8 ms on the venv) is dominated by hashing every node name for
+  the hierarchy hash; it runs once per index.
+- Memory is 16 B per laid-out node plus 18 B per node for the tree. Peak RSS (460 MB on the
+  venv) is the index, not the layout.
+- Loading the cache costs about as much as recomputing on these inputs (4.5 ms against
+  5.8 ms on the venv). The layout is deterministic, so positions are stable across runs
+  either way; the cache (keyed by hierarchy hash and config) only pays off if the layout gets
+  costlier. It is written on the layout thread when idle, so it never delays a frame.
+
 ### Hotspots and coupling (S4.3a)
 
 `hotspot` target: `load`, then the hotspot pass and the top 100 functions. `coupling` target:
@@ -1066,3 +1094,64 @@ Per query (mean / worst; mean result size in brackets):
   and call cycles against plain BFS, Tarjan and hash-map brute force. It runs them on the test
   corpus plus a generated project with dense cross-module calls, cycles and cross-file
   overrides.
+
+### Deps (S6.1)
+
+`pymapper deps [--score] --stats` on `lectio` (1,803 first-party files) with its venv (491
+distributions, 62,331 files, 17.5M LOC in total; the stdlib off), cache in a temporary
+directory. 14-core Apple M4 Pro, release build, warm OS file cache. "Cold" = cache directory
+removed (every file extracted, every scorecard computed); "warm facts, cold scores" =
+`scores.pmc` deleted, facts cached; "warm" = everything cached. Phases from `--stats`; peak RSS
+is `ru_maxrss`. Warm rows: 2-3 runs, range shown.
+
+| run | threads | total | resolve.calls | deps.usage | deps.score | scorecards | peak RSS |
+|-----|---------|-------|---------------|------------|------------|------------|----------|
+| `--score`, cold | 14 | 6.96 s (load.extract 5.74 s) | 59.9 ms | 20.4 ms | 4.5 ms | 491 computed | 634 MB |
+| `--score`, warm facts, cold scores | 14 | 428 ms | | 19.9 ms | 5.4 ms | 491 computed | 655 MB |
+| `--score`, warm facts, cold scores | 1 | 1.34 s | 471 ms | 20.4 ms | 18.8 ms | 491 computed | 566 MB |
+| `--score`, warm | 14 | 503-748 ms | 52-79 ms | 20.4-22.0 ms | 0.1 ms (+0.1-0.9 ms read) | 490 cached, 1 computed | 628-656 MB |
+| no `--score`, warm | 14 | 575-593 ms | | 20.0-20.1 ms | - | - | 625-635 MB |
+| `check --deps`, warm (reference) | 14 | 732-787 ms | 54-60 ms | - | - | - | 659-686 MB |
+
+The cold `load.extract` (5.7 s) was I/O-bound in that session; "Check (S4.5)" measured 2.16 s
+for the same files. `scores.pmc` holds 491 scorecards in 47 KB. The one scorecard computed on
+every warm run is a distribution without a `RECORD` hash (no cache key).
+
+Observations:
+
+- **Scorecards are cheap**: one pass over the definitions and module edges of 491
+  distributions costs 18.8 ms on one thread and 5.4 ms on 14 (parallel per distribution). The
+  cache turns that into a 0.1 ms lookup plus reading a 47 KB file.
+- **Usage** (one pass over the first-party imports and all call edges, a forward CSR of the
+  call and import graphs, a BFS from the first-party nodes that reached 109k of 1.02M nodes,
+  then summing exclusive lines per distribution) is 20 ms, sequential. Its transient memory is,
+  by construction, 4 bytes per node and per edge for the forward CSR, 4 bytes per node of line
+  weights, two bits per node (BFS and used-symbol sets) and the BFS queue (4 bytes per reached
+  node); it is freed before the report and stays below the load's peak, so peak RSS is that of
+  loading the venv (as `check --deps`).
+- **Whole-run cost** is the venv load plus call resolution, as for `check --deps`: `deps` is
+  15-25% faster than `check --deps` warm because it runs no rule analyses.
+
+### Test-code evidence (S4.6)
+
+`deadcode` target, 14-core M4 Pro, release, warm, best of 3-5 (RSS worst), before (rewrite
+`394d5b6`) and after. The evidence scan now reads every first-party `.py` file (not only the
+importable ones) and keeps test-code occurrences in a second slot per name group.
+
+| corpus | candidates | findings (>= 10) | `deadcode.evidence` | peak RSS MB |
+|--------|------------|------------------|---------------------|-------------|
+| stdlib, before | 12,883 | 6,877 | 4.55ms | 32.0 |
+| stdlib, after  | 18,004 | 10,141 | 6.68ms | 35.7 |
+| venv, before   | 572,011 | 313,846 | 277.1ms | 751.9 |
+| venv, after    | 572,124 | 313,917 | 273.1ms | 754.7 |
+
+- The stdlib corpus contains `site-packages/pip` (411 files, not importable below the stdlib
+  root, so not analysed before): those files account for the extra candidates and findings.
+  In `check`, `site-packages` is third-party and never analysed.
+- A first version filtered each group's explained-file events by slot while scanning them and
+  took 311 ms on the venv; sorting the events by (group, slot, file) so each slot scans only
+  its own run, and skipping the test slot once production code links a def, brought it back
+  to the baseline.
+- `check --select PM4` on aiml-lectio (1,803 first-party files, 741 of them not importable,
+  warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
+  analysed files; peak RSS +1.5 MB.

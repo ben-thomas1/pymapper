@@ -31,14 +31,17 @@ of a base class does (name-based dispatch); in application mode 30 when \
 listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API \
 and 50 for a public method of a class that is not part of it (its instances may reach callers). \
 With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports \
-it or its module, 50 when it occurs anywhere else (attribute, identifier, string). Callees inherit \
-the confidence of such callers. `check` reports findings at or above `min-confidence` (default \
+it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every \
+first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test \
+code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is \
+not dead). Callees inherit the confidence of such callers. `check` reports findings at or above `min-confidence` (default \
 80).";
 
 /// Confidence documentation of PM404.
 const MODULE_CONFIDENCE: &str = "100 when no live module imports it or calls into it; 50 when \
 reached only through `possible` calls or when its name occurs in another file (for instance \
-`importlib.import_module(\"pkg.plugins.x\")`); 40 for a module outside any regular package (it \
+`importlib.import_module(\"pkg.plugins.x\")`; `used-only-in-tests` when only test code names it); \
+40 for a module outside any regular package (it \
 may be run as a script) and for modules imported only from such modules.";
 
 /// Wordings of PM401-PM403, indexed by the `USE_*` phrase constants. "is never used" only when
@@ -61,6 +64,7 @@ const USE: &[&str] = &[
     "is never used (public method; instances may reach callers)",
     "has no resolved callers (name appears in a config file)",
     "has no resolved callers (named with its module in a config file)",
+    "has no resolved callers (name appears only in tests)",
 ];
 /// Wordings of PM404, indexed by the `IMP_*` phrase constants.
 const IMPORTED: &[&str] = &[
@@ -71,6 +75,7 @@ const IMPORTED: &[&str] = &[
     "is only reached through possible calls",
     "is not imported (may be run as a script)",
     "is not imported (name appears in a config file)",
+    "is not imported (name appears only in tests)",
 ];
 
 /// Phrase argument: nothing refers to the definition (no call, decorator, import or subclass;
@@ -93,6 +98,8 @@ pub const USE_LIBRARY_PUBLIC: u32 = 12;
 pub const USE_API_METHOD: u32 = 13;
 pub const USE_CONFIG_NAME: u32 = 14;
 pub const USE_CONFIG_LINKED: u32 = 15;
+/// Phrase argument: its name occurs only in test code.
+pub const USE_TESTS: u32 = 16;
 
 /// PM404 phrases (see [`IMPORTED`]).
 pub const IMP_NEVER: u32 = 0;
@@ -102,6 +109,7 @@ pub const IMP_NAME_ELSEWHERE: u32 = 3;
 pub const IMP_POSSIBLE: u32 = 4;
 pub const IMP_SCRIPT_LIKE: u32 = 5;
 pub const IMP_CONFIG_NAME: u32 = 6;
+pub const IMP_TESTS: u32 = 7;
 
 /// Confidence reasons of PM401-PM405 findings ([`super::Finding::reasons`] bits).
 pub mod reason {
@@ -153,6 +161,8 @@ pub mod reason {
     pub const CONDITIONAL_IMPORT: u32 = 1 << 22;
     /// Overrides a method of a third-party or stdlib base class (a framework hook).
     pub const EXTERNAL_OVERRIDE: u32 = 1 << 23;
+    /// Its name occurs only in test code (test files, importable or not): test-only API.
+    pub const USED_ONLY_IN_TESTS: u32 = 1 << 24;
 
     /// Names of the bits, lowest first (as rendered in output).
     pub const NAMES: &[&str] = &[
@@ -180,6 +190,7 @@ pub mod reason {
         "type-checking-import",
         "conditional-import",
         "external-override",
+        "used-only-in-tests",
     ];
 }
 

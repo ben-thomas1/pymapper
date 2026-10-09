@@ -18,15 +18,15 @@ use crate::rules::dead_code::{self as dc_rules, reason};
 
 /// One finding: rule, qid (or `qid:name` for PM405), confidence, phrase index, reasons.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
-    rule: String,
-    qid: String,
-    conf: u8,
-    phrase: Option<u32>,
-    reasons: u32,
+pub(super) struct Row {
+    pub(super) rule: String,
+    pub(super) qid: String,
+    pub(super) conf: u8,
+    pub(super) phrase: Option<u32>,
+    pub(super) reasons: u32,
 }
 
-fn collect(f: &Fx, opts: &DeadCodeOptions<'_>) -> (DeadCode, Vec<Row>) {
+pub(super) fn collect(f: &Fx, opts: &DeadCodeOptions<'_>) -> (DeadCode, Vec<Row>) {
     let mut out = Findings::new();
     let dc = run(&f.ix, &f.imp, &f.calls, opts, Emit::ALL, &mut out);
     let rows = out
@@ -50,11 +50,11 @@ fn collect(f: &Fx, opts: &DeadCodeOptions<'_>) -> (DeadCode, Vec<Row>) {
     (dc, rows)
 }
 
-fn app_opts<'a>() -> DeadCodeOptions<'a> {
+pub(super) fn app_opts<'a>() -> DeadCodeOptions<'a> {
     DeadCodeOptions { mode: Mode::Application, ..DeadCodeOptions::default() }
 }
 
-fn find<'r>(rows: &'r [Row], qid: &str) -> Option<&'r Row> {
+pub(super) fn find<'r>(rows: &'r [Row], qid: &str) -> Option<&'r Row> {
     rows.iter().find(|r| r.qid == qid)
 }
 
@@ -133,7 +133,7 @@ fn string_references_by_dotted_path() {
     let m = find(&rows, "pkg.other").expect("module reported");
     assert_eq!((m.rule.as_str(), m.conf, m.phrase), ("PM404", 100, Some(dc_rules::IMP_NEVER)));
 
-    // A file outside any package (not analysed itself) still references by path.
+    // A file outside any package (not importable) references by path too.
     let f = fx(&[
         ("pkg/__init__.py", ""),
         ("pkg/other.py", "def lonely():\n    pass\n\ndef left():\n    pass\n"),

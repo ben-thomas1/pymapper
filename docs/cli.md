@@ -38,14 +38,21 @@ pymapper check [paths]
 
 Third-party (`--deps`) and stdlib (`--stdlib`) code is loaded so first-party code links to it
 (imports, base classes, calls), but it is never reported by `check` and never affects the exit
-code. Only first-party importable `.py` files are analysed for findings.
+code. Only first-party `.py` files are analysed for findings: importable modules and files that
+cannot be imported (tests in hyphenated directories such as `tests/my-service/test_x.py`,
+scripts such as `scripts/bump-version.py`; never reported as unused modules). Stubs and files
+shadowed by another file of the same module are not analysed, but every first-party `.py` file
+contributes dead-code name evidence; a name used only by test code gets the reason
+`used-only-in-tests`.
 
 The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them (see
 "Rules that cannot run" below).
 
-The other subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are
-not implemented yet: they are hidden from `pymapper --help`, accept any operands and the
-configuration flags, and exit 2 with "not implemented".
+`pymapper deps` (third-party distributions, their use by first-party code and `--score`
+scorecards) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
+`impact`, `path`, `cycles`, `summary`) are not implemented yet: they are hidden from
+`pymapper --help`, accept any operands and the configuration flags, and exit 2 with "not
+implemented".
 
 ## Project root
 

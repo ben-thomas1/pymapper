@@ -337,7 +337,7 @@ pub fn top_functions(ix: &Index, metric: Metric, k: usize, include: impl Fn(File
 
 /// Parameters of function row `g` of file `f`, without the leading `self` / `cls` of a method.
 #[inline]
-fn effective_params(ix: &Index, f: FileId, g: usize, flags: u16) -> u32 {
+pub(crate) fn effective_params(ix: &Index, f: FileId, g: usize, flags: u16) -> u32 {
     let defs = &ix.facts().defs;
     let np = u32::from(defs.params_len[g]);
     if np == 0 || flags & def_flags::METHOD == 0 || flags & def_flags::STATICMETHOD != 0 {
