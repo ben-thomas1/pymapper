@@ -85,6 +85,9 @@ struct Scratch {
 const PROTOCOL: u8 = 1;
 const INCOMPLETE: u8 = 2;
 const PUBLIC: u8 = 4;
+/// A class with a loaded ancestor defined in a module that uses dynamic access (name-based
+/// dispatch such as `getattr(self, "_print_" + name)` in a base printer or visitor).
+const DYNAMIC_BASE: u8 = 8;
 
 /// Fills the child seeds and sibling rings of `g` for the files `include` selects, and returns
 /// the per-file facts. `library`: library-mode public seeds; otherwise application-mode
@@ -97,10 +100,11 @@ pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, library: boo
     for f in 0..files {
         let inc = include(f);
         info.included.push(inc);
-        let dynamic = inc && is_dynamic(ix, f, &names);
-        info.dynamic.push(dynamic);
-        if inc {
-            file_seeds(ix, imp, g, f, library, dynamic, &names, &mut sc);
+        info.dynamic.push(inc && is_dynamic(ix, f, &names));
+    }
+    for f in 0..files {
+        if info.included[f as usize] {
+            file_seeds(ix, imp, g, f, library, &info.dynamic, &names, &mut sc);
         }
     }
     if library {
@@ -192,10 +196,11 @@ fn file_seeds(
     g: &mut DefGraph<'_>,
     f: FileId,
     library: bool,
-    dynamic: bool,
+    dynamic_files: &[bool],
     names: &Names,
     sc: &mut Scratch,
 ) {
+    let dynamic = dynamic_files[f as usize];
     let m = ix.file_node(f);
     if m == NONE {
         return;
@@ -231,6 +236,13 @@ fn file_seeds(
             {
                 mark |= INCOMPLETE;
             }
+            if let Some(c) = g.classes.id(ix, v) {
+                let cl = g.classes;
+                let dyn_ancestor = cl.mro(c).iter().skip(1).any(|&a| ix.file(cl.node(a)).is_some_and(|af| dynamic_files[af as usize]));
+                if dyn_ancestor {
+                    mark |= DYNAMIC_BASE;
+                }
+            }
         }
         if flags & def_flags::PRIVATE == 0 && (parent == 0 || (in_class && pmark & PUBLIC != 0)) {
             mark |= PUBLIC;
@@ -259,7 +271,7 @@ fn file_seeds(
                 }
             }
         }
-        if dynamic {
+        if dynamic || (in_class && pmark & DYNAMIC_BASE != 0) {
             put(seed, Why::Dynamic);
         }
         if library {

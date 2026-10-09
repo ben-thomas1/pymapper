@@ -218,6 +218,16 @@ fn external_bases_and_dynamic_modules() {
     ]);
     assert_eq!(dc.why(f.node("app:Worker.run")), Why::ExternalBase);
     assert_eq!(dc.why(f.node("dyn:handler_a")), Why::Dynamic);
+
+    // Name-based dispatch in a base class's module reaches the subclass's methods.
+    let f = fx(&[
+        ("printer.py", "class Printer:\n    def doprint(self, x):\n        return getattr(self, '_print_' + type(x).__name__)(x)\n"),
+        ("mathml.py", "from printer import Printer\n\nclass MathML(Printer):\n    def _print_Add(self, x):\n        pass\n"),
+        ("main.py", "from mathml import MathML\n\nif __name__ == '__main__':\n    MathML().doprint(1)\n"),
+    ]);
+    let (dc, _) = f.app();
+    let v = f.node("mathml:MathML._print_Add");
+    assert_eq!((dc.level(v), dc.why(v)), (level::DYNAMIC, Why::Dynamic));
 }
 
 const LIB: &[(&str, &str)] = &[
@@ -412,7 +422,8 @@ fn unused_imports_across_modules() {
         "PM405 app:side@3 30",
         "PM405 app.dyn:collections@1 70",
         "PM405 app.main:system@2 100",
-        "PM405 app.main:Unused@13 100",
+        // Type-only: quoted annotations such as `"Dict[str, Unused]"` are not evidence.
+        "PM405 app.main:Unused@13 50",
         // Named in a string of the tests (`mocker.patch('app.patched.shutil')`).
         "PM405 app.patched:shutil@1 60",
     ]);
@@ -617,4 +628,20 @@ fn results_do_not_depend_on_the_thread_count() {
     for threads in [2, 8] {
         assert_eq!(run_on(threads), one, "{threads} threads");
     }
+}
+
+#[test]
+fn imports_used_anywhere_in_expressions() {
+    let f = fx(&[(
+        "app.py",
+        "from m import A, B, C, D, E, F, G, H, I, J, K, Unused\n\n\
+         @A\ndef f(x: B, y=C) -> D:\n    pass\n\n\
+         class Z(E, metaclass=F):\n    attr: G = None\n\n\
+         def g():\n    try:\n        pass\n    except H:\n        pass\n    with I():\n        pass\n    \
+         return f'{J}' + 'K'\n\n\
+         if __name__ == '__main__':\n    g()\n",
+    )]);
+    let (_, lines) = f.app();
+    let imports: Vec<&String> = lines.iter().filter(|l| l.starts_with("PM405")).collect();
+    assert_eq!(imports, ["PM405 app:Unused@1 100"]);
 }

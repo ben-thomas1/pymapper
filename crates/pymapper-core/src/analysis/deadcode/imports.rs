@@ -29,6 +29,9 @@ pub(super) mod penalty {
     pub const INIT: u8 = 20;
     pub const INIT_SUBMODULE: u8 = 20;
     pub const CONDITIONAL: u8 = 10;
+    /// Under `if TYPE_CHECKING:`: such names are mostly used in quoted annotations, and name
+    /// evidence only sees a string that is a plain dotted name (`"Foo"`, not `"Dict[str, Foo]"`).
+    pub const TYPE_ONLY: u8 = 50;
 }
 
 /// The import rows of included files that their file does not use and no other import
@@ -98,7 +101,9 @@ pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, library: bo
                     pen += penalty::INIT_SUBMODULE;
                 }
             }
-            if flags & (import_flags::CONDITIONAL | import_flags::TYPE_CHECKING) == import_flags::CONDITIONAL {
+            if flags & import_flags::TYPE_CHECKING != 0 {
+                pen += penalty::TYPE_ONLY;
+            } else if flags & import_flags::CONDITIONAL != 0 {
                 pen += penalty::CONDITIONAL;
             }
             out.push(ImportCand { row: row as u32, file: f, name, penalty: pen });

@@ -40,6 +40,7 @@
 //! | scope -> child with an unknown decorator (may register it) | min(scope, [`level::DECORATED`]) |
 //! | class with an unloaded base -> its methods (may override a framework method) | min(class, [`level::EXTERNAL_BASE`]) |
 //! | module -> its defs when the module uses dynamic access (`getattr`, `globals()`, `vars()`, `locals()`, `__getattr__`, `__dict__`) | min(module, [`level::DYNAMIC`]) |
+//! | class -> its methods when a loaded ancestor's module uses dynamic access (name-based dispatch in a base printer / visitor) | min(class, [`level::DYNAMIC`]) |
 //! | application mode: module -> defs listed in `__all__` or re-exported | min(module, [`level::EXPORTED`]) |
 //! | library mode: scope -> public defs that are not roots (private modules, outside `__all__`) | min(scope, [`level::LIBRARY_PUBLIC`]) |
 //! | library mode: class -> its public methods (instances returned by the API reach callers) | min(class, [`level::API_METHOD`]) |
@@ -93,7 +94,9 @@
 //! the name and the module's name occur in another file that does not import the module
 //! (string references such as `mock.patch("pkg.mod.name")`), 30 for an application-mode
 //! `__init__` re-export, 20 in an `__init__` file plus 20 more for a submodule import there
-//! (often for side effects), 10 for a conditional import outside `if TYPE_CHECKING:`.
+//! (often for side effects), 50 under `if TYPE_CHECKING:` (such names are mostly used in quoted
+//! annotations, and evidence only sees strings that are plain dotted names such as `"Foo"`, not
+//! `"Dict[str, Foo]"`), 10 for another conditional import.
 //!
 //! # What is reported
 //!
@@ -118,14 +121,18 @@
 //!   improvement; levels only rise and take at most a dozen distinct values, so each node and
 //!   edge is visited a bounded number of times. Per expansion: its call edges, its children
 //!   with a seed, and for classes their loaded bases and overriding methods.
-//! - Evidence: candidate names (defs and modules still below [`level::LINKED`], unused
-//!   imports) go into a hash map; every hash of every first-party file's evidence is probed once
-//!   (O(evidence)). Explained occurrences are checked by binary search in sorted
-//!   `(candidate, file)` lists built from one pass over call edges, classes and import rows.
+//! - Evidence: candidates (defs and modules still below [`level::LINKED`], unused imports) are
+//!   grouped by name behind one hash map; every hash of every first-party file's evidence is
+//!   probed once (O(evidence)), in parallel over files with idempotent atomic updates (results
+//!   do not depend on scheduling). Work per hit is bounded by the smaller side of each
+//!   intersection (see `evidence`), so common names stay linear. Explanations come from one
+//!   parallel pass over call edges, classes, call rows and import rows, plus an SCC over the
+//!   call edges between candidates (recursion).
 //! - Memory: two bytes per node (level and why), a labelled call graph without override edges
 //!   (`10` bytes per edge plus `8` per node), the override edges (`8` bytes each), one seed
-//!   byte per node, the module graphs, and the candidate tables. Nothing is allocated per edge
-//!   during propagation; no string is built (names are compared as interned ids and hashes).
+//!   byte per node, the module graphs, and during the evidence pass 4 bytes per node (candidate
+//!   index) plus about 40 bytes per candidate. Nothing is allocated per edge during
+//!   propagation; no string is built (names are compared as interned ids and hashes).
 //!
 //! See "Dead code (S4.3c)" in `docs/benchmarks.md` for measured costs.
 

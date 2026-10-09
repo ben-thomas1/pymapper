@@ -26,7 +26,8 @@ const REACH_CONFIDENCE: &str = "100 minus how live the definition looks. 100 whe
 reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 \
 when it carries an unknown decorator that may register it; 50 for a method of a class with a base \
 that is not loaded (it may override a framework method); 70 when the defining module uses \
-dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`); in application mode 30 when \
+dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module \
+of a base class does (name-based dispatch); in application mode 30 when \
 listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API \
 and 50 for a public method of a class that is not part of it (its instances may reach callers). \
 With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports \
@@ -137,6 +138,7 @@ access (`globals()`, `vars()`, `getattr`, `__getattr__`), 40 when another module
 (public names), 40 when another file mentions both the name and the module without importing it \
 (string references such as `mock.patch(\"pkg.mod.name\")`), 30 for an application-mode \
 `__init__.py` re-export, 20 in an `__init__.py` (20 more for a submodule import, often made for \
-its side effects), 10 for a conditional import."),
+its side effects), 50 under `if TYPE_CHECKING:` (mostly used in quoted annotations, which name \
+evidence sees only when the whole string is a dotted name), 10 for another conditional import."),
     },
 ];
