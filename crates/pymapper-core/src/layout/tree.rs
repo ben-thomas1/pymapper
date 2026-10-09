@@ -96,9 +96,13 @@ impl LayoutTree {
                 roots.push(v);
             }
         }
+        // Index invariant: every group has exactly one distribution node (`group_node`), and
+        // every depth-0 node is one. A root no group maps to would stay in the main region.
+        debug_assert_eq!(roots.len(), ix.groups().len(), "depth-0 nodes are the groups' distributions");
         let mut region = vec![Region::Main as u8; roots.len()];
         for (g, grp) in ix.groups().iter().enumerate() {
             let v = ix.group_node(g as u32);
+            debug_assert!(roots.binary_search(&v).is_ok(), "group {g} maps to a depth-0 node");
             if let Ok(s) = roots.binary_search(&v) {
                 region[s] = Region::of(grp.origin) as u8;
             }

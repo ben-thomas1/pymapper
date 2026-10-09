@@ -746,8 +746,11 @@ fn clear_and_config() {
     cache.clear().expect("clear of a missing dir is fine");
     let _ = cached(t.path(), &cache);
     assert_eq!(pmc_files(cache.dir()).len(), 1);
+    let layout = cache.dir().join(crate::layout::LAYOUT_FILE);
+    fs::write(&layout, b"layout").expect("write");
     cache.clear().expect("clear");
     assert!(pmc_files(cache.dir()).is_empty());
+    assert!(!layout.exists(), "the layout cache is cleared too");
     assert!(cache.dir().join(".gitignore").exists());
     cfg.cache = false;
     assert!(Cache::from_config(&cfg).is_none());

@@ -540,9 +540,8 @@ fn store_round_trip_and_partial_levels() {
     let dir = TempDir::new("store");
     let (t, l) = medium();
     let cfg = *l.config();
-    let path = cache_path(&dir.path().join("sub"), &t, &cfg);
-    let name = path.file_name().and_then(|n| n.to_str()).expect("name").to_owned();
-    assert!(name.starts_with("layout-") && name.ends_with(".pml") && name.len() == 7 + 16 + 4, "{name}");
+    let path = cache_path(&dir.path().join("sub"));
+    assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(LAYOUT_FILE));
     save_levels(&path, &t, &cfg, l.levels()).expect("save");
     let back = load_levels(&path, &t, &cfg).expect("load");
     let lb = Layout::with_levels(Arc::clone(&t), cfg, back);
@@ -561,12 +560,11 @@ fn store_rejects_stale_or_damaged_files() {
     let dir = TempDir::new("store-bad");
     let (t, l) = medium();
     let cfg = *l.config();
-    let path = cache_path(dir.path(), &t, &cfg);
+    let path = cache_path(dir.path());
     save_levels(&path, &t, &cfg, l.levels()).expect("save");
-    // Another config or tree: another key (and file name).
+    // Another config or tree: another key, rejected from the header.
     let other = LayoutConfig { pad: 3.0, ..cfg };
     assert_ne!(cache_key(&t, &other), cache_key(&t, &cfg));
-    assert_ne!(cache_path(dir.path(), &t, &other), path);
     assert!(matches!(load_levels(&path, &t, &other), Err(StoreError::Invalid("key"))));
     let t2 = LayoutTree::from_preorder(&[0, 1], &[0, 1], &[Region::Main], 1);
     assert!(matches!(load_levels(&path, &t2, &cfg), Err(StoreError::Invalid("key"))));
@@ -586,6 +584,33 @@ fn store_rejects_stale_or_damaged_files() {
     fs::write(&path, b"garbage").expect("write");
     assert!(load_levels(&path, &t, &cfg).is_err());
     assert!(matches!(load_levels(&dir.path().join("missing.pml"), &t, &cfg), Err(StoreError::Io(_))));
+}
+
+#[test]
+fn store_keeps_one_file_per_dir() {
+    let dir = TempDir::new("store-one");
+    let (t, l) = medium();
+    let cfg = *l.config();
+    let (depths, metric) = gen_tree(9, 2, 6, 4);
+    let t2 = Arc::new(LayoutTree::from_preorder(&depths, &metric, &regions_for(&depths, &[Region::Main]), 1));
+    assert_ne!(t2.hash(), t.hash());
+    let mut l2 = Layout::new(Arc::clone(&t2), cfg);
+    l2.ensure(u32::MAX);
+    let other = LayoutConfig { pad: 3.0, ..cfg };
+    let files = || {
+        let mut v: Vec<String> = fs::read_dir(dir.path()).expect("read dir").flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+        v.sort();
+        v
+    };
+    // Two trees and two configs saved to the same dir: one file, holding the last save.
+    save_levels(&cache_path(dir.path()), &t, &cfg, l.levels()).expect("save");
+    save_levels(&cache_path(dir.path()), &t2, &cfg, l2.levels()).expect("save");
+    assert_eq!(files(), [LAYOUT_FILE]);
+    assert!(matches!(load_levels(&cache_path(dir.path()), &t, &cfg), Err(StoreError::Invalid("key"))));
+    assert_eq!(load_levels(&cache_path(dir.path()), &t2, &cfg).expect("load").len(), t2.levels() as usize);
+    save_levels(&cache_path(dir.path()), &t2, &other, l2.levels()).expect("save");
+    assert_eq!(files(), [LAYOUT_FILE]);
+    assert!(matches!(load_levels(&cache_path(dir.path()), &t2, &cfg), Err(StoreError::Invalid("key"))));
 }
 
 // -- worker -------------------------------------------------------------------------------
@@ -621,7 +646,7 @@ fn worker_saves_and_reuses_the_cache() {
         let w = LayoutWorker::spawn(Arc::clone(&t), cfg, Some(dir.path().to_path_buf()), 2, Box::new(|| {})).expect("spawn");
         assert_eq!(w.wait_for(2), 3);
         // Saved once idle; drop joins the thread, so poll for the file first.
-        let path = cache_path(dir.path(), &t, &cfg);
+        let path = cache_path(dir.path());
         for _ in 0..500 {
             if load_levels(&path, &t, &cfg).is_ok_and(|lv| lv.len() == 3) {
                 break;
@@ -644,6 +669,15 @@ fn worker_on_empty_tree_and_early_drop() {
     drop(w);
     let (t, _) = medium();
     let w = LayoutWorker::spawn(t, LayoutConfig::default(), None, u32::MAX, Box::new(|| {})).expect("spawn");
+    drop(w);
+}
+
+#[test]
+fn worker_wait_returns_when_the_thread_panics() {
+    let (t, _) = medium();
+    // The notify hook panics after the first level: waiting for deeper levels must return.
+    let w = LayoutWorker::spawn(t, LayoutConfig::default(), None, 0, Box::new(|| panic!("notify hook panics (expected)"))).expect("spawn");
+    assert_eq!(w.wait_for(u32::MAX), 1);
     drop(w);
 }
 
@@ -701,4 +735,13 @@ fn tree_from_index_follows_the_hierarchy() {
         l.ensure(u32::MAX);
         check_layout(&l);
     }
+}
+
+#[test]
+fn fingerprint_ignores_zero_sign_and_nan_payload() {
+    let cfg = LayoutConfig { region_gap: 0.0, ..LayoutConfig::default() };
+    assert_eq!(LayoutConfig { region_gap: -0.0, ..cfg }.fingerprint(), cfg.fingerprint());
+    let nan = LayoutConfig { pad: f32::NAN, ..cfg };
+    assert_eq!(LayoutConfig { pad: f32::from_bits(f32::NAN.to_bits() | 1), ..cfg }.fingerprint(), nan.fingerprint());
+    assert_ne!(LayoutConfig { pad: 3.0, ..cfg }.fingerprint(), cfg.fingerprint());
 }

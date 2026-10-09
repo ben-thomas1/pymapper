@@ -222,7 +222,7 @@ fn main() {
     let mb = layout.heap_bytes() as f64 / 1e6;
     println!("layout: all levels {:.2} ms ({:.1} ns/node), rects {mb:.1} MB", ms(full), full.as_nanos() as f64 / tree.len().max(1) as f64);
     let dir = std::env::temp_dir().join(format!("pymapper-layout-bench-{}", std::process::id()));
-    let path = cache_path(&dir, &tree, &cfg);
+    let path = cache_path(&dir);
     let (ts, ()) = best(reps, || save_levels(&path, &tree, &cfg, layout.levels()).expect("save"));
     let (tl, back) = best(reps, || load_levels(&path, &tree, &cfg).expect("load"));
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);

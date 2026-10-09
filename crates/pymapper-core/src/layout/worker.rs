@@ -70,7 +70,10 @@ impl LayoutWorker {
         let sh = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
             .name("pymapper-layout".into())
-            .spawn(move || run(&sh, layout, cache_dir, notify))?;
+            .spawn(move || {
+                let _exit = ExitGuard(&sh);
+                run(&sh, layout, cache_dir, notify);
+            })?;
         Ok(LayoutWorker { shared, tree, cfg, regions, handle: Some(handle) })
     }
 
@@ -147,8 +150,20 @@ impl Drop for LayoutWorker {
     }
 }
 
+/// Marks the worker stopped when the layout thread exits, normally or by a panic (in a
+/// layout step or the `notify` hook), so [`LayoutWorker::wait_for`] never waits on a thread
+/// that is gone.
+struct ExitGuard<'a>(&'a Shared);
+
+impl Drop for ExitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().stop = true;
+        self.0.cv.notify_all();
+    }
+}
+
 fn run(sh: &Shared, mut layout: Layout, cache_dir: Option<PathBuf>, notify: Box<dyn Fn() + Send>) {
-    let path = cache_dir.map(|d| cache_path(&d, layout.tree(), layout.config()));
+    let path = cache_dir.map(|d| cache_path(&d));
     if let Some(p) = &path
         && let Ok(levels) = load_levels(p, layout.tree(), layout.config())
         && !levels.is_empty()

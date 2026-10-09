@@ -1,7 +1,8 @@
 //! On-disk layout cache: the computed levels of one (tree, config) pair.
 //!
 //! ```text
-//!   <dir>/layout-<key:016x>.pml          key = hash(format version, tree hash, config fingerprint)
+//!   <dir>/layout.pml                     one file per cache dir; the header carries the key
+//!                                        key = hash(format version, tree hash, config fingerprint)
 //!
 //!   offset  size  field
 //!   0       8     magic "PMLAYOUT"
@@ -17,6 +18,11 @@
 //! reused buffer, so the only large allocation is the levels themselves. Anything that does
 //! not validate (magic, version, key, node count, level lengths against the tree, checksum)
 //! is an error and the caller recomputes: the cache never changes what is laid out.
+//!
+//! The file name is fixed, so the cache holds at most one layout per directory: a save for
+//! another tree or config replaces the previous file instead of adding one next to it, and
+//! the disk use stays bounded (about 16 bytes per laid-out node) however often the hierarchy
+//! changes. A stale file is rejected by its key and overwritten by the next save.
 
 use std::fs::File;
 use std::hash::Hasher;
@@ -50,17 +56,13 @@ pub fn cache_key(tree: &LayoutTree, cfg: &LayoutConfig) -> u64 {
     h.finish()
 }
 
-/// The cache file of a tree laid out with a config, in `dir`.
-pub fn cache_path(dir: &Path, tree: &LayoutTree, cfg: &LayoutConfig) -> PathBuf {
-    let mut name = String::with_capacity(28);
-    name.push_str("layout-");
-    let key = cache_key(tree, cfg);
-    for i in (0..16).rev() {
-        let d = ((key >> (i * 4)) & 0xf) as u8;
-        name.push(char::from(if d < 10 { b'0' + d } else { b'a' + d - 10 }));
-    }
-    name.push_str(".pml");
-    dir.join(name)
+/// The name of the layout cache file in a cache directory.
+pub const LAYOUT_FILE: &str = "layout.pml";
+
+/// The layout cache file in `dir`. One per directory, whatever the tree and config: the key
+/// in its header says which pair it holds.
+pub fn cache_path(dir: &Path) -> PathBuf {
+    dir.join(LAYOUT_FILE)
 }
 
 #[inline]

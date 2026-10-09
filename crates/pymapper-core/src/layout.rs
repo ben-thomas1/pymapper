@@ -56,6 +56,14 @@
 //! hierarchy loads the levels it had instead of computing them. Any change of a weight
 //! changes the hash: the cache never serves positions of another hierarchy.
 //!
+//! Determinism is not geographic stability under edits. With the default [`Order::Size`],
+//! siblings are re-sorted by weight, so a one-line edit that changes which of two siblings is
+//! bigger moves both (and everything nested in them), and every weight change is a new cache
+//! key. [`Order::Preorder`] keeps siblings in place when weights change (cells only grow or
+//! shrink), at the cost of worse aspect ratios; it is the choice for a map that should keep
+//! its geography while code is being edited (watch mode). `Size` stays the default because it
+//! gives the most readable cells for a one-off view of a large hierarchy.
+//!
 //! # Levels and laziness
 //!
 //! Level `d` holds the rects of every node at depth `d`, in pre-order: a parent's children
@@ -80,7 +88,7 @@ mod worker;
 mod tests;
 
 pub use engine::Layout;
-pub use store::{StoreError, cache_key, cache_path, load_levels, save_levels};
+pub use store::{LAYOUT_FILE, StoreError, cache_key, cache_path, load_levels, save_levels};
 pub use tree::{LayoutTree, SizeMetric, TreeOptions};
 pub use worker::LayoutWorker;
 
@@ -217,7 +225,9 @@ impl LayoutConfig {
             self.header_frac,
         ];
         for v in f {
-            std::hash::Hasher::write_u32(&mut h, v.to_bits());
+            // -0.0 and 0.0 lay out identically, as do all NaNs: one key each.
+            let bits = if v == 0.0 { 0 } else if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+            std::hash::Hasher::write_u32(&mut h, bits);
         }
         std::hash::Hasher::write_u8(&mut h, self.order as u8);
         std::hash::Hasher::finish(&h)
