@@ -594,6 +594,35 @@ fn summary_counts_and_rankings() {
     assert_eq!((top1.cognitive.len(), top1.most_called.len(), top1.most_imported.len()), (1, 1, 1));
 }
 
+#[test]
+fn summary_where_restricts_rankings_only() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let opts = SummaryOptions::default();
+    let all = q.summary(&opts);
+    assert_eq!(q.summary_where(&opts, |_| true), all);
+    let none = q.summary_where(&opts, |_| false);
+    assert_eq!((none.origins, none.call_sites, none.import_cycles), (all.origins, all.call_sites, all.import_cycles));
+    assert!(none.cognitive.is_empty() && none.cyclomatic.is_empty() && none.most_called.is_empty() && none.most_imported.is_empty());
+    // One file: every ranked node lies in it.
+    let core = f.ix.file(f.node("pkg.core")).expect("file");
+    let one = q.summary_where(&opts, |file| file == core);
+    for r in one.cognitive.iter().chain(&one.cyclomatic).chain(&one.most_called).chain(&one.most_imported) {
+        assert_eq!(f.ix.file(r.node), Some(core));
+    }
+    assert!(!one.most_called.is_empty() || !one.cognitive.is_empty());
+}
+
+#[test]
+fn edge_site_agrees_with_call_sites() {
+    let f = corpus_fx();
+    let q = f.q();
+    for e in f.calls.edges().iter().filter(|e| e.conf != Confidence::Unresolved).take(5000) {
+        let site = q.edge_site(e);
+        assert!(q.call_sites(e.src, e.dst).any(|s| s == site), "{e:?}");
+    }
+}
+
 // -- brute-force references on the corpus ---------------------------------------------------
 
 /// Adjacency of the kept call edges: node -> neighbours (forward or reverse).

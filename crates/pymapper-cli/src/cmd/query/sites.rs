@@ -66,3 +66,90 @@ pub fn import_site(q: &Query<'_>, src: NodeId, dst: NodeId) -> Option<(u32, u32,
     let imp = q.imports();
     ix.file_facts(f).imports.range().find(|&row| imp.module_node(row) == dst).map(|row| (f, st.line[row], st.col[row] + 1))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::walk::{WalkOptions, walk};
+
+    use super::*;
+
+    /// A generated package: modules calling each other's functions at random (repeated calls
+    /// give pairs with several sites), and a base class whose method dispatches to overrides
+    /// in every module.
+    fn generate(dir: &Path) {
+        let (mods, funcs) = (6u64, 8u64);
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("__init__.py"), "").expect("write");
+        std::fs::write(pkg.join("base.py"), "class Base:\n    def run(self):\n        return self.step()\n\n    def step(self):\n        return 0\n")
+            .expect("write");
+        for m in 0..mods {
+            let mut src = String::from("from pkg.base import Base\n");
+            for o in (0..mods).filter(|&o| o != m) {
+                src.push_str(&format!("from pkg import m{o}\n"));
+            }
+            src.push_str(&format!("\n\nclass K{m}(Base):\n    def step(self):\n        return f0(1)\n"));
+            for f in 0..funcs {
+                src.push_str(&format!("\n\ndef f{f}(x):\n"));
+                for _ in 0..4 {
+                    let (tm, tf) = (next(mods), next(funcs));
+                    // Half the calls are repeated: pairs with several sites.
+                    for _ in 0..=next(2) {
+                        if tm == m {
+                            src.push_str(&format!("    f{tf}(x)\n"));
+                        } else {
+                            src.push_str(&format!("    m{tm}.f{tf}(x)\n"));
+                        }
+                    }
+                }
+                src.push_str("    return x\n");
+            }
+            std::fs::write(pkg.join(format!("m{m}.py")), src).expect("write");
+        }
+    }
+
+    /// Every (caller, callee) pair of a generated project, real and dispatch, located in one
+    /// call against `Query::call_sites` per pair.
+    #[test]
+    fn locate_matches_call_sites() {
+        let dir = std::env::temp_dir().join(format!("pymapper-sites-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        generate(&dir);
+        let w = walk(&[dir.as_path()], &WalkOptions::everything());
+        let ix = load(Inputs::from_root_dir(&dir, &w.files, Origin::FirstParty, b"gen"));
+        let imp = resolve_imports(&ix, &Attribution::new());
+        let calls = resolve_calls(&ix, &imp);
+        let q = Query::new(&ix, &imp, &calls);
+        let mut pairs: Vec<Pair> = Vec::new();
+        for v in 0..ix.node_count() {
+            for (w, _, dispatch) in q.direct_callees(v) {
+                pairs.push(Pair { src: v, dst: w, dispatch });
+            }
+        }
+        assert!(pairs.len() > 150, "too few pairs: {}", pairs.len());
+        assert!(pairs.iter().any(|p| p.dispatch), "no dispatch pair");
+        let got = locate(&q, &pairs);
+        let multi = got.iter().filter(|s| s.count > 1).count();
+        assert!(multi > 10, "too few pairs with several sites: {multi}");
+        for (p, s) in pairs.iter().zip(&got) {
+            let want: Vec<Site> =
+                q.call_sites(p.src, p.dst).filter(|s| p.dispatch == (s.reason == Reason::Override)).collect();
+            assert_eq!(s.count as usize, want.len(), "{}:{}", ix.qid_string(p.src), ix.qid_string(p.dst));
+            assert_eq!(s.first, want.first().copied());
+            assert!(s.count > 0, "every pair has a site");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

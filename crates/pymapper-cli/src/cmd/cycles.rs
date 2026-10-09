@@ -9,8 +9,9 @@
 //!   ──> PATHS filter (a cycle with a member under PATHS) ──> concise | json ──> exit 0
 //! ```
 //!
-//! Every cycle is one line at the import (call) that starts its witness: the shortest cycle
-//! through the component's first module, members in the order they import each other.
+//! Every cycle is one line at the import (call) that starts its witness: a shortest cycle,
+//! each member importing (calling) the next. Import witnesses start at the module whose import
+//! closes the cycle, as PM301; call witnesses start at the symbol.
 
 use std::io;
 use std::path::PathBuf;
