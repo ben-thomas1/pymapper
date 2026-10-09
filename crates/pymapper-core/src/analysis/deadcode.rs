@@ -1,10 +1,11 @@
-//! Cross-module dead code analysis (design: Checks / CLI, Dead code (a)-(g), (i); rules
+//! Cross-module dead code analysis (design: Checks / CLI, Dead code (a)-(i); rules
 //! PM401-PM405).
 //!
 //! ```text
-//!   Index + Imports + ResolvedCalls + options (mode, entrypoints, presets, scripts)
+//!   Index + Imports + ResolvedCalls + options (mode, entrypoints, presets, scripts, coverage)
 //!     ├─> reach::roots          RootSet: <module> scopes, __main__, tests, entrypoint
-//!     │                         decorators / bases / names, scripts, public API (library mode)
+//!     │                         decorators / bases / names, scripts, public API (library mode);
+//!     │                         plus defs and modules a coverage report shows executed
 //!     ├─> seeds                 per def: a conditional "child seed" (dunder / protocol member,
 //!     │                         unknown decorator, external base, dynamic module, exported,
 //!     │                         library public) and same-name sibling rings
@@ -14,6 +15,7 @@
 //!     ├─> name fallback         one scan over the evidence hashes of every file, probing the
 //!     │   (evidence)            names of the defs, modules and imports still in doubt
 //!     ├─> levels (phase 2)      propagation continued from the evidence seeds
+//!     ├─> coverage              levels below 100 of code the report shows never ran: / 3
 //!     └─> findings              PM401 / PM402 / PM403 per def, PM404 per module, PM405 per
 //!                               import; confidence = 100 - level
 //! ```
@@ -72,6 +74,8 @@
 //! | name fallback: its name and its module's dotted path occur in the same config file | [`level::LINKED`] |
 //! | name fallback: the name occurs anywhere else (attribute, identifier, string, quoted type, config file) | [`level::EVIDENCE`] |
 //! | name fallback, test code only (no production file or config file mentions the name): as above, linked or elsewhere | [`level::LINKED`] / [`level::EVIDENCE`], reason `used-only-in-tests` |
+//! | coverage: its own code ran ([`coverage`]; a seed, like a root) | 100, why [`Why::Executed`] |
+//! | coverage: its code never ran and its final level is below 100 (applied last, not propagated) | level / [`NOT_EXECUTED_DIVISOR`], reason `never-executed` |
 //!
 //! Name evidence comes from every first-party `.py` file, importable or not: tests in
 //! directories that are not package names (`tests/my-service/pkg/test_x.py`, run by pytest's
@@ -114,6 +118,21 @@
 //!
 //! A file that both calls a def from dead code and references it from live code without a
 //! call (`register(f)`) is the case this misses.
+//!
+//! # Coverage evidence (design (h))
+//!
+//! With a coverage.py JSON report (`analysis.coverage`, `check --coverage FILE`), each def and
+//! module of a listed file is *executed*, *not executed* or unknown (see [`coverage`] for the
+//! line rules). Executed code is live: it seeds the propagation at level 100 (why
+//! [`Why::Executed`]) before phase 1, so what it calls and its class are live too. Statically
+//! live code that never ran (untested) keeps level 100: a report never lowers a reachable node.
+//! A node below 100 that never ran has its final level divided by [`NOT_EXECUTED_DIVISOR`]:
+//! unreachable and never executed stays at confidence 100; weak evidence of use goes up (name
+//! elsewhere or `possible` call 50 -> 84, unknown decorator 40 -> 80, dynamic access 70 -> 90,
+//! library public name 80 -> 94, script-like module 40 -> 80, name in an importer 10 -> 70).
+//! The division comes after propagation and is not propagated: what such a node reaches is
+//! lowered only when the report shows that it never ran either. Findings of never-executed
+//! nodes carry the reason `never-executed`. A report built for another index is ignored.
 //!
 //! # Modules (PM404)
 //!
@@ -191,7 +210,11 @@
 //!   index) plus about 40 bytes per candidate. Nothing is allocated per edge during
 //!   propagation; no string is built (names are compared as interned ids and hashes).
 //!
-//! See "Dead code (S4.3c)" in `docs/benchmarks.md` for measured costs.
+//! - Coverage (when given): the report is read and mapped by [`coverage`] (O(report bytes));
+//!   seeding and lowering are one pass over its two bit sets (2 bits per node).
+//!
+//! See "Dead code (S4.3c)" and "Coverage evidence (S6.3)" in `docs/benchmarks.md` for measured
+//! costs.
 
 pub mod coverage;
 mod evidence;

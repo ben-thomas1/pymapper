@@ -185,6 +185,12 @@ only when nothing refers to the symbol, and the reasons are listed, e.g.
 first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
 is test-only API, reported below the gate as `used-only-in-tests`.
 
+Runtime evidence from a test run sharpens the scores: pass a coverage.py JSON report with
+`pymapper check --coverage coverage.json` (or `analysis.coverage`). Code that ran is never
+reported; code that never ran and has only weak static evidence of use moves above the gate
+(`(confidence 84: name-elsewhere, never-executed)`). Create the report with
+`coverage run -m pytest && coverage json`.
+
 ## Performance
 
 Performance (time and memory) is a first-class requirement: the target is millions of lines.

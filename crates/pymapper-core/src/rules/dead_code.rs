@@ -34,15 +34,19 @@ With `analysis.name-fallback`, 10 when the name occurs in its own file or in a f
 it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every \
 first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test \
 code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is \
-not dead). Callees inherit the confidence of such callers. `check` reports findings at or above `min-confidence` (default \
-80).";
+not dead). Callees inherit the confidence of such callers. With a coverage report \
+(`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the \
+doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason \
+`never-executed`). `check` reports findings at or above `min-confidence` (default 80).";
 
 /// Confidence documentation of PM404.
 const MODULE_CONFIDENCE: &str = "100 when no live module imports it or calls into it; 50 when \
 reached only through `possible` calls or when its name occurs in another file (for instance \
 `importlib.import_module(\"pkg.plugins.x\")`; `used-only-in-tests` when only test code names it); \
 40 for a module outside any regular package (it \
-may be run as a script) and for modules imported only from such modules.";
+may be run as a script) and for modules imported only from such modules. With a coverage report, a \
+module that was imported is never reported and the doubt of one that never was is divided by 3 \
+(40 becomes 80; reason `never-executed`).";
 
 /// Wordings of PM401-PM403, indexed by the `USE_*` phrase constants. "is never used" only when
 /// nothing refers to the definition at all; otherwise the wording names the strongest evidence
