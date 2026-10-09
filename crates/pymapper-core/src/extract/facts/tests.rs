@@ -46,7 +46,7 @@ fn row_sizes_match_the_documented_layout() {
     assert_eq!(Decorators::ROW_BYTES, 10);
     assert_eq!(Bases::ROW_BYTES, 14);
     assert_eq!(Params::ROW_BYTES, 5);
-    assert_eq!(Imports::ROW_BYTES, 27);
+    assert_eq!(Imports::ROW_BYTES, 32);
     assert_eq!(Calls::ROW_BYTES, 18);
     assert_eq!(Bindings::ROW_BYTES, 20);
     assert_eq!(Decls::ROW_BYTES, 9);
@@ -606,6 +606,28 @@ fn with_view<R>(src: &str, f: impl FnOnce(FileView<'_>) -> R) -> R {
 }
 
 #[test]
+fn import_module_pos_is_shared_by_the_names_of_a_statement() {
+    let src = "import a, b.c\nfrom d.e import (\n    f,\n    g as h,\n)\nfrom . import (\n  i)\nfrom d.e import *\n";
+    with_view(src, |v| {
+        let rows = v.ff.imports.range();
+        let st = &v.store.imports;
+        let got: Vec<((u32, u32), (u32, u32))> = rows.map(|r| ((st.line[r], st.col[r]), v.import_module_pos(r))).collect();
+        assert_eq!(
+            got,
+            [
+                ((1, 7), (1, 7)),
+                ((1, 10), (1, 10)),
+                ((3, 4), (2, 5)),
+                ((4, 4), (2, 5)),
+                // An empty module: the `from` keyword.
+                ((7, 2), (6, 0)),
+                ((8, 16), (8, 5)),
+            ]
+        );
+    });
+}
+
+#[test]
 fn evidence_covers_names_attributes_and_identifier_strings() {
     let src = "\
 handler_ref = registry
@@ -1008,4 +1030,50 @@ fn main_guard_line_is_recorded() {
     assert_eq!(ff.main_line, 5);
     let ff = extract(b"def f():\n    if __name__ == '__main__':\n        pass\n", &mut st, &mut spans);
     assert_eq!(ff.main_line, 0);
+}
+
+/// The one-pass string classifier agrees with the straightforward multi-pass definitions.
+#[test]
+fn classify_string_matches_reference() {
+    use super::build::{StrShape, classify_string};
+    fn ident(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+    }
+    fn reference(s: &[u8]) -> StrShape {
+        if s.is_empty() || s.len() > 200 {
+            return StrShape::Other;
+        }
+        let path = s.iter().filter(|&&b| b == b':').count() <= 1
+            && s.split(|&b| b == b'.' || b == b':').all(|seg| !seg.is_empty() && !seg[0].is_ascii_digit() && seg.iter().all(|&b| ident(b)));
+        if path {
+            return StrShape::Path;
+        }
+        let ty = s.iter().any(|&b| b == b'[' || b == b'|')
+            && s.iter().all(|&b| ident(b) || matches!(b, b'.' | b'[' | b']' | b',' | b'|' | b'\'' | b' '));
+        if ty { StrShape::TypeExpr } else { StrShape::Other }
+    }
+    let fixed: [&[u8]; 24] = [
+        b"", b"a", b"a.b", b"a:b", b"a:b:c", b"a.b:c", b".a", b"a.", b"a..b", b"1a", b"a.1b", b"a1.b2", b"Dict[str, Foo]",
+        b"Foo | None", b"Foo|", b"a b", b"x[1]", b"a:b[c]", b"hello world.", b"\xff\xfe", b"a.b[c]", b"'x' | 'y'", b"_", b"a-b",
+    ];
+    for s in fixed {
+        assert_eq!(classify_string(s), reference(s), "{s:?}");
+    }
+    // Random strings over an alphabet of every byte class, all lengths up to past the limit.
+    let alphabet = b"ab_Z09.:[]|, '-(\x80";
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..200_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let len = (x % 12) as usize + if x.is_multiple_of(97) { 195 } else { 0 };
+        let mut y = x;
+        let s: Vec<u8> = (0..len)
+            .map(|_| {
+                y = y.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                alphabet[(y >> 33) as usize % alphabet.len()]
+            })
+            .collect();
+        assert_eq!(classify_string(&s), reference(&s), "{s:?}");
+    }
 }

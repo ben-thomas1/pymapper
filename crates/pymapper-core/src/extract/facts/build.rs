@@ -53,6 +53,8 @@ pub(super) struct Scratch {
     /// (`from x import (\n a,\n b)`), in source order: a `# noqa` on the first line covers
     /// them too.
     split_imports: Vec<(u32, u32)>,
+    /// Line of each suppression comment of the current file.
+    sup_lines: Vec<u32>,
 }
 
 /// Slots of the evidence dedup filter (power of two).
@@ -224,8 +226,17 @@ pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, st
     // The parser's line cursor sits near the end already: this is cheap.
     let end = p.pos(len32(src.len()));
     let lines = if end.col == 0 { end.line - 1 } else { end.line };
+    // Lines of the suppression comments, from the parser's line index.
+    let mut sup_lines = std::mem::take(&mut p.v.0.sc.sup_lines);
+    sup_lines.clear();
+    for i in 0..p.lx.suppressions().len() {
+        let off = p.lx.suppressions()[i].start;
+        sup_lines.push(p.pos(off).line);
+    }
     let (Tee(mut b, extra), sups) = p.finish();
-    (b.finish(&sups, lines), extra)
+    let ff = b.finish(&sups, &sup_lines, lines);
+    b.sc.sup_lines = sup_lines;
+    (ff, extra)
 }
 
 impl<S: StrSink> Builder<'_, S> {
@@ -311,13 +322,12 @@ impl<S: StrSink> Builder<'_, S> {
     }
 
     /// Finalises the file: suppressions, line count, `__all__`, evidence, header.
-    fn finish(&mut self, sups: &[Suppression], lines: u32) -> FileFacts {
+    /// `sup_lines[i]` is the line of `sups[i]`.
+    fn finish(&mut self, sups: &[Suppression], sup_lines: &[u32], lines: u32) -> FileFacts {
         // Decorators / bases never followed by their def (malformed input) are dropped.
         self.claim_header_rows(0, 0);
         let src = self.src;
-        let mut lc = LineCounter::default();
-        for s in sups {
-            let line = lc.line_at(src, s.start);
+        for (s, &line) in sups.iter().zip(sup_lines) {
             if s.noqa {
                 self.noqa(src, s, line);
                 continue;
@@ -629,7 +639,8 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         }
         let level = i.level.min(255) as u8;
         let scope = self.scope();
-        self.st.imports.push(scope, module.c, module.len, name, alias, level, flags, i.pos.line, i.pos.col);
+        let dline = (i.pos.line - i.module_pos.line).min(255) as u8;
+        self.st.imports.push(scope, module.c, module.len, name, alias, level, flags, i.pos.line, i.pos.col, dline, i.module_pos.col);
         if i.stmt_line != i.pos.line {
             self.sc.split_imports.push((i.stmt_line, i.pos.line));
         }
@@ -704,8 +715,10 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
                 out.push(h);
             }
         };
-        if !path_evidence(text, &mut push) {
-            type_expr_idents(text, |seg| push(evidence_hash(seg)));
+        match classify_string(text) {
+            StrShape::Path => path_pushes(text, &mut push),
+            StrShape::TypeExpr => type_expr_idents(text, |seg| push(evidence_hash(seg))),
+            StrShape::Other => {}
         }
     }
 
@@ -823,23 +836,6 @@ fn sort_dedup_tail(v: &mut Vec<u32>, from: usize) {
     v.truncate(w);
 }
 
-/// `src[i]` ends a line: `\n`, or a `\r` not followed by `\n`.
-#[inline(always)]
-fn is_line_end(src: &[u8], i: usize) -> bool {
-    match src[i] {
-        b'\n' => true,
-        b'\r' => src.get(i + 1) != Some(&b'\n'),
-        _ => false,
-    }
-}
-
-/// Forward line lookup for increasing offsets.
-#[derive(Default)]
-struct LineCounter {
-    off: usize,
-    line: u32,
-}
-
 /// Sets the owner of the last `keep` of the `pending` rows at the end of a table's owner
 /// column to `def`; returns the other pending rows, to be drained from every column.
 fn claim(owner: &mut [Scope], pending: u32, keep: u32, def: Scope) -> Option<std::ops::Range<usize>> {
@@ -859,20 +855,6 @@ fn last_line_len(src: &[u8]) -> u32 {
     }
     let start = src[..end].iter().rposition(|&b| b == b'\n' || b == b'\r').map_or(0, |i| i + 1);
     len32(end - start)
-}
-
-impl LineCounter {
-    fn line_at(&mut self, src: &[u8], off: u32) -> u32 {
-        let end = (off as usize).min(src.len());
-        if end < self.off {
-            *self = LineCounter::default();
-        }
-        for i in self.off..end {
-            self.line += is_line_end(src, i) as u32;
-        }
-        self.off = end;
-        self.line + 1
-    }
 }
 
 /// Content span `(start, len)` of a plain string literal token (prefix and quotes stripped).
@@ -943,22 +925,101 @@ fn step_getattr(ga: &mut Getattr, src: &[u8], t: Token) -> bool {
 /// Most segments of a dotted path whose prefixes get a path hash.
 const MAX_PATH_SEGS: usize = 8;
 
-/// When `s` looks like an identifier or a dotted path (`name`, `pkg.mod.func`, `pkg.mod:attr`
-/// with at most one `:`), calls `push` with the evidence hash of each segment and, for paths,
-/// of each prefix of two segments or more with `:` read as `.` (`pkg.mod`, `pkg.mod.attr`):
-/// string references to modules and definitions by dotted path. Returns whether it did.
-pub(crate) fn path_evidence(s: &[u8], mut push: impl FnMut(u32)) -> bool {
+/// What a string literal's content looks like, for name evidence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StrShape {
+    /// An identifier or a dotted path (see [`path_pushes`]).
+    Path,
+    /// A quoted type expression (see [`type_expr_idents`]).
+    TypeExpr,
+    Other,
+}
+
+// Byte classes of `classify_string`.
+const C_IDENT: u8 = 1;
+const C_DIGIT: u8 = 2;
+/// `.` or `:` (path separators).
+const C_SEP: u8 = 4;
+/// Allowed in a type expression besides identifier bytes and `.`.
+const C_TYPE: u8 = 8;
+/// `[` or `|`: a type expression needs one.
+const C_TRIGGER: u8 = 16;
+
+static STR_CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        t[i] = if b.is_ascii_digit() {
+            C_IDENT | C_DIGIT
+        } else if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 {
+            C_IDENT
+        } else {
+            match b {
+                b'.' | b':' => C_SEP,
+                b'[' | b'|' => C_TYPE | C_TRIGGER,
+                b']' | b',' | b'\'' | b' ' => C_TYPE,
+                _ => 0,
+            }
+        };
+        i += 1;
+    }
+    t
+};
+
+/// Classifies `s` in one pass (one table load per byte, stopping at the first byte that
+/// rules out both shapes):
+/// - [`StrShape::Path`]: identifier bytes and `.` / `:` separators, at most one `:`, every
+///   segment non-empty and not starting with a digit (`name`, `pkg.mod.func`, `pkg.mod:attr`);
+/// - [`StrShape::TypeExpr`]: only identifier bytes, `.`, `[`, `]`, `,`, `|`, `'` and spaces,
+///   with at least one `[` or `|` (`"Dict[str, Foo]"`, `"Foo | None"`); prose never qualifies.
+///
+/// Empty strings and strings longer than [`MAX_EVIDENCE_STR`] are [`StrShape::Other`].
+pub(crate) fn classify_string(s: &[u8]) -> StrShape {
     if s.is_empty() || s.len() > MAX_EVIDENCE_STR {
-        return false;
+        return StrShape::Other;
     }
-    if s.iter().filter(|&&b| b == b':').count() > 1 {
-        return false;
-    }
-    for seg in s.split(|&b| b == b'.' || b == b':') {
-        if seg.is_empty() || seg[0].is_ascii_digit() || !seg.iter().all(|&b| is_ident_byte(b)) {
-            return false;
+    let (mut path, mut ty, mut trigger) = (true, true, false);
+    let mut colons = 0u32;
+    // At the start of a path segment (start of string or after a separator).
+    let mut seg_start = true;
+    for &b in s {
+        let c = STR_CLASS[b as usize];
+        if c & C_IDENT != 0 {
+            path &= !(seg_start && c & C_DIGIT != 0);
+            seg_start = false;
+        } else if c & C_SEP != 0 {
+            path &= !seg_start;
+            seg_start = true;
+            if b == b':' {
+                colons += 1;
+                ty = false;
+            }
+        } else {
+            path = false;
+            if c & C_TYPE == 0 {
+                return StrShape::Other;
+            }
+            trigger |= c & C_TRIGGER != 0;
+        }
+        if !path && !ty {
+            return StrShape::Other;
         }
     }
+    if path && !seg_start && colons <= 1 {
+        StrShape::Path
+    } else if ty && trigger {
+        StrShape::TypeExpr
+    } else {
+        StrShape::Other
+    }
+}
+
+/// For a [`StrShape::Path`] string, calls `push` with the evidence hash of each segment and of
+/// each prefix of two segments or more with `:` read as `.` (`pkg.mod`, `pkg.mod.attr`):
+/// string references to modules and definitions by dotted path.
+pub(crate) fn path_pushes(s: &[u8], mut push: impl FnMut(u32)) {
+    debug_assert_eq!(classify_string(s), StrShape::Path);
     let mut buf = [0u8; MAX_EVIDENCE_STR];
     let mut segs = 0;
     let mut start = 0;
@@ -979,19 +1040,12 @@ pub(crate) fn path_evidence(s: &[u8], mut push: impl FnMut(u32)) -> bool {
     if (2..=MAX_PATH_SEGS).contains(&segs) {
         push(evidence_hash(&buf[..s.len()]));
     }
-    true
 }
 
-/// Calls `f` with each identifier of `s` when `s` looks like a quoted type expression
-/// (`"Dict[str, Foo]"`, `"Foo | None"`): only identifier bytes, `.`, `[`, `]`, `,`, `|`, `'`
-/// and spaces, with at least one `[` or `|`. Prose never qualifies.
+/// For a [`StrShape::TypeExpr`] string, calls `f` with each identifier (segments of
+/// identifier bytes not starting with a digit).
 fn type_expr_idents(s: &[u8], mut f: impl FnMut(&[u8])) {
-    if s.is_empty() || s.len() > MAX_EVIDENCE_STR || !s.iter().any(|&b| b == b'[' || b == b'|') {
-        return;
-    }
-    if !s.iter().all(|&b| is_ident_byte(b) || matches!(b, b'.' | b'[' | b']' | b',' | b'|' | b'\'' | b' ')) {
-        return;
-    }
+    debug_assert_eq!(classify_string(s), StrShape::TypeExpr);
     for seg in s.split(|&b| !is_ident_byte(b)) {
         if !seg.is_empty() && !seg[0].is_ascii_digit() {
             f(seg);

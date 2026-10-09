@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use band::QueryScratch;
 use camera::Camera;
 use hit::{Bands, Hit, HitKind, HitScratch};
-use scene::{Band, GlyphInstance, Rgba, Scene, WorldRect, band_zoom};
+use scene::{Band, GlyphInstance, RectInstance, Rgba, Scene, WorldRect, band_zoom};
 use text::TextSystem;
 
 /// Label font size in points (scaled by the DPI factor).
@@ -66,12 +66,19 @@ pub struct CanvasInput {
     /// Multiplicative zoom factor (1.0 = none) about `zoom_anchor` (or the canvas centre).
     pub zoom: f32,
     pub zoom_anchor: Option<[f32; 2]>,
-    /// Fit the whole scene (Home key / double click).
+    /// Fit the whole scene (Home key, or a double click on empty canvas).
     pub fit: bool,
+    /// Primary click / double click on the canvas, Shift held, Escape pressed (interaction;
+    /// [`MapState::apply_input`] ignores them).
+    pub click: bool,
+    pub double_click: bool,
+    pub shift: bool,
+    pub escape: bool,
 }
 
 impl CanvasInput {
-    pub const NONE: Self = Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false };
+    pub const NONE: Self =
+        Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false, click: false, double_click: false, shift: false, escape: false };
 }
 
 /// Duration counters for one kind of rebuild.
@@ -123,6 +130,25 @@ pub struct Labels {
 
 type HoverKey = (Option<[f32; 2]>, Camera, u64, u64, f32);
 
+/// Overlay slots, drawn in this order over the scene and its labels (and under the hover
+/// outline). Overlays are never hit-tested.
+pub const OVERLAYS: usize = 2;
+/// Persistent overlays (cycles, layer violations, finding badges): rebuilt on toggle.
+pub const OVERLAY_MARKS: usize = 0;
+/// Interaction highlight (hover neighbourhood, selection, path, search hit): rebuilt when the
+/// hovered or selected item changes.
+pub const OVERLAY_HIGHLIGHT: usize = 1;
+
+/// A small scene drawn over the main one, in the same world, with its own LOD band filter and
+/// grid culling (so overlays cost nothing while panning and are band-filtered like the map).
+#[derive(Debug, Default)]
+pub struct Overlay {
+    pub scene: Arc<Scene>,
+    pub bands: Bands,
+    /// Bumped on every [`MapState::set_overlay`].
+    pub generation: u64,
+}
+
 /// CPU-side state of the map: scene, camera, band-filtered views, labels, hover.
 pub struct MapState {
     pub scene: Arc<Scene>,
@@ -135,11 +161,20 @@ pub struct MapState {
     pub labels: Labels,
     pub text: Option<TextSystem>,
     pub hover: Option<Hit>,
+    pub overlays: [Overlay; OVERLAYS],
     pub stats: MapStats,
     /// Pixels per point of the last update (label size, hit tolerance).
     pub pixels_per_point: f32,
     /// When set, every item is drawn regardless of LOD (stress worst case).
     pub force_all: bool,
+    /// Selection outlines drawn over the scene with the hover highlight (see
+    /// [`Self::set_marks`]).
+    pub marks: Vec<RectInstance>,
+    /// Bumped by [`Self::set_marks`] and [`Self::set_transition_rects`].
+    pub marks_generation: u64,
+    /// Transient overlay rects drawn under the marks (watch-mode transitions, see
+    /// [`Self::set_transition_rects`]).
+    pub overlay: Vec<RectInstance>,
     needs_fit: bool,
     /// Inputs of the last hover hit test: (pointer, camera, band and scene generation, ppp).
     hover_key: Option<HoverKey>,
@@ -171,9 +206,13 @@ impl MapState {
             labels: Labels::default(),
             text: None,
             hover: None,
+            overlays: Default::default(),
             stats: MapStats::default(),
             pixels_per_point: 1.0,
             force_all: false,
+            marks: Vec::new(),
+            marks_generation: 0,
+            overlay: Vec::new(),
             needs_fit: true,
             hover_key: None,
             query: QueryScratch::default(),
@@ -192,6 +231,79 @@ impl MapState {
         self.hover = None;
         self.scene_generation += 1;
         self.needs_fit = true;
+        for slot in 0..OVERLAYS {
+            self.set_overlay(slot, Arc::new(Scene::default()));
+        }
+    }
+
+    /// Replaces overlay `slot` (see [`OVERLAYS`]); its band view is rebuilt on the next update.
+    pub fn set_overlay(&mut self, slot: usize, scene: Arc<Scene>) {
+        let o = &mut self.overlays[slot];
+        o.scene = scene;
+        o.bands = Bands::default();
+        o.generation += 1;
+    }
+
+    /// Replaces the scene but keeps the camera where it is (same world, other metrics), unless
+    /// the camera was never fitted to a scene.
+    pub fn replace_scene(&mut self, scene: Arc<Scene>) {
+        let keep = !self.needs_fit;
+        self.set_scene(scene);
+        if keep && self.scene.bounds.is_positive() {
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+    }
+
+    /// Shows `scene` with `camera` (saved by [`Self::fitted_camera`] while this scene's world
+    /// was shown before), or fits it on the next update when `None`. The viewport is kept.
+    pub fn show_scene(&mut self, scene: Arc<Scene>, camera: Option<Camera>) {
+        self.set_scene(scene);
+        if let Some(c) = camera
+            && self.scene.bounds.is_positive()
+        {
+            let viewport = self.camera.viewport;
+            self.camera = c;
+            self.camera.viewport = viewport;
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+    }
+
+    /// The camera, if it has been fitted to the current scene (to restore it later).
+    pub fn fitted_camera(&self) -> Option<Camera> {
+        (!self.needs_fit && self.scene.bounds.is_positive()).then_some(self.camera)
+    }
+
+    /// Centres the camera on `r` and zooms so it fills about `fill` of the view (within the
+    /// zoom limits).
+    pub fn frame(&mut self, r: &WorldRect, fill: f32) {
+        if !r.is_positive() {
+            return;
+        }
+        if self.needs_fit && self.scene.bounds.is_positive() {
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+        self.camera.fit(r, fill);
+    }
+
+    /// Replaces the selection outlines (drawn in the overlay pass, no scene rebuild).
+    pub fn set_marks(&mut self, marks: &[RectInstance]) {
+        if self.marks != marks {
+            self.marks.clear();
+            self.marks.extend_from_slice(marks);
+            self.marks_generation += 1;
+        }
+    }
+
+    /// Replaces the transient overlay rects (drawn with the marks; no scene rebuild).
+    pub fn set_transition_rects(&mut self, rects: &[RectInstance]) {
+        if self.overlay != rects {
+            self.overlay.clear();
+            self.overlay.extend_from_slice(rects);
+            self.marks_generation += 1;
+        }
     }
 
     /// Band used for filtering (the camera's, or the top band when forcing everything).
@@ -226,6 +338,12 @@ impl MapState {
             self.band_generation += 1;
             self.stats.band_rebuilds.record(t.elapsed());
             rebuilt = true;
+        }
+        for o in &mut self.overlays {
+            let sc = &*o.scene;
+            let b = &mut o.bands;
+            // Small: no need to filter concurrently.
+            rebuilt |= b.rects.refresh(&sc.rects, band) | b.lines.refresh(&sc.lines, band) | b.curves.refresh(&sc.curves, band);
         }
         let px = (LABEL_POINTS * self.pixels_per_point).round();
         let view = self.camera.visible();

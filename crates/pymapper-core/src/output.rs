@@ -71,6 +71,7 @@ use std::io;
 pub use baseline::{Baseline, BaselineError};
 pub use buf::{Out, Outcome, is_broken_pipe};
 pub use context::{Context, IndexContext};
+pub(crate) use context::write_lossy;
 
 pub use crate::config::OutputFormat;
 use crate::rules::codes::UNUSED_IMPORT;

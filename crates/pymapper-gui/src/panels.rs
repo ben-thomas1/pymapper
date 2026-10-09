@@ -13,7 +13,14 @@
 
 use egui::{Align2, Event, FontId, Key, MouseWheelUnit, PointerButton, Rect, Sense};
 
+use crate::codemap::scene::Legend;
+use crate::codemap::worker::Request;
+use crate::interact::panel::{self, PanelState};
+use crate::interact::state::Interaction;
 use crate::map::CanvasInput;
+use crate::mapui;
+use crate::views::ViewKind;
+use crate::views::ui::{self as views_ui, ViewsUi};
 
 pub const LEFT_ID: &str = "pm_left";
 pub const RIGHT_ID: &str = "pm_right";
@@ -24,9 +31,7 @@ pub const RIGHT_DEFAULT: f32 = 300.0;
 pub const BOTTOM_DEFAULT: f32 = 170.0;
 
 /// Per-window UI state. Built once; nothing here is reallocated per frame.
-#[derive(Debug)]
 pub struct UiState {
-    pub search: String,
     /// Project root as displayed (computed once).
     pub project: String,
     /// GPU adapter / backend summary (computed once).
@@ -41,12 +46,34 @@ pub struct UiState {
     pub hover_text: String,
     /// Input: renderer statistics line for the details panel.
     pub map_info: String,
+    /// In/out: the code map options (`None`: no code map, e.g. the stress scene). The
+    /// controls edit it in place.
+    pub map_request: Option<Request>,
+    /// Output: the user changed `map_request` this frame.
+    pub map_request_changed: bool,
+    /// Input: legend of the scene shown.
+    pub legend: Option<Legend>,
+    /// Input: code map status over the canvas (loading phase or error; empty: none).
+    pub map_status: String,
+    /// In/out: hover, selection, search, path, overlays (see [`crate::interact`]).
+    pub interact: Interaction,
+    /// egui caches of the interaction panels.
+    pub panel: PanelState,
+    /// Watch mode: the last update (details panel).
+    pub watch_info: String,
+    /// The secondary views' tabs, options and texts.
+    pub views: ViewsUi,
+}
+
+impl std::fmt::Debug for UiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiState").field("canvas_rect", &self.canvas_rect).field("map_empty", &self.map_empty).finish_non_exhaustive()
+    }
 }
 
 impl UiState {
     pub fn new(project: String, renderer_info: String) -> Self {
         Self {
-            search: String::new(),
             project,
             renderer_info,
             canvas_rect: Rect::NOTHING,
@@ -54,6 +81,14 @@ impl UiState {
             map_empty: true,
             hover_text: String::new(),
             map_info: String::new(),
+            map_request: None,
+            map_request_changed: false,
+            legend: None,
+            map_status: String::new(),
+            interact: Interaction::default(),
+            panel: PanelState::default(),
+            watch_info: String::new(),
+            views: ViewsUi::default(),
         }
     }
 }
@@ -76,13 +111,20 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
         .resizable(true)
         .default_size(BOTTOM_DEFAULT)
         .size_range(60.0..=600.0)
-        .show(ui, bottom);
+        .show(ui, |ui| bottom(ui, state));
 
     let central = egui::CentralPanel::no_frame().show(ui, |ui| {
         let rect = ui.max_rect();
         let response = ui.interact(rect, ui.id().with("pm_canvas"), Sense::click_and_drag());
         state.canvas_input = canvas_input(ui, &response, rect);
-        if state.map_empty {
+        let codemap = state.views.active == ViewKind::CodeMap;
+        if !state.map_status.is_empty() {
+            mapui::status(ui, rect, &state.map_status);
+        } else if !codemap {
+            if !state.views.status.is_empty() {
+                mapui::status(ui, rect, &state.views.status);
+            }
+        } else if state.map_empty {
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -91,12 +133,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
                 ui.visuals().weak_text_color(),
             );
         }
+        if let Some(l) = &state.legend
+            && codemap
+        {
+            mapui::legend(ui, rect, l);
+        }
+        views_ui::tabs(ui, rect, &mut state.views);
     });
     state.canvas_rect = central.response.rect;
 }
 
 /// Mouse wheel (line/page units) zooms about the pointer; trackpad scrolling (point units)
-/// pans; pinch and Cmd/Ctrl+scroll zoom; dragging pans; double click or Home fits.
+/// pans; pinch and Cmd/Ctrl+scroll zoom; dragging pans; Home fits. Clicks, double clicks
+/// (Shift held or not) and Escape are reported for the interaction (select, zoom to, path).
 fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasInput {
     let mut input = CanvasInput::NONE;
     let rel = |p: egui::Pos2| [p.x - rect.min.x, p.y - rect.min.y];
@@ -105,7 +154,11 @@ fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasI
         input.drag = [d.x, d.y];
     }
     input.hover = response.hover_pos().map(rel);
-    input.fit = response.double_clicked();
+    input.click = response.clicked();
+    input.double_click = response.double_clicked();
+    input.shift = ui.input(|i| i.modifiers.shift);
+    // Escape clears the selection unless a text field has the focus.
+    input.escape = ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(Key::Escape));
     if !response.hovered() {
         return input;
     }
@@ -135,29 +188,45 @@ fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasI
 
 fn left(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
-    ui.add(
-        egui::TextEdit::singleline(&mut state.search)
-            .hint_text("Search symbols")
-            .desired_width(f32::INFINITY),
-    );
+    panel::search(ui, &mut state.interact, &mut state.panel);
     ui.separator();
     ui.strong("Project");
     ui.weak(&state.project);
-    ui.add_space(4.0);
-    egui::ScrollArea::vertical().id_salt("pm_tree").auto_shrink([false, false]).show(ui, |ui| {
-        ui.weak("No project loaded.");
+    ui.separator();
+    egui::CollapsingHeader::new("Overlays").id_salt("pm_overlays").default_open(true).show(ui, |ui| {
+        panel::overlays(ui, &mut state.interact);
     });
 }
 
-fn right(ui: &mut egui::Ui, state: &UiState) {
+fn right(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
-    ui.strong("Details");
-    if state.hover_text.is_empty() {
-        ui.weak("Nothing selected.");
-    } else {
-        ui.label(&state.hover_text);
+    state.map_request_changed = false;
+    if let Some(req) = state.map_request.as_mut() {
+        ui.strong("Code map");
+        state.map_request_changed = mapui::controls(ui, req);
+        ui.separator();
     }
+    views_ui::controls(ui, &mut state.views);
+    ui.strong("Details");
+    // Bar always shown: wrapped details would otherwise toggle it (and re-wrap) every frame.
+    egui::ScrollArea::vertical()
+        .id_salt("pm_details")
+        .max_height(ui.available_height() * 0.8)
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(ui, |ui| {
+        if state.interact.selected.is_some() && !state.hover_text.is_empty() {
+            ui.weak(&state.hover_text);
+            ui.separator();
+        }
+        panel::details(ui, &mut state.interact, &mut state.panel, &state.hover_text);
+    });
     ui.separator();
+    if !state.watch_info.is_empty() {
+        ui.strong("Watching");
+        ui.label(&state.watch_info);
+        ui.separator();
+    }
     if !state.map_info.is_empty() {
         ui.collapsing("Map", |ui| {
             ui.monospace(&state.map_info);
@@ -168,12 +237,9 @@ fn right(ui: &mut egui::Ui, state: &UiState) {
     });
 }
 
-fn bottom(ui: &mut egui::Ui) {
+fn bottom(ui: &mut egui::Ui, state: &mut UiState) {
     ui.add_space(4.0);
-    ui.strong("Findings");
-    egui::ScrollArea::vertical().id_salt("pm_findings").auto_shrink([false, false]).show(ui, |ui| {
-        ui.weak("No findings.");
-    });
+    panel::bottom(ui, &mut state.interact, &mut state.panel);
 }
 
 #[cfg(test)]
@@ -256,6 +322,39 @@ mod tests {
                 assert!(p.x + p.w <= target[0] && p.y + p.h <= target[1], "{p:?} {target:?}");
             }
         }
+    }
+
+    #[test]
+    fn code_map_controls_and_legend_stay_idle() {
+        use crate::codemap::metrics::{ColorLegend, ColorMetric, EdgeMetric};
+        let ctx = egui::Context::default();
+        let mut s = state();
+        s.map_request = Some(Request::default());
+        for color_legend in [ColorLegend::Kinds, ColorLegend::Ramp { lo: "0", hi: "30+".to_owned() }] {
+            s.legend = Some(Legend {
+                size: pymapper_core::layout::SizeMetric::Loc,
+                color: ColorMetric::Kind,
+                color_legend,
+                edge: EdgeMetric::Sites,
+                edge_max: 12,
+                edges: 3,
+                segments: 9,
+                rects: 10,
+                has_muted: true,
+            });
+            let mut last = None;
+            for _ in 0..4 {
+                let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))), ..RawInput::default() };
+                let mut out = ctx.run_ui(raw, |ui| show(ui, &mut s));
+                out.textures_delta.clear();
+                last = Some(out.viewport_output[&ViewportId::ROOT].repaint_delay);
+                assert!(!s.map_request_changed, "no input, no change");
+            }
+            assert_eq!(last, Some(std::time::Duration::MAX));
+        }
+        // A tiny canvas skips the legend instead of drawing outside it.
+        s.map_status = "loading project: index".to_owned();
+        layout(&ctx, &mut s, 300.0, 200.0, 1.0, 2);
     }
 
     #[test]

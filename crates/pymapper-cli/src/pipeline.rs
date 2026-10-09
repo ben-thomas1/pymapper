@@ -84,6 +84,22 @@ pub struct Project {
     pub walk_errors: usize,
     /// Dead-code evidence from config files (`analysis.config-evidence`).
     pub config_evidence: Option<ConfigEvidence>,
+    /// The import roots and distributions the project was loaded with.
+    pub roots: Roots,
+}
+
+/// A [`Project`] before import resolution (watch mode resolves through
+/// `incremental::Program`, which tracks dependencies).
+pub struct Unresolved {
+    pub units: ProjectUnits,
+    pub index: Index,
+    pub fingerprints: Option<Fingerprints>,
+    pub cache: Option<CacheStats>,
+    pub walk_errors: usize,
+    pub config_evidence: Option<ConfigEvidence>,
+    pub roots: Roots,
+    /// Config files of the first-party walks (the config-evidence inputs).
+    pub configs: PathList,
 }
 
 /// Loads the project described by `config` (rooted at `project_root`).
@@ -91,11 +107,22 @@ pub struct Project {
 /// `dupes`: take duplication fingerprints during extraction (see
 /// [`DupesParams::from_engine`]).
 pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) -> Project {
+    let u = load_unresolved(config, project_root, dupes);
+    let imports = resolve_imports(&u.index, &Attribution::from_roots(&u.roots));
+    let Unresolved { units, index, fingerprints, cache, walk_errors, config_evidence, roots, configs: _ } = u;
+    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
+}
+
+/// [`load`] without the import resolution.
+pub fn load_unresolved(config: &Config, project_root: &Path, dupes: Option<DupesParams>) -> Unresolved {
     let mut roots = timing::time("roots", || roots::discover(project_root, &RootOptions::from_config(config)));
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, pyprojects, configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (files, pyprojects, mut configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    if let Some(report) = &config.analysis.coverage {
+        exclude_file(&mut configs, report);
+    }
     let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
     drop(pyprojects);
     for d in &diags {
@@ -128,10 +155,42 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
             io::Error::from(e.kind)
         ));
     }
-    let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
-    let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
-        .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
-    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence }
+    let config_evidence = load_config_evidence(config, &configs);
+    Unresolved { units, index, fingerprints, cache, walk_errors, config_evidence, roots, configs }
+}
+
+/// Dead-code evidence from the config files `configs`, when enabled.
+pub fn load_config_evidence(config: &Config, configs: &PathList) -> Option<ConfigEvidence> {
+    (config.analysis.config_evidence && config.analysis.name_fallback)
+        .then(|| timing::time("config-evidence", || cache::config_evidence(configs, Cache::from_config(config).as_ref())))
+}
+
+/// Walks again with the roots and project units of a load: the inputs of an incremental
+/// update after files were added or removed, the config files of the first-party walks, and
+/// the number of walk diagnostics (each printed).
+pub fn rewalk(roots: &Roots, config: &Config, project_root: &Path) -> (Inputs, PathList, usize) {
+    let (files, _, mut configs, errors) = timing::time("walk", || collect_files(roots, config, project_root));
+    if let Some(report) = &config.analysis.coverage {
+        exclude_file(&mut configs, report);
+    }
+    (Inputs::from_roots(roots, &files), configs, errors)
+}
+
+/// Removes `file` from `paths`: the same path, or another path to the same file (symlinks,
+/// hard links, `..`), compared by device and inode among the paths with the same file name.
+/// Used to keep the coverage report (`analysis.coverage`) out of the config-evidence files,
+/// whatever its contents: it names every function, executed or not.
+fn exclude_file(paths: &mut PathList, file: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let id = std::fs::metadata(file).ok().map(|m| (m.dev(), m.ino()));
+    let name = file.file_name();
+    paths.remove_if(|p| {
+        if p == file {
+            return true;
+        }
+        let Some(id) = id else { return false };
+        p.file_name() == name && std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == id)
+    });
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).
@@ -237,7 +296,13 @@ fn flush_walk(
 /// Inline `# pymapper: ignore[...]` and F401 `# noqa` suppressions of every file, from the facts.
 /// Malformed codes suppress nothing; they, unknown codes and empty lists (`ignore[]`) are passed
 /// to `bad(file, line, code, kind)` (`code` is empty for an empty list), in file and line order.
-pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+pub fn suppressions(ix: &Index, bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+    suppressions_builder(ix, bad).build()
+}
+
+/// [`suppressions`] before `build`, so callers can add entries for files beyond the index
+/// (`pyproject.toml` files, with ids above every index file).
+pub fn suppressions_builder(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> SuppressionsBuilder {
     let mut b = SuppressionsBuilder::new();
     let st = &ix.facts().suppressions;
     let mut entries = Vec::new();
@@ -268,5 +333,5 @@ pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind
         }
         b.push_file(rules::FileId(f), &entries);
     }
-    b.build()
+    b
 }

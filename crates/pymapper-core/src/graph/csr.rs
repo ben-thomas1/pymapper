@@ -123,9 +123,9 @@ impl Csr {
         out.start[0] = 0;
     }
 
-    /// Removes adjacent duplicates in every row (rows must be sorted), keeping the minimum
-    /// label. Compacts in place.
-    fn dedup_sorted_rows(&mut self) {
+    /// Removes adjacent duplicates in every row (rows must be sorted), folding their labels
+    /// with `merge` (in edge order). Compacts in place.
+    fn dedup_sorted_rows(&mut self, merge: fn(u8, u8) -> u8) {
         let n = self.node_count() as usize;
         let labelled = !self.lab.is_empty();
         let mut w = 0usize;
@@ -136,8 +136,8 @@ impl Csr {
             for i in row_begin..row_end {
                 let t = self.adj[i];
                 if w > out_begin && self.adj[w - 1] == t {
-                    if labelled && self.lab[i] < self.lab[w - 1] {
-                        self.lab[w - 1] = self.lab[i];
+                    if labelled {
+                        self.lab[w - 1] = merge(self.lab[w - 1], self.lab[i]);
                     }
                     continue;
                 }
@@ -178,7 +178,7 @@ impl Graph {
     where
         I: Iterator<Item = (u32, u32)>,
     {
-        build(n, false, || edges().map(|(s, d)| (s, d, 0)))
+        build(n, false, std::cmp::min, || edges().map(|(s, d)| (s, d, 0)))
     }
 
     /// Like [`Graph::build`] with a `u8` label per edge; parallel edges keep the minimum label.
@@ -186,7 +186,16 @@ impl Graph {
     where
         I: Iterator<Item = (u32, u32, u8)>,
     {
-        build(n, true, edges)
+        build(n, true, std::cmp::min, edges)
+    }
+
+    /// Like [`Graph::build_labelled`], parallel edges folding their labels with `merge`
+    /// (commutative and associative: the fold order follows the scatter order).
+    pub fn build_labelled_with<I>(n: u32, merge: fn(u8, u8) -> u8, edges: impl Fn() -> I) -> Graph
+    where
+        I: Iterator<Item = (u32, u32, u8)>,
+    {
+        build(n, true, merge, edges)
     }
 
     /// Builds from a slice of `(src, dst)` pairs (tests and small graphs).
@@ -256,7 +265,7 @@ impl Graph {
 /// Counting-sort build: scatter by source (rows unsorted), transpose (reverse rows sorted by
 /// source, duplicates adjacent), dedup, transpose back (forward rows sorted by target). O(n + m)
 /// time, no comparison sort, peak memory two CSRs.
-fn build<I>(n: u32, labelled: bool, edges: impl Fn() -> I) -> Graph
+fn build<I>(n: u32, labelled: bool, merge: fn(u8, u8) -> u8, edges: impl Fn() -> I) -> Graph
 where
     I: Iterator<Item = (u32, u32, u8)>,
 {
@@ -291,7 +300,7 @@ where
     tmp.start[0] = 0;
     let mut rev = Csr::default();
     tmp.transpose_into(&mut rev);
-    rev.dedup_sorted_rows();
+    rev.dedup_sorted_rows(merge);
     rev.shrink();
     // Reuse the scatter buffers for the forward direction.
     rev.transpose_into(&mut tmp);

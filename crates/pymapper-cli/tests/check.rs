@@ -356,7 +356,7 @@ fn unknown_selectors_are_usage_errors() {
 fn selections_that_cannot_run() {
     let p = simple_project("cannot-run");
     for (sel, needle) in [
-        ("PM6", "PM601-PM604: dependency rules are not run by `check`"),
+        ("PM6", "PM601-PM604: dependency rules are run by `pymapper deps --check`, not `check`"),
         ("PM601", "PM601: dependency rules"),
         ("PM501", "PM501: expensive, needs `analysis.dupes = true`"),
         ("PM302", "PM302: no [[contracts]] are configured"),
@@ -381,7 +381,7 @@ fn selections_that_cannot_run() {
     let r = p.check(&["--select", "ALL"]);
     r.expect_code(0);
     assert!(!r.stderr.contains("does not run"), "{}", r.stderr);
-    for needle in ["8 skipped", "PM302-PM304: no [[contracts]]", "PM501: needs `analysis.dupes = true`", "PM601-PM604: run by `pymapper deps`"] {
+    for needle in ["8 skipped", "PM302-PM304: no [[contracts]]", "PM501: needs `analysis.dupes = true`", "PM601-PM604: run by `pymapper deps --check`"] {
         assert!(r.stdout.contains(needle), "{needle}: {}", r.stdout);
     }
     // `PM3` without contracts is a normal way to ask for cycles: no warning.

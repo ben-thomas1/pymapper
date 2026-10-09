@@ -11,7 +11,7 @@ use crate::intern::{FxHashMap, Interner, Sym};
 use crate::roots::FileStatus;
 
 /// Name of a def the parser could not name (recovered syntax error).
-const ANONYMOUS: &[u8] = b"<anonymous>";
+pub(super) const ANONYMOUS: &[u8] = b"<anonymous>";
 
 /// Compares dotted names segment-wise (`a` < `a.b` < `a-b` < `a0`): `.` sorts before every
 /// other byte, so a package is directly followed by everything below it.
@@ -55,11 +55,7 @@ struct Builder<'a> {
     /// Next duplicate ordinal per dotted package/module name.
     module_dups: FxHashMap<Sym, u16>,
     modules: FxHashMap<(Sym, u16), NodeId>,
-    /// Duplicate ordinals of defs of the current file, by (parent, name).
-    def_dups: FxHashMap<(u32, Sym), u16>,
-    /// Files with `@overload`s: the implementation row (last non-`@overload` def) of each
-    /// (parent, name) group that has overloads (`NONE`: none yet).
-    impl_rows: FxHashMap<(u32, Sym), (u32, bool)>,
+    dups: DefDups,
     anonymous: Sym,
     /// Open packages/modules below the distribution node (`stack[0]` = depth 1).
     stack: Vec<Open>,
@@ -118,8 +114,7 @@ pub(super) fn build(
         file_node: vec![NONE; n],
         module_dups: FxHashMap::default(),
         modules: FxHashMap::default(),
-        def_dups: FxHashMap::default(),
-        impl_rows: FxHashMap::default(),
+        dups: DefDups::default(),
         anonymous,
         stack: Vec::new(),
         pending: Vec::new(),
@@ -160,6 +155,8 @@ pub(super) fn build(
         nodes,
         chain,
         group_node,
+        // Distribution nodes are pushed in `group_order`, so node ids ascend along it.
+        groups_by_node: group_order,
         modules,
         read_errors,
         stats,
@@ -261,59 +258,74 @@ impl Builder<'_> {
         let kind = if is_init(self.paths.get_bytes(f as usize)) { NodeKind::Package } else { NodeKind::Module };
         let m = self.push_module(kind, parent, seg, module, f);
         self.file_node[f as usize] = m;
-        let ff = self.files[f as usize];
-        let defs = &self.facts.defs;
-        let r = ff.defs.range();
-        let dedupe = r.len() > 2;
-        if dedupe {
-            self.def_dups.clear();
-        }
-        // A group of same-named siblings with `@overload` signatures: the implementation (the
-        // last non-overload def) is the unsuffixed id, the signatures get `#2`, `#3`, ... in
-        // source order. Only files with overloads pay for the extra pass.
-        self.impl_rows.clear();
-        let overloads = dedupe && (r.start + 1..r.end).any(|row| defs.flags[row] & def_flags::OVERLOAD != 0);
-        if overloads {
-            for row in r.start + 1..r.end {
-                let key = (m + defs.parent[row], defs.name[row].unwrap_or(self.anonymous));
-                let e = self.impl_rows.entry(key).or_insert((NONE, false));
-                if defs.flags[row] & def_flags::OVERLOAD != 0 {
-                    e.1 = true;
-                } else {
-                    e.0 = row as u32;
-                }
+        push_defs(&mut self.nodes, self.facts, &self.files[f as usize], m, f, self.anonymous, &mut self.dups);
+        m
+    }
+}
+
+/// Scratch of [`push_defs`].
+#[derive(Default)]
+pub(super) struct DefDups {
+    /// Duplicate ordinals of defs of the current file, by (parent, name).
+    def_dups: FxHashMap<(u32, Sym), u16>,
+    /// Files with `@overload`s: the implementation row (last non-`@overload` def) of each
+    /// (parent, name) group that has overloads (`NONE`: none yet).
+    impl_rows: FxHashMap<(u32, Sym), (u32, bool)>,
+}
+
+/// Pushes the def nodes of file `f` (header `ff`), whose package/module node `m` was just
+/// pushed: pre-order, source order, with duplicate ordinals (see the module docs of `index`).
+pub(super) fn push_defs(nodes: &mut Nodes, facts: &FactStore, ff: &FileFacts, m: NodeId, f: u32, anonymous: Sym, dd: &mut DefDups) {
+    let defs = &facts.defs;
+    let r = ff.defs.range();
+    let dedupe = r.len() > 2;
+    if dedupe {
+        dd.def_dups.clear();
+    }
+    // A group of same-named siblings with `@overload` signatures: the implementation (the
+    // last non-overload def) is the unsuffixed id, the signatures get `#2`, `#3`, ... in
+    // source order. Only files with overloads pay for the extra pass.
+    dd.impl_rows.clear();
+    let overloads = dedupe && (r.start + 1..r.end).any(|row| defs.flags[row] & def_flags::OVERLOAD != 0);
+    if overloads {
+        for row in r.start + 1..r.end {
+            let key = (m + defs.parent[row], defs.name[row].unwrap_or(anonymous));
+            let e = dd.impl_rows.entry(key).or_insert((NONE, false));
+            if defs.flags[row] & def_flags::OVERLOAD != 0 {
+                e.1 = true;
+            } else {
+                e.0 = row as u32;
             }
         }
-        for row in r.start + 1..r.end {
-            let parent = m + defs.parent[row];
-            let kind = if defs.kind[row] == DefKind::Class as u8 { NodeKind::Class } else { NodeKind::Function };
-            let name = defs.name[row].unwrap_or(self.anonymous);
-            let dup = if dedupe {
-                let imp = match self.impl_rows.get(&(parent, name)) {
-                    Some(&(i, true)) if i != NONE => Some(i),
-                    _ => None,
-                };
-                if imp == Some(row as u32) {
-                    0
-                } else {
-                    let d = self.def_dups.entry((parent, name)).or_insert(u16::from(imp.is_some()));
-                    let dup = *d;
-                    *d = d.saturating_add(1);
-                    dup
-                }
-            } else {
-                0
+    }
+    for row in r.start + 1..r.end {
+        let parent = m + defs.parent[row];
+        let kind = if defs.kind[row] == DefKind::Class as u8 { NodeKind::Class } else { NodeKind::Function };
+        let name = defs.name[row].unwrap_or(anonymous);
+        let dup = if dedupe {
+            let imp = match dd.impl_rows.get(&(parent, name)) {
+                Some(&(i, true)) if i != NONE => Some(i),
+                _ => None,
             };
-            let depth = self.nodes.depth[parent as usize] + 1;
-            self.nodes.push(kind, dup, depth, parent, name, f);
-        }
-        m
+            if imp == Some(row as u32) {
+                0
+            } else {
+                let d = dd.def_dups.entry((parent, name)).or_insert(u16::from(imp.is_some()));
+                let dup = *d;
+                *d = d.saturating_add(1);
+                dup
+            }
+        } else {
+            0
+        };
+        let depth = nodes.depth[parent as usize] + 1;
+        nodes.push(kind, dup, depth, parent, name, f);
     }
 }
 
 /// Fills subtree ends (reverse pass) and the ancestor paths of inner nodes (forward pass);
 /// returns the ancestor pool.
-fn finish(nodes: &mut Nodes) -> Vec<u32> {
+pub(super) fn finish(nodes: &mut Nodes) -> Vec<u32> {
     let n = nodes.len() as usize;
     for v in (0..n).rev() {
         let p = nodes.parent[v];

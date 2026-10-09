@@ -47,7 +47,8 @@
 //!   ├── bases       owner u32 | chain Sym+u8 | keyword Option<Sym> | flags u8  14 B/row
 //!   ├── params      name Sym | kind+flags u8                                    5 B/row
 //!   ├── imports     scope u32 | module Sym+u8 | name,alias Option<Sym> |
-//!   │               level u8 | flags u8 | line,col u32                         27 B/row
+//!   │               level u8 | flags u8 | line,col u32 |
+//!   │               module_dline u8 | module_col u32                           32 B/row
 //!   ├── calls       scope u32 | chain Sym+u8 | flags+receiver u8 |
 //!   │               line,col u32                                               18 B/row
 //!   ├── bindings    scope u32 | target Sym+u8 | kind u8 | flags+value u8 |
@@ -104,6 +105,7 @@ pub use render::render;
 pub use strs::{SpanStrs, StrSink};
 
 use super::events::{AssignKind, DeclKind, DiagKind, ParamKind, Receiver};
+use super::splice::{Splice, splice_col};
 use crate::intern::Sym;
 
 // ---------------------------------------------------------------------------------------------
@@ -490,6 +492,11 @@ macro_rules! soa {
                 $(self.$f.shrink_to_fit();)+
             }
 
+            /// Replaces row runs by rows of `src` (see [`super::splice`]).
+            fn splice(&mut self, plan: &[Splice], src: &Self) {
+                $(splice_col(&mut self.$f, plan, &src.$f);)+
+            }
+
             fn append(&mut self, other: &mut Self) -> u32 {
                 let base = self.len();
                 $(self.$f.append(&mut other.$f);)+
@@ -604,8 +611,14 @@ soa! {
         level: u8,
         /// [`import_flags`].
         flags: u8,
+        /// Position of the imported name (of the module for plain `import`, of `*`).
         line: u32,
         col: u32,
+        /// `line` minus the line of the module token (saturating at 255; nonzero for the
+        /// names of a multi-line `from` statement): see [`FileView::import_module_pos`].
+        module_dline: u8,
+        /// 0-based column of the module token (of the `from` keyword for `from . import x`).
+        module_col: u32,
     }
 }
 
@@ -910,6 +923,57 @@ impl FactStore {
         b
     }
 
+    /// Replaces the rows of some files by rows of `src`, in place (incremental updates).
+    ///
+    /// `edits` are `(old, new)` header pairs sorted by position in `self`: the runs of `old`
+    /// (rows of `self`) become the runs of `new` (rows of `src`). A removal has empty `new`
+    /// runs; an insertion has empty `old` runs starting where the rows go. Every table is
+    /// patched with one pass of [`splice_col`]; headers of the files after an edit must be
+    /// rebased by the caller. `plan` is a reused buffer.
+    pub(crate) fn splice(&mut self, edits: &[(FileFacts, FileFacts)], src: &FactStore, plan: &mut Vec<Splice>) {
+        // Exhaustive on purpose: a new table must be spliced too (compile error until it is).
+        let FactStore {
+            defs: _,
+            decorators: _,
+            bases: _,
+            params: _,
+            imports: _,
+            calls: _,
+            bindings: _,
+            decls: _,
+            names: _,
+            exports: _,
+            evidence: _,
+            diags: _,
+            suppressions: _,
+            scratch: _,
+        } = self;
+        macro_rules! table {
+            ($t:ident, $apply:expr) => {{
+                plan.clear();
+                for (o, n) in edits {
+                    plan.push(Splice { at: o.$t.start, old: o.$t.len, src: n.$t.start, new: n.$t.len });
+                }
+                $apply;
+            }};
+        }
+        table!(defs, self.defs.splice(plan, &src.defs));
+        table!(decorators, self.decorators.splice(plan, &src.decorators));
+        table!(bases, self.bases.splice(plan, &src.bases));
+        table!(params, self.params.splice(plan, &src.params));
+        table!(imports, self.imports.splice(plan, &src.imports));
+        table!(calls, self.calls.splice(plan, &src.calls));
+        table!(bindings, self.bindings.splice(plan, &src.bindings));
+        table!(decls, self.decls.splice(plan, &src.decls));
+        table!(names, splice_col(&mut self.names, plan, &src.names));
+        table!(exports, splice_col(&mut self.exports, plan, &src.exports));
+        table!(evidence, splice_col(&mut self.evidence, plan, &src.evidence));
+        table!(diags, self.diags.splice(plan, &src.diags));
+        table!(suppressions, self.suppressions.splice(plan, &src.suppressions));
+        // Validates the lengths.
+        let _ = self.bases();
+    }
+
     /// Releases spare capacity of every table (e.g. once a worker is done).
     pub fn shrink_to_fit(&mut self) {
         self.defs.shrink_to_fit();
@@ -1090,6 +1154,15 @@ impl<'a> FileView<'a> {
     #[inline]
     pub fn import_module(&self, row: usize) -> &'a [Sym] {
         self.chain_at(&self.store.imports.module, &self.store.imports.module_len, row)
+    }
+
+    /// `(line, 0-based column)` of the module token of import `row`: one position per
+    /// statement, shared by every name of `from m import (a, b)`. A statement spanning more
+    /// than 255 lines gets a later line.
+    #[inline]
+    pub fn import_module_pos(&self, row: usize) -> (u32, u32) {
+        let st = &self.store.imports;
+        (st.line[row] - st.module_dline[row] as u32, st.module_col[row])
     }
 
     /// Target chain of binding `row`.

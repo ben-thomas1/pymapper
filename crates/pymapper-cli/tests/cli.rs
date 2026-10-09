@@ -2,7 +2,7 @@
 
 use std::process::{Command, Output};
 
-const SUBCOMMANDS: [&str; 8] = ["check", "callers", "callees", "impact", "path", "deps", "cycles", "summary"];
+const SUBCOMMANDS: [&str; 10] = ["check", "callers", "callees", "impact", "path", "imports", "deps", "cycles", "summary", "config"];
 
 fn pymapper(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_pymapper"))
@@ -12,36 +12,29 @@ fn pymapper(args: &[&str]) -> Output {
 }
 
 #[test]
-fn unimplemented_subcommands_are_stubs_that_exit_2() {
-    // `check` is implemented (see tests/check.rs).
-    for name in SUBCOMMANDS.into_iter().filter(|&n| n != "check") {
-        let out = pymapper(&[name]);
-        assert_eq!(out.status.code(), Some(2), "{name}: wrong exit code");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("not implemented"), "{name}: stderr was {stderr:?}");
-        assert!(stderr.contains(name), "{name}: stderr was {stderr:?}");
-        assert!(out.stdout.is_empty(), "{name}: stdout must stay clean");
-    }
-}
-
-#[test]
-fn help_lists_only_implemented_subcommands() {
+fn help_lists_every_subcommand() {
     let out = pymapper(&["--help"]);
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let commands = stdout.split("Commands:").nth(1).expect("commands section");
     let commands = commands.split("Options:").next().expect("commands");
     let listed: Vec<&str> = commands.lines().filter_map(|l| l.split_whitespace().next()).collect();
-    assert_eq!(listed, ["check", "config", "help"], "{stdout}");
+    let mut want = SUBCOMMANDS.to_vec();
+    want.push("help");
+    assert_eq!(listed, want, "{stdout}");
 }
 
 #[test]
-fn unimplemented_subcommands_accept_config_flags() {
-    for name in SUBCOMMANDS.into_iter().filter(|&n| n != "check") {
-        let out = pymapper(&[name, "some.symbol", "--isolated", "--deps", "--select", "PM1"]);
-        assert_eq!(out.status.code(), Some(2), "{name}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"), "{name}");
+fn query_subcommands_need_their_symbols() {
+    for name in ["callers", "callees", "impact", "imports", "path"] {
+        let out = pymapper(&[name]);
+        assert_eq!(out.status.code(), Some(2), "{name}: missing symbol is a usage error");
+        assert!(out.stdout.is_empty(), "{name}: stdout must stay clean");
     }
+    assert_eq!(pymapper(&["path", "a"]).status.code(), Some(2), "path needs two symbols");
+    assert_eq!(pymapper(&["cycles", "--calls"]).status.code(), Some(2), "--calls needs --symbol");
+    assert_eq!(pymapper(&["callers", "x", "--edges", "sure"]).status.code(), Some(2), "bad --edges");
+    assert_eq!(pymapper(&["callers", "x", "--depth", "0"]).status.code(), Some(2), "depth starts at 1");
 }
 
 #[test]

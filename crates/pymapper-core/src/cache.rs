@@ -59,6 +59,8 @@ pub use format::CacheError;
 pub use segment::Stamp;
 
 pub(crate) use segment::Segment;
+/// The container, for other cache files of the crate (`deps` scorecards).
+pub(crate) use format::{Reader, Writer, write_atomic_with};
 
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -80,7 +82,7 @@ use crate::intern::{FxHashSet, FxHasher, Interner, hash_bytes};
 use crate::roots::{Origin, Roots};
 
 /// Bump whenever the extractor changes the facts or metrics it produces for some input.
-pub const FACTS_VERSION: u32 = 4;
+pub const FACTS_VERSION: u32 = 5;
 
 /// Kind of a facts segment in the container header.
 const KIND_FACTS: u32 = 1;
@@ -153,7 +155,8 @@ impl Cache {
         Ok(())
     }
 
-    /// Removes every cache file (`*.pmc` and stale temp files); keeps the directory.
+    /// Removes every cache file (`*.pmc` segments, the `*.pml` layout cache and stale temp
+    /// files); keeps the directory.
     pub fn clear(&self) -> io::Result<()> {
         let rd = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd,
@@ -164,7 +167,7 @@ impl Cache {
             let ent = ent?;
             let n = ent.file_name();
             let n = n.as_bytes();
-            if n.ends_with(b".pmc") || n.starts_with(b".tmp-") {
+            if n.ends_with(b".pmc") || n.ends_with(b".pml") || n.starts_with(b".tmp-") {
                 std::fs::remove_file(ent.path())?;
             }
         }

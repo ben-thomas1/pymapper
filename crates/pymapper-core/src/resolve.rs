@@ -115,6 +115,7 @@ mod calls;
 mod classes;
 mod edges;
 mod imports;
+pub(crate) mod incr;
 mod lookup;
 mod modules;
 mod namespace;
@@ -195,7 +196,7 @@ pub fn resolve_imports(ix: &Index, attr: &Attribution) -> Imports {
         rayon::join(|| ModuleTable::build(ix), || Namespaces::build(ix))
     });
     let t1 = Instant::now();
-    let getattr = ix.strings().get(b"__getattr__");
+    let getattr = ix.strings().get(builtins::texts::GETATTR);
     let files = ix.file_count() as usize;
     let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
     let (p1, p2) = timing::time("resolve.imports", || {
@@ -300,6 +301,14 @@ impl Imports {
     #[inline]
     pub fn module_node(&self, row: usize) -> NodeId {
         edges::row_dst(&self.modules, self.p1[row], self.p2[row])
+    }
+
+    /// The external edge `row` adds (as [`Imports::ext_edges`]): `(kind, key)` for imports of
+    /// code that is not loaded, else `None`. Unlike [`Imports::dist`] / [`Imports::ext_name`],
+    /// re-export chains are not followed.
+    #[inline]
+    pub fn ext_key(&self, row: usize) -> Option<(ExtKind, u32)> {
+        edges::row_ext(self.p1[row])
     }
 
     /// The distribution of a [`ImportStatus::ThirdParty`] row (also when re-exported).

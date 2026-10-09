@@ -43,6 +43,10 @@ pub(super) struct Locals {
     /// The file the rows belong to (`NONE`: none yet).
     f: FileId,
     built: bool,
+    /// Record the files the lookups read (incremental updates, see `crate::incremental`).
+    pub logging: bool,
+    /// Files read while `logging` (unsorted, with repeats).
+    pub log: RefCell<Vec<FileId>>,
 }
 
 impl Locals {
@@ -102,6 +106,38 @@ impl Locals {
             self.rows.push(Local { scope: st.decls.scope[row], name: st.decls.name[row], r: row as u32, kind });
         }
         self.rows.sort_unstable_by_key(|l| (l.scope, l.name.to_raw(), l.kind, l.r));
+    }
+
+    /// Records that a lookup read the facts of file `f` (when logging).
+    #[inline]
+    pub fn touch(&self, f: FileId) {
+        if self.logging {
+            self.log.borrow_mut().push(f);
+        }
+    }
+
+    /// Records the file of node `v` (when logging).
+    #[inline]
+    pub fn touch_node(&self, ix: &Index, v: NodeId) {
+        if self.logging
+            && let Some(f) = ix.file(v)
+        {
+            self.log.borrow_mut().push(f);
+        }
+    }
+
+    /// Runs `f` with the thread's star-import scratch, moving the files its lookups read into
+    /// this log.
+    pub fn with_stars<T>(&self, f: impl FnOnce(&mut Scratch) -> T) -> T {
+        STARS.with_borrow_mut(|sc| {
+            sc.logging = self.logging;
+            let r = f(sc);
+            if sc.logging {
+                self.log.borrow_mut().append(&mut sc.log);
+                sc.logging = false;
+            }
+            r
+        })
     }
 
     /// Whether the table holds the bindings of file `f`.
@@ -275,6 +311,7 @@ impl Cx<'_> {
     /// The local bindings table is used when `loc` holds `f`; otherwise function scopes are
     /// skipped (class bodies are looked up through the class table).
     pub fn name(&self, loc: &Locals, f: FileId, scope: u32, name: Sym, depth: u8) -> R {
+        loc.touch(f);
         let have = loc.is_for(f);
         let mut s = scope;
         let mut first = true;
@@ -342,6 +379,7 @@ impl Cx<'_> {
     /// A module-level name of file `f`: its namespace (defs, imports, assignments), its star
     /// imports, then (`builtins`) the builtins.
     pub fn global(&self, loc: &Locals, f: FileId, name: Sym, depth: u8, builtins: bool) -> R {
+        loc.touch(f);
         let ix = self.ix;
         match self.imp.ns.get(f, name) {
             Some(e) if e.base() == nskind::DEF => {
@@ -352,7 +390,7 @@ impl Cx<'_> {
             _ => {}
         }
         let is_builtin = builtins && self.tables.builtins.contains(name);
-        let star = if self.imp.ns.has_stars(f) { STARS.with_borrow_mut(|sc| self.imp.star_global(ix, f, name, sc)) } else { None };
+        let star = if self.imp.ns.has_stars(f) { loc.with_stars(|sc| self.imp.star_global(ix, f, name, sc)) } else { None };
         match star {
             // A star import of unresolved code could bind anything; builtins win.
             Some(Global::Dynamic) if is_builtin => return R::unknown(Reason::Builtin),
@@ -423,6 +461,7 @@ impl Cx<'_> {
     /// class a construction calls (`why` = the hint kind), the target of an alias, or nothing
     /// usable ([`Reason::Variable`]).
     pub fn binding(&self, loc: &Locals, f: FileId, brow: usize, depth: u8, why: Reason) -> R {
+        loc.touch(f);
         if depth >= MAX_DEPTH {
             return R::unknown(Reason::Variable);
         }
@@ -483,13 +522,16 @@ impl Cx<'_> {
     /// and stubs (`from m import seg` semantics).
     fn module_attr(&self, loc: &Locals, m: ModId, seg: Sym, depth: u8) -> R {
         let ix = self.ix;
+        if let Some(v) = self.imp.modules.node(m) {
+            loc.touch_node(ix, v);
+        }
         if let Some(file) = self.imp.modules.node(m).and_then(|v| ix.file(v))
             && let Some(e) = self.imp.ns.get(file, seg)
             && matches!(e.base(), nskind::DEF | nskind::VAR | nskind::IMPORT)
         {
             return self.global(loc, file, seg, depth + 1, false);
         }
-        match STARS.with_borrow_mut(|sc| self.imp.attribute_with(ix, m, seg, sc)) {
+        match loc.with_stars(|sc| self.imp.attribute_with(ix, m, seg, sc)) {
             Some(g) => self.global_val(g),
             None => R::unknown(Reason::MissingAttr),
         }
@@ -500,7 +542,9 @@ impl Cx<'_> {
     /// of an incomplete MRO is only `Likely` (an unloaded base may come first).
     pub fn class_attr(&self, loc: &Locals, c: ClassId, seg: Sym, instance: bool, skip: usize, depth: u8) -> R {
         let cl = self.classes;
+        loc.touch_node(self.ix, cl.node(c));
         for (i, &k) in cl.mro(c).iter().enumerate().skip(skip) {
+            loc.touch_node(self.ix, cl.node(k));
             let Some(m) = pick(cl.members(k, seg), instance) else { continue };
             let r = self.member(loc, k, m, depth);
             return if i > 0 && cl.flags(c) & class_flags::INCOMPLETE != 0 { r.worst(Confidence::Likely) } else { r };

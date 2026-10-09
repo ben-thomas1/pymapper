@@ -79,7 +79,8 @@
 mod build;
 mod inputs;
 mod load;
-mod qid;
+mod patch;
+pub(crate) mod qid;
 
 #[cfg(test)]
 mod tests;
@@ -87,6 +88,7 @@ mod tests;
 pub use inputs::{Group, Inputs};
 pub use load::{LoadOptions, LoadStats, ReadError, load, load_with};
 pub(crate) use load::load_cached;
+pub(crate) use patch::{NodeShift, Src};
 
 use std::ops::Range;
 use std::path::Path;
@@ -231,6 +233,8 @@ pub struct Index {
     chain: Vec<u32>,
     /// Distribution node per group.
     group_node: Vec<NodeId>,
+    /// Groups in distribution node order (ascending `group_node`).
+    groups_by_node: Vec<u32>,
     /// (dotted name, duplicate ordinal) -> package/module node.
     modules: FxHashMap<(Sym, u16), NodeId>,
     read_errors: Vec<ReadError>,
@@ -270,6 +274,9 @@ impl Index {
         &self.read_errors
     }
 
+    /// Load statistics. After [`Index::patch`] (an incremental update), `files` and `lines`
+    /// still describe the whole program, but `bytes` and `extract` describe only the files
+    /// re-extracted by that update, and `merge` / `build` its patch phases.
     pub fn stats(&self) -> &LoadStats {
         &self.stats
     }
@@ -419,6 +426,12 @@ impl Index {
         self.group_node[g as usize]
     }
 
+    /// Group of a distribution node (`None` for any other node). O(log groups).
+    pub fn dist_group(&self, d: NodeId) -> Option<u32> {
+        let i = self.groups_by_node.partition_point(|&g| self.group_node[g as usize] < d);
+        self.groups_by_node.get(i).copied().filter(|&g| self.group_node[g as usize] == d)
+    }
+
     /// Global row of a node in the defs table of [`Index::facts`] (the `<module>` row for
     /// package/module nodes with a file); `None` for distributions and namespace packages.
     #[inline]
@@ -456,6 +469,7 @@ impl Index {
             + self.nodes.heap_bytes()
             + self.chain.capacity() * 4
             + self.group_node.capacity() * 4
+            + self.groups_by_node.capacity() * 4
             + self.modules.capacity() * (size_of::<((Sym, u16), NodeId)>() + 1)
     }
 }

@@ -296,6 +296,16 @@ pub struct RectStyle {
     pub stroke_width: f32,
 }
 
+impl RectStyle {
+    /// A rect that draws nothing and only carries its label over a background of colour
+    /// `under` (which picks the label colour): fill and stroke are fully transparent, and the
+    /// vertex shader culls such rects. Hit tests still find it.
+    pub const fn label_only(under: Rgba) -> RectStyle {
+        let [r, g, b, _] = under.0;
+        RectStyle { fill: Rgba::new(r, g, b, 0), stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }
+    }
+}
+
 /// Rects smaller than this many physical pixels are left out of a band (auto LOD).
 pub const MIN_RECT_PX: f32 = 2.0;
 

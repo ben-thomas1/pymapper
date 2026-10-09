@@ -17,6 +17,15 @@ Options:
       --idle <SECS>  Idle window in --measure mode [default: 5]
       --stress <N>   Show a synthetic stress scene with N rects and N edges (with
                      --measure, the timed frames fly a scripted pan/zoom path)
+      --deps         Include third-party distributions (the venv), drawn muted
+      --no-deps      Exclude third-party distributions
+      --stdlib       Include the stdlib, drawn muted
+      --no-stdlib    Exclude the stdlib
+      --isolated     Ignore configuration files
+      --no-cache     Do not read or write the analysis cache
+      --cache-dir <DIR>  Cache directory [default: from the configuration]
+      --watch        Update the map when project files change (stable layout,
+                     animated changes)
   -h, --help         Print help
   -V, --version      Print version
 
@@ -42,6 +51,15 @@ pub struct Options {
     pub measure: Option<MeasureOpts>,
     /// Synthetic stress scene size (rects = edges = N).
     pub stress: Option<u32>,
+    /// Include third-party distributions (`None`: as configured).
+    pub deps: Option<bool>,
+    /// Include the stdlib (`None`: as configured).
+    pub stdlib: Option<bool>,
+    pub isolated: bool,
+    pub no_cache: bool,
+    pub cache_dir: Option<PathBuf>,
+    /// Watch the project and apply changes incrementally.
+    pub watch: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +76,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
     let mut frames: Option<u32> = None;
     let mut idle: Option<u32> = None;
     let mut stress: Option<u32> = None;
+    let (mut deps, mut stdlib, mut isolated, mut no_cache, mut cache_dir) = (None, None, false, false, None);
+    let mut watch = false;
     let mut it = args.into_iter();
     let mut positional_only = false;
     while let Some(arg) = it.next() {
@@ -81,6 +101,30 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
                     stress = Some(number(s, it.next())?);
                     continue;
                 }
+                "--deps" | "--no-deps" => {
+                    deps = Some(s == "--deps");
+                    continue;
+                }
+                "--stdlib" | "--no-stdlib" => {
+                    stdlib = Some(s == "--stdlib");
+                    continue;
+                }
+                "--isolated" => {
+                    isolated = true;
+                    continue;
+                }
+                "--no-cache" => {
+                    no_cache = true;
+                    continue;
+                }
+                "--watch" => {
+                    watch = true;
+                    continue;
+                }
+                "--cache-dir" => {
+                    cache_dir = Some(PathBuf::from(it.next().ok_or_else(|| "--cache-dir requires a value".to_owned())?));
+                    continue;
+                }
                 "--" => {
                     positional_only = true;
                     continue;
@@ -94,6 +138,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
         }
         path = Some(PathBuf::from(arg));
     }
+    if watch && stress.is_some() {
+        return Err("--watch needs a project (not --stress)".to_owned());
+    }
     if !measure && (frames.is_some() || idle.is_some()) {
         return Err("--frames and --idle require --measure".to_owned());
     }
@@ -101,7 +148,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
         frames: frames.unwrap_or(DEFAULT_FRAMES),
         idle_secs: idle.unwrap_or(DEFAULT_IDLE_SECS),
     });
-    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure, stress }))
+    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure, stress, deps, stdlib, isolated, no_cache, cache_dir, watch }))
 }
 
 fn number(flag: &str, value: Option<OsString>) -> Result<u32, String> {
@@ -168,6 +215,29 @@ mod tests {
         assert!(run(&["--measure", "--frames", "0"]).unwrap_err().contains("positive"));
         assert!(run(&["--measure", "--idle", "x"]).unwrap_err().contains("positive"));
         assert!(run(&["--frames", "5"]).unwrap_err().contains("require --measure"));
+    }
+
+    #[test]
+    fn load_options() {
+        let o = opts(&[]);
+        assert_eq!((o.deps, o.stdlib, o.isolated, o.no_cache, o.cache_dir), (None, None, false, false, None));
+        let o = opts(&["--deps", "--no-stdlib", "--isolated", "--no-cache", "--cache-dir", "/tmp/c", "p"]);
+        assert_eq!((o.deps, o.stdlib, o.isolated, o.no_cache), (Some(true), Some(false), true, true));
+        assert_eq!(o.cache_dir, Some(PathBuf::from("/tmp/c")));
+        assert_eq!(o.path, PathBuf::from("p"));
+        // The last of a pair wins.
+        assert_eq!(opts(&["--deps", "--no-deps"]).deps, Some(false));
+        assert_eq!(opts(&["--no-stdlib", "--stdlib"]).stdlib, Some(true));
+        assert!(run(&["--cache-dir"]).unwrap_err().contains("requires a value"));
+    }
+
+    #[test]
+    fn watch_flag() {
+        assert!(!opts(&[]).watch);
+        let o = opts(&["--watch", "p"]);
+        assert!(o.watch);
+        assert_eq!(o.path, PathBuf::from("p"));
+        assert!(run(&["--watch", "--stress", "10"]).unwrap_err().contains("--watch"));
     }
 
     #[test]

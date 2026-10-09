@@ -338,3 +338,143 @@ fn glyph_atlas_grows_when_full() {
     assert!(!map.text.as_ref().unwrap().atlas_full);
     assert!(map.stats.glyphs > 0);
 }
+
+#[test]
+fn label_only_rects_draw_only_their_label() {
+    let Some(g) = gpu() else { return };
+    let size = [600, 300];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut b = SceneBuilder::new();
+    let fill = RectStyle { fill: FILL_B, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 };
+    b.add_rect(1, 0, WorldRect::new(50.0, 50.0, 550.0, 250.0), fill, None);
+    b.add_rect(1, 0, WorldRect::new(50.0, 50.0, 550.0, 250.0), RectStyle::label_only(FILL_B), Some(b"Carrier_label"));
+    let mut map = MapState::new(Arc::new(b.build()));
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [300.0, 150.0];
+    map.camera.zoom = 1.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let at = |x, y| px(&p, size, x, y);
+    assert!(close(at(300, 200), rgb(FILL_B)), "the carrier hides nothing {:?}", at(300, 200));
+    let bright = (52..250).flat_map(|x| (52..72).map(move |y| (x, y))).filter(|&(x, y)| at(x, y)[1] > 150).count();
+    assert!(bright > 30, "label pixels: {bright}");
+    assert_eq!(map.stats.labels, 1);
+}
+
+#[test]
+fn code_map_renders_and_reveals_children_on_zoom() {
+    use pymapper_gui::codemap::load::{LoadParams, load};
+    use pymapper_gui::codemap::scene::SceneParams;
+    use pymapper_gui::codemap::{CodeMap, MapParams};
+    let Some(g) = gpu() else { return };
+    let corpus = std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/sample_python")).expect("corpus");
+    let lp = LoadParams { path: corpus, isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true, watch: false };
+    let cm = CodeMap::build(Arc::new(load(&lp, &|_| {}).expect("load")), MapParams::default());
+    let (scene, legend, _) = cm.scene(&SceneParams::default());
+    assert!(legend.edges > 0);
+    let size = [1200, 800];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = MapState::new(Arc::new(scene));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    let covered = p.as_chunks::<4>().0.iter().filter(|c| !close([c[0], c[1], c[2]], bg)).count();
+    assert!(covered > (size[0] * size[1] / 2) as usize, "covered {covered}");
+    let (fit_rects, fit_curves) = (map.bands.rects.len(), map.bands.curves.len());
+    assert!(fit_rects > 0);
+    // Zooming far in shows deeper cells (children revealed) and switches edge levels.
+    let max_band = cm.reveal.change_bands().last().copied().expect("bands");
+    let zoom = pymapper_gui::map::scene::band_zoom(max_band) as f32 * 1.5;
+    map.camera.zoom = zoom.min(map.camera.max_zoom);
+    let rebuilds = map.stats.band_rebuilds.count;
+    render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    assert!(map.stats.band_rebuilds.count > rebuilds);
+    assert!(map.bands.rects.len() > fit_rects, "{} -> {}", fit_rects, map.bands.rects.len());
+    assert_ne!(map.bands.curves.len(), fit_curves, "edges switch rollup level");
+}
+
+#[test]
+fn overlays_draw_over_the_scene_in_their_bands() {
+    use pymapper_gui::map::{OVERLAY_HIGHLIGHT, OVERLAY_MARKS};
+    let Some(g) = gpu() else { return };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let size = [1000, 500];
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    // Highlight: a translucent veil over everything plus a green outline on rect A.
+    let mut b = SceneBuilder::new();
+    let veil = b.add_rect(0, 0, WorldRect::new(0.0, 0.0, 1000.0, 500.0), RectStyle { fill: Rgba::new(0, 0, 0, 128), stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }, None);
+    b.set_rect_lod(veil, Lod::ALWAYS);
+    let o = b.add_rect(1, 1, WorldRect::new(100.0, 100.0, 400.0, 400.0), RectStyle { fill: Rgba::TRANSPARENT, stroke: GREEN, radius: 8.0, stroke_width: 4.0 }, None);
+    b.set_rect_lod(o, Lod::ALWAYS);
+    map.set_overlay(OVERLAY_HIGHLIGHT, Arc::new(b.build()));
+    // Marks: a yellow dot that only shows from band 129 (zoom >= 2).
+    let mut m = SceneBuilder::new();
+    let d = m.add_rect(2, 0, WorldRect::new(240.0, 190.0, 260.0, 210.0), RectStyle { fill: YELLOW, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }, None);
+    m.set_rect_lod(d, Lod { min: 129, max: 255 });
+    map.set_overlay(OVERLAY_MARKS, Arc::new(m.build()));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let at = |x, y| px(&p, size, x, y);
+    let dim = |c: Rgba| [c.0[0] / 2, c.0[1] / 2, c.0[2] / 2];
+    assert!(close(at(250, 200), dim(FILL_A)), "veiled fill {:?}", at(250, 200));
+    assert!(close(at(101, 250), rgb(GREEN)), "outline over the veil {:?}", at(101, 250));
+    assert!(!close(at(250, 200), rgb(YELLOW)), "mark hidden below its band");
+    // Zoom 2x about the dot: the mark's band shows it (under the highlight's veil, which is
+    // the top overlay).
+    map.camera.center = [250.0, 200.0];
+    map.camera.zoom = 2.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), dim(YELLOW)), "mark in its band {:?}", px(&p, size, 500, 250));
+    map.set_overlay(OVERLAY_HIGHLIGHT, Arc::new(SceneBuilder::new().build()));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), rgb(YELLOW)), "mark without the veil {:?}", px(&p, size, 500, 250));
+    // Replacing the scene clears the overlays.
+    map.set_scene(Arc::new(SceneBuilder::new().build()));
+    assert!(map.overlays.iter().all(|o| o.scene.rects.is_empty()));
+}
+
+/// Selection marks draw in the overlay pass, and swapping scenes (view tabs) re-uploads
+/// everything and restores the saved camera.
+#[test]
+fn selection_marks_and_scene_swaps_render() {
+    use pymapper_gui::map::scene::RectInstance;
+    use pymapper_gui::views::scene::SELECT_COLOR;
+    let Some(g) = gpu() else { return };
+    let size = [1000, 500];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    // An outline in empty space.
+    let mark = RectInstance { min: [550.0, 100.0], max: [850.0, 200.0], fill: Rgba::TRANSPARENT, stroke: SELECT_COLOR, radius: 0.0, stroke_width: 3.0 };
+    map.set_marks(&[mark]);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 700, 101), rgb(SELECT_COLOR)), "mark stroke {:?}", px(&p, size, 700, 101));
+    assert!(close(px(&p, size, 700, 150), bg), "mark is hollow");
+    map.set_marks(&[]);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 700, 101), bg), "mark cleared");
+    // Swap to another scene (fitted), then back with the saved camera.
+    let saved = map.fitted_camera().expect("fitted");
+    let first = Arc::clone(&map.scene);
+    let mut b = SceneBuilder::new();
+    b.add_rect(9, 0, WorldRect::new(0.0, 0.0, 50.0, 50.0), RectStyle { fill: GREEN, stroke: GREEN, radius: 0.0, stroke_width: 0.0 }, None);
+    map.show_scene(Arc::new(b.build()), None);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), rgb(GREEN)), "other scene fitted {:?}", px(&p, size, 500, 250));
+    map.show_scene(first, Some(saved));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert_eq!((map.camera.center, map.camera.zoom), (saved.center, saved.zoom));
+    assert!(close(px(&p, size, 250, 200), rgb(FILL_A)), "first scene again {:?}", px(&p, size, 250, 200));
+    assert!(close(px(&p, size, 700, 50), rgb(GREEN)), "its line re-uploaded {:?}", px(&p, size, 700, 50));
+}

@@ -235,7 +235,7 @@ pub struct CallEdge {
 
 /// Packs a call row's outcome into one byte (confidence in the top two bits).
 #[inline]
-fn pack(conf: Confidence, reason: Reason) -> u8 {
+pub(super) fn pack(conf: Confidence, reason: Reason) -> u8 {
     ((conf as u8) << 6) | reason as u8
 }
 
@@ -297,14 +297,14 @@ pub(super) fn par_chunks<S: Default, O: Default + Send>(files: usize, per: impl 
 
 /// Resolved calls of an index (see the module docs of `resolve`).
 pub struct ResolvedCalls {
-    classes: Classes,
-    methods: MethodIndex,
+    pub(super) classes: Classes,
+    pub(super) methods: MethodIndex,
     /// Per call row (store-absolute): [`pack`]ed confidence and reason.
-    info: Vec<u8>,
-    edges: Vec<CallEdge>,
+    pub(super) info: Vec<u8>,
+    pub(super) edges: Vec<CallEdge>,
     /// First edge of every file (`files + 1` entries).
-    edge_start: Vec<u32>,
-    stats: CallStats,
+    pub(super) edge_start: Vec<u32>,
+    pub(super) stats: CallStats,
 }
 
 impl ResolvedCalls {
@@ -383,19 +383,10 @@ pub(super) struct Names {
 }
 
 impl Names {
-    fn new(ix: &Index) -> Names {
-        let g = |s: &[u8]| ix.strings().get(s);
-        Names {
-            self_: g(b"self"),
-            init: g(b"__init__"),
-            new: g(b"__new__"),
-            call: g(b"__call__"),
-            getattr: g(b"__getattr__"),
-            class_: g(b"__class__"),
-            metaclass: g(b"metaclass"),
-            object: g(b"object"),
-            markers: [g(b"Generic"), g(b"Protocol"), g(b"ABC")],
-        }
+    pub(super) fn new(ix: &Index) -> Names {
+        let [self_, init, new, call, getattr, class_, metaclass, object, generic, protocol, abc] =
+            super::builtins::texts::CALLS.map(|s| ix.strings().get(s));
+        Names { self_, init, new, call, getattr, class_, metaclass, object, markers: [generic, protocol, abc] }
     }
 }
 
@@ -406,7 +397,7 @@ pub(super) struct Tables {
 }
 
 impl Tables {
-    fn new(ix: &Index) -> Tables {
+    pub(super) fn new(ix: &Index) -> Tables {
         Tables { builtins: SymSet::new(ix.strings(), BUILTINS), builtin_methods: SymSet::new(ix.strings(), BUILTIN_METHODS) }
     }
 }
@@ -414,7 +405,7 @@ impl Tables {
 const _: () = assert!(size_of::<CallEdge>() == 16);
 
 /// Most subclass methods considered for one `self.m()` that the class itself lacks.
-const MAX_SUBCLASS_CANDIDATES: usize = 64;
+pub(super) const MAX_SUBCLASS_CANDIDATES: usize = 64;
 
 /// Resolves every call site of `ix` against the resolved imports (see the `resolve` module
 /// docs). Runs on the current rayon pool. Phases are recorded with [`timing`] as
@@ -497,7 +488,7 @@ struct BaseChunk {
 
 /// Resolves the direct bases of every class (parallel per file), in the class's enclosing
 /// scope. Returns the bases, their per-class starts and per-class flags.
-fn class_bases(cx: &Cx<'_>) -> (Vec<ClassId>, Vec<u32>, Vec<u8>) {
+pub(super) fn class_bases(cx: &Cx<'_>) -> (Vec<ClassId>, Vec<u32>, Vec<u8>) {
     let ix = cx.ix;
     let files = ix.file_count() as usize;
     let chunks = par_chunks(files, |loc: &mut Locals, f, out: &mut BaseChunk| {
@@ -564,8 +555,8 @@ fn class_bases(cx: &Cx<'_>) -> (Vec<ClassId>, Vec<u32>, Vec<u8>) {
 
 /// Per-task scratch of the call pass.
 #[derive(Default)]
-struct FileScratch {
-    loc: Locals,
+pub(super) struct FileScratch {
+    pub loc: Locals,
     linked: Vec<ClassId>,
     /// `(node, name)` of the methods of one class, in node order (see [`override_edges`]).
     methods: Vec<(NodeId, Sym)>,
@@ -573,10 +564,12 @@ struct FileScratch {
 
 /// Output of the call pass for a chunk of files.
 #[derive(Default)]
-struct CallChunk {
-    info: Vec<u8>,
-    edges: Vec<CallEdge>,
-    edge_lens: Vec<u32>,
+pub(super) struct CallChunk {
+    pub info: Vec<u8>,
+    pub edges: Vec<CallEdge>,
+    pub edge_lens: Vec<u32>,
+    /// Per file, how many of its edges come from call rows (the rest: decorators, overrides).
+    pub call_lens: Vec<u32>,
 }
 
 /// Where the edges of one site go.
@@ -603,7 +596,7 @@ struct Site<'a> {
 }
 
 /// Resolves the calls, uncalled decorators and overrides of file `f`.
-fn file_calls(cx: &Cx<'_>, methods: &MethodIndex, sc: &mut FileScratch, f: FileId, out: &mut CallChunk) {
+pub(super) fn file_calls(cx: &Cx<'_>, methods: &MethodIndex, sc: &mut FileScratch, f: FileId, out: &mut CallChunk) {
     let ix = cx.ix;
     let st = ix.facts();
     let ff = ix.file_facts(f);
@@ -621,6 +614,7 @@ fn file_calls(cx: &Cx<'_>, methods: &MethodIndex, sc: &mut FileScratch, f: FileI
         let (conf, why) = resolve_site(cx, methods, loc, &site, &mut sink, false);
         out.info.push(pack(conf, why));
     }
+    out.call_lens.push((out.edges.len() - before) as u32);
     if !ff.decorators.is_empty() {
         for d in 1..ff.defs.len {
             if st.defs.decorators_len[fv.def_row(d)] == 0 {
@@ -642,7 +636,7 @@ fn file_calls(cx: &Cx<'_>, methods: &MethodIndex, sc: &mut FileScratch, f: FileI
             }
         }
     }
-    override_edges(cx, f, &mut sc.linked, &mut sc.methods, &mut out.edges);
+    override_edges(cx, f, &sc.loc, &mut sc.linked, &mut sc.methods, &mut out.edges);
     out.edge_lens.push((out.edges.len() - before) as u32);
 }
 
@@ -679,7 +673,7 @@ fn resolve_site(
                 } else if instance
                     && chain.len() == 2
                     && matches!(first.val, Val::Unknown(Reason::MissingAttr | Reason::ExternalBase))
-                    && subclass_edges(cx, methods, c, chain[1], sink)
+                    && subclass_edges(cx, methods, loc, c, chain[1], sink)
                 {
                     return (Confidence::Likely, Reason::SubclassMethod);
                 } else if chain.len() > 2 && first.val == Val::Unknown(Reason::MissingAttr) {
@@ -783,13 +777,14 @@ fn finish(
 /// `self.m()` where class `c` has no `m`: edges to the methods `m` of its subclasses (only
 /// when at most [`MAX_SUBCLASS_CANDIDATES`] methods have that name). Returns whether any
 /// edge was added.
-fn subclass_edges(cx: &Cx<'_>, methods: &MethodIndex, c: ClassId, name: Sym, sink: &mut Sink<'_>) -> bool {
+fn subclass_edges(cx: &Cx<'_>, methods: &MethodIndex, loc: &Locals, c: ClassId, name: Sym, sink: &mut Sink<'_>) -> bool {
     let cands = methods.candidates(name);
     if cands.len() > MAX_SUBCLASS_CANDIDATES {
         return false;
     }
     let mut any = false;
     for &(_, t) in cands {
+        loc.touch_node(cx.ix, t);
         let Some(k) = cx.ix.parent(t).and_then(|p| cx.classes.id(cx.ix, p)) else { continue };
         if k != c && cx.classes.inherits(k, c) {
             sink.push(t, Confidence::Likely, Reason::SubclassMethod);
@@ -807,6 +802,7 @@ fn subclass_edges(cx: &Cx<'_>, methods: &MethodIndex, c: ClassId, name: Sym, sin
 fn override_edges(
     cx: &Cx<'_>,
     f: FileId,
+    loc: &Locals,
     linked: &mut Vec<ClassId>,
     methods: &mut Vec<(NodeId, Sym)>,
     out: &mut Vec<CallEdge>,
@@ -828,6 +824,7 @@ fn override_edges(
         for &(r, name) in methods.iter() {
             linked.clear();
             for &k in &mro[1..] {
+                loc.touch_node(ix, cl.node(k));
                 let Some(b) = cl.members(k, name).first().filter(|b| b.kind == mkind::DEF) else { continue };
                 if ix.kind(b.r) != NodeKind::Function {
                     continue;

@@ -10,14 +10,24 @@ use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::args::Options;
+use crate::args::{MeasureOpts, Options};
+use crate::codemap::load::LoadParams;
+use crate::codemap::transition::Transition;
+use crate::codemap::worker::{MapWorker, Published, Status, Update};
+use crate::codemap::{CodeMap, MapParams};
+use crate::interact::highlight::Focus;
+use crate::interact::state::{FOCUS_FILL, Interaction, SceneCtx};
+use crate::map::CanvasInput;
+use crate::map::hit::HitKind;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
+use crate::map::scene::RectInstance;
 use crate::map::{MapState, stress};
 use crate::measure::{self, FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
+use crate::views::{ViewKind, Views};
 
 /// Events sent to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -36,8 +46,23 @@ pub struct App {
     sched: Scheduler,
     measure: Option<Measure>,
     map: MapState,
-    /// Time to build the scene (stress mode), for the measurement report.
+    /// Time to build the scene (stress mode, or the code map and its first scene), for the
+    /// measurement report.
     scene_build: Option<Duration>,
+    /// Background loader / scene builder of the code map (`None` in stress mode).
+    worker: Option<MapWorker>,
+    /// The code map of the scene shown (hover details).
+    codemap: Option<Arc<CodeMap>>,
+    /// Secondary views (graph, matrix, focus) and the shared selection.
+    views: Views,
+    /// The overlay animation of the last watch-mode update, while it runs.
+    transition: Option<Transition>,
+    /// Scratch for the transition's overlay rects.
+    overlay: Vec<RectInstance>,
+    /// Last status shown (the status line is rewritten only when it changes).
+    status: Option<Status>,
+    /// `--measure` with a project: measuring starts once the first scene is shown.
+    pending_measure: Option<MeasureOpts>,
     win: Option<WindowState>,
     error: Option<anyhow::Error>,
     report: Option<String>,
@@ -70,16 +95,46 @@ impl App {
         egui_ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint { delay: info.delay, pass_nr: info.current_cumulative_pass_nr });
         });
-        let measure = opts.measure.clone().map(|m| Measure::new(m, launched));
         let name = opts.path.file_name().map_or_else(|| project.clone(), |n| n.to_string_lossy().into_owned());
-        let (map, scene_build) = match opts.stress {
+        let (map, scene_build, worker) = match opts.stress {
             Some(n) => {
                 let t = Instant::now();
                 let scene = stress::scene(n as usize, n as usize, stress::SEED);
-                (MapState::new(Arc::new(scene)), Some(t.elapsed()))
+                (MapState::new(Arc::new(scene)), Some(t.elapsed()), None)
             }
-            None => (MapState::default(), None),
+            None => {
+                let load = LoadParams {
+                    path: opts.path.clone(),
+                    isolated: opts.isolated,
+                    deps: opts.deps,
+                    stdlib: opts.stdlib,
+                    cache_dir: opts.cache_dir.clone(),
+                    no_cache: opts.no_cache,
+                    watch: opts.watch,
+                };
+                // The worker wakes the loop through egui's repaint callback.
+                let ctx = egui_ctx.clone();
+                let notify = Arc::new(move || ctx.request_repaint());
+                // A thread that cannot start leaves an empty map with the error as status.
+                let worker = MapWorker::spawn(load, MapParams::default(), Default::default(), notify);
+                (MapState::default(), None, Some(worker))
+            }
         };
+        let (worker, status) = match worker {
+            Some(Ok(w)) => (Some(w), None),
+            Some(Err(e)) => (None, Some(Status::Failed(format!("cannot start the map thread: {e}")))),
+            None => (None, None),
+        };
+        // With a project, measuring starts once the map is shown (not during loading).
+        let (measure, pending_measure) = match (&opts.measure, &worker) {
+            (Some(m), Some(_)) => (None, Some(m.clone())),
+            (Some(m), None) => (Some(Measure::new(m.clone(), launched)), None),
+            (None, _) => (None, None),
+        };
+        let ctx = egui_ctx.clone();
+        let mut views = Views::new(Arc::new(move || ctx.request_repaint()));
+        // The interaction's highlight overlay outlines the selection on the code map.
+        views.codemap_marks = false;
         Self {
             opts,
             title: format!("pymapper - {name}"),
@@ -90,6 +145,13 @@ impl App {
             measure,
             map,
             scene_build,
+            worker,
+            codemap: None,
+            views,
+            transition: None,
+            overlay: Vec::new(),
+            status,
+            pending_measure,
             win: None,
             error: None,
             report: None,
@@ -152,7 +214,10 @@ impl App {
             window.theme(),
             Some(max_dim as usize),
         );
-        let ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
+        let mut ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
+        if self.opts.watch && self.opts.stress.is_none() {
+            ui.watch_info.push_str("waiting for changes");
+        }
         Ok(WindowState {
             renderer,
             surface,
@@ -172,7 +237,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, map, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, views, status, pending_measure, scene_build, transition, overlay, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -221,12 +286,77 @@ impl App {
         };
         let t1 = Instant::now();
 
+        if let Some(wk) = worker.as_ref() {
+            if let Some(p) = wk.take() {
+                let ctx = egui_ctx.clone();
+                let notify = Arc::new(move || ctx.request_repaint());
+                *transition = apply_published(p, map, codemap, views, &mut w.ui, scene_build, notify);
+                if let Some(m) = pending_measure.take() {
+                    *measure = Some(Measure::new(m, t1));
+                }
+            }
+            let st = wk.status();
+            if status.as_ref() != Some(&st)
+                && let Some(e) = wk.watch_error()
+            {
+                w.ui.watch_info = format!("cannot watch for changes: {e}");
+            }
+            if status.as_ref() != Some(&st) {
+                status_line(&st, map.scene.bounds.is_positive(), &mut w.ui.map_status);
+                *status = Some(st);
+            }
+        } else if let Some(st) = status.as_ref()
+            && w.ui.map_status.is_empty()
+        {
+            status_line(st, false, &mut w.ui.map_status);
+        }
+        w.ui.interact.poll();
         let raw = w.egui.take_egui_input(&w.window);
         w.ui.map_empty = !map.scene.bounds.is_positive();
         let mut full = egui_ctx.run_ui(raw, |ui| panels::show(ui, &mut w.ui));
         w.egui.handle_platform_output(&w.window, full.platform_output);
         let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
-        let hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
+        if w.ui.map_request_changed
+            && let (Some(wk), Some(req)) = (worker.as_ref(), w.ui.map_request)
+        {
+            wk.request(req);
+        }
+        let color = w.ui.map_request.map_or(Default::default(), |r| r.scene.color);
+        // A jump requested in the panels (search, findings) shows the code map.
+        if w.ui.interact.focus_request.is_some() && views.active != ViewKind::CodeMap {
+            w.ui.views.tab = Some(ViewKind::CodeMap);
+        }
+        // Selections made in the panels are the views' selection too.
+        views.set_selection(w.ui.interact.selected);
+        let mut views_changed = views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+        let on_codemap = views.active == ViewKind::CodeMap;
+        let mut input = w.ui.canvas_input;
+        // On the code map a double click on a cell zooms to it; on empty canvas (or in another
+        // view) it fits.
+        let hovered_node = map.hover.filter(|h| h.kind == HitKind::Rect).map(|h| h.id);
+        input.fit |= input.double_click && (!on_codemap || hovered_node.is_none());
+        let mut hover_changed = map.apply_input(&input, full.pixels_per_point);
+        let interacted = if on_codemap {
+            interact(&mut w.ui.interact, map, &input, hover_changed)
+        } else {
+            // Hits refer to another view's scene: no code map hover, clicks go to the views.
+            w.ui.interact.set_hover(None);
+            if input.click || input.escape {
+                let hit = if input.escape { None } else { map.hover };
+                views.on_click(hit, map, codemap.as_ref(), color);
+                hover_changed = true;
+            }
+            let changed = views.selection != w.ui.interact.selected;
+            if changed {
+                w.ui.interact.select(views.selection);
+            }
+            changed
+        };
+        if interacted {
+            // Apply the new selection (marks, texts) in this frame.
+            views.set_selection(w.ui.interact.selected);
+            views_changed |= views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+        }
         if let Some(t) = measure.as_ref().and_then(Measure::progress)
             && map.scene.bounds.is_positive()
         {
@@ -236,8 +366,21 @@ impl App {
             map.camera.center = center;
             map.camera.zoom = zoom.clamp(map.camera.min_zoom, map.camera.max_zoom);
         }
+        // Watch-mode transition: overlay rects animated over the new scene (code map only).
+        let mut animating = false;
+        if let Some(t) = transition.as_mut() {
+            t.start(t1);
+            animating = views.active == ViewKind::CodeMap && t.frame(t1, overlay);
+            if !animating {
+                overlay.clear();
+                *transition = None;
+            }
+            map.set_transition_rects(overlay);
+        }
         let t2 = Instant::now();
 
+        // Overlays of this frame's hover / selection / path, drawn in this frame.
+        w.ui.interact.sync_overlays(map);
         let size = [w.config.width, w.config.height];
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let input = FrameInput {
@@ -278,9 +421,19 @@ impl App {
                 st.label_rebuilds.count
             );
         }
+        if interacted || views_changed || animating {
+            // The panels were laid out before the click and before the views updated their
+            // texts (show the new selection next frame); or the next frame of the transition.
+            sched.request(t3, Duration::ZERO);
+        }
         if hover_changed {
             // The details panel was laid out before the hit test: show the new hover next frame.
-            map.describe_hover(&mut w.ui.hover_text);
+            match (codemap.as_ref(), map.hover) {
+                (_, Some(h)) if views.describe(h, &mut w.ui.hover_text) => {}
+                (Some(cm), Some(h)) if h.kind == HitKind::Rect => cm.describe_node(h.id, &mut w.ui.hover_text),
+                (Some(cm), Some(h)) if h.kind == HitKind::Curve => cm.describe_edge(h.id, &mut w.ui.hover_text),
+                _ => map.describe_hover(&mut w.ui.hover_text),
+            }
             sched.request(t3, Duration::ZERO);
         }
         if let Some(m) = measure.as_mut() {
@@ -289,6 +442,111 @@ impl App {
                 w.window.request_redraw();
             }
         }
+    }
+}
+
+/// Canvas interaction for one frame: hover focus, click to select, Shift-click for a path,
+/// double click to zoom to a cell, Escape to clear, and camera jumps requested by the panels.
+/// Returns true if the selection changed (the panels must be laid out again).
+fn interact(it: &mut Interaction, map: &mut MapState, input: &CanvasInput, hover_changed: bool) -> bool {
+    if hover_changed {
+        let focus = map.hover.map(|h| match h.kind {
+            HitKind::Rect => Focus::Node(h.id),
+            HitKind::Line | HitKind::Curve => Focus::Edge(h.id),
+        });
+        it.set_hover(focus);
+    }
+    let before = (it.selected, it.path.is_some());
+    let node = map.hover.filter(|h| h.kind == HitKind::Rect).map(|h| h.id);
+    if input.escape {
+        it.select(None);
+    } else if input.double_click {
+        if let Some(v) = node {
+            it.focus(v);
+        }
+    } else if input.click {
+        match (node, input.shift) {
+            (Some(v), true) => it.path_to(v),
+            (Some(v), false) => it.select(Some(v)),
+            // Clicking an edge keeps the selection; empty canvas clears it.
+            (None, _) if map.hover.is_none() => it.select(None),
+            (None, _) => {}
+        }
+    }
+    if let Some(r) = it.focus_request.take()
+        && r.is_positive()
+    {
+        // `frame` fits the camera to the scene first if it never was (e.g. just switched to).
+        map.frame(&r, FOCUS_FILL);
+    }
+    // A pending path needs no redraws: the worker's notify wakes the UI when it arrives.
+    before != (it.selected, it.path.is_some())
+}
+
+/// Shows a published code map scene: keeps the camera when replacing a scene of the same
+/// world, and seeds the controls from the first request. A watch-mode update also carries
+/// the selection over to the new nodes and returns its transition.
+fn apply_published(
+    p: Published,
+    map: &mut MapState,
+    codemap: &mut Option<Arc<CodeMap>>,
+    views: &mut Views,
+    ui: &mut UiState,
+    scene_build: &mut Option<Duration>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> Option<Transition> {
+    views.show_codemap_scene(map, Arc::clone(&p.scene));
+    let selected = ui.interact.selected;
+    ui.interact.set_scene(SceneCtx { map: Arc::clone(&p.map), scene: p.scene, index: p.index }, true, notify);
+    *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
+    *codemap = Some(p.map);
+    ui.legend = Some(p.legend);
+    ui.map_request.get_or_insert(p.request);
+    ui.hover_text.clear();
+    let u = p.update?;
+    views.remap(&u.node_map);
+    // The interaction restarts on the updated analysis: carry its selection over too.
+    let remapped = selected.and_then(|v| u.node_map.get(v as usize).copied()).filter(|&n| n != pymapper_core::index::NONE);
+    ui.interact.select(remapped);
+    watch_info(&u, &mut ui.watch_info);
+    (!u.transition.is_empty()).then_some(u.transition)
+}
+
+/// The details panel's line about the last watch-mode update.
+fn watch_info(u: &Update, out: &mut String) {
+    use std::fmt::Write as _;
+    out.clear();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let (re, add, rm) = u.files;
+    if u.node_map.is_empty() {
+        out.push_str("reloaded (configuration changed)");
+    } else {
+        let _ = write!(out, "{re} re-extracted, {add} added, {rm} removed");
+    }
+    let _ = write!(
+        out,
+        "\nedit to map {:.0} ms (update {:.1}, rebuild {:.1}, release {:.1} ms)",
+        ms(u.latency),
+        ms(u.update),
+        ms(u.rebuild),
+        ms(u.release)
+    );
+}
+
+/// The canvas status line for a worker status (`has_scene`: a map is already shown).
+fn status_line(st: &Status, has_scene: bool, out: &mut String) {
+    out.clear();
+    match st {
+        Status::Loading(phase) => {
+            out.push_str("loading project: ");
+            out.push_str(phase);
+        }
+        Status::Building if !has_scene => out.push_str("laying out the map"),
+        Status::Failed(e) => {
+            out.push_str("cannot load the project: ");
+            out.push_str(e);
+        }
+        Status::Building | Status::Updating | Status::Ready => {}
     }
 }
 
@@ -400,6 +658,26 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        // Watch mode: the map thread needs the analysis to itself. Handled here, not in
+        // `redraw`, so an occluded window does not hold an update back.
+        if let Some(wk) = &self.worker
+            && wk.wants_release()
+        {
+            self.codemap = None;
+            self.views.release();
+            if let Some(w) = self.win.as_mut() {
+                w.ui.hover_text.clear();
+                w.ui.interact.release();
+            }
+            wk.released();
+        }
+        if self.pending_measure.is_some()
+            && let Some(Status::Failed(e)) = &self.status
+        {
+            let err = anyhow!("--measure: {e}");
+            self.fail(event_loop, err);
+            return;
+        }
         if self.measure.as_ref().is_some_and(|m| m.stalled(now)) {
             let err = anyhow!("--measure: no frame presented for {} s (window hidden or occluded?)", STALL.as_secs());
             self.fail(event_loop, err);
@@ -412,6 +690,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut report = m.report(&w.ui.renderer_info, [w.config.width, w.config.height], w.window.scale_factor() as f32);
                 if self.map.scene.bounds.is_positive() {
                     measure::map_report(&mut report, &self.map, w.renderer.canvas().map().memory(), self.scene_build);
+                }
+                if let Some(cm) = &self.codemap {
+                    measure::codemap_report(&mut report, cm);
+                }
+                if self.opts.watch {
+                    report.push_str("watch: ");
+                    report.push_str(&w.ui.watch_info.replace('\n', "; "));
+                    report.push('\n');
                 }
                 self.report = Some(report);
             }

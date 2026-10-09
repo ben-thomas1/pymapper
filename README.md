@@ -6,9 +6,8 @@ codes, config, suppressions, baselines and exit codes. ruff and ty check one fil
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. `pymapper check` and `pymapper config` work end to end; the query
-subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are not
-implemented yet (hidden from `--help`; running one exits 2).
+**Status:** under rewrite. Every subcommand works end to end: `check`, the queries (`callers`,
+`callees`, `impact`, `path`, `imports`, `cycles`, `summary`), `deps` and `config`.
 See [`docs/design.md`](docs/design.md) for the design.
 
 ## Install
@@ -35,6 +34,9 @@ pymapper check --deps --stdlib       # link first-party code to the venv and the
 pymapper check --save-baseline .pymapper-baseline.json   # record today's findings
 pymapper check --baseline .pymapper-baseline.json        # report only new ones
 pymapper check --stats               # phase timings and peak RSS on stderr
+pymapper check --watch               # check again after every change (incremental update)
+pymapper deps --score                # third-party distributions: use by first-party code, grades (docs/deps.md)
+pymapper deps --check                # dependency hygiene: undeclared, unused, private imports (PM6xx)
 pymapper config                      # the effective configuration
 pymapper config --template           # every option, commented, with its default and cost
 ```
@@ -61,6 +63,39 @@ Output to a closed pipe (`| head`) stops quietly.
 
 Full reference (pipeline, every flag, output formats, baselines, `--stats`):
 [`docs/cli.md`](docs/cli.md).
+
+### Queries
+
+Questions about the code, answered from the same whole-program load as `check` (same root,
+config, flags and cache). The output is meant for agents: one fact per line, at the
+`path:line:col` it is about (a call site, an import statement), call edges tagged with their
+confidence, then one summary line; `--format json` gives one document with `check`'s
+conventions.
+
+```
+pymapper callers app.util:helper             # who calls it (--depth N, --transitive)
+pymapper callees Engine.run                  # what it calls; a last-segments suffix is enough
+pymapper impact app.models:User --depth 3    # everything that transitively calls it, tests, importers
+pymapper path app.cli:main app.db:connect    # a shortest call chain (--imports: import chain)
+pymapper imports app.billing --depth 1       # module imports in and out, rolled up to packages
+pymapper cycles                              # every import cycle (--symbol X [--calls])
+pymapper summary                             # sizes, resolution rates, cycles, top hotspots
+```
+
+```
+$ pymapper callers app.util:helper
+app/main.py:6:9: app.main:run [certain] +1 site
+app/util.py:7:16: app.util:Base.run [certain]
+tests/test_util.py:5:12: tests.test_util:test_helper [certain]
+3 callers of app.util:helper (function, app/util.py:1)
+```
+
+A symbol is a qualified id (`pkg.mod:Class.method`), a dotted name (`pkg.mod.Class.method`) or
+its last segments (`Class.method`, `method`). An ambiguous symbol lists its candidates on stdout
+and exits 2; an unknown one lists similar names and exits 2. Positional paths filter the rows
+(`pymapper callers helper src/api`), never what is loaded; `path` takes `--root DIR` to query
+a project from outside it. Details:
+[`docs/cli.md`](docs/cli.md#query-subcommands).
 
 ## Configuration
 
@@ -132,8 +167,9 @@ application-mode unit with no entry point at all gets a warning, since everythin
 look unused. Functions a framework loads by name from non-Python configuration (YAML tool
 lists, plugin registries) are found through config-file evidence (`analysis.config-evidence`,
 on by default): `*.yaml`, `*.yml`, `*.toml`, `*.json`, `*.cfg` and `*.ini` files of the
-first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles and pymapper /
-coverage.py reports are skipped) are tokenized once and cached. A full dotted path
+first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles, pymapper /
+coverage.py JSON reports and the configured `analysis.coverage` report are skipped) are
+tokenized once and cached. A full dotted path
 (`pkg.mod.func`, `pkg.mod:Class`) keeps a definition or module; a bare name lowers the
 confidence to 50 (10 when the file also names the module). Cost: one read per config file on a
 cold cache (a few ms for hundreds of files), a stat per file when warm. Rules you know better
@@ -169,7 +205,7 @@ Each rule's explanation, thresholds, cost class and confidence model:
 [`docs/rules.md`](docs/rules.md).
 
 Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`tests/`, `test/`,
-`testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
+`testing/`, `_tests/`, `_testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
 `analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
 tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
 structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a
@@ -180,7 +216,15 @@ route pymapper knows; lower values mean only weak evidence (a matching attribute
 string elsewhere, dynamic dispatch) keeps it possibly alive. `check` reports findings at or
 above `min-confidence`. Each finding names its evidence: the message says "is never used"
 only when nothing refers to the symbol, and the reasons are listed, e.g.
-`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON.
+`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON. Every
+first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
+is test-only API, reported below the gate as `used-only-in-tests`.
+
+Runtime evidence from a test run sharpens the scores: pass a coverage.py JSON report with
+`pymapper check --coverage coverage.json` (or `analysis.coverage`). Code that ran is never
+reported; code that never ran and has only weak static evidence of use moves above the gate
+(`(confidence 84: name-elsewhere, never-executed)`). Create the report with
+`coverage run -m pytest && coverage json`.
 
 ## Performance
 
@@ -215,7 +259,7 @@ crates/pymapper-gui    the `pymapper-gui` binary (native GUI; see docs/gui.md)
 xtask                  dev tooling: cargo xtask bench | diff-ruff | fuzz
 tests/corpus           Python inputs used by tests and benchmarks
 docs/design.md         design document (source of truth)
-docs/cli.md            `pymapper check` reference
+docs/cli.md            `pymapper check` and query subcommand reference
 docs/rules.md          rule reference (generated)
 ```
 
