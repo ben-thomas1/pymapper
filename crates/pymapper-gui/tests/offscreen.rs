@@ -394,3 +394,47 @@ fn code_map_renders_and_reveals_children_on_zoom() {
     assert!(map.bands.rects.len() > fit_rects, "{} -> {}", fit_rects, map.bands.rects.len());
     assert_ne!(map.bands.curves.len(), fit_curves, "edges switch rollup level");
 }
+
+#[test]
+fn overlays_draw_over_the_scene_in_their_bands() {
+    use pymapper_gui::map::{OVERLAY_HIGHLIGHT, OVERLAY_MARKS};
+    let Some(g) = gpu() else { return };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let size = [1000, 500];
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    // Highlight: a translucent veil over everything plus a green outline on rect A.
+    let mut b = SceneBuilder::new();
+    let veil = b.add_rect(0, 0, WorldRect::new(0.0, 0.0, 1000.0, 500.0), RectStyle { fill: Rgba::new(0, 0, 0, 128), stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }, None);
+    b.set_rect_lod(veil, Lod::ALWAYS);
+    let o = b.add_rect(1, 1, WorldRect::new(100.0, 100.0, 400.0, 400.0), RectStyle { fill: Rgba::TRANSPARENT, stroke: GREEN, radius: 8.0, stroke_width: 4.0 }, None);
+    b.set_rect_lod(o, Lod::ALWAYS);
+    map.set_overlay(OVERLAY_HIGHLIGHT, Arc::new(b.build()));
+    // Marks: a yellow dot that only shows from band 129 (zoom >= 2).
+    let mut m = SceneBuilder::new();
+    let d = m.add_rect(2, 0, WorldRect::new(240.0, 190.0, 260.0, 210.0), RectStyle { fill: YELLOW, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }, None);
+    m.set_rect_lod(d, Lod { min: 129, max: 255 });
+    map.set_overlay(OVERLAY_MARKS, Arc::new(m.build()));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let at = |x, y| px(&p, size, x, y);
+    let dim = |c: Rgba| [c.0[0] / 2, c.0[1] / 2, c.0[2] / 2];
+    assert!(close(at(250, 200), dim(FILL_A)), "veiled fill {:?}", at(250, 200));
+    assert!(close(at(101, 250), rgb(GREEN)), "outline over the veil {:?}", at(101, 250));
+    assert!(!close(at(250, 200), rgb(YELLOW)), "mark hidden below its band");
+    // Zoom 2x about the dot: the mark's band shows it (under the highlight's veil, which is
+    // the top overlay).
+    map.camera.center = [250.0, 200.0];
+    map.camera.zoom = 2.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), dim(YELLOW)), "mark in its band {:?}", px(&p, size, 500, 250));
+    map.set_overlay(OVERLAY_HIGHLIGHT, Arc::new(SceneBuilder::new().build()));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), rgb(YELLOW)), "mark without the veil {:?}", px(&p, size, 500, 250));
+    // Replacing the scene clears the overlays.
+    map.set_scene(Arc::new(SceneBuilder::new().build()));
+    assert!(map.overlays.iter().all(|o| o.scene.rects.is_empty()));
+}

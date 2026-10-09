@@ -271,7 +271,7 @@ mod tests {
         // Cut inside a triple-quoted string, invalid UTF-8, stray bytes.
         for src in [&b"    x = \"\"\"never closed\n"[..], b"def f(\n  \xff\xfe = $\n", b"", b"\n\n", b"   ", b"@"] {
             let h = highlight(src, 1, false);
-            assert_eq!(h.text.len() >= src.len().saturating_sub(4), true);
+            assert!(h.text.len() >= src.len().saturating_sub(4));
             let total: u32 = h.runs.iter().map(|r| r.end - r.start).sum();
             assert_eq!(total as usize, h.text.len());
         }

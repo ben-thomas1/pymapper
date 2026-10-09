@@ -35,19 +35,13 @@ pub fn severity_color(s: Severity) -> Rgba {
 }
 
 /// Which persistent overlays are on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MarksSpec {
     pub cycles: bool,
     pub layers: bool,
     pub badges: bool,
     /// Findings below this confidence are not marked (cycles and violations are 100).
     pub min_conf: u8,
-}
-
-impl Default for MarksSpec {
-    fn default() -> Self {
-        MarksSpec { cycles: false, layers: false, badges: false, min_conf: 0 }
-    }
 }
 
 impl MarksSpec {

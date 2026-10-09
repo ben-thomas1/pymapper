@@ -6,6 +6,7 @@ pub mod findings;
 pub mod fuzzy;
 pub mod highlight;
 pub mod marks;
+pub mod panel;
 pub mod search;
 pub mod sceneindex;
 pub mod source;

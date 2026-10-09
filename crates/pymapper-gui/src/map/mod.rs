@@ -66,12 +66,19 @@ pub struct CanvasInput {
     /// Multiplicative zoom factor (1.0 = none) about `zoom_anchor` (or the canvas centre).
     pub zoom: f32,
     pub zoom_anchor: Option<[f32; 2]>,
-    /// Fit the whole scene (Home key / double click).
+    /// Fit the whole scene (Home key, or a double click on empty canvas).
     pub fit: bool,
+    /// Primary click / double click on the canvas, Shift held, Escape pressed (interaction;
+    /// [`MapState::apply_input`] ignores them).
+    pub click: bool,
+    pub double_click: bool,
+    pub shift: bool,
+    pub escape: bool,
 }
 
 impl CanvasInput {
-    pub const NONE: Self = Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false };
+    pub const NONE: Self =
+        Self { hover: None, drag: [0.0, 0.0], zoom: 1.0, zoom_anchor: None, fit: false, click: false, double_click: false, shift: false, escape: false };
 }
 
 /// Duration counters for one kind of rebuild.

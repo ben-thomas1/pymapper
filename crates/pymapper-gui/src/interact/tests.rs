@@ -450,3 +450,52 @@ fn interaction_state_end_to_end() {
     it.set_scene(SceneCtx { map: Arc::clone(&m), scene: other, index: Arc::clone(&sx) }, true, Arc::new(|| {}));
     assert!(!it.sync_overlays(&mut map));
 }
+
+#[test]
+fn source_job_numbers_every_line() {
+    let h = super::source::highlight(b"def f(x):\n    return x  # c\n\nclass A: pass\n", 41, false);
+    let job = super::panel::source_job(&h, true, egui::FontId::monospace(12.0));
+    let text = job.text.as_str();
+    for n in 41..=44 {
+        assert!(text.contains(&format!("{n}  ")), "line {n} in {text:?}");
+    }
+    assert!(!text.contains("45  "));
+    assert!(text.contains("return x"));
+}
+
+#[test]
+fn panels_render_every_interaction_view_and_settle() {
+    use crate::interact::panel::BottomTab;
+    use crate::panels::{self, UiState};
+    use egui::{RawInput, Rect, ViewportId, pos2, vec2};
+    let (_p, m, scene, sx) = fixture();
+    let ix = &m.analysis.index;
+    let mut state = UiState::new("proj".to_owned(), "test".to_owned());
+    state.interact.set_scene(SceneCtx { map: Arc::clone(&m), scene, index: sx }, true, Arc::new(|| {}));
+    state.interact.search_text = "tangled".to_owned();
+    state.interact.update_search();
+    state.interact.select(Some(node(ix, "app.low:tangled")));
+    state.interact.set_marks(MarksSpec { cycles: true, layers: true, badges: true, min_conf: 0 });
+    pump(&mut state.interact, |it| it.search.is_some() && it.insights.is_some() && it.neighbours.is_some() && it.source.is_some());
+    state.interact.path_to(node(ix, "app.a:helper"));
+    pump(&mut state.interact, |it| !it.path_pending());
+    let ctx = egui::Context::default();
+    let mut t = 0.0;
+    for tab in [BottomTab::Findings, BottomTab::Source] {
+        state.panel.tab = tab;
+        let mut last = None;
+        for _ in 0..12 {
+            // Time advances so scroll bar fade-ins finish.
+            t += 0.25;
+            let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))), time: Some(t), ..RawInput::default() };
+            let mut out = ctx.run_ui(raw, |ui| panels::show(ui, &mut state));
+            out.textures_delta.clear();
+            last = Some(out.viewport_output[&ViewportId::ROOT].repaint_delay);
+        }
+        assert_eq!(last, Some(std::time::Duration::MAX), "idle panels settle ({tab:?})");
+    }
+    // A selection cleared from the panel state renders the empty details.
+    state.interact.select(None);
+    let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), ..RawInput::default() };
+    let _ = ctx.run_ui(raw, |ui| panels::show(ui, &mut state));
+}

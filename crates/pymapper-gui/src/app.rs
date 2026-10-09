@@ -14,6 +14,9 @@ use crate::args::{MeasureOpts, Options};
 use crate::codemap::load::LoadParams;
 use crate::codemap::worker::{MapWorker, Published, Status};
 use crate::codemap::{CodeMap, MapParams};
+use crate::interact::highlight::Focus;
+use crate::interact::state::{FOCUS_FILL, Interaction, SceneCtx};
+use crate::map::CanvasInput;
 use crate::map::hit::HitKind;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
@@ -265,7 +268,9 @@ impl App {
 
         if let Some(wk) = worker.as_ref() {
             if let Some(p) = wk.take() {
-                apply_published(p, map, codemap, &mut w.ui, scene_build);
+                let ctx = egui_ctx.clone();
+                let notify = Arc::new(move || ctx.request_repaint());
+                apply_published(p, map, codemap, &mut w.ui, scene_build, notify);
                 if let Some(m) = pending_measure.take() {
                     *measure = Some(Measure::new(m, t1));
                 }
@@ -280,6 +285,7 @@ impl App {
         {
             status_line(st, false, &mut w.ui.map_status);
         }
+        w.ui.interact.poll();
         let raw = w.egui.take_egui_input(&w.window);
         w.ui.map_empty = !map.scene.bounds.is_positive();
         let mut full = egui_ctx.run_ui(raw, |ui| panels::show(ui, &mut w.ui));
@@ -290,7 +296,12 @@ impl App {
         {
             wk.request(req);
         }
-        let hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
+        let mut input = w.ui.canvas_input;
+        // A double click on a cell zooms to it; on empty canvas it fits the map.
+        let hovered_node = map.hover.filter(|h| h.kind == HitKind::Rect).map(|h| h.id);
+        input.fit |= input.double_click && hovered_node.is_none();
+        let hover_changed = map.apply_input(&input, full.pixels_per_point);
+        let interacted = interact(&mut w.ui.interact, map, &input, hover_changed);
         if let Some(t) = measure.as_ref().and_then(Measure::progress)
             && map.scene.bounds.is_positive()
         {
@@ -302,6 +313,8 @@ impl App {
         }
         let t2 = Instant::now();
 
+        // Overlays of this frame's hover / selection / path, drawn in this frame.
+        w.ui.interact.sync_overlays(map);
         let size = [w.config.width, w.config.height];
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let input = FrameInput {
@@ -342,6 +355,10 @@ impl App {
                 st.label_rebuilds.count
             );
         }
+        if interacted {
+            // Panels were laid out before the click: show the new selection next frame.
+            sched.request(t3, Duration::ZERO);
+        }
         if hover_changed {
             // The details panel was laid out before the hit test: show the new hover next frame.
             match (codemap.as_ref(), map.hover) {
@@ -360,14 +377,51 @@ impl App {
     }
 }
 
+/// Canvas interaction for one frame: hover focus, click to select, Shift-click for a path,
+/// double click to zoom to a cell, Escape to clear, and camera jumps requested by the panels.
+/// Returns true if the selection changed (the panels must be laid out again).
+fn interact(it: &mut Interaction, map: &mut MapState, input: &CanvasInput, hover_changed: bool) -> bool {
+    if hover_changed {
+        let focus = map.hover.map(|h| match h.kind {
+            HitKind::Rect => Focus::Node(h.id),
+            HitKind::Line | HitKind::Curve => Focus::Edge(h.id),
+        });
+        it.set_hover(focus);
+    }
+    let before = (it.selected, it.path.is_some());
+    let node = map.hover.filter(|h| h.kind == HitKind::Rect).map(|h| h.id);
+    if input.escape {
+        it.select(None);
+    } else if input.double_click {
+        if let Some(v) = node {
+            it.focus(v);
+        }
+    } else if input.click {
+        match (node, input.shift) {
+            (Some(v), true) => it.path_to(v),
+            (Some(v), false) => it.select(Some(v)),
+            // Clicking an edge keeps the selection; empty canvas clears it.
+            (None, _) if map.hover.is_none() => it.select(None),
+            (None, _) => {}
+        }
+    }
+    if let Some(r) = it.focus_request.take()
+        && r.is_positive()
+    {
+        map.camera.fit(&r, FOCUS_FILL);
+    }
+    before != (it.selected, it.path.is_some()) || it.path_pending()
+}
+
 /// Shows a published code map scene: keeps the camera when replacing a scene of the same
 /// world, and seeds the controls from the first request.
-fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, ui: &mut UiState, scene_build: &mut Option<Duration>) {
+fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, ui: &mut UiState, scene_build: &mut Option<Duration>, notify: Arc<dyn Fn() + Send + Sync>) {
     if map.scene.bounds.is_positive() {
-        map.replace_scene(p.scene);
+        map.replace_scene(Arc::clone(&p.scene));
     } else {
-        map.set_scene(p.scene);
+        map.set_scene(Arc::clone(&p.scene));
     }
+    ui.interact.set_scene(SceneCtx { map: Arc::clone(&p.map), scene: p.scene, index: p.index }, true, notify);
     *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
     *codemap = Some(p.map);
     ui.legend = Some(p.legend);
