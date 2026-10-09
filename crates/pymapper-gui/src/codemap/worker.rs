@@ -331,11 +331,8 @@ fn run(s: &Arc<Shared>, load: &LoadParams, params: MapParams, notify: &Notify) {
                 }
                 // Changes first (once there is a map to update), then the newest request.
                 if last.is_some() && !st.batches.is_empty() {
+                    // A pending request stays pending: it is built right after the update.
                     st.status = Some(Status::Updating);
-                    // A pending request is answered by the update's scene.
-                    if let Some(r) = st.pending.take() {
-                        last = Some(r);
-                    }
                     break Job::Batches(std::mem::take(&mut st.batches));
                 }
                 if let Some(r) = st.pending.take() {
