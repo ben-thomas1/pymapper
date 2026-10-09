@@ -5,7 +5,7 @@
 //! project root (absolute outside it); invalid UTF-8 becomes U+FFFD in both formats, as in
 //! `check`.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -72,12 +72,6 @@ const FLAG_NAMES: [(u8, &str); 5] = [
 impl<'w> Writer<'w> {
     pub fn new(ix: &'w Index, root: &'w Path, roots: &'w Roots, json: bool, sink: &'w mut dyn Write) -> Writer<'w> {
         Writer { ix, root, roots, json, out: Out::new(sink), tmp: Vec::with_capacity(256) }
-    }
-
-    /// The buffer, for direct appends. Call [`Writer::end_line`] (or `flush_maybe`) after.
-    #[inline]
-    pub fn buf(&mut self) -> &mut Vec<u8> {
-        self.out.buf()
     }
 
     #[inline]
@@ -180,6 +174,12 @@ impl<'w> Writer<'w> {
     pub fn key_num(&mut self, k: &str, v: u64) {
         self.key(k, false);
         self.num(v);
+    }
+
+    /// A JSON string.
+    #[inline]
+    pub fn json_str(&mut self, s: &str) {
+        push_str(self.out.buf(), s.as_bytes());
     }
 
     /// `,"key":"s"`.
@@ -386,14 +386,5 @@ impl SymbolLoc {
             }
             _ => SymbolLoc { file, line: 0, col: 0 },
         }
-    }
-}
-
-/// Writes `text` to stdout; a closed pipe is not an error.
-pub fn write_stdout(text: &[u8]) -> anyhow::Result<()> {
-    let mut out = io::stdout().lock();
-    match out.write_all(text).and_then(|()| out.flush()) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e).context("cannot write to stdout"),
-        _ => Ok(()),
     }
 }

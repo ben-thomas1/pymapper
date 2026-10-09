@@ -113,6 +113,12 @@ impl TopK {
 impl Query<'_> {
     /// Summary of the whole program (see [`Summary`]).
     pub fn summary(&self, opts: &SummaryOptions) -> Summary {
+        self.summary_where(opts, |_| true)
+    }
+
+    /// [`Query::summary`] with rankings restricted to the files `keep` accepts (counts still
+    /// cover the whole program; namespace packages, which have no file, rank as before).
+    pub fn summary_where(&self, opts: &SummaryOptions, keep: impl Fn(FileId) -> bool) -> Summary {
         let ix = self.ix;
         let mut s = Summary::default();
         for f in 0..ix.file_count() {
@@ -128,6 +134,7 @@ impl Query<'_> {
         let rankable = |f: FileId| {
             (!opts.first_party_only || ix.file_origin(f) == Origin::FirstParty)
                 && (opts.include_tests || !testfiles::is_test_file(ix, f))
+                && keep(f)
         };
         let mut called = TopK::new(opts.top);
         let mut origin = Origin::FirstParty;
@@ -180,7 +187,7 @@ impl Query<'_> {
         for m in 0..mg.len() {
             let v = mg.node(m);
             let ok = match ix.file(v) {
-                Some(f) => !opts.first_party_only || ix.file_origin(f) == Origin::FirstParty,
+                Some(f) => (!opts.first_party_only || ix.file_origin(f) == Origin::FirstParty) && keep(f),
                 None => !opts.first_party_only,
             };
             if ok {

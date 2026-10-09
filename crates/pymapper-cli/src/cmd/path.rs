@@ -103,7 +103,7 @@ fn write(q: &pymapper_core::query::Query<'_>, w: &mut Writer<'_>, from: NodeId, 
         w.close_array(nodes.len());
         w.open_array("edges");
         if let Some(p) = found {
-            for i in 0..p.len() {
+            for (i, &site) in sites.iter().enumerate() {
                 w.item(i);
                 w.str("{");
                 w.key("from", true);
@@ -117,7 +117,7 @@ fn write(q: &pymapper_core::query::Query<'_>, w: &mut Writer<'_>, from: NodeId, 
                     }
                     None => w.import_flags(p.import_flags(i)),
                 }
-                match sites[i] {
+                match site {
                     Some((f, line, col)) => w.key_site("site", f, line, col),
                     None => {
                         w.key("site", false);
@@ -147,8 +147,8 @@ fn write(q: &pymapper_core::query::Query<'_>, w: &mut Writer<'_>, from: NodeId, 
         return;
     }
     if let Some(p) = found {
-        for i in 0..p.len() {
-            match sites[i] {
+        for (i, &site) in sites.iter().enumerate() {
+            match site {
                 Some((f, line, col)) => w.loc(f, line, col),
                 None => w.node_loc(p.nodes[i]),
             }

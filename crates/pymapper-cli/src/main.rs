@@ -21,8 +21,8 @@ struct Cli {
     command: Command,
 }
 
-/// Subcommands. The query and `cycles` / `summary` subcommands are hidden from
-/// `--help` until they are implemented; running them reports "not implemented" (exit 2).
+/// Subcommands. The queries (`callers` to `summary`) share the whole-program load of `check`
+/// and its configuration flags (see `cmd::query`).
 #[derive(Subcommand)]
 enum Command {
     /// Run rule checks and report findings.
@@ -35,15 +35,15 @@ enum Command {
     Impact(Box<cmd::impact::Args>),
     /// Find a shortest call (or import) chain from one symbol to another.
     Path(Box<cmd::path::Args>),
+    /// List the module-level imports of a symbol, in and out, optionally rolled up to packages.
+    Imports(Box<cmd::imports::Args>),
     /// List third-party distributions, how much first-party code uses each, and (--score)
     /// their scorecards.
     Deps(Box<cmd::deps::Args>),
-    /// Report import cycles.
-    #[command(hide = true)]
-    Cycles(cmd::cycles::Args),
-    /// Summarise the codebase.
-    #[command(hide = true)]
-    Summary(cmd::summary::Args),
+    /// List import cycles (or, with --calls, the recursion through a symbol).
+    Cycles(Box<cmd::cycles::Args>),
+    /// Summarise the codebase: size per origin, resolution rates, cycles, top hotspots.
+    Summary(Box<cmd::summary::Args>),
     /// Show the effective configuration, or print the commented template.
     Config(Box<cmd::config::Args>),
 }
@@ -56,9 +56,10 @@ fn main() -> ExitCode {
         Command::Callees(args) => cmd::callees::run(*args),
         Command::Impact(args) => cmd::impact::run(*args),
         Command::Path(args) => cmd::path::run(*args),
+        Command::Imports(args) => cmd::imports::run(*args),
         Command::Deps(args) => cmd::deps::run(*args),
-        Command::Cycles(args) => cmd::cycles::run(&args),
-        Command::Summary(args) => cmd::summary::run(&args),
+        Command::Cycles(args) => cmd::cycles::run(*args),
+        Command::Summary(args) => cmd::summary::run(*args),
         Command::Config(args) => cmd::config::run(*args),
     };
     match result {

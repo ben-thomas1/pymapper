@@ -24,8 +24,8 @@ mod render;
 mod session;
 mod sites;
 
-pub use render::{SymbolLoc, Writer, finish, origin_str};
-pub use sites::{Pair, Sites, import_site, locate};
+pub use render::{Writer, finish, origin_str};
+pub use sites::{Pair, import_site, locate};
 pub use session::{QueryFlags, Session, WalkFlags, parse_conf};
 
 /// Exit code of a query that found nothing it was asked to prove (`path`: no path).

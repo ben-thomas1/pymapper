@@ -81,8 +81,6 @@ pub struct Session {
     stats: bool,
     pub config: Config,
     pub root: PathBuf,
-    /// Positional paths (empty: no filter).
-    pub scope: Vec<PathBuf>,
     pub project: Project,
     pub calls: ResolvedCalls,
     pub json: bool,
@@ -126,11 +124,21 @@ impl Session {
         pipeline::configure_threads(config.threads)?;
         let project = pipeline::load(&config, &root, None);
         let calls = resolve_calls(&project.index, &project.imports);
-        let in_scope = (!scope.is_empty()).then(|| {
+        let in_scope: Option<Vec<bool>> = (!scope.is_empty()).then(|| {
             let ix = &project.index;
             (0..ix.file_count()).map(|f| scope.iter().any(|s| ix.file_path(f).starts_with(s))).collect()
         });
-        Ok(Session { t0, stats: flags.stats, config, root, scope, project, calls, json, in_scope })
+        if in_scope.as_ref().is_some_and(|s| !s.contains(&true)) {
+            let mut list = String::new();
+            for (i, p) in scope.iter().enumerate() {
+                if i > 0 {
+                    list.push_str(", ");
+                }
+                list.push_str(&p.to_string_lossy());
+            }
+            warn(format_args!("no loaded Python files under {list}: every row is filtered out"));
+        }
+        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, in_scope })
     }
 
     /// The query state (call graph built here, O(V + E)).
