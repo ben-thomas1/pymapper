@@ -8,6 +8,8 @@
 use std::fs::File;
 use std::io::Read;
 
+use rayon::prelude::*;
+
 use crate::intern::{FxHashMap, Interner, Sym};
 use crate::roots::{DistId, Distributions, normalize_name};
 
@@ -117,25 +119,43 @@ impl RequiresCache {
     pub fn get(&mut self, dists: &Distributions, d: DistId, names: &mut Interner) -> &[Requirement] {
         if !self.map.contains_key(&d) {
             self.reads += 1;
-            let reqs = self.read(dists, d, names);
+            let mut raw = Vec::new();
+            requires_lines(dists, d, &mut self.buf, &mut raw);
+            let reqs = self.parse(&raw, names);
             self.map.insert(d, reqs);
         }
         &self.map[&d]
     }
 
-    fn read(&mut self, dists: &Distributions, d: DistId, names: &mut Interner) -> Vec<Requirement> {
-        let info = dists.info_path(d);
-        let path = if dists.is_egg_info(d) {
-            if info.is_file() { info } else { info.join("PKG-INFO") }
-        } else {
-            info.join("METADATA")
-        };
-        if read_headers(&path, &mut self.buf).is_err() {
-            return Vec::new();
+    /// Reads the metadata of those of `ds` not read yet, in parallel (file reads dominate),
+    /// then parses and interns sequentially. Later [`get`](Self::get)s of them are hits.
+    pub fn prefetch(&mut self, dists: &Distributions, ds: &[DistId], names: &mut Interner) {
+        let mut missing: Vec<DistId> = ds.iter().copied().filter(|d| !self.map.contains_key(d)).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        if missing.len() < 2 {
+            return;
         }
+        let raws: Vec<Vec<u8>> = missing
+            .par_iter()
+            .map_init(Vec::new, |buf, &d| {
+                let mut raw = Vec::new();
+                requires_lines(dists, d, buf, &mut raw);
+                raw
+            })
+            .collect();
+        for (d, raw) in missing.into_iter().zip(raws) {
+            self.reads += 1;
+            let reqs = self.parse(&raw, names);
+            self.map.insert(d, reqs);
+        }
+    }
+
+    /// Requirements of `Requires-Dist` lines (see [`requires_lines`]).
+    fn parse(&mut self, raw: &[u8], names: &mut Interner) -> Vec<Requirement> {
         let mut out = Vec::new();
         let scratch = &mut self.scratch;
-        for_each_requires_dist(&self.buf, |name, extras, marker| {
+        for_each_requires_dist(raw, |name, extras, marker| {
             let mut norm = |s: &[u8], names: &mut Interner| {
                 normalize_name(s, scratch);
                 names.intern(scratch)
@@ -148,6 +168,30 @@ impl RequiresCache {
             out.push(r);
         });
         out
+    }
+}
+
+/// Appends the `Requires-Dist` header lines of `d`'s metadata to `out` (nothing when it
+/// cannot be read); `buf` is scratch for the file.
+fn requires_lines(dists: &Distributions, d: DistId, buf: &mut Vec<u8>, out: &mut Vec<u8>) {
+    let info = dists.info_path(d);
+    let path = if dists.is_egg_info(d) {
+        if info.is_file() { info } else { info.join("PKG-INFO") }
+    } else {
+        info.join("METADATA")
+    };
+    if read_headers(&path, buf).is_err() {
+        return;
+    }
+    for line in buf.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if line.len() > 13 && line[..13].eq_ignore_ascii_case(b"requires-dist") {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
     }
 }
 

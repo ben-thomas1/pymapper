@@ -297,14 +297,54 @@ fn workspace_members_declare_their_own_dependencies() {
 }
 
 #[test]
+fn meta_packages_declare_what_they_require() {
+    let p = Project::new("meta");
+    // `bundle` installs no module; it pulls in `core-impl` (module `core_impl`) and, with the
+    // `extra` extra only, `addon`.
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"bundle\"]\n")
+        .file("app/__init__.py", "import core_impl\n")
+        .file(".venv/pyvenv.cfg", "version = 3.12.4\n")
+        .dist("bundle", "1.0", &[], &["core-impl==1.0", "addon; extra == \"extra\""])
+        .dist("core-impl", "1.0", &["core_impl"], &[])
+        .dist("addon", "1.0", &["addon"], &[]);
+    let r = p.run(&["--min-confidence", "0"]);
+    r.expect_code(0);
+    assert!(r.findings().is_empty(), "{}", r.stdout);
+    // Not used through what it requires: unused like any tool without modules (confidence 50).
+    p.file("app/__init__.py", "import addon\n");
+    let r = p.run(&["--min-confidence", "0"]);
+    assert_eq!(
+        r.findings(),
+        [
+            "app/__init__.py:1:8: PM601 `addon` is provided by `addon`, which is not a declared dependency",
+            "pyproject.toml:3:17: PM602 dependency `bundle` is declared but never imported (confidence 50)",
+        ],
+        "{}",
+        r.stdout
+    );
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"bundle[extra]\"]\n");
+    let r = p.run(&["--min-confidence", "0"]);
+    r.expect_code(0);
+    assert!(r.findings().is_empty(), "{}", r.stdout);
+}
+
+#[test]
 fn namespace_packages_map_to_the_distribution_listing_the_module() {
     let p = Project::new("namespace");
-    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"google-api-core\"]\n")
-        .file("app/__init__.py", "import google.protobuf\nfrom google.api_core import f\n")
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"google-api-core\", \"google-cloud-storage\"]\n")
+        .file(
+            "app/__init__.py",
+            "import google.protobuf\nfrom google.api_core import f\nfrom google.cloud import storage\nfrom google.cloud import bigquery\n",
+        )
         .file(".venv/pyvenv.cfg", "version = 3.12.4\n")
         .dist("google-api-core", "2.0", &["google/api_core"], &[])
+        .dist("google-cloud-bigquery", "3.0", &["google/cloud/bigquery"], &[])
+        .dist("google-cloud-storage", "2.0", &["google/cloud/storage"], &[])
         .dist("protobuf", "5.0", &["google/protobuf"], &[]);
-    let want = ["app/__init__.py:1:8: PM601 `google.protobuf` is provided by `protobuf`, which is not a declared dependency"];
+    let want = [
+        "app/__init__.py:1:8: PM601 `google.protobuf` is provided by `protobuf`, which is not a declared dependency",
+        "app/__init__.py:4:26: PM601 `google.cloud` is provided by `google-cloud-bigquery`, which is not a declared dependency",
+    ];
     for args in [&[][..], &["--deps"][..]] {
         let r = p.run(args);
         r.expect_code(1);

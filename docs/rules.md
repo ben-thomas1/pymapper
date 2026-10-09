@@ -497,7 +497,7 @@ Import of a third-party distribution not declared in `pyproject.toml`.
 - Cost: O(n)
 - Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. Units whose `dependencies` are `dynamic` are not checked.
+First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. What a declared meta-package (installed, no importable name) requires directly counts as declared. Units whose `dependencies` are `dynamic` are not checked.
 
 Fix: add the distribution to the project's dependencies.
 

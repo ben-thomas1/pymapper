@@ -35,7 +35,8 @@ pub(super) const RULES: &[RuleDef] = &[
 `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the \
 poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest \
 project unit that declares dependencies). The code works only because the package happens to be \
-installed. Units whose `dependencies` are `dynamic` are not checked.\n\n\
+installed. What a declared meta-package (installed, no importable name) requires directly \
+counts as declared. Units whose `dependencies` are `dynamic` are not checked.\n\n\
 Fix: add the distribution to the project's dependencies.",
         severity: Severity::Error,
         default_enabled: true,

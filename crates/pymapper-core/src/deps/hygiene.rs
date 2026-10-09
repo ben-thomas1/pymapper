@@ -17,7 +17,8 @@
 //! Confidence follows the mapping ([`Mapping::confidence`]): 100 through installed metadata,
 //! 90 through the name table, 60 for a guess; an import guarded by `except ImportError` is an
 //! optional dependency and gets at most 50. A declared dependency that installs no importable
-//! name (a command-line tool, a meta-package) is reported as unused with confidence 50.
+//! name is a meta-package: what it requires directly counts as declared, and it is used when
+//! one of those is; otherwise (a command-line tool) it is reported as unused with confidence 50.
 //!
 //! Cost: one pass over the import rows of first-party files with O(1) work per row (hash
 //! lookups; nothing is allocated or interned except for findings), then one pass over the
@@ -153,6 +154,7 @@ pub fn is_private(name: &[u8]) -> bool {
 /// the declarations were loaded with); render them with [`HygieneContext`].
 pub fn analyse(cx: &HygieneCtx<'_>, rules: HygieneRules, names: &mut Interner, out: &mut Findings) -> HygieneStats {
     let mut a = Analysis::new(cx, rules);
+    a.meta_packages(names);
     a.imports(names, out);
     if rules.unused {
         a.unused(names, out);
@@ -178,6 +180,9 @@ struct Analysis<'c, 'a> {
     /// Per unit, once computed: distributions required (transitively) by its declared
     /// dependencies -> the declared dependency (display name) that pulls each in.
     closures: FxHashMap<u32, FxHashMap<Sym, Sym>>,
+    /// `(unit, distribution)` -> the declared meta-package of the unit that requires it
+    /// directly (see [`Analysis::meta_packages`]).
+    meta: FxHashMap<(u32, Sym), Sym>,
     requires: RequiresCache,
     scratch: Vec<u8>,
     stats: HygieneStats,
@@ -201,6 +206,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
             unit_files: vec![0; cx.decls.len() as usize],
             projects,
             closures: FxHashMap::default(),
+            meta: FxHashMap::default(),
             requires: RequiresCache::default(),
             scratch: Vec::new(),
             stats: HygieneStats::default(),
@@ -247,7 +253,9 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 }
                 let chain = view.import_module(row);
                 let Some(&top) = chain.first() else { continue };
-                let Some(p) = self.provider(row, chain, names) else { continue };
+                let from = st.flags[row] & (import_flags::FROM | import_flags::STAR) == import_flags::FROM;
+                let name = if from { st.name[row] } else { None };
+                let Some(p) = self.provider(row, chain, name, names) else { continue };
                 let third = match p {
                     Provider::FirstParty(target) => {
                         self.first_party_use(eu, target);
@@ -310,7 +318,34 @@ impl<'c, 'a> Analysis<'c, 'a> {
     /// Whether unit `u` declares `norm` or is (or contains) the project named `norm`.
     #[inline]
     fn declared(&self, u: u32, norm: Sym) -> bool {
-        self.cx.decls.find(u, norm).is_some() || self.projects.contains(&norm)
+        self.cx.decls.find(u, norm).is_some() || self.projects.contains(&norm) || self.meta.contains_key(&(u, norm))
+    }
+
+    /// Declared dependencies that are installed but provide no importable name are
+    /// meta-packages (`pydantic-ai` installs nothing but requires `pydantic-ai-slim`, which
+    /// provides `pydantic_ai`): what they require directly (extras honoured) counts as
+    /// declared, and their use makes the meta-package used. Editable installs and project
+    /// units are not meta-packages. Reads the `METADATA` of those distributions only.
+    fn meta_packages(&mut self, names: &mut Interner) {
+        let (dists, decls) = (self.cx.dists, self.cx.decls);
+        for u in 0..decls.len() {
+            if decls.unit(u).status != DeclStatus::Declared {
+                continue;
+            }
+            for dep in decls.deps(u) {
+                let Some(d) = dists.by_name(names.resolve(dep.norm)) else { continue };
+                // Editable installs (workspace members, often) list no top-level names either.
+                if dists.top_level(d).len() > 0 || dists.is_editable(d) || self.projects.contains(&dep.norm) {
+                    continue;
+                }
+                let extras = decls.extras(dep);
+                for r in self.requires.get(dists, d, names) {
+                    if r.when_extra.is_empty() || r.when_extra.iter().any(|e| extras.contains(e)) {
+                        self.meta.entry((u, r.norm)).or_insert(dep.norm);
+                    }
+                }
+            }
+        }
     }
 
     /// Records that a file of effective unit `eu` imports first-party file `target`: when that
@@ -330,9 +365,10 @@ impl<'c, 'a> Analysis<'c, 'a> {
         }
     }
 
-    /// Who provides the module of absolute import `row` (dotted module `chain`, index
-    /// strings); `None` for the stdlib and for imports that resolve nowhere useful.
-    fn provider(&mut self, row: usize, chain: &[Sym], names: &mut Interner) -> Option<Provider> {
+    /// Who provides the module of absolute import `row` (dotted module `chain` and, for
+    /// `from m import name`, `name`; index strings); `None` for the stdlib and for imports that
+    /// resolve nowhere useful.
+    fn provider(&mut self, row: usize, chain: &[Sym], name: Option<Sym>, names: &mut Interner) -> Option<Provider> {
         let (ix, imp) = (self.cx.ix, self.cx.imp);
         if let Some(m) = imp.module(row) {
             // A namespace package has no node of its own: use what the import reaches in it.
@@ -346,21 +382,23 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 return None;
             }
             let grp = &ix.groups()[g as usize];
-            return match (grp.origin, grp.dist) {
-                (Origin::FirstParty, _) => ix.file(v).map(Provider::FirstParty),
-                (Origin::Stdlib, _) => None,
-                (Origin::ThirdParty, Some(d)) => Some(self.dist(d, true, names)),
-                // Loaded from site-packages, but no RECORD claims it.
-                (Origin::ThirdParty, None) => self.by_name(chain, true, names),
+            return match (grp.origin, grp.dist, ix.file(v)) {
+                // A first-party namespace package alone (`import ns`) maps to no file.
+                (Origin::FirstParty, _, f) => f.map(Provider::FirstParty),
+                (Origin::Stdlib, _, _) => None,
+                (Origin::ThirdParty, Some(d), Some(_)) => Some(self.dist(d, true, names)),
+                // A namespace package node (filed under whichever distribution came first), or
+                // code loaded from site-packages that no RECORD claims.
+                (Origin::ThirdParty, _, _) => self.by_name(chain, name, true, names),
             };
         }
         match imp.status(row) {
             ImportStatus::ThirdParty => {
                 let d = imp.dist(row)?;
-                let (d, exact) = self.refine(d, chain);
+                let (d, exact) = self.refine(d, chain, name);
                 Some(self.dist(d, exact, names))
             }
-            ImportStatus::External => self.by_name(chain, false, names),
+            ImportStatus::External => self.by_name(chain, name, false, names),
             _ => None,
         }
     }
@@ -371,18 +409,19 @@ impl<'c, 'a> Analysis<'c, 'a> {
     }
 
     /// For a top-level name several distributions provide (namespace packages such as
-    /// `google`), the one whose `RECORD` lists the deepest module of `chain`, and whether
-    /// the answer is exact (see [`Third::exact`]); else `(d, false)`. Only asked for shared
-    /// names: a few O(1) lookups.
-    fn refine(&mut self, d: DistId, chain: &[Sym]) -> (DistId, bool) {
+    /// `google`), the one whose `RECORD` lists the deepest module of `chain` (`chain.name`
+    /// first: `from google.cloud import storage`), and whether the answer is exact (see
+    /// [`Third::exact`]); else `(d, false)`. Only asked for shared names: a few O(1) lookups.
+    fn refine(&mut self, d: DistId, chain: &[Sym], name: Option<Sym>) -> (DistId, bool) {
         let (ix, dists) = (self.cx.ix, self.cx.dists);
         if dists.providers(ix.str(chain[0])).len() < 2 {
             return (d, true);
         }
         let site = dists.site(d);
-        for n in (2..=chain.len()).rev() {
+        let full = chain.len() + usize::from(name.is_some());
+        for n in (2..=full).rev() {
             self.scratch.clear();
-            for (i, &s) in chain[..n].iter().enumerate() {
+            for (i, &s) in chain.iter().chain(name.as_ref()).take(n).enumerate() {
                 if i > 0 {
                     self.scratch.push(b'/');
                 }
@@ -403,13 +442,13 @@ impl<'c, 'a> Analysis<'c, 'a> {
     /// Provider of a module that no loaded module of a distribution answers for: an installed
     /// distribution listing its top-level name, else the name table or a guess. `known`: the
     /// code is third-party for sure (loaded from site-packages).
-    fn by_name(&mut self, chain: &[Sym], known: bool, names: &mut Interner) -> Option<Provider> {
+    fn by_name(&mut self, chain: &[Sym], name: Option<Sym>, known: bool, names: &mut Interner) -> Option<Provider> {
         let top = self.cx.ix.str(*chain.first()?);
         if crate::resolve::is_builtin_stdlib(top) {
             return None;
         }
         if let Some(&d) = self.cx.dists.providers(top).first() {
-            let (d, exact) = self.refine(d, chain);
+            let (d, exact) = self.refine(d, chain, name);
             return Some(self.dist(d, exact, names));
         }
         let (dist, mapping) = names::distribution_of(top)?;
@@ -471,7 +510,18 @@ impl<'c, 'a> Analysis<'c, 'a> {
             queue.push((d, decls.extras(dep).to_vec(), dep.name));
         }
         let mut head = 0;
+        // Entries of the current breadth-first level not processed yet.
+        let mut level_left = 0;
+        let mut level: Vec<DistId> = Vec::new();
         while head < queue.len() {
+            // One level at a time: its metadata files are read in parallel.
+            if level_left == 0 {
+                level.clear();
+                level.extend(queue[head..].iter().map(|q| q.0));
+                level_left = level.len();
+                self.requires.prefetch(dists, &level, names);
+            }
+            level_left -= 1;
             let (d, via) = (queue[head].0, queue[head].2);
             let extras = std::mem::take(&mut queue[head].1);
             head += 1;
@@ -526,6 +576,12 @@ impl<'c, 'a> Analysis<'c, 'a> {
     fn unused(&mut self, names: &mut Interner, out: &mut Findings) {
         let (ix, dists, decls) = (self.cx.ix, self.cx.dists, self.cx.decls);
         let mut reported: FxHashSet<Sym> = FxHashSet::default();
+        // A meta-package is used when what it pulls in is.
+        for (&(u, r), &m) in &self.meta {
+            if self.used.contains(&(u, r)) {
+                self.used.insert((u, m));
+            }
+        }
         for u in 0..decls.len() {
             let decl = decls.unit(u);
             if decl.status != DeclStatus::Declared || self.unit_files[u as usize] == 0 {

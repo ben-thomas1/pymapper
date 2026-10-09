@@ -182,7 +182,11 @@ Requirement strings are PEP 508; names are compared PEP 503-normalised (`PyYAML`
 and extras are kept (`requests[socks]`). A unit whose `[project] dynamic` lists
 `dependencies` is not checked by PM601, PM602 and PM604 (warning); one that lists
 `optional-dependencies` is not checked by PM601 and PM604. Without any declaration, these rules
-report nothing (warning); PM603 needs none. Imports of the project itself or of another unit
+report nothing (warning); PM603 needs none. A declared dependency that is installed but
+provides no importable name is a meta-package (`pydantic-ai` installs nothing and requires
+`pydantic-ai-slim`, which provides `pydantic_ai`): what it requires directly (with the
+requested extras) counts as declared, and it is used when one of those is imported (editable
+installs and project units are never meta-packages). Imports of the project itself or of another unit
 (a workspace member) are never undeclared, and a workspace member imported through its
 first-party package counts as a used dependency of the importing unit.
 
@@ -208,7 +212,8 @@ The confidence of PM601, PM602 and PM604 says which step answered: 100 for insta
 90 for the table, 60 for a guess (below the default gate of 80, so a project without a venv
 only sees the table's answers by default). An import guarded by `except ImportError` is an
 optional dependency: at most 50. A declared dependency that installs no importable name (a
-command-line tool, a meta-package) is reported unused with confidence 50; one that is not
+command-line tool, a meta-package none of whose requirements is imported) is reported unused
+with confidence 50; one that is not
 installed is matched by its table or guessed import names. `from m import a, b` on one line is
 one PM601.
 
