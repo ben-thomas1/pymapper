@@ -111,18 +111,21 @@ struct Forward {
 
 impl Forward {
     fn build<I: Iterator<Item = (u32, u32)>>(n: u32, edges: impl Fn() -> I) -> Forward {
+        // Counts at `off[s]`, inclusive prefix sums (`off[s]` = end of row `s`), then a
+        // scatter that decrements each row's end down to its start: no second offsets array.
         let mut off = vec![0u32; n as usize + 1];
         for (s, _) in edges() {
-            off[s as usize + 1] += 1;
+            off[s as usize] += 1;
         }
-        for i in 0..n as usize {
-            off[i + 1] += off[i];
+        for i in 1..n as usize {
+            off[i] += off[i - 1];
         }
-        let mut next = off.clone();
-        let mut adj = vec![0u32; off[n as usize] as usize];
+        let m = if n == 0 { 0 } else { off[n as usize - 1] };
+        off[n as usize] = m;
+        let mut adj = vec![0u32; m as usize];
         for (s, d) in edges() {
-            adj[next[s as usize] as usize] = d;
-            next[s as usize] += 1;
+            off[s as usize] -= 1;
+            adj[off[s as usize] as usize] = d;
         }
         Forward { off, adj }
     }
@@ -301,5 +304,31 @@ fn reach_lines(ix: &Index, imp: &Imports, calls: &ResolvedCalls, scope: &BitSet,
                 u.loc_reached = u.loc_reached.saturating_add(lines);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::Forward;
+
+    #[test]
+    fn forward_csr_groups_successors_by_source() {
+        let edges = [(2, 0), (0, 1), (2, 1), (0, 1), (3, 3)];
+        let g = Forward::build(5, || edges.iter().copied());
+        let sorted = |v: u32| {
+            let mut s = g.succ(v).to_vec();
+            s.sort_unstable();
+            s
+        };
+        assert_eq!(sorted(0), [1, 1]);
+        assert!(g.succ(1).is_empty());
+        assert_eq!(sorted(2), [0, 1]);
+        assert_eq!(sorted(3), [3]);
+        assert!(g.succ(4).is_empty());
+        assert_eq!(g.adj.len(), edges.len());
+        let empty = Forward::build(0, std::iter::empty);
+        assert_eq!((empty.off.as_slice(), empty.adj.len()), (&[0u32][..], 0));
+        let no_edges = Forward::build(3, std::iter::empty);
+        assert!((0..3).all(|v| no_edges.succ(v).is_empty()));
     }
 }

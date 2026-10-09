@@ -1,0 +1,143 @@
+# `pymapper deps`
+
+`pymapper deps [PATHS]` lists the third-party distributions of the project's virtualenv, how
+much of each the first-party code uses, and with `--score` a scorecard per distribution: size,
+complexity, hotspots, maintainability, coupling and a letter grade. It is information for
+humans and agents choosing, auditing or replacing dependencies; it never produces findings and
+always exits 0 (2 only for usage and fatal errors, as `check`).
+
+```
+$ pymapper deps --score
+distribution  version  grade  score      loc  hot/kloc    mi   cc  deps  importers  api used  loc reached
+...
+PyYAML        6.0.3    C       61.2     5923       7.8  51.4  3.3     0         42     5/381  721/5923 (12%)
+requests      2.34.2   C       69.8     6385       3.8  48.3  2.9     8          6     4/208  3689/6385 (58%)
+rich          13.9.4   D       53.7    26607       4.3  46.0  2.7     6         10    18/586  15817/26607 (59%)
+tenacity      8.5.0    B       82.5     2075       1.6  58.6  1.8     3         11     20/73  922/2075 (44%)
+torch         2.13.0   D       48.9  1233764       4.5  41.9  3.0    92          1    3/7041  273667/1314561 (21%)
+...
+
+115 of 491 distributions used by first-party code (1803 first-party files); --all lists every one.
+Scorecards: 1 computed, 490 cached.
+```
+
+(Rows taken from a real run on a project with 491 installed distributions; the column widths
+of the real table follow its longest name.)
+
+## Loading
+
+The project is loaded exactly as `pymapper check --deps` loads it (the same project root,
+configuration, import roots, walk and cache, see [`cli.md`](cli.md)): third-party code is
+always loaded (`--deps` semantics; `--no-deps` is ignored with a warning), the stdlib only
+with `--stdlib` / `include-stdlib`. Without a virtualenv the import roots warn and the list is
+empty. The whole program is resolved (imports and calls), third-party code included.
+
+Positional `PATHS` restrict which first-party files count as users: `pymapper deps src/api`
+shows what the code under `src/api` uses. The whole project is loaded either way, and a path
+covering the project root filters nothing. A path that does not exist is a usage error.
+
+## Flags
+
+| flag | meaning |
+|------|---------|
+| `--score` | add the scorecard columns (JSON: a `scorecard` object per distribution) |
+| `--all` | list every distribution, not only those first-party code imports or calls |
+| `--format concise\|json` | output format (`--output-format`, config `output-format`); `sarif` and `github` are usage errors |
+| `--stats` | phase timings (`deps.usage`, `deps.score`, ...), counters and peak RSS on stderr |
+| configuration flags | as for `check` (`--venv`, `--cache-dir`, `--no-cache`, `-j`, `--set`, `--config`, ...) |
+
+## Usage columns
+
+Computed on every run (never cached), from the first-party files in `PATHS`:
+
+| column / JSON field | meaning |
+|---------------------|---------|
+| `importers` | first-party files importing the distribution (`import_rows`: their import rows) |
+| `modules_used` (JSON) | distinct packages / modules of it imported directly |
+| `api used` / `api_used` | distinct classes and functions of it referenced directly: targets of `from m import name` and of call edges from first-party code; with `--score`, out of its public API (`public_api`) |
+| `call_sites` (JSON) | call edges from first-party code into it (one per call site and target) |
+| `loc reached` / `loc_reached`, `loc` | lines of its code reachable from first-party code, out of all its loaded lines (stubs included) |
+
+Reachability is a breadth-first search from every node (module and definition) of the
+first-party files in scope over: call edges at least `likely` (unique-method-name guesses
+would link first-party code to arbitrary libraries), import edges that are not type-only
+(importing a module runs its module-level code) and edges from a module to its parent package
+(importing `a.b` runs `a/__init__.py`). It is transitive across distributions: code of `urllib3`
+that `requests` calls on behalf of first-party code counts for `urllib3`. Lines are exclusive
+per node: a reached module counts its lines outside definitions, a reached class its body
+outside methods, a reached function its own lines. Calls through attributes the resolver cannot
+type (a value returned by a library call, a parameter) are not followed, so `loc reached` is a
+lower bound.
+
+A distribution that first-party code imports but whose code is not loaded (compiled modules
+only, no `RECORD` file list) is listed with `- (code not loaded)`.
+
+## Scorecard
+
+Computed once per distribution and cached in `scores.pmc` in the cache directory, keyed like
+the distribution's facts segment (normalized name, version, hash of its `RECORD`) plus the
+scorecard version: a warm run computes none. Editable installs and distributions without a
+`RECORD` are scored on every run. A scorecard depends only on the distribution's own code and
+on how its imports resolved, never on the project or the configuration: thresholds are the
+built-in defaults so scorecards compare across projects. Stub files (`.pyi`) are counted
+(`stub_files`) but not measured.
+
+| field | meaning |
+|-------|---------|
+| `files`, `stub_files` | loaded `.py` files / `.pyi` files |
+| `loc`, `code_lines` | lines of the `.py` files, without docstrings |
+| `classes`, `functions` | methods and nested functions included, `@overload` signatures excluded |
+| `public_api` | classes and functions with a public dotted path (no package, module, class or enclosing function starting with `_`; not nested in a function; dunders excluded), plus those re-exported by a public module (`__all__`, `import x as x`, public names of an `__init__` without `__all__`) |
+| `cc_mean`, `cc_max` | McCabe complexity per function (ruff C901 semantics) |
+| `cognitive_mean`, `cognitive_max`, `nesting_max` | cognitive complexity per function, deepest block nesting |
+| `hotspots`, `hotspot_density` (`hot/kloc`) | functions over at least one default function threshold (McCabe 10, cognitive 15, nesting 4, 60 code lines, 6 parameters), and their number per 1000 code lines |
+| `mi_mean`, `mi_min` | maintainability index (0-100) of the functions, mean weighted by line span, and lowest |
+| `internal_edges`, `fan_out_mean`, `fan_out_max` | import edges between its modules (type-only imports excluded), per module and at most |
+| `cyclic_modules` | modules in an import cycle inside the distribution |
+| `external_deps` (`deps`) | distinct other distributions and unattributed top-level packages it imports (stdlib and first-party code excluded), as resolved when the scorecard was computed |
+| `score`, `grade` | see below; `null` / `-` for a distribution without functions |
+
+### Grade
+
+Four sub-scores in `[0, 1]`, with `clamp01(x) = min(max(x, 0), 1)`:
+
+```
+hotspots        H = 1 - clamp01(hotspot_density / 15)
+maintainability M = clamp01((mi_mean - 25) / 40)
+complexity      C = 1 - clamp01((cc_mean - 1.5) / 5)
+coupling        K = 1 - 0.5 * clamp01(2 * cyclic_modules / files)
+                    - 0.5 * clamp01((fan_out_mean - 1) / 4)
+
+score = 100 * (0.30 H + 0.25 M + 0.25 C + 0.20 K)
+grade = A if score >= 85, B >= 70, C >= 55, D >= 40, else F
+```
+
+The ranges were calibrated on a virtualenv of 491 distributions (477 with functions, 16.2M
+lines of `.py` code): the median score is 70 and the grades split A 19%, B 32%, C 35%, D 12%,
+F 2%. A grade says how a distribution's code compares with typical published Python code on
+these four axes; it says nothing about correctness, security or maintenance activity. Size is
+reported but not graded.
+
+## JSON
+
+One document with the conventions of `check`'s JSON (schema `version` 2, `tool`, a list, a
+`summary`), one distribution per line, sorted by normalized name then version:
+
+```
+{"version":2,"tool":{"name":"pymapper","version":"0.3.0"},"distributions":[
+{"name":"requests","version":"2.34.2","loaded":true,"used":true,"importers":6,"import_rows":6,"modules_used":2,"api_used":4,"call_sites":9,"loc_reached":3689,"loc":6385,"scorecard":{"grade":"C","score":69.77,"files":19,"stub_files":0,"loc":6385,"code_lines":5029,"classes":52,"functions":247,"public_api":208,"cc_mean":2.89,"cc_max":25,"cognitive_mean":3.55,"cognitive_max":40,"nesting_max":5,"hotspots":19,"hotspot_density":3.78,"mi_mean":48.3,"mi_min":26.77,"internal_edges":59,"fan_out_mean":3.11,"fan_out_max":12,"cyclic_modules":0,"external_deps":8}},
+...
+],"summary":{"distributions":491,"used":115,"listed":115,"first_party_files":1803,"scorecards_computed":1,"scorecards_cached":490}}
+```
+
+`scorecard` is present with `--score` (`null` for a distribution without loaded code), and so
+are the `scorecards_*` counters. Reals have at most two decimals; fields are only ever added
+within a version.
+
+## Cost
+
+Measured numbers are in [`benchmarks.md`](benchmarks.md#deps-s61). Scorecards cost one pass over
+the definitions and module edges of the scored distributions (19 ms on one thread, 5 ms on 14,
+for 491 distributions and 16.2M lines; 0.1 ms warm), usage one pass over the first-party imports and the call
+edges plus a BFS over the call and import graphs (20 ms). Loading the venv and resolving calls
+dominate, as for `check --deps`.

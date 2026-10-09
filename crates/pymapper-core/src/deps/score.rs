@@ -40,10 +40,11 @@
 //! ```
 //!
 //! Grades: A >= 85, B >= 70, C >= 55, D >= 40, else F. The ranges were calibrated on a venv of
-//! 491 distributions (17.5M lines; median score 70, grades A 19%, B 32%, C 36%, D 12%, F 2%):
-//! the grade says how a distribution compares with typical published Python code. A distribution without functions
-//! (stubs only, data, compiled code) has no score and no grade. Size is reported but not
-//! graded: a large library is not worse for being large.
+//! 491 distributions (477 with functions, 16.2M lines; median score 70, grades A 19%, B 32%,
+//! C 35%, D 12%, F 2%): the grade says how a distribution compares with typical published
+//! Python code. A distribution without functions (stubs only, data, compiled code) has no
+//! score and no grade. Size is reported but not graded: a large library is not worse for
+//! being large.
 
 use crate::analysis::hotspot::{effective_params, module_code_lines};
 use crate::extract::facts::{DefKind, def_flags};

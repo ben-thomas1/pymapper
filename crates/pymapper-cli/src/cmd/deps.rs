@@ -71,6 +71,13 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     };
     let root = &loaded.project.root;
     let scope = &loaded.scope;
+    for p in scope.iter().filter(|p| !p.starts_with(root)) {
+        warn(format_args!(
+            "{} is outside the project root {} and is not counted (run pymapper on it separately)",
+            p.display(),
+            root.display()
+        ));
+    }
     // A path covering the whole project (`deps .` at the root) filters nothing.
     let scope: &[PathBuf] = if scope.iter().any(|s| root.starts_with(s)) { &[] } else { scope };
     pipeline::configure_threads(config.threads)?;

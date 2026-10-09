@@ -6,8 +6,8 @@ codes, config, suppressions, baselines and exit codes. ruff and ty check one fil
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. `pymapper check` and `pymapper config` work end to end; the query
-subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are not
+**Status:** under rewrite. `pymapper check`, `pymapper deps` and `pymapper config` work end to
+end; the query subcommands (`callers`, `callees`, `impact`, `path`, `cycles`, `summary`) are not
 implemented yet (hidden from `--help`; running one exits 2).
 See [`docs/design.md`](docs/design.md) for the design.
 
@@ -35,6 +35,7 @@ pymapper check --deps --stdlib       # link first-party code to the venv and the
 pymapper check --save-baseline .pymapper-baseline.json   # record today's findings
 pymapper check --baseline .pymapper-baseline.json        # report only new ones
 pymapper check --stats               # phase timings and peak RSS on stderr
+pymapper deps --score                # third-party distributions: use by first-party code, grades (docs/deps.md)
 pymapper config                      # the effective configuration
 pymapper config --template           # every option, commented, with its default and cost
 ```
