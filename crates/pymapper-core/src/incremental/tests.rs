@@ -71,7 +71,11 @@ fn lossy(b: &[u8]) -> std::borrow::Cow<'_, str> {
 /// Everything observable about a program, with strings resolved (never `Sym` values), one
 /// fact per line.
 fn dump(p: &Program) -> Vec<String> {
-    let ix = p.index();
+    dump_parts(p.index(), p.imports(), p.calls())
+}
+
+/// [`dump`] of an index and its resolution.
+fn dump_parts(ix: &Index, imp: &Imports, calls: Option<&ResolvedCalls>) -> Vec<String> {
     let mut out = Vec::new();
     let mut q = Vec::new();
     for f in 0..ix.file_count() {
@@ -116,14 +120,12 @@ fn dump(p: &Program) -> Vec<String> {
         assert_eq!(ix.find(&q), Some(v), "qid {} finds its node", lossy(&q));
     }
     out.push(format!("errors {:?}", ix.read_errors()));
-    dump_imports(p, &mut out);
-    dump_calls(p, &mut out);
+    dump_imports(ix, imp, &mut out);
+    dump_calls(ix, calls, &mut out);
     out
 }
 
-fn dump_imports(p: &Program, out: &mut Vec<String>) {
-    let ix = p.index();
-    let imp = p.imports();
+fn dump_imports(ix: &Index, imp: &Imports, out: &mut Vec<String>) {
     let mut name = Vec::new();
     for row in 0..imp.len() {
         name.clear();
@@ -142,6 +144,8 @@ fn dump_imports(p: &Program, out: &mut Vec<String>) {
             imp.ext_name(ix, row).map(lossy),
         ));
     }
+    let st = imp.stats();
+    out.push(format!("import stats {} {:?} {} {} {}", st.rows, st.by_status, st.module_edges, st.ext_edges, st.modules));
     for f in 0..ix.file_count() {
         for e in imp.module_edges(f) {
             out.push(format!("medge {f} {e:?}"));
@@ -156,9 +160,13 @@ fn dump_imports(p: &Program, out: &mut Vec<String>) {
     }
 }
 
-fn dump_calls(p: &Program, out: &mut Vec<String>) {
-    let ix = p.index();
-    let Some(c) = p.calls() else { return };
+fn dump_calls(ix: &Index, calls: Option<&ResolvedCalls>, out: &mut Vec<String>) {
+    let Some(c) = calls else { return };
+    let st = c.stats();
+    out.push(format!(
+        "call stats {} {:?} {:?} {} {:?} {} {} {}",
+        st.calls, st.by_conf, st.by_reason, st.edges, st.edges_by_reason, st.classes, st.incomplete_classes, st.no_c3
+    ));
     for row in 0..c.len() {
         out.push(format!("call {row} {:?}", c.call(row)));
     }
@@ -624,6 +632,13 @@ fn random_edits_on_stdlib_match_full_rebuild() {
         eprintln!("stdlib not found; skipped");
         return;
     };
+    {
+        let p = Program::load(inputs(&dir), Attribution::new(), true);
+        let ix = crate::index::load(inputs(&dir));
+        let imp = crate::resolve::resolve_imports(&ix, &Attribution::new());
+        let calls = crate::resolve::resolve_calls(&ix, &imp);
+        assert_same(&dump(&p), &dump_parts(&ix, &imp, Some(&calls)), "stdlib: tracked vs plain resolution");
+    }
     for seed in [3u64, 99] {
         property(&dir, 12, seed, "stdlib");
     }
@@ -854,4 +869,66 @@ fn construction_hint_of_an_imported_variable() {
     step_matches(&t, &mut p, std::slice::from_ref(&v), "x is a Bar now");
     t.write("v.py", "from foo import Foo\nfrom bar import Bar\nx = Foo\n");
     step_matches(&t, &mut p, &[v], "x is an alias of Foo");
+}
+
+/// Peak RSS so far, MB (macOS reports bytes).
+fn peak_mb() -> f64 {
+    // SAFETY: `getrusage` only writes the zeroed struct we pass.
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru
+    };
+    ru.ru_maxrss as f64 / 1e6
+}
+
+/// Memory probe (not a check): `PYMAPPER_PROBE=<dir> cargo test --release -p pymapper-core
+/// --lib probe_memory -- --ignored --nocapture`. Edits nothing: files are re-extracted with
+/// unchanged contents.
+#[test]
+#[ignore]
+fn probe_memory() {
+    let Some(dir) = std::env::var_os("PYMAPPER_PROBE").map(PathBuf::from) else { return };
+    let w = walk(&[&dir], &WalkOptions::everything());
+    let inp = || Inputs::from_root_dir(&dir, &w.files, Origin::FirstParty, b"probe");
+    let ix = crate::index::load(inp());
+    eprintln!("load: peak {:.0} MB, index {:.0} MB", peak_mb(), ix.heap_bytes() as f64 / 1e6);
+    let mut prog = Program::from_parts(ix, Attribution::new(), true);
+    let (di, dc) = prog.dependency_entries();
+    eprintln!(
+        "tracked resolve: peak {:.0} MB, program {:.0} MB, tracking {:.1} MB ({di} + {dc} entries)",
+        peak_mb(),
+        prog.heap_bytes() as f64 / 1e6,
+        prog.tracking_bytes() as f64 / 1e6
+    );
+    for k in 0..6 {
+        let p = w.files.get(k * w.files.len() / 6).to_path_buf();
+        let i = inp();
+        timing::enable(true);
+        let _ = timing::take();
+        let (_, st) = prog.update(i, &[&p]);
+        let phases = timing::take();
+        timing::enable(false);
+        let ph: Vec<String> = phases.iter().map(|ph| format!("{}={:.2}", ph.name, ph.elapsed.as_secs_f64() * 1e3)).collect();
+        eprintln!("  {}", ph.join(" "));
+        eprintln!(
+            "update {k}: {:.1} ms (imports {} files, calls {} files), peak {:.0} MB, program {:.0} MB",
+            st.total.as_secs_f64() * 1e3,
+            st.reresolved_imports,
+            st.reresolved_calls,
+            peak_mb(),
+            prog.heap_bytes() as f64 / 1e6
+        );
+    }
+}
+
+#[test]
+fn tracked_resolution_equals_the_plain_one() {
+    let t = TempDir::new("tracked");
+    copy_tree(&corpus(), t.path());
+    let p = full(t.path());
+    let ix = crate::index::load(inputs(t.path()));
+    let imp = crate::resolve::resolve_imports(&ix, &Attribution::new());
+    let calls = crate::resolve::resolve_calls(&ix, &imp);
+    assert_same(&dump(&p), &dump_parts(&ix, &imp, Some(&calls)), "tracked vs plain resolution");
 }

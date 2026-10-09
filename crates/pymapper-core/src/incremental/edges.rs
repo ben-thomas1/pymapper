@@ -7,7 +7,7 @@
 
 use super::diff::{EdgeDelta, EdgeLabel};
 use crate::index::{FileId, Index, NONE, NodeId};
-use crate::resolve::{CallEdge, Confidence, Imports, Reason, ResolvedCalls};
+use crate::resolve::{CallEdge, Confidence, Imports, ModuleEdge, Reason, ResolvedCalls};
 
 #[inline]
 fn tr(map: &[NodeId], v: NodeId) -> NodeId {
@@ -45,18 +45,19 @@ fn merge(src: NodeId, old: &[(NodeId, EdgeLabel)], new: &[(NodeId, EdgeLabel)], 
     }
 }
 
-/// Import edge deltas of every new file. `old_of`: old file of each new file (`u32::MAX`:
-/// added); `removed`: old files that are gone (their edges count for the new file their module
-/// node maps to, see [`super::diff`]; `old_fnode`: old file nodes). `skip(f)`: the file's
-/// edges are known to be unchanged.
+/// Import edge deltas of every new file. `old_edges(f)`: the old edges (old ids) of the old
+/// file new file `f` comes from (empty for added files); `removed`: old files that are gone,
+/// with their edges `removed_edges(g)` (they count for the new file their module node maps
+/// to, see [`super::diff`]; `old_fnode`: old file nodes). `skip(f)`: the file's edges are
+/// known to be unchanged.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn import_deltas(
+pub(super) fn import_deltas<'a>(
     ix: &Index,
     map: &[NodeId],
-    old: &Imports,
+    old_edges: &dyn Fn(FileId) -> &'a [ModuleEdge],
     new: &Imports,
-    old_of: &[u32],
     removed: &[FileId],
+    removed_edges: &dyn Fn(FileId) -> &'a [ModuleEdge],
     old_fnode: &[NodeId],
     skip: impl Fn(FileId) -> bool,
     out: &mut Vec<EdgeDelta>,
@@ -70,7 +71,7 @@ pub(super) fn import_deltas(
             continue;
         }
         gone.clear();
-        for e in old.module_edges(f) {
+        for e in removed_edges(f) {
             let d = tr(map, e.dst);
             if d != NONE {
                 gone.push((d, EdgeLabel { count: e.rows, label: e.flags }));
@@ -97,8 +98,7 @@ pub(super) fn import_deltas(
             continue;
         }
         let ne = new.module_edges(i);
-        let f = old_of[i as usize];
-        let oe = if f == u32::MAX { &[][..] } else { old.module_edges(f) };
+        let oe = old_edges(i);
         if orph.is_empty()
             && oe.len() == ne.len()
             && oe.iter().zip(ne).all(|(a, b)| tr(map, a.dst) == b.dst && a.rows == b.rows && a.flags == b.flags)
@@ -179,15 +179,16 @@ fn same_edge(map: &[NodeId], a: &CallEdge, b: &CallEdge) -> bool {
 }
 
 /// Call edge deltas of every new file: call and decorator edges into `calls`, override edges
-/// (base method -> override, listed with the overriding class's file) into `overrides`.
+/// (base method -> override, listed with the overriding class's file) into `overrides`. The
+/// old edges come as in [`import_deltas`].
 #[allow(clippy::too_many_arguments)]
-pub(super) fn call_deltas(
+pub(super) fn call_deltas<'a>(
     ix: &Index,
     map: &[NodeId],
-    old: &ResolvedCalls,
+    old_edges: &dyn Fn(FileId) -> &'a [CallEdge],
     new: &ResolvedCalls,
-    old_of: &[u32],
     removed: &[FileId],
+    removed_edges: &dyn Fn(FileId) -> &'a [CallEdge],
     skip: impl Fn(FileId) -> bool,
     calls: &mut Vec<EdgeDelta>,
     overrides: &mut Vec<EdgeDelta>,
@@ -198,7 +199,7 @@ pub(super) fn call_deltas(
     let mut orphans: Vec<(FileId, NodeId, NodeId, u8, bool)> = Vec::new();
     let mut gone: [Pairs; 2] = Default::default();
     for &f in removed {
-        for e in old.file_edges(f) {
+        for e in removed_edges(f) {
             let (s, d) = (tr(map, e.src), tr(map, e.dst));
             if s == NONE || d == NONE || !counted(e) {
                 continue;
@@ -227,8 +228,7 @@ pub(super) fn call_deltas(
             continue;
         }
         let ne = new.file_edges(i);
-        let f = old_of[i as usize];
-        let oe = if f == u32::MAX { &[][..] } else { old.file_edges(f) };
+        let oe = old_edges(i);
         if orph.is_empty() && oe.len() == ne.len() && oe.iter().zip(ne).all(|(a, b)| same_edge(map, a, b)) {
             continue;
         }

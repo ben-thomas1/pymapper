@@ -208,7 +208,8 @@ impl Program {
         st.extract = t2 - t1;
 
         let old = std::mem::replace(&mut self.index, index::load(Inputs::new()));
-        self.index = old.patch(inputs, &plan.src, fresh, plan.same_meta);
+        let (index, shift) = timing::time("incremental.patch", || old.patch(inputs, &plan.src, fresh, plan.same_meta));
+        self.index = index;
         let mut compacted = false;
         let n = self.index.strings().len();
         if n >= MIN_COMPACT_STRINGS && n >= 2 * self.strings_base {
@@ -228,74 +229,111 @@ impl Program {
         st.full_resolve = !carry_ok;
         let ix = &self.index;
         let nf = ix.file_count() as usize;
-        let carry = Carry { map: &d.node_map, imports: &snap.imports, calls: &snap.calls, decorators: &snap.decorators };
+        let dead = snap.any_dropped_gone(&d.node_map);
+        let carry = Carry {
+            map: &d.node_map,
+            shift: shift.as_ref(),
+            dead,
+            imports: &snap.imports,
+            calls: &snap.calls,
+            decorators: &snap.decorators,
+        };
         let dirty: Vec<bool> = plan.src.iter().map(|s| matches!(s, Src::Fresh(_))).collect();
-        let (imports, aff_imp) = if carry_ok {
-            incr::reresolve_imports(ix, &self.attr, &self.imports, &mut self.import_deps, &dirty, &carry)
+        // Old resolution results: updated in place when carried (only the old edges of the
+        // re-resolved files are kept, for the diff), kept whole for the diff otherwise.
+        let old_imports = std::mem::replace(&mut self.imports, incr::empty_imports());
+        let (imports, imp_up, old_imports) = if carry_ok {
+            let (imp, up) = incr::reresolve_imports(ix, &self.attr, old_imports, &mut self.import_deps, &dirty, &carry);
+            (imp, Some(up), None)
         } else {
             let (imp, deps) = incr::resolve_imports_tracked(ix, &self.attr);
             self.import_deps = deps;
-            (imp, vec![true; nf])
+            (imp, None, Some(old_imports))
         };
+        let all = vec![true; nf];
+        let aff_imp = imp_up.as_ref().map_or(&all, |u| &u.affected);
         st.reresolved_imports = aff_imp.iter().filter(|&&a| a).count() as u32;
         let t4 = Instant::now();
         st.resolve_imports = t4 - t3;
 
-        let mut aff_calls = vec![true; nf];
+        let mut calls_up = None;
+        let mut old_calls = None;
         let calls = match self.calls.take() {
-            Some(c) if carry_ok => {
-                // Calls read the import results of other files: affected files whose results
-                // changed are dirty too.
-                let mut dirty_calls = dirty.clone();
-                for f in 0..nf {
-                    if aff_imp[f] && !dirty_calls[f] {
-                        dirty_calls[f] = incr::import_results_changed(&self.imports, &imports, &carry, ix, f as u32);
-                    }
-                }
-                let mut touched: FxHashSet<Sym> = snap.dropped_names().collect();
-                for (i, s) in plan.src.iter().enumerate() {
-                    if matches!(s, Src::Fresh(_)) {
-                        let fnode = ix.file_node(i as u32);
-                        for dd in 1..ix.file_facts(i as u32).defs.len {
-                            touched.insert(ix.name_sym(fnode + dd));
+            Some(Calls { rc, mut deps, mut split }) => {
+                let rc = match &imp_up {
+                    Some(up) => {
+                        // Calls read the import results of other files: files whose results
+                        // changed are dirty too.
+                        let mut touched: FxHashSet<Sym> = snap.dropped_names().collect();
+                        for (i, s) in plan.src.iter().enumerate() {
+                            if matches!(s, Src::Fresh(_)) {
+                                let fnode = ix.file_node(i as u32);
+                                for dd in 1..ix.file_facts(i as u32).defs.len {
+                                    touched.insert(ix.name_sym(fnode + dd));
+                                }
+                            }
                         }
+                        let (new, cu) =
+                            incr::reresolve_calls(ix, &imports, rc, &mut deps, &mut split, &up.changed, &carry, &touched);
+                        calls_up = Some(cu);
+                        new
                     }
-                }
-                let Calls { rc, mut deps, mut split } = c;
-                let (new, aff) = incr::reresolve_calls(ix, &imports, &rc, &mut deps, &mut split, &dirty_calls, &carry, &touched);
-                aff_calls = aff;
-                Some((rc, Calls { rc: new, deps, split }))
-            }
-            Some(c) => {
-                let (new, deps, split) = incr::resolve_calls_tracked(ix, &imports);
-                Some((c.rc, Calls { rc: new, deps, split }))
+                    None => {
+                        let (new, d2, s2) = incr::resolve_calls_tracked(ix, &imports);
+                        (deps, split) = (d2, s2);
+                        old_calls = Some(rc);
+                        new
+                    }
+                };
+                Some(Calls { rc, deps, split })
             }
             None => None,
         };
+        let aff_calls = calls_up.as_ref().map_or(&all, |u| &u.affected);
         st.reresolved_calls = if calls.is_some() { aff_calls.iter().filter(|&&a| a).count() as u32 } else { 0 };
         let t5 = Instant::now();
         st.resolve_calls = t5 - t4;
 
         timing::time("incremental.diff", || {
             let (map, removed, fnodes) = (&d.node_map, &d.removed_files, snap.file_nodes());
+            let old_of = &plan.old_of;
             let mut ie = Vec::new();
-            let skip_i = |f: u32| carry_ok && !aff_imp[f as usize];
-            edges::import_deltas(ix, map, &self.imports, &imports, &plan.old_of, removed, fnodes, skip_i, &mut ie);
-            if let Some((old_rc, c)) = &calls {
+            match (&imp_up, &old_imports) {
+                (Some(up), _) => {
+                    let skip = |f: u32| !up.affected[f as usize];
+                    edges::import_deltas(ix, map, &|f| up.old_edges.get(f), &imports, &[], &|_| &[], fnodes, skip, &mut ie);
+                }
+                (None, Some(old)) => {
+                    let by_new = |f: u32| if old_of[f as usize] == u32::MAX { &[][..] } else { old.module_edges(old_of[f as usize]) };
+                    edges::import_deltas(ix, map, &by_new, &imports, removed, &|g| old.module_edges(g), fnodes, |_| false, &mut ie);
+                }
+                (None, None) => unreachable!("old imports are kept without a carried update"),
+            }
+            d.import_edges = ie;
+            if let Some(c) = &calls {
                 let (mut ce, mut oe) = (Vec::new(), Vec::new());
-                let skip_c = |f: u32| carry_ok && !aff_calls[f as usize];
-                edges::call_deltas(ix, map, old_rc, &c.rc, &plan.old_of, removed, skip_c, &mut ce, &mut oe);
+                match (&calls_up, &old_calls) {
+                    (Some(up), _) => {
+                        let skip = |f: u32| !up.affected[f as usize];
+                        edges::call_deltas(ix, map, &|f| up.old_edges.get(f), &c.rc, &[], &|_| &[], skip, &mut ce, &mut oe);
+                    }
+                    (None, Some(old)) => {
+                        let by_new = |f: u32| if old_of[f as usize] == u32::MAX { &[][..] } else { old.file_edges(old_of[f as usize]) };
+                        edges::call_deltas(ix, map, &by_new, &c.rc, removed, &|g| old.file_edges(g), |_| false, &mut ce, &mut oe);
+                    }
+                    (None, None) => unreachable!("old calls are kept without a carried update"),
+                }
                 d.call_edges = ce;
                 d.override_edges = oe;
             }
-            d.import_edges = ie;
         });
         debug_assert!(d.node_map.iter().all(|&v| v == NONE || v < self.index.node_count()));
         self.imports = imports;
-        self.calls = calls.map(|(_, c)| c);
+        self.calls = calls;
         let t6 = Instant::now();
         st.diff = t6 - t5;
         st.total = t6 - t0;
         (d, st)
     }
 }
+

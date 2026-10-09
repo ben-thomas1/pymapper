@@ -44,10 +44,11 @@ use super::lookup::Cx;
 use super::modules::ModuleTable;
 use super::namespace::{Namespaces, chunk_size};
 use super::{
-    Attribution, CallEdge, CallStats, ExtEdge, ImportStats, Imports, ModuleEdge, Reason, ResolvedCalls, edges,
+    Attribution, CallEdge, CallStats, ExtEdge, ImportStats, Imports, ModuleEdge, ResolvedCalls, edges,
 };
-use crate::index::{FileId, Index, NONE, NodeId};
-use crate::intern::{FxHashMap, FxHashSet, Sym};
+use crate::extract::splice::{Splice, splice_col};
+use crate::index::{FileId, Index, NONE, NodeId, NodeShift};
+use crate::intern::{FxHashSet, Sym};
 use crate::timing;
 
 /// Files each file's resolution read, per file sorted and without the file itself (CSR).
@@ -167,6 +168,12 @@ fn par_files<T: Send, S: Default>(
 pub(crate) struct Carry<'a> {
     /// New node of every old node (`NONE`: gone).
     pub map: &'a [NodeId],
+    /// The same by offset, with the defs of re-extracted files gone (when the hierarchy was
+    /// patched): carried results translate through it (no random access into `map`).
+    pub shift: Option<&'a NodeShift>,
+    /// Some old node is gone (a def removed or renamed in a re-extracted file): carried
+    /// results are checked for references to it.
+    pub dead: bool,
     /// Old run starts per file (`files + 1` entries, the last is the table length) of the
     /// import, call and decorator tables.
     pub imports: &'a [u32],
@@ -175,9 +182,17 @@ pub(crate) struct Carry<'a> {
 }
 
 impl Carry<'_> {
+    /// New id of old node `v` (`NONE`: gone): by offset where possible, else through the
+    /// node map (defs of re-extracted files matched by def path).
     #[inline]
     fn node(&self, v: NodeId) -> NodeId {
-        if v == NONE { NONE } else { self.map.get(v as usize).copied().unwrap_or(NONE) }
+        if v == NONE {
+            return NONE;
+        }
+        match self.shift.map(|s| s.translate(v)) {
+            Some(w) if w != NONE => w,
+            _ => self.map.get(v as usize).copied().unwrap_or(NONE),
+        }
     }
 }
 
@@ -199,149 +214,290 @@ fn listed(affected: &[bool]) -> Vec<FileId> {
     (0..affected.len() as FileId).filter(|&f| affected[f as usize]).collect()
 }
 
-/// Import resolution where only the `affected` files are resolved and every other file's
-/// results come from `old` (translated with `carry`). With `old == None` every file must be
-/// affected (a full tracked resolution). Returns the resolution and the dependency lists of
-/// the affected files (in order, with lengths).
-fn imports_with(
-    ix: &Index,
-    attr: &Attribution,
-    affected: &[bool],
-    old: Option<(&Imports, &Carry<'_>)>,
-) -> (Imports, Vec<FileId>, Vec<FileId>, Vec<u32>) {
-    let t0 = Instant::now();
-    let (modules, ns) = timing::time("resolve.modules", || rayon::join(|| ModuleTable::build(ix), || Namespaces::build(ix)));
-    let t1 = Instant::now();
-    let getattr = ix.strings().get(b"__getattr__");
-    let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
-    let n = ix.file_count();
-    let fresh = listed(affected);
-    let new_start = |f: FileId| ix.file_facts(f).imports.start;
-    let (p1, p2, deps, dep_lens) = timing::time("resolve.imports", || {
-        let (p1_fresh, p1_lens, _, _) = par_files(&fresh, |_: &mut (), f, out: &mut Vec<ModRes>, _| {
-            for row in ix.file_facts(f).imports.range() {
-                out.push(cx.module_part(attr, f, row));
-            }
-        });
-        let mut p1 = Vec::with_capacity(ix.facts().imports.len() as usize);
-        let (mut k, mut at) = (0usize, 0usize);
-        for f in 0..n {
-            if affected[f as usize] {
-                let l = p1_lens[k] as usize;
-                p1.extend_from_slice(&p1_fresh[at..at + l]);
-                at += l;
-                k += 1;
-            } else if let Some((o, c)) = old {
-                p1.extend_from_slice(&o.p1[c.imports[f as usize] as usize..c.imports[f as usize + 1] as usize]);
-            }
+/// Runs `per(file, run)` in parallel over the runs `start[f]..start[f + 1]` of `v` of every
+/// file not in `skip` (disjoint mutable slices: no copy, no lock).
+fn par_runs_mut<T: Send>(v: &mut [T], start: &[u32], skip: &[bool], per: impl Fn(usize, &mut [T]) + Sync) {
+    let mut runs: Vec<(usize, &mut [T])> = Vec::with_capacity(skip.len());
+    let mut rest = v;
+    for f in 0..skip.len() {
+        let len = (start[f + 1] - start[f]) as usize;
+        let (run, tail) = rest.split_at_mut(len);
+        rest = tail;
+        if !skip[f] && len > 0 {
+            runs.push((f, run));
         }
-        drop(p1_fresh);
-        debug_assert_eq!(p1.len(), ix.facts().imports.len() as usize);
-        let names = Names { cx: &cx, p1: &p1 };
-        let (p2_fresh, p2_lens, deps, dep_lens) = par_files(&fresh, |sc: &mut Scratch, f, out: &mut Vec<NameRes>, log| {
-            sc.logging = true;
-            for row in ix.file_facts(f).imports.range() {
-                out.push(names.row(f, row, sc));
-            }
-            log.append(&mut sc.log);
-        });
-        let mut p2 = Vec::with_capacity(p1.len());
-        let (mut k, mut at) = (0usize, 0usize);
-        for f in 0..n {
-            if affected[f as usize] {
-                let l = p2_lens[k] as usize;
-                p2.extend_from_slice(&p2_fresh[at..at + l]);
-                at += l;
-                k += 1;
-            } else if let Some((o, c)) = old {
-                for r in &o.p2[c.imports[f as usize] as usize..c.imports[f as usize + 1] as usize] {
-                    p2.push(NameRes { target: c.node(r.target), via: shift_row(r.via, c.imports, new_start), ..*r });
-                }
-            }
+    }
+    runs.into_par_iter().with_min_len(64).for_each(|(f, run)| per(f, run));
+}
+
+/// Old rows of the files of `files` (ascending): `start` runs per file, copied out of `v`.
+fn save<T: Copy>(v: &[T], start: &[u32], files: &[FileId]) -> Saved<T> {
+    let mut s = Saved { files: files.to_vec(), start: Vec::with_capacity(files.len() + 1), rows: Vec::new() };
+    s.start.push(0);
+    for &f in files {
+        s.rows.extend_from_slice(&v[start[f as usize] as usize..start[f as usize + 1] as usize]);
+        s.start.push(s.rows.len() as u32);
+    }
+    s
+}
+
+/// Rows of some files saved before an in-place update (old ids).
+#[derive(Debug, Default)]
+pub(crate) struct Saved<T> {
+    files: Vec<FileId>,
+    start: Vec<u32>,
+    rows: Vec<T>,
+}
+
+impl<T> Saved<T> {
+    /// Saved rows of file `f` (empty if not saved).
+    pub fn get(&self, f: FileId) -> &[T] {
+        match self.files.binary_search(&f) {
+            Ok(k) => &self.rows[self.start[k] as usize..self.start[k + 1] as usize],
+            Err(_) => &[],
         }
-        (p1, p2, deps, dep_lens)
+    }
+
+    fn at(&self, k: usize) -> &[T] {
+        &self.rows[self.start[k] as usize..self.start[k + 1] as usize]
+    }
+}
+
+/// Splices the per-file runs of the `files` (ascending) into `v`: the old runs (`old_start`)
+/// become the fresh rows (`fresh`, consecutive per file with lengths `lens`).
+fn splice_files<T: Copy>(v: &mut Vec<T>, old_start: &[u32], files: &[FileId], fresh: &[T], lens: &[u32]) {
+    let mut plan = Vec::with_capacity(files.len());
+    let mut at = 0u32;
+    for (k, &f) in files.iter().enumerate() {
+        let (s, e) = (old_start[f as usize], old_start[f as usize + 1]);
+        plan.push(Splice { at: s, old: e - s, src: at, new: lens[k] });
+        at += lens[k];
+    }
+    splice_col(v, &plan, fresh);
+}
+
+/// Per-file run starts after replacing the runs of `files` (lengths `lens`).
+fn new_starts(old_start: &[u32], files: &[FileId], lens: &[u32]) -> Vec<u32> {
+    let n = old_start.len() - 1;
+    let mut s = Vec::with_capacity(n + 1);
+    s.push(0u32);
+    let (mut k, mut at) = (0usize, 0u32);
+    for f in 0..n {
+        if k < files.len() && files[k] as usize == f {
+            at += lens[k];
+            k += 1;
+        } else {
+            at += old_start[f + 1] - old_start[f];
+        }
+        s.push(at);
+    }
+    s
+}
+
+/// The global tables of the import pass, timed as `resolve.modules`.
+fn import_tables(ix: &Index) -> (ModuleTable, Namespaces) {
+    timing::time("resolve.modules", || rayon::join(|| ModuleTable::build(ix), || Namespaces::build(ix)))
+}
+
+/// Phase 1 of `files`: rows in order and per-file lengths.
+fn p1_of(cx: &Ctx<'_>, attr: &Attribution, files: &[FileId]) -> (Vec<ModRes>, Vec<u32>) {
+    let (rows, lens, _, _) = par_files(files, |_: &mut (), f, out: &mut Vec<ModRes>, _| {
+        for row in cx.ix.file_facts(f).imports.range() {
+            out.push(cx.module_part(attr, f, row));
+        }
     });
-    let t2 = Instant::now();
-    let ((edges, edge_start), (ext_edges, ext_start)) = timing::time("resolve.edges", || {
-        let (e_fresh, e_lens, _, _) =
-            par_files(&fresh, |_: &mut (), f, out: &mut Vec<ModuleEdge>, _| edges::file_edges(ix, &modules, &p1, &p2, f, out));
-        let (x_fresh, x_lens, _, _) =
-            par_files(&fresh, |_: &mut (), f, out: &mut Vec<ExtEdge>, _| edges::file_ext_edges(ix, &p1, &p2, f, out));
-        let mut e = (Vec::with_capacity(e_fresh.len()), Vec::with_capacity(n as usize + 1));
-        let mut x = (Vec::with_capacity(x_fresh.len()), Vec::with_capacity(n as usize + 1));
-        e.1.push(0u32);
-        x.1.push(0u32);
-        let (mut k, mut ea, mut xa) = (0usize, 0usize, 0usize);
-        for f in 0..n {
-            if affected[f as usize] {
-                let (el, xl) = (e_lens[k] as usize, x_lens[k] as usize);
-                e.0.extend_from_slice(&e_fresh[ea..ea + el]);
-                x.0.extend_from_slice(&x_fresh[xa..xa + xl]);
-                ea += el;
-                xa += xl;
-                k += 1;
-            } else if let Some((o, c)) = old {
-                e.0.extend(o.module_edges(f).iter().map(|m| ModuleEdge { dst: c.node(m.dst), ..*m }));
-                x.0.extend_from_slice(o.ext_edges(f));
-            }
-            e.1.push(e.0.len() as u32);
-            x.1.push(x.0.len() as u32);
+    (rows, lens)
+}
+
+/// Phase 2 of `files` (logged): rows, per-file lengths, dependency lists and their lengths.
+fn p2_of(names: &Names<'_>, files: &[FileId]) -> (Vec<NameRes>, Vec<u32>, Vec<FileId>, Vec<u32>) {
+    let ix = names.cx.ix;
+    par_files(files, |sc: &mut Scratch, f, out: &mut Vec<NameRes>, log| {
+        sc.logging = true;
+        for row in ix.file_facts(f).imports.range() {
+            out.push(names.row(f, row, sc));
         }
-        (e, x)
-    });
-    let t3 = Instant::now();
+        log.append(&mut sc.log);
+    })
+}
+
+/// Import statistics of a finished resolution.
+fn import_stats(imp: &mut Imports, t: [Instant; 4]) {
     let mut stats = ImportStats {
-        rows: p2.len() as u64,
-        module_edges: edges.len() as u64,
-        ext_edges: ext_edges.len() as u64,
-        modules: u64::from(modules.len()),
-        build: t1 - t0,
-        resolve: t2 - t1,
-        edges: t3 - t2,
+        rows: imp.p2.len() as u64,
+        module_edges: imp.edges.len() as u64,
+        ext_edges: imp.ext_edges.len() as u64,
+        modules: u64::from(imp.modules.len()),
+        build: t[1] - t[0],
+        resolve: t[2] - t[1],
+        edges: t[3] - t[2],
         ..ImportStats::default()
     };
-    for r in &p2 {
+    for r in &imp.p2 {
         stats.by_status[r.status as usize] += 1;
     }
-    let imp = Imports { modules, ns, p1, p2, edges, edge_start, ext_edges, ext_start, getattr, stats };
-    (imp, fresh, deps, dep_lens)
+    imp.stats = stats;
 }
 
 /// [`super::resolve_imports`] that also records every file's dependencies.
 pub(crate) fn resolve_imports_tracked(ix: &Index, attr: &Attribution) -> (Imports, Deps) {
-    let all = vec![true; ix.file_count() as usize];
-    let (imp, _, files, lens) = imports_with(ix, attr, &all, None);
+    let t0 = Instant::now();
+    let (modules, ns) = import_tables(ix);
+    let t1 = Instant::now();
+    let getattr = ix.strings().get(b"__getattr__");
+    let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
+    let all: Vec<FileId> = (0..ix.file_count()).collect();
+    let (p1, p2, files, lens) = timing::time("resolve.imports", || {
+        let (p1, _) = p1_of(&cx, attr, &all);
+        let (p2, _, files, lens) = p2_of(&Names { cx: &cx, p1: &p1 }, &all);
+        (p1, p2, files, lens)
+    });
+    let t2 = Instant::now();
+    let ((edges, el), (ext_edges, xl)) = timing::time("resolve.edges", || {
+        let (e, el, _, _) = par_files(&all, |_: &mut (), f, out: &mut Vec<ModuleEdge>, _| edges::file_edges(ix, &modules, &p1, &p2, f, out));
+        let (x, xl, _, _) = par_files(&all, |_: &mut (), f, out: &mut Vec<ExtEdge>, _| edges::file_ext_edges(ix, &p1, &p2, f, out));
+        ((e, el), (x, xl))
+    });
+    let t3 = Instant::now();
+    let mut imp = Imports {
+        modules,
+        ns,
+        p1,
+        p2,
+        edges,
+        edge_start: starts(&el),
+        ext_edges,
+        ext_start: starts(&xl),
+        getattr,
+        stats: ImportStats::default(),
+    };
+    import_stats(&mut imp, [t0, t1, t2, t3]);
     (imp, Deps { start: starts(&lens), files })
 }
 
-/// Re-resolves the imports of `ix` after an update (see the module docs): `dirty` marks the
-/// re-extracted files. Returns the new resolution and which files were re-resolved; `deps` is
-/// updated in place.
+/// What [`reresolve_imports`] did besides the new resolution.
+pub(crate) struct ImportsUpdate {
+    /// Files resolved again.
+    pub affected: Vec<bool>,
+    /// Affected files whose results differ from their old ones (re-extracted files count as
+    /// changed).
+    pub changed: Vec<bool>,
+    /// Old module edges of the affected files (old ids), for the diff.
+    pub old_edges: Saved<ModuleEdge>,
+}
+
+/// Re-resolves the imports of `ix` after an update (see the module docs), updating `old` in
+/// place: carried rows are translated where they are, affected files' rows are spliced in.
+/// `dirty` marks the re-extracted files; `deps` is updated.
 pub(crate) fn reresolve_imports(
     ix: &Index,
     attr: &Attribution,
-    old: &Imports,
+    old: Imports,
     deps: &mut Deps,
     dirty: &[bool],
     carry: &Carry<'_>,
-) -> (Imports, Vec<bool>) {
+) -> (Imports, ImportsUpdate) {
     let n = ix.file_count() as usize;
+    let g = timing::phase("incremental.affected");
     let mut affected = vec![false; n];
     deps.readers(dirty, &mut affected);
-    // Safety net: a carried result must not point at a node or row that is gone.
-    for (f, a) in affected.iter_mut().enumerate() {
-        if *a {
+    // Safety net: a carried result must not point at a node that is gone (re-export rows of
+    // re-extracted files are covered by the dependencies: the lookup that found them read
+    // their file).
+    if carry.dead {
+        for (f, a) in affected.iter_mut().enumerate() {
+            if !*a {
+                let rows = &old.p2[carry.imports[f] as usize..carry.imports[f + 1] as usize];
+                *a = rows.iter().any(|r| r.target != NONE && carry.node(r.target) == NONE);
+            }
+        }
+    }
+    drop(g);
+    let fresh = listed(&affected);
+    let Imports { modules, ns, mut p1, mut p2, mut edges, edge_start, mut ext_edges, ext_start, getattr, stats: old_stats } = old;
+    drop((modules, ns));
+    let t0 = Instant::now();
+    let (modules, ns) = import_tables(ix);
+    let t1 = Instant::now();
+    let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
+    let new_start = |f: FileId| ix.file_facts(f).imports.start;
+    let saved_p1 = save(&p1, carry.imports, &fresh);
+    let saved_p2 = save(&p2, carry.imports, &fresh);
+    let saved_x = save(&ext_edges, &ext_start, &fresh);
+    let old_edges = save(&edges, &edge_start, &fresh);
+    let (files, lens) = timing::time("resolve.imports", || {
+        let (p1_fresh, p1_lens) = p1_of(&cx, attr, &fresh);
+        splice_files(&mut p1, carry.imports, &fresh, &p1_fresh, &p1_lens);
+        drop(p1_fresh);
+        par_runs_mut(&mut p2, carry.imports, &affected, |_, run| {
+            for r in run {
+                r.target = carry.node(r.target);
+                r.via = shift_row(r.via, carry.imports, new_start);
+            }
+        });
+        let (p2_fresh, p2_lens, files, lens) = p2_of(&Names { cx: &cx, p1: &p1 }, &fresh);
+        splice_files(&mut p2, carry.imports, &fresh, &p2_fresh, &p2_lens);
+        (files, lens)
+    });
+    debug_assert_eq!(p2.len(), ix.facts().imports.len() as usize);
+    let t2 = Instant::now();
+    let (edge_start, ext_start) = timing::time("resolve.edges", || {
+        par_runs_mut(&mut edges, &edge_start, &affected, |_, run| {
+            for e in run {
+                e.dst = carry.node(e.dst);
+            }
+        });
+        let (e, el, _, _) = par_files(&fresh, |_: &mut (), f, out: &mut Vec<ModuleEdge>, _| edges::file_edges(ix, &modules, &p1, &p2, f, out));
+        let (x, xl, _, _) = par_files(&fresh, |_: &mut (), f, out: &mut Vec<ExtEdge>, _| edges::file_ext_edges(ix, &p1, &p2, f, out));
+        splice_files(&mut edges, &edge_start, &fresh, &e, &el);
+        splice_files(&mut ext_edges, &ext_start, &fresh, &x, &xl);
+        (new_starts(&edge_start, &fresh, &el), new_starts(&ext_start, &fresh, &xl))
+    });
+    let t3 = Instant::now();
+    let mut imp = Imports { modules, ns, p1, p2, edges, edge_start, ext_edges, ext_start, getattr, stats: old_stats };
+    // Statistics: the old counts minus the old rows of the re-resolved files plus their new
+    // rows (no pass over every row).
+    let st = &mut imp.stats;
+    for r in &saved_p2.rows {
+        st.by_status[r.status as usize] -= 1;
+    }
+    for &f in &fresh {
+        for r in &imp.p2[ix.file_facts(f).imports.range()] {
+            st.by_status[r.status as usize] += 1;
+        }
+    }
+    st.rows = imp.p2.len() as u64;
+    st.module_edges = imp.edges.len() as u64;
+    st.ext_edges = imp.ext_edges.len() as u64;
+    st.modules = u64::from(imp.modules.len());
+    (st.build, st.resolve, st.edges) = (t1 - t0, t2 - t1, t3 - t2);
+    deps.replace(&fresh, &files, &lens);
+    // Which affected files' results changed (translated old rows against the new ones).
+    let mut changed = dirty.to_vec();
+    for (k, &f) in fresh.iter().enumerate() {
+        if dirty[f as usize] {
             continue;
         }
-        let rows = &old.p2[carry.imports[f] as usize..carry.imports[f + 1] as usize];
-        *a = rows.iter().any(|r| {
-            (r.target != NONE && carry.node(r.target) == NONE)
-                || (r.via != NONE && dirty[carry.imports.partition_point(|&s| s <= r.via) - 1])
-        });
+        let r = ix.file_facts(f).imports.range();
+        let (o1, o2) = (saved_p1.at(k), saved_p2.at(k));
+        let same = o1.len() == r.len()
+            && o1.iter().zip(&imp.p1[r.clone()]).all(|(a, b)| {
+                a.module == b.module && a.ext == b.ext && a.status == b.status && a.matched == b.matched
+            })
+            && o2.iter().zip(&imp.p2[r]).all(|(a, b)| {
+                carry.node(a.target) == b.target
+                    && shift_row(a.via, carry.imports, new_start) == b.via
+                    && a.status == b.status
+                    && a.flags == b.flags
+            })
+            && {
+                let (oe, ne) = (old_edges.at(k), imp.module_edges(f));
+                oe.len() == ne.len() && oe.iter().zip(ne).all(|(a, b)| carry.node(a.dst) == b.dst && a.rows == b.rows && a.flags == b.flags)
+            }
+            && saved_x.at(k) == imp.ext_edges(f);
+        changed[f as usize] = !same;
     }
-    let (imp, fresh, files, lens) = imports_with(ix, attr, &affected, Some((old, carry)));
-    deps.replace(&fresh, &files, &lens);
-    (imp, affected)
+    (imp, ImportsUpdate { affected, changed, old_edges })
 }
 
 /// The global tables of the call pass: interned names, builtins, classes with their MROs and
@@ -386,23 +542,22 @@ struct CallPart {
 /// its edges come from call rows (the others: decorators, then overrides).
 pub(crate) type CallSplit = Vec<u32>;
 
-/// Call resolution where only the `affected` files are resolved (see [`imports_with`]).
-/// Returns the resolution, the affected files, their dependency lists and the split of every
-/// file's edges.
-#[allow(clippy::type_complexity)]
-fn calls_with(
-    ix: &Index,
-    imp: &Imports,
-    t: CallTables,
-    affected: &[bool],
-    old: Option<(&ResolvedCalls, &Carry<'_>, &CallSplit)>,
-) -> (ResolvedCalls, Vec<FileId>, Vec<FileId>, Vec<u32>, CallSplit) {
-    let t2 = Instant::now();
-    let fresh = listed(affected);
+/// Fresh call results of `files` (logged), concatenated: info rows, edges with per-file
+/// edge counts and call-edge counts, dependency lists with lengths.
+struct FreshCalls {
+    info: Vec<u8>,
+    edges: Vec<CallEdge>,
+    edge_lens: Vec<u32>,
+    call_lens: Vec<u32>,
+    deps: Vec<FileId>,
+    dep_lens: Vec<u32>,
+}
+
+fn calls_of(ix: &Index, imp: &Imports, t: &CallTables, files: &[FileId]) -> FreshCalls {
     let parts: Vec<CallPart> = timing::time("resolve.calls", || {
         let cx = Cx { ix, imp, classes: &t.classes, tables: &t.tables, names: t.names };
-        fresh
-            .par_chunks(chunk_size(fresh.len()).max(1))
+        files
+            .par_chunks(chunk_size(files.len()).max(1))
             .map(|fs| {
                 let mut sc = FileScratch::default();
                 sc.loc.logging = true;
@@ -417,133 +572,119 @@ fn calls_with(
             })
             .collect()
     });
-    let n = ix.file_count() as usize;
-    let mut info = Vec::with_capacity(ix.facts().calls.len() as usize);
-    let mut edges: Vec<CallEdge> = Vec::new();
-    let mut edge_start = Vec::with_capacity(n + 1);
-    let mut split = Vec::with_capacity(n);
-    let (mut deps, mut dep_lens) = (Vec::new(), Vec::new());
-    edge_start.push(0u32);
-    let calls_start = |f: FileId| ix.file_facts(f).calls.start;
-    let dec_start = |f: FileId| ix.file_facts(f).decorators.start;
-    let mut parts = parts.into_iter();
-    let mut cur: Option<CallPart> = None;
-    // Position in the current part: file, info row, edge.
-    let (mut pf, mut pi, mut pe) = (0usize, 0usize, 0usize);
-    for f in 0..n {
-        if affected[f] {
-            while cur.as_ref().is_none_or(|c| pf == c.out.edge_lens.len()) {
-                let mut c = parts.next().expect("a part per affected file");
-                deps.append(&mut c.deps);
-                dep_lens.append(&mut c.dep_lens);
-                cur = Some(c);
-                (pf, pi, pe) = (0, 0, 0);
-            }
-            let c = cur.as_ref().expect("current part");
-            let rows = ix.file_facts(f as FileId).calls.len as usize;
-            info.extend_from_slice(&c.out.info[pi..pi + rows]);
-            let el = c.out.edge_lens[pf] as usize;
-            edges.extend_from_slice(&c.out.edges[pe..pe + el]);
-            split.push(c.out.call_lens[pf]);
-            pf += 1;
-            pi += rows;
-            pe += el;
-        } else if let Some((o, c, osplit)) = old {
-            info.extend_from_slice(&o.info[c.calls[f] as usize..c.calls[f + 1] as usize]);
-            let k = osplit[f] as usize;
-            for (i, e) in o.file_edges(f as FileId).iter().enumerate() {
-                let site = if i < k {
-                    shift_row(e.site, c.calls, calls_start)
-                } else if e.reason == Reason::Override {
-                    NONE
-                } else {
-                    shift_row(e.site, c.decorators, dec_start)
-                };
-                edges.push(CallEdge { src: c.node(e.src), dst: c.node(e.dst), site, ..*e });
-            }
-            split.push(osplit[f]);
-        }
-        edge_start.push(edges.len() as u32);
+    let mut out = FreshCalls {
+        info: Vec::with_capacity(parts.iter().map(|p| p.out.info.len()).sum()),
+        edges: Vec::with_capacity(parts.iter().map(|p| p.out.edges.len()).sum()),
+        edge_lens: Vec::with_capacity(files.len()),
+        call_lens: Vec::with_capacity(files.len()),
+        deps: Vec::with_capacity(parts.iter().map(|p| p.deps.len()).sum()),
+        dep_lens: Vec::with_capacity(files.len()),
+    };
+    for mut p in parts {
+        out.info.append(&mut p.out.info);
+        out.edges.append(&mut p.out.edges);
+        out.edge_lens.append(&mut p.out.edge_lens);
+        out.call_lens.append(&mut p.out.call_lens);
+        out.deps.append(&mut p.deps);
+        out.dep_lens.append(&mut p.dep_lens);
     }
-    debug_assert_eq!(info.len(), ix.facts().calls.len() as usize);
-    let t3 = Instant::now();
-    let classes = t.classes;
+    out
+}
+
+/// Call statistics of a finished resolution.
+fn call_stats(rc: &mut ResolvedCalls, t: &CallTables, calls_time: std::time::Duration) {
     let mut stats = CallStats {
-        calls: info.len() as u64,
-        edges: edges.len() as u64,
-        classes: u64::from(classes.len()),
+        calls: rc.info.len() as u64,
+        edges: rc.edges.len() as u64,
+        classes: u64::from(t.classes.len()),
         classes_time: t.t_classes,
         mro_time: t.t_mro,
-        calls_time: t3 - t2,
+        calls_time,
         ..CallStats::default()
     };
-    for &v in &info {
+    for &v in &rc.info {
         stats.by_conf[(v >> 6) as usize] += 1;
         stats.by_reason[(v & 0x3f) as usize] += 1;
     }
-    for e in &edges {
+    for e in &rc.edges {
         stats.edges_by_reason[e.reason as usize] += 1;
     }
-    for c in 0..classes.len() {
-        let fl = classes.flags(c);
+    class_stats(&mut stats, t);
+    rc.stats = stats;
+}
+
+/// Class counts and the class / MRO phase times of `t`.
+fn class_stats(stats: &mut CallStats, t: &CallTables) {
+    stats.classes = u64::from(t.classes.len());
+    stats.classes_time = t.t_classes;
+    stats.mro_time = t.t_mro;
+    (stats.incomplete_classes, stats.no_c3) = (0, 0);
+    for c in 0..t.classes.len() {
+        let fl = t.classes.flags(c);
         stats.incomplete_classes += u64::from(fl & super::class_flags::INCOMPLETE != 0);
         stats.no_c3 += u64::from(fl & super::class_flags::NO_C3 != 0);
     }
-    let rc = ResolvedCalls { classes, methods: t.methods, info, edges, edge_start, stats };
-    (rc, fresh, deps, dep_lens, split)
 }
 
 /// [`super::resolve_calls`] that also records every file's dependencies and edge split.
 pub(crate) fn resolve_calls_tracked(ix: &Index, imp: &Imports) -> (ResolvedCalls, Deps, CallSplit) {
     let t = call_tables(ix, imp);
-    let all = vec![true; ix.file_count() as usize];
-    let (rc, _, files, lens, split) = calls_with(ix, imp, t, &all, None);
-    (rc, Deps { start: starts(&lens), files }, split)
+    let all: Vec<FileId> = (0..ix.file_count()).collect();
+    let t2 = Instant::now();
+    let fc = calls_of(ix, imp, &t, &all);
+    debug_assert_eq!(fc.info.len(), ix.facts().calls.len() as usize);
+    let FreshCalls { info, edges, edge_lens, call_lens, deps, dep_lens } = fc;
+    let mut rc = ResolvedCalls { classes: Classes::default(), methods: MethodIndex::default(), info, edges, edge_start: starts(&edge_lens), stats: CallStats::default() };
+    let elapsed = t2.elapsed();
+    call_stats(&mut rc, &t, elapsed);
+    rc.classes = t.classes;
+    rc.methods = t.methods;
+    (rc, Deps { start: starts(&dep_lens), files: deps }, call_lens)
 }
 
-/// Re-resolves the calls of `ix` after an update (see the module docs). `dirty` marks the
-/// re-extracted files and the files whose import results changed; `touched` holds the def
-/// names of the re-extracted files, before and after. `deps` and `split` are updated in place.
+/// What [`reresolve_calls`] did besides the new resolution.
+pub(crate) struct CallsUpdate {
+    /// Files resolved again.
+    pub affected: Vec<bool>,
+    /// Old edges of the affected files (old ids), for the diff.
+    pub old_edges: Saved<CallEdge>,
+}
+
+/// Re-resolves the calls of `ix` after an update (see the module docs), updating `old` in
+/// place. `dirty` marks the re-extracted files and the files whose import results changed;
+/// `touched` holds the def names of the re-extracted files, before and after. `deps` and
+/// `split` are updated.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reresolve_calls(
     ix: &Index,
     imp: &Imports,
-    old: &ResolvedCalls,
+    old: ResolvedCalls,
     deps: &mut Deps,
     split: &mut CallSplit,
     dirty: &[bool],
     carry: &Carry<'_>,
     touched: &FxHashSet<Sym>,
-) -> (ResolvedCalls, Vec<bool>) {
+) -> (ResolvedCalls, CallsUpdate) {
     let t = call_tables(ix, imp);
     let n = ix.file_count() as usize;
+    let g = timing::phase("incremental.affected");
     let mut dirty = dirty.to_vec();
-    // Classes whose MRO or flags changed (as nodes): their files are dirty.
-    let mut old_class: FxHashMap<NodeId, u32> = FxHashMap::default();
-    old_class.reserve(old.classes.len() as usize);
-    for k in 0..old.classes.len() {
-        let w = carry.node(old.classes.node(k));
-        if w != NONE {
-            old_class.insert(w, k);
-        }
-    }
-    for c in 0..t.classes.len() {
-        let w = t.classes.node(c);
-        let Some(fw) = ix.file(w) else { continue };
-        if dirty[fw as usize] {
+    // Classes whose MRO or flags changed (as nodes): their files are dirty. A file that was
+    // not re-extracted has the same classes in the same order in both tables.
+    for (f, d) in dirty.iter_mut().enumerate() {
+        if *d {
             continue;
         }
-        let same = old_class.get(&w).is_some_and(|&k| {
-            let (om, nm) = (old.classes.mro(k), t.classes.mro(c));
-            old.classes.flags(k) == t.classes.flags(c)
-                && om.len() == nm.len()
-                && om.iter().zip(nm).all(|(&a, &b)| carry.node(old.classes.node(a)) == t.classes.node(b))
-        });
-        if !same {
-            dirty[fw as usize] = true;
-        }
+        let (or, nr) = (old.classes.file_classes(f as FileId), t.classes.file_classes(f as FileId));
+        let same = or.len() == nr.len()
+            && or.zip(nr).all(|(k, c)| {
+                let (om, nm) = (old.classes.mro(k), t.classes.mro(c));
+                old.classes.flags(k) == t.classes.flags(c)
+                    && om.len() == nm.len()
+                    && om.iter().zip(nm).all(|(&a, &b)| carry.node(old.classes.node(a)) == t.classes.node(b))
+            });
+        *d = !same;
     }
-    drop(old_class);
     let mut affected = vec![false; n];
     deps.readers(&dirty, &mut affected);
     // Method names whose candidates changed, where a lookup by name can see it (one candidate
@@ -573,36 +714,86 @@ pub(crate) fn reresolve_calls(
         }
     }
     // Safety net: carried edges must not point at nodes that are gone.
-    for (f, a) in affected.iter_mut().enumerate() {
-        if !*a {
-            *a = old.file_edges(f as FileId).iter().any(|e| carry.node(e.src) == NONE || carry.node(e.dst) == NONE);
+    if carry.dead {
+        for (f, a) in affected.iter_mut().enumerate() {
+            if !*a {
+                *a = old.file_edges(f as FileId).iter().any(|e| carry.node(e.src) == NONE || carry.node(e.dst) == NONE);
+            }
         }
     }
-    let (rc, fresh, files, lens, new_split) = calls_with(ix, imp, t, &affected, Some((old, carry, split)));
-    deps.replace(&fresh, &files, &lens);
-    *split = new_split;
-    (rc, affected)
+    drop(g);
+    let fresh = listed(&affected);
+    let ResolvedCalls { mut info, mut edges, edge_start, stats: old_stats, .. } = old;
+    let old_edges = save(&edges, &edge_start, &fresh);
+    let old_info = save(&info, carry.calls, &fresh);
+    let t2 = Instant::now();
+    let fc = calls_of(ix, imp, &t, &fresh);
+    let carry_phase = timing::phase("incremental.carry");
+    let calls_start = |f: FileId| ix.file_facts(f).calls.start;
+    let dec_start = |f: FileId| ix.file_facts(f).decorators.start;
+    let osplit: &CallSplit = split;
+    par_runs_mut(&mut edges, &edge_start, &affected, |f, run| {
+        // Sites are rows of the file's own call / decorator runs: one shift per file.
+        let k = osplit[f] as usize;
+        let dc = i64::from(calls_start(f as FileId)) - i64::from(carry.calls[f]);
+        let dd = i64::from(dec_start(f as FileId)) - i64::from(carry.decorators[f]);
+        for (i, e) in run.iter_mut().enumerate() {
+            e.src = carry.node(e.src);
+            e.dst = carry.node(e.dst);
+            if e.site != NONE {
+                e.site = (i64::from(e.site) + if i < k { dc } else { dd }) as u32;
+            }
+        }
+    });
+    let info_lens: Vec<u32> = fresh.iter().map(|&f| ix.file_facts(f).calls.len).collect();
+    splice_files(&mut info, carry.calls, &fresh, &fc.info, &info_lens);
+    splice_files(&mut edges, &edge_start, &fresh, &fc.edges, &fc.edge_lens);
+    let edge_start = new_starts(&edge_start, &fresh, &fc.edge_lens);
+    for (k, &f) in fresh.iter().enumerate() {
+        split[f as usize] = fc.call_lens[k];
+    }
+    drop(carry_phase);
+    debug_assert_eq!(info.len(), ix.facts().calls.len() as usize);
+    deps.replace(&fresh, &fc.deps, &fc.dep_lens);
+    // Statistics: the old counts minus the old rows and edges of the re-resolved files plus
+    // their new ones (no pass over every row).
+    let mut st = old_stats;
+    for &v in old_info.rows.iter() {
+        st.by_conf[(v >> 6) as usize] -= 1;
+        st.by_reason[(v & 0x3f) as usize] -= 1;
+    }
+    for &v in &fc.info {
+        st.by_conf[(v >> 6) as usize] += 1;
+        st.by_reason[(v & 0x3f) as usize] += 1;
+    }
+    for e in &old_edges.rows {
+        st.edges_by_reason[e.reason as usize] -= 1;
+    }
+    for e in &fc.edges {
+        st.edges_by_reason[e.reason as usize] += 1;
+    }
+    st.calls = info.len() as u64;
+    st.edges = edges.len() as u64;
+    class_stats(&mut st, &t);
+    st.calls_time = t2.elapsed();
+    let rc = ResolvedCalls { classes: t.classes, methods: t.methods, info, edges, edge_start, stats: st };
+    (rc, CallsUpdate { affected, old_edges })
 }
 
-/// Whether file `f`'s import results differ between `old` (translated) and `new`: phase-1
-/// and phase-2 results of every row, module edges and external edges. The file's facts must
-/// be unchanged (same rows).
-pub(crate) fn import_results_changed(old: &Imports, new: &Imports, carry: &Carry<'_>, ix: &Index, f: FileId) -> bool {
-    let (o0, o1) = (carry.imports[f as usize] as usize, carry.imports[f as usize + 1] as usize);
-    let r = ix.file_facts(f).imports.range();
-    if o1 - o0 != r.len() {
-        return true;
+/// An empty resolution (a placeholder while the real one is updated in place).
+pub(crate) fn empty_imports() -> Imports {
+    Imports {
+        modules: ModuleTable::default(),
+        ns: Namespaces::default(),
+        p1: Vec::new(),
+        p2: Vec::new(),
+        edges: Vec::new(),
+        edge_start: vec![0],
+        ext_edges: Vec::new(),
+        ext_start: vec![0],
+        getattr: None,
+        stats: ImportStats::default(),
     }
-    let new_start = |g: FileId| ix.file_facts(g).imports.start;
-    let p1_same = old.p1[o0..o1].iter().zip(&new.p1[r.clone()]).all(|(a, b)| {
-        a.module == b.module && a.ext == b.ext && a.status == b.status && a.matched == b.matched
-    });
-    let p2_same = old.p2[o0..o1].iter().zip(&new.p2[r]).all(|(a, b)| {
-        carry.node(a.target) == b.target && shift_row(a.via, carry.imports, new_start) == b.via && a.status == b.status && a.flags == b.flags
-    });
-    let (oe, ne) = (old.module_edges(f), new.module_edges(f));
-    let edges_same = oe.len() == ne.len() && oe.iter().zip(ne).all(|(a, b)| carry.node(a.dst) == b.dst && a.rows == b.rows && a.flags == b.flags);
-    !(p1_same && p2_same && edges_same && old.ext_edges(f) == new.ext_edges(f))
 }
 
 /// The interned ids of every name the resolvers look up by text (builtins, dunders, marker

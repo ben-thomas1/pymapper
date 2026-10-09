@@ -248,6 +248,15 @@ impl OldSnap {
         self.defs.iter().filter_map(|d| d.name)
     }
 
+    /// Whether a node of a re-extracted or removed file has no new node in `map`.
+    pub fn any_dropped_gone(&self, map: &[NodeId]) -> bool {
+        self.dropped.iter().enumerate().any(|(k, &(f, first))| {
+            let end = self.dropped.get(k + 1).map_or(self.defs.len(), |&(_, s)| s as usize);
+            let v0 = self.file_node[f as usize];
+            (0..(end - first as usize) as u32).any(|d| map[(v0 + d) as usize] == NONE)
+        })
+    }
+
     /// Package/module node of every old file.
     pub fn file_nodes(&self) -> &[NodeId] {
         &self.file_node

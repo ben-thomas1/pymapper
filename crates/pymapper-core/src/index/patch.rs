@@ -75,24 +75,42 @@ fn metrics_run(ff: &FileFacts, f: FileId) -> (u32, u32) {
     (ff.defs.start - f, ff.defs.len.saturating_sub(1))
 }
 
-/// Old node -> new node outside the replaced def blocks: old ids at or after the end of
-/// block `k` (`ends[k]`) move by `shift[k]` (cumulative).
-struct Shift {
+/// Old node -> new node of a content-only patch: the def blocks `starts[k]..ends[k]` of the
+/// re-extracted files were replaced; old ids at or after `ends[k]` move by `shift[k]`
+/// (cumulative).
+#[derive(Debug, Default)]
+pub(crate) struct NodeShift {
+    starts: Vec<u32>,
     ends: Vec<u32>,
     shift: Vec<i64>,
 }
 
-impl Shift {
+impl NodeShift {
     fn is_identity(&self) -> bool {
         self.shift.iter().all(|&d| d == 0)
     }
 
+    /// New id of an old node outside the replaced blocks (callers never pass ids inside).
     #[inline]
     fn apply(&self, v: NodeId) -> NodeId {
         if v == NONE {
             return NONE;
         }
         let k = self.ends.partition_point(|&e| e <= v);
+        if k == 0 { v } else { (i64::from(v) + self.shift[k - 1]) as NodeId }
+    }
+
+    /// New id of old node `v`; `NONE` for `NONE` and for the defs of re-extracted files (which
+    /// have no translation by offset). O(log blocks), no memory access beyond the blocks.
+    #[inline]
+    pub(crate) fn translate(&self, v: NodeId) -> NodeId {
+        if v == NONE {
+            return NONE;
+        }
+        let k = self.ends.partition_point(|&e| e <= v);
+        if k < self.starts.len() && v >= self.starts[k] {
+            return NONE;
+        }
         if k == 0 { v } else { (i64::from(v) + self.shift[k - 1]) as NodeId }
     }
 }
@@ -109,7 +127,7 @@ fn patch_nodes(
     dirty: &[bool],
     store: &crate::extract::facts::FactStore,
     anonymous: Sym,
-) -> (Nodes, Vec<u32>, Vec<NodeId>, Shift) {
+) -> (Nodes, Vec<u32>, Vec<NodeId>, NodeShift) {
     // Replaced blocks in node order: (module node, old block end, file).
     let mut blocks: Vec<(NodeId, NodeId, FileId)> = Vec::new();
     for (f, &d) in dirty.iter().enumerate() {
@@ -119,10 +137,15 @@ fn patch_nodes(
         }
     }
     blocks.sort_unstable();
-    let mut shift = Shift { ends: Vec::with_capacity(blocks.len()), shift: Vec::with_capacity(blocks.len()) };
+    let mut shift = NodeShift {
+        starts: Vec::with_capacity(blocks.len()),
+        ends: Vec::with_capacity(blocks.len()),
+        shift: Vec::with_capacity(blocks.len()),
+    };
     let mut cum = 0i64;
-    for &(_, end, f) in &blocks {
+    for &(m, end, f) in &blocks {
         cum += i64::from(new_ff[f as usize].defs.len.max(1)) - i64::from(old_ff[f as usize].defs.len.max(1));
+        shift.starts.push(m + 1);
         shift.ends.push(end);
         shift.shift.push(cum);
     }
@@ -160,11 +183,11 @@ impl Index {
     /// increasing order (convert out-of-order files to `Fresh` first); old files not referenced
     /// are removed. `same_meta`: `inputs` has the old files in the old order with the same
     /// groups, module names and statuses (only contents changed): the hierarchy is patched
-    /// instead of rebuilt. See the module docs.
+    /// instead of rebuilt and the node translation is returned. See the module docs.
     ///
     /// # Panics
     /// If `src` does not match `inputs`, or `Old` entries are not increasing.
-    pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index, same_meta: bool) -> Index {
+    pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index, same_meta: bool) -> (Index, Option<NodeShift>) {
         assert_eq!(src.len(), inputs.len(), "one source per input file");
         let t0 = Instant::now();
         let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, nodes, group_node, modules, .. } = self;
@@ -271,7 +294,7 @@ impl Index {
             drop((nodes, group_node, modules));
             let mut ix = timing::time("incremental.build", || build::build(inputs, strings, store, metrics, headers, errors, st));
             ix.stats.build = t1.elapsed();
-            return ix;
+            return (ix, None);
         }
         // Same files, names and statuses: the hierarchy only changes inside the def blocks of
         // re-extracted files.
@@ -291,7 +314,7 @@ impl Index {
         let files = Files { facts: headers, group, status, module: files.module, node };
         let mut ix = Index { strings, paths, groups, files, facts: store, metrics, nodes, chain, group_node, modules, read_errors: errors, stats: st };
         ix.stats.build = t1.elapsed();
-        ix
+        (ix, Some(shift))
     }
 
     /// Whether `inputs` lists exactly this index's paths, in the same order.

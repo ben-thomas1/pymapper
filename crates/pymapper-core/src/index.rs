@@ -88,7 +88,7 @@ mod tests;
 pub use inputs::{Group, Inputs};
 pub use load::{LoadOptions, LoadStats, ReadError, load, load_with};
 pub(crate) use load::load_cached;
-pub(crate) use patch::Src;
+pub(crate) use patch::{NodeShift, Src};
 
 use std::ops::Range;
 use std::path::Path;
