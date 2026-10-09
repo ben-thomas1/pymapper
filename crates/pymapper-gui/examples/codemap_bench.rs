@@ -24,7 +24,7 @@ use pymapper_gui::codemap::metrics::{ColorMetric, EdgeMetric};
 use pymapper_gui::codemap::scene::SceneParams;
 use pymapper_gui::codemap::{CodeMap, MapParams};
 use pymapper_gui::gpu;
-use pymapper_gui::map::stress::{self, Rng};
+use pymapper_gui::map::stress::Rng;
 use pymapper_gui::map::{MapState, MapStats};
 use pymapper_gui::render::{FrameInput, Renderer};
 use pymapper_gui::stats::{Samples, process_usage};
@@ -168,11 +168,12 @@ fn main() -> Result<()> {
     for (name, d) in &map.phases {
         println!("  {name:<22} {:>8.1} ms", ms(*d));
     }
-    for size in [SizeMetric::CcSum] {
-        let t = Instant::now();
-        let m = CodeMap::build(Arc::clone(&analysis), MapParams { size, ..MapParams::default() });
-        println!("  rebuild for size {size:?}: {:.1} ms ({} edges)", ms(t.elapsed()), m.edges.len());
-    }
+    // A size-metric change (cc sum) rebuilds layout, reveal bands and edges. It also
+    // replaces the one-file layout cache, so the next run lays out from scratch.
+    let t = Instant::now();
+    let m = CodeMap::build(Arc::clone(&analysis), MapParams { size: SizeMetric::CcSum, ..MapParams::default() });
+    println!("  rebuild for size CcSum: {:.1} ms ({} edges)", ms(t.elapsed()), m.edges.len());
+    drop(m);
 
     println!("scene builds:");
     let mut scene = None;
@@ -322,6 +323,5 @@ fn main() -> Result<()> {
         mib(mem.atlas as usize),
         mib(process_usage().peak_rss_bytes as usize)
     );
-    let _ = stress::SEED;
     Ok(())
 }

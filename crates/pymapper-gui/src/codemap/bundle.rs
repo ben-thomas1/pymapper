@@ -63,8 +63,9 @@ impl Bundler {
         spline(&self.thin, out)
     }
 
-    /// The control polygon into `self.pts`; false if a needed rect is missing.
-    fn polygon(&mut self, ix: &Index, layout: &Layout, src: NodeId, src_open: bool, dst: NodeId, dst_open: bool) -> bool {
+    /// The control polygon into `self.pts` (see [`Bundler::points`]); false if a needed rect is
+    /// missing.
+    pub(crate) fn polygon(&mut self, ix: &Index, layout: &Layout, src: NodeId, src_open: bool, dst: NodeId, dst_open: bool) -> bool {
         let anchor = |v: NodeId, open: bool| -> Option<Point> {
             let r = layout.rect(v)?;
             if open {
@@ -147,6 +148,14 @@ impl Bundler {
         }
         self.pts.push(b0);
         true
+    }
+}
+
+impl Bundler {
+    /// The control polygon of the last [`Bundler::route`] (before straightening for
+    /// `polygon` only; after it for `route`).
+    pub fn points(&self) -> &[Point] {
+        &self.pts
     }
 }
 

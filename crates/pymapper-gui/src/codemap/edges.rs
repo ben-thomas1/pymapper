@@ -83,6 +83,8 @@ struct Scratch {
     rows: Vec<RollupEdge>,
     /// `api, loc, complexity` per row of `rows`.
     extra: Vec<[u64; 3]>,
+    /// Every metric per row of `rows`.
+    ws: Vec<EdgeWeights>,
     seen: Vec<u32>,
     vals: Vec<u32>,
     keep: Vec<bool>,
@@ -153,6 +155,8 @@ fn band_edges(ix: &Index, rollup: &Rollup, reveal: &Reveal, callee: &Callee<'_>,
         x[2] += u64::from(sites) * u64::from(callee.cc[w as usize].max(1));
     }
     let sat = |x: u64| x.min(u64::from(u32::MAX)) as u32;
+    s.ws.clear();
+    s.ws.extend(rows.iter().zip(&s.extra).map(|(e, x)| weights(e, x, sat)));
     // Prune per source run, then emit the rows new at this band.
     s.keep.clear();
     s.keep.resize(rows.len(), per_source == 0);
@@ -166,16 +170,16 @@ fn band_edges(ix: &Index, rollup: &Rollup, reveal: &Reveal, callee: &Callee<'_>,
             if j - i <= per_source {
                 s.keep[i..j].fill(true);
             } else {
+                let ws = &s.ws[i..j];
                 for m in EdgeMetric::ALL {
+                    let c = m.column();
                     s.vals.clear();
-                    s.vals.extend((i..j).map(|r| weights(&rows[r], &s.extra[r], sat)[m.column()]));
+                    s.vals.extend(ws.iter().map(|w| w[c]));
                     let k = s.vals.len() - per_source;
                     let (_, t, _) = s.vals.select_nth_unstable(k);
                     let t = (*t).max(1);
-                    for r in i..j {
-                        if weights(&rows[r], &s.extra[r], sat)[m.column()] >= t {
-                            s.keep[r] = true;
-                        }
+                    for (keep, w) in s.keep[i..j].iter_mut().zip(ws) {
+                        *keep |= w[c] >= t;
                     }
                 }
             }
@@ -190,7 +194,7 @@ fn band_edges(ix: &Index, rollup: &Rollup, reveal: &Reveal, callee: &Callee<'_>,
         if ea.lod.min.max(eb.lod.min) != b {
             continue;
         }
-        let w = weights(e, &s.extra[r], sat);
+        let w = s.ws[r];
         if w.iter().all(|&x| x == 0) {
             continue;
         }
