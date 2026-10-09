@@ -667,6 +667,34 @@ Per level on the venv (edges, time with a warm scratch):
 - Correctness: `stdlib_rollup_matches_reference` (ignored test) checks every level, under three
   call/import filters, against a hash-set brute force, and the aggregates against subtree walks.
 
+### Treemap layout (S7.3)
+
+`cargo bench -p pymapper-core --bench layout -- [--third DIR] [--stdlib DIR] [--first DIR]
+[--synthetic NODES] [--reps R]`. `--third` makes every top-level entry of a `site-packages`
+one distribution. Loading is not part of the layout numbers. Times are best of R, release
+build, Apple M4 Pro (14 cores).
+
+| input                                        | nodes     | levels | tree build | all levels | per node | rects   | tree    | cache save / load  |
+|----------------------------------------------|-----------|--------|------------|------------|----------|---------|---------|--------------------|
+| stdlib 3.13 (631 files, 305k LOC)            | 18 779    | 7      | 0.31 ms    | 0.43 ms    | 22.7 ns  | 0.3 MB  | 0.3 MB  | 0.71 / 0.10 ms     |
+| venv + stdlib + crates/ (55k files, 16.9M LOC, 482 groups) | 912 128 | 25 | 25.8 ms | 5.8 ms | 6.4 ns | 14.6 MB | 16.4 MB | 7.4 / 4.5 ms |
+| synthetic venv-like, 14 threads              | 2 001 421 | 5      | 24.3 ms    | 6.9 ms     | 3.4 ns   | 32.0 MB | 36.0 MB | 16.1 / 11.7 ms     |
+| synthetic venv-like, 1 thread                | 2 001 421 | 5      | 23.9 ms    | 42.0 ms    | 21.0 ns  | 32.0 MB | 36.0 MB |                    |
+
+Observations:
+
+- The layout itself is a few milliseconds even for the whole venv; the deepest level a
+  semantic zoom asks for is computed on the layout thread in well under a frame. The
+  largest venv level (226k nodes at depth 5) takes about 1 ms.
+- `LayoutTree::from_index` (25.8 ms on the venv) is dominated by hashing every node name for
+  the hierarchy hash; it runs once per index.
+- Memory is 16 B per laid-out node plus 18 B per node for the tree. Peak RSS (460 MB on the
+  venv) is the index, not the layout.
+- Loading the cache costs about as much as recomputing on these inputs (4.5 ms against
+  5.8 ms on the venv). The layout is deterministic, so positions are stable across runs
+  either way; the cache (keyed by hierarchy hash and config) only pays off if the layout gets
+  costlier. It is written on the layout thread when idle, so it never delays a frame.
+
 ### Hotspots and coupling (S4.3a)
 
 `hotspot` target: `load`, then the hotspot pass and the top 100 functions. `coupling` target:

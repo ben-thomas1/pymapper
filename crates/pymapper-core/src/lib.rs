@@ -12,6 +12,7 @@ pub mod graph;
 pub mod incremental;
 pub mod index;
 pub mod intern;
+pub mod layout;
 pub mod lex;
 pub mod output;
 pub mod query;
