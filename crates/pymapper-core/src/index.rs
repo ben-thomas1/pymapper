@@ -79,7 +79,7 @@
 mod build;
 mod inputs;
 mod load;
-mod qid;
+pub(crate) mod qid;
 
 #[cfg(test)]
 mod tests;
