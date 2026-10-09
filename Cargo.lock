@@ -2213,7 +2213,9 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "pymapper-core",
+ "rayon",
 ]
 
 [[package]]
