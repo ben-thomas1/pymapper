@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "tool": "pymapper",
+  "entries": [
+    {"code": "PM101", "id": "pkg.zeta:handle", "count": 1},
+    {"code": "PM106", "id": "pkg.alpha:Big.run", "count": 1},
+    {"code": "PM107", "id": "pkg", "count": 1},
+    {"code": "PM301", "id": "", "detail": ["pkg.alpha", "pkg.zeta", "pkg.alpha"], "count": 1},
+    {"code": "PM303", "id": "pkg.alpha", "detail": ["we\"ird\nname", "core-layers"], "count": 1},
+    {"code": "PM401", "id": "odd:f", "count": 1},
+    {"code": "PM405", "id": "pkg.alpha", "detail": ["os.path"], "count": 1},
+    {"code": "PM405", "id": "pkg.alpha", "detail": ["yaml"], "count": 1},
+    {"code": "PM601", "id": "pkg/café/�.py", "detail": ["yaml", "PyYAML"], "count": 1},
+    {"code": "PM602", "id": "", "detail": ["requests"], "count": 1}
+  ]
+}

@@ -1,0 +1,25 @@
+[package]
+name = "xtask"
+description = "pymapper dev tooling (bench, diff-ruff, fuzz); never shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pymapper-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+# Oracle for `cargo xtask diff-ruff`. Ruff's crates are not on crates.io: pin the newest tag
+# that builds on rust-toolchain.toml (0.16.10 needs rustc >= 1.97). ruff_text_size is the
+# range type of their public API (same repository, already a dependency of both).
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.10" }
+
+[lints]
+workspace = true

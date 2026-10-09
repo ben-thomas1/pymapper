@@ -1,0 +1,5 @@
+file lines=8 evidence=0
+module 0:<module> L1-8 b0-65
+def 1:foo in=0 L1-2 b0-19 @1:4 ()
+def 2:bar in=0 L4-5 b21-40 @4:4 ()
+def 3:unused in=0 L7-8 b42-64 @7:4 ()

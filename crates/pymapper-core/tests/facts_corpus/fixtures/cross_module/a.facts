@@ -1,0 +1,14 @@
+file lines=16 evidence=8
+module 0:<module> L1-16 b0-226
+def 1:caller in=0 L6-10 b84-157 @6:4 ()
+def 2:local_func in=0 L12-13 b159-185 @12:4 ()
+def 3:same_name_test in=0 L15-16 b187-225 @15:4 ()
+import 0:<module> L1:14 from b import foo
+import 0:<module> L2:14 from b import bar as b_bar
+import 0:<module> L3:7 import utils
+import 0:<module> L4:20 from os.path import join
+call 1:caller L7:4 foo()
+call 1:caller L8:4 b_bar()
+call 1:caller L9:4 utils.helper() dotted
+call 1:caller L10:4 join()
+call 3:same_name_test L16:4 local_func()

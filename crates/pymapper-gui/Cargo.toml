@@ -1,0 +1,38 @@
+[package]
+name = "pymapper-gui"
+description = "pymapper native GUI (winit + wgpu, egui panels)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pymapper-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+glyphon.workspace = true
+libc.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+# macOS: Metal only.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+# Linux: Vulkan; Wayland first, X11 (XWayland) as fallback. The Wayland/X11/xkb client
+# libraries are dlopen'ed at runtime, so building needs no system -dev packages.
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan"] }
+winit = { workspace = true, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle", "x11"] }
+egui-winit = { workspace = true, features = ["wayland", "x11"] }
+
+[lints]
+workspace = true

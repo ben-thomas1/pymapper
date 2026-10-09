@@ -1,0 +1,381 @@
+# pymapper configuration template
+# ================================
+#
+# Copy this file to `pymapper.toml` at your project root, or put the same options in
+# `pyproject.toml` under `[tool.pymapper]` (sections become `[tool.pymapper.rules]`,
+# `[tool.pymapper.thresholds]`, `[[tool.pymapper.contracts]]`, ...). A standalone
+# `pymapper.toml` uses top-level keys only: do not add a `[tool.pymapper]` header to it.
+#
+# Discovery: pymapper walks up from the first path given on the command line (or the working
+# directory). In each directory `pymapper.toml` wins over a `pyproject.toml` that has a
+# `[tool.pymapper]` table; a `pyproject.toml` without one is skipped. The directory holding the
+# config file is the project root. `--config FILE` picks a file explicitly, `--isolated` ignores
+# config files entirely.
+#
+# Precedence (lowest to highest): built-in defaults, this file, `--set 'KEY = VALUE'` fragments
+# (same syntax as this file, e.g. `--set 'thresholds.max-mccabe = 12'`), typed CLI flags.
+#
+# Validation is strict: unknown keys, wrong types and out-of-range values are errors, reported
+# together with file:line:col and a "did you mean" suggestion.
+#
+# Every option below is shown commented out with its DEFAULT value (`# key = default`). Lines
+# indented further (`#   key = ...`) are examples only. Relative paths are resolved against the
+# directory of this file; globs are relative to the project root.
+#
+# Cost notes give the asymptotic class of the work an option enables, with numbers measured by
+# `pymapper check --stats` on a 14-core Apple M4 Pro, release build, warm OS file cache (see
+# "Check (S4.5)" in docs/benchmarks.md). "Uncached" = first run, "cached" = later runs.
+
+# ---------------------------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------------------------
+
+# Files and directories to analyse. Positional CLI paths replace this list.
+# Default: the project root.
+#   paths = ["src", "tests"]
+# cost: O(files + bytes) - the walk, read and parse of everything listed. Measured: 305k LOC
+#       in 54 ms uncached / 20 ms cached; 17M LOC (60k files) in 3.4 s / 1.5 s, 0.7 GB peak.
+
+# Extra first-party import roots (where `import pkg` is resolved from). Empty = auto-detect:
+# the project root plus a `src/` layout, namespace packages and editable installs.
+# src = []
+#   src = ["src", "libs/shared"]
+# cost: none.
+
+# Gitignore-style globs to skip. Setting `exclude` REPLACES the default list below; use
+# `extend-exclude` to add to it.
+# exclude = [".bzr", ".direnv", ".eggs", ".git", ".hg", ".mypy_cache", ".nox", ".pants.d", ".pymapper_cache", ".pytest_cache", ".pytype", ".ruff_cache", ".svn", ".tox", ".venv", "__pycache__", "__pypackages__", "_build", "buck-out", "build", "dist", "node_modules", "site-packages", "venv"]
+# cost: O(1) per path checked; excluded directories are never entered (saves time).
+
+# Globs added to `exclude` (CLI: `--exclude`).
+# extend-exclude = []
+#   extend-exclude = ["migrations", "**/generated/*.py"]
+# cost: as `exclude`.
+
+# Honour .gitignore, .ignore and .git/info/exclude files.
+# respect-gitignore = true
+# cost: one small file read per directory that has an ignore file.
+
+# ---------------------------------------------------------------------------------------------
+# Environment: third-party packages and the standard library
+# ---------------------------------------------------------------------------------------------
+
+# Analyse third-party packages from the virtualenv, link first-party code to them and score
+# them (`pymapper deps --score`). Third-party findings never affect the `check` exit code.
+# (CLI: `--deps` / `--no-deps`.)
+# include-deps = false
+# cost: proportional to the size of site-packages (a large venv can be 60k files / 17M LOC);
+#       cached per distribution, so only the first run pays. Measured on a 478k-LOC project
+#       with a 17M-LOC venv (and the stdlib): 2.8 s uncached, 0.5 s cached, 0.7 GB peak RSS,
+#       vs 0.16 s / 0.10 s and 45 MB without them. Third-party files come from RECORD file
+#       lists (no walk).
+
+# Analyse the standard library of the target interpreter. (CLI: `--stdlib` / `--no-stdlib`.)
+# include-stdlib = false
+# cost: ~300-440k LOC for CPython 3.13 (305k measured for an install without the test
+#       suite: 54 ms uncached, 20 ms cached, 25 MB peak); cached per Python version.
+
+# Virtualenv to use. Unset = $VIRTUAL_ENV, then `.venv` or `venv` under the project root.
+# (CLI: `--venv`.)
+#   venv = ".venv"
+# cost: none.
+
+# Target Python version ("3.N"). Unset = from the venv's pyvenv.cfg, else `requires-python`.
+# Python 2 is not supported.
+#   python-version = "3.13"
+# cost: none.
+
+# ---------------------------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------------------------
+
+# Use the on-disk cache (first-party per file, third-party per distribution, stdlib per
+# version). (CLI: `--no-cache`.)
+# cache = true
+# cost: saves time on every run after the first (17M LOC: 3.4 s -> 1.5 s; 305k LOC: 54 ms ->
+#       20 ms); disk usage about 0.43 bytes per source byte (4.6 MB for 11 MB of stdlib,
+#       270 MB for a 650 MB venv; +10% with analysis.dupes fingerprints).
+
+# Cache directory. (CLI: `--cache-dir`.)
+# cache-dir = ".pymapper_cache"
+# cost: none.
+
+# Worker threads; 0 = one per logical CPU. (CLI: `--threads` / `-j`.)
+# threads = 0
+# cost: peak memory grows with threads (one bump arena per thread). Measured on 17.8M LOC:
+#       1 thread 10.4 s uncached / 1.4 s cached, 0.60-0.63 GB; 4 threads 3.5 s / 0.67 s,
+#       0.64-0.66 GB; 14 threads 2.8 s / 0.52 s, 0.68-0.70 GB.
+
+# Dead-code mode:
+#   "application" - only code reachable from entry points is live.
+#   "library"     - public (non-underscore) names in public modules are also roots.
+#   "auto"        - decided per project unit: the project root and every directory below it
+#                   with a pyproject.toml (monorepo packages); each file belongs to its
+#                   nearest unit. A unit is application if its pyproject.toml declares entry
+#                   points ([project.scripts], [project.gui-scripts], [project.entry-points])
+#                   or one of its files is a __main__ module / has an
+#                   `if __name__ == "__main__":` guard; library otherwise.
+# "application" / "library" force that mode for every unit. An application-mode unit without
+# any entry point (no __main__ guard, scripts, entrypoint rules or tests) gets a warning: every
+# definition in it looks unused. (CLI: `--mode`; `check --stats` shows the unit counts.)
+# mode = "auto"
+# cost: O(files) to assign files to units; one pyproject.toml parse per unit.
+
+# Finding output format: "concise" (path:line:col: CODE message), "json", "sarif", "github"
+# (GitHub Actions annotations). (CLI: `--output-format`.)
+# output-format = "concise"
+# cost: none.
+
+# Minimum confidence (0-100) a finding needs for `check` to report it. Dead-code findings are
+# scored by how sure the analysis is (resolved references, dynamic access, name fallback...).
+# (CLI: `--min-confidence`.)
+# min-confidence = 80
+# cost: none.
+
+# Baseline file: findings recorded in it (by stable id) are not reported.
+#   baseline = "pymapper-baseline.json"
+# cost: O(findings) hash lookups.
+
+# Framework presets: entrypoint rules for code that frameworks call by convention.
+#   "flask"    - routes, request hooks, error handlers, template filters, CLI commands,
+#                flask.views.View / MethodView subclasses, create_app.
+#   "fastapi"  - route / websocket / event / middleware / exception-handler decorators,
+#                Starlette endpoint and middleware classes, lifespan.
+#   "django"   - Model, Manager, QuerySet, Migration, AppConfig, View (and generic views),
+#                ModelAdmin and inlines, Form, ModelForm, BaseCommand, TestCase subclasses;
+#                @receiver, @admin.register/display/action, template tags and filters;
+#                urlpatterns, app_name, handler400/403/404/500, Meta, clean_*.
+#   "click"    - @click.command / @click.group / @<group>.command, result callbacks,
+#                click.Command / Group / ParamType subclasses.
+#   "pytest"   - test_* functions, Test* classes, pytest_* hooks, fixtures, hookimpls,
+#                xunit-style setup/teardown, unittest.TestCase subclasses.
+#   "pydantic" - BaseModel / RootModel / BaseSettings subclasses, validators, serializers,
+#                computed fields, model_config, model_post_init, Config.
+# (CLI: `--preset`, repeatable, adds to this list.)
+# presets = []
+#   presets = ["fastapi", "pydantic", "pytest"]
+# cost: O(1) amortised per definition (binary searches over the merged patterns).
+
+# ---------------------------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------------------------
+# Rules are identified by codes `PMxxx` (reference: docs/rules.md). Selectors are code
+# prefixes: "ALL", "PM", "PM1", "PM10", "PM101". When a rule matches both a select and an ignore
+# selector, the more specific selector wins; on a tie, ignore wins. Rules whose cost class is
+# "expensive" also need their analysis toggle (see [analysis]) to run; turning the toggle on is
+# enough to enable them unless they are ignored.
+[rules]
+
+# Rules to enable. Unset = the default rule set (the rules marked "on" in docs/rules.md).
+# (CLI: `--select`, replaces this list.)
+#   select = ["PM1", "PM2"]
+# cost: each enabled rule declares its own cost class (O(n), O(V+E) or expensive).
+
+# Rules enabled on top of `select` (or of the default set). (CLI: `--extend-select`.)
+# extend-select = []
+# cost: as `select`.
+
+# Rules to disable. (CLI: `--ignore`, adds to this list.)
+# ignore = []
+#   ignore = ["PM3"]
+# cost: none (disabled rules do not run).
+
+# Rules ignored in files matching a gitignore-style glob (relative to the project root).
+# per-file-ignores = {}
+#   [rules.per-file-ignores]
+#   "tests/**" = ["PM3"]
+#   "**/__init__.py" = ["PM101", "PM102"]
+# cost: one glob match per finding.
+
+# ---------------------------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------------------------
+# Per-rule numeric limits, named after the metric they bound. A finding is raised when a value
+# is strictly greater than a `max-*` limit (strictly less than a `min-*` limit); each rule's
+# documentation names the threshold it reads. Metrics are computed during extraction whether
+# or not a rule uses them; the thresholds themselves cost nothing.
+[thresholds]
+
+# McCabe cyclomatic complexity per function (identical to ruff C901 / PyCQA mccabe).
+# max-mccabe = 10
+
+# Cognitive complexity per function (SonarSource definition).
+# max-cognitive = 15
+
+# Block nesting depth per function.
+# max-nesting = 4
+
+# Lines per function (inclusive span, blank lines and comments included).
+# max-function-loc = 100
+
+# Parameters per function, excluding self / cls.
+# max-params = 7
+
+# Minimum maintainability index per function (0-100 scale; lower is worse).
+# min-maintainability = 10.0
+
+# Lines per module.
+# max-module-loc = 1000
+
+# Distinct first-party modules imported by one module (efferent coupling).
+# max-fan-out = 30
+
+# Distance from the main sequence `|A + I - 1|` per module, 0-1 (PM202, off by default), and the
+# smallest total coupling (importing plus imported first-party modules) a module needs to be
+# judged at all.
+# max-distance = 0.7
+# distance-min-coupling = 10
+
+# God module (PM203): more classes and functions than `max-module-symbols` AND a total coupling
+# (importing plus imported first-party modules) above `max-module-coupling`.
+# max-module-symbols = 80
+# max-module-coupling = 25
+
+# God class (PM204): weighted methods per class (summed McCabe) above `max-class-wmc` AND calls
+# into more than `max-class-fan-out` distinct other classes. Reads the call graph; the cost is
+# O(calls of the classes above `max-class-wmc`).
+# max-class-wmc = 47
+# max-class-fan-out = 5
+
+# Duplicate detection (needs `analysis.dupes = true`): shortest reported duplicate, in tokens
+# (at least 10) and in lines (at least 2). Lower values find more, smaller duplicates and cost
+# more time and memory.
+# dupes-min-tokens = 50
+# dupes-min-lines = 6
+
+# ---------------------------------------------------------------------------------------------
+# Entry points (dead-code roots)
+# ---------------------------------------------------------------------------------------------
+# Code matched here is treated as called from outside (so it, and everything it reaches, is
+# live). Presets add to these lists. Globs: `*` matches any run of characters including dots,
+# `?` one character; everything else is literal.
+[entrypoints]
+
+# Decorators, matched against the dotted name as written without call arguments
+# (`@app.route("/")` is `app.route`).
+# decorators = []
+#   decorators = ["*.route", "celery.task", "*.task"]
+# cost: O(1) amortised per decorator.
+
+# Base classes, fully qualified. Subclasses (direct or indirect, via the MRO) and their methods
+# are roots.
+# bases = []
+#   bases = ["myapp.plugins.Plugin", "django.views.generic.*"]
+# cost: O(MRO length) per class.
+
+# Symbol names. Patterns without `.` or `:` match the bare name; others match the stable
+# qualified id `pkg.mod:Class.method`. Use this for functions a framework loads by name from
+# non-Python configuration (YAML, JSON, ...): `"pkg.mod:*"` keeps every definition of a module.
+# names = []
+#   names = ["handle_*", "myapp.hooks:*", "aiml_ais_mcp.elnb.tools:*"]
+# cost: O(1) amortised per definition.
+
+# Treat [project.scripts], [project.gui-scripts], [project.entry-points] and
+# entry_points.txt targets as roots.
+# project-scripts = true
+# cost: none.
+
+# ---------------------------------------------------------------------------------------------
+# Analysis toggles
+# ---------------------------------------------------------------------------------------------
+[analysis]
+
+# Duplicate-code detection (token-window hashing across all first-party files).
+# dupes = false
+# cost: EXPENSIVE - O(tokens) time with a large hash table; memory grows with codebase size
+#       and falls as dupes-min-tokens rises. Measured: 305k LOC +20-30 ms, +6 MB peak;
+#       17M LOC +0.2 s extraction and +3.1 s matching, peak 0.7 -> 1.0 GB.
+
+# Exact transitive reachability ("LOC reached", impact sizes) instead of HyperLogLog
+# estimates (3.25% relative standard error; sets of at most 256 symbols and 4,096 lines are
+# exact anyway).
+# exact-reachability = false
+# cost: EXPENSIVE - one search per component of the condensed call graph, in parallel:
+#       O(sum of reached parts), up to O(V * (V + E)) (quadratic on long call chains); memory
+#       4 bytes per component per worker. Measured: 47-55ms on 14 threads (324ms on one) for
+#       a 17M-LOC venv, where the estimate takes ~240ms; a 30k-node chain takes 196ms (75x
+#       the estimate). On shallow call graphs (small reach sets, as in the venv) exact mode
+#       is therefore cheaper than the estimate and bounded in memory, while the estimate
+#       holds 2 * (2^p + 136) bytes per live dense sketch (2.3 KB at p = 10; 3.4 MB on the
+#       venv, 142 MB on an adversarial 200k-node synthetic graph).
+
+# Dead code: a name referenced anywhere (attribute access, identifier-like string literals,
+# getattr) keeps a definition possibly live; it is reported with lower confidence instead of
+# as certainly dead. Turning this off reports more, less reliable findings.
+# name-fallback = true
+# cost: O(n): the evidence hashes are taken during extraction anyway; the fallback probes each
+#       once against the names still in doubt (parallel). Measured: 3 ms on the stdlib (437k
+#       LOC), 50-130 ms on a 17M-LOC venv (library / application mode) out of 0.18-0.25 s for
+#       the whole dead-code pass.
+
+# Call resolution: link a call on an unknown receiver (`obj.method()`) to the only method with
+# that name in the program, with confidence "possible".
+# unique-method-fallback = true
+# cost: O(calls) hash lookups.
+
+# Count `if TYPE_CHECKING:` (type-only) imports when finding import cycles.
+# type-checking-cycles = false
+# cost: none (same O(V + E) cycle search over a few more edges; the whole search takes about
+#       14 ms on a 17M-LOC venv).
+
+# coverage.py JSON report (`coverage json`) used as runtime evidence for dead-code confidence.
+#   coverage = "coverage.json"
+# cost: O(size of report) to load.
+
+# ---------------------------------------------------------------------------------------------
+# Import contracts
+# ---------------------------------------------------------------------------------------------
+# Rules about which modules may import which. A module name covers its submodules. Each
+# contract is a `[[contracts]]` table (in pyproject.toml: `[[tool.pymapper.contracts]]`).
+#
+# Keys shared by all kinds:
+#   name                - unique name, shown in findings (required).
+#   kind                - "layers", "forbidden" or "independence" (required).
+#   allow-type-checking - exempt `if TYPE_CHECKING:` imports (default true).
+#   transitive          - also forbid indirect imports through other modules (default false).
+#                         cost: O(V + E) per contract instead of O(E); a `layers`
+#                         contract with `containers` costs O(V + E) and 4 bytes per module
+#                         for each container.
+#   ignore-imports      - exempt edges, "importer -> imported"; `*` matches exactly one
+#                         segment, `**` zero or more, so "a.**" also matches "a" itself
+#                         (default []).
+#
+# kind = "layers": highest layer first; a layer may import any lower layer, never a higher
+# one. A layer is a module or a list of sibling modules.
+#   layers               - the ordered layers (required, at least two; a layer may not be
+#                          an empty list).
+#   containers           - when set, the layers are relative to each container
+#                          (`container.layer`), e.g. one layering per app (default []).
+#   independent-siblings - siblings in one layer may not import each other (default false).
+#
+#   [[contracts]]
+#   name = "architecture"
+#   kind = "layers"
+#   layers = ["myapp.api", ["myapp.billing", "myapp.accounts"], "myapp.db"]
+#   containers = []
+#   independent-siblings = true
+#   allow-type-checking = true
+#   transitive = false
+#   ignore-imports = ["myapp.db.migrations -> myapp.api.**"]
+#
+# kind = "forbidden": `source` modules may not import `forbidden` modules.
+#   source    - importing modules (required, not empty).
+#   forbidden - modules they may not import (required, not empty).
+#
+#   [[contracts]]
+#   name = "core stays pure"
+#   kind = "forbidden"
+#   source = ["myapp.core"]
+#   forbidden = ["django", "requests"]
+#
+# kind = "independence": none of `modules` may import another.
+#   modules - the mutually independent modules (required, at least two).
+#
+#   [[contracts]]
+#   name = "plugins are independent"
+#   kind = "independence"
+#   modules = ["myapp.plugins.a", "myapp.plugins.b", "myapp.plugins.c"]
+#
+# cost: O(import edges) per contract (O(V + E) with `transitive`, per container for `layers`
+#       with `containers`). Measured on a 17M-LOC venv: 4 contracts (one covering every
+#       module) in 5 ms, 24 ms with `transitive` (most of it building the import graph).
