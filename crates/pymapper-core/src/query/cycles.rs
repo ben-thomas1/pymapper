@@ -13,7 +13,7 @@
 //!   no whole-graph Tarjan.
 
 use super::walk::WalkOptions;
-use super::{LABEL_OVERRIDE, Query, Scratch, label_conf};
+use super::{Query, Scratch, follows};
 use crate::analysis::cycles::witness;
 use crate::index::{NONE, NodeId};
 
@@ -31,16 +31,14 @@ pub struct CycleHit {
 impl Query<'_> {
     /// Import cycles containing a module of `target` (its module for a def; every module of
     /// a package), one per cyclic component, in component order.
-    pub fn import_cycles(&self, target: NodeId) -> Vec<CycleHit> {
+    pub fn import_cycles(&self, target: NodeId, scratch: &mut Scratch) -> Vec<CycleHit> {
         let (mg, scc) = self.cycle_graph();
         let g = mg.graph();
         let range = self.module_range(target);
         let lo = mg.nodes().partition_point(|&v| v < range.start) as u32;
         let hi = mg.nodes().partition_point(|&v| v < range.end) as u32;
         let mut seen: Vec<u32> = Vec::new();
-        let mut parent: Vec<u32> = Vec::new();
-        let mut queue = Vec::new();
-        let mut local = Vec::new();
+        let (parent, queue, local) = (&mut scratch.parent, &mut scratch.queue, &mut scratch.buf);
         let mut out = Vec::new();
         for m in lo..hi {
             let c = scc.comp(m);
@@ -48,12 +46,13 @@ impl Query<'_> {
                 continue;
             }
             seen.push(c);
-            if parent.is_empty() {
-                parent = vec![NONE; mg.len() as usize];
+            // `parent` is all `NONE` between queries (`witness` resets what it sets).
+            if parent.len() < mg.len() as usize {
+                parent.resize(mg.len() as usize, NONE);
             }
             local.clear();
             // `m` is the lowest module of the target in this component.
-            witness(g, scc, c, m, &mut parent, &mut queue, &mut local);
+            witness(g, scc, c, m, parent, queue, local);
             let mut members: Vec<NodeId> = scc.members(c).iter().map(|&l| mg.node(l)).collect();
             members.sort_unstable();
             out.push(CycleHit { members, witness: local.iter().map(|&l| mg.node(l)).collect() });
@@ -66,7 +65,7 @@ impl Query<'_> {
     pub fn call_cycle(&self, t: NodeId, opts: &WalkOptions, scratch: &mut Scratch) -> Option<CycleHit> {
         let g = &self.graph;
         let n = g.node_count() as usize;
-        let keep = |l: u8| label_conf(l) <= opts.min_conf && (opts.overrides || l & LABEL_OVERRIDE == 0);
+        let keep = |l: u8| follows(l, opts.min_conf, opts.overrides);
         // Forward BFS: `a.pos` = BFS parent.
         let (fa, queue) = (&mut scratch.a, &mut scratch.queue);
         fa.begin(n);

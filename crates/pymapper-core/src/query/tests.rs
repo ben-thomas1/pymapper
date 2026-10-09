@@ -187,6 +187,36 @@ fn lookup_ambiguous_and_resolve() {
 }
 
 #[test]
+fn resolve_with_limit_one_stays_ambiguous() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let one = LookupOptions { limit: 1, ..LookupOptions::default() };
+    // A second suffix match is still looked for; the list is cut to the limit.
+    match q.resolve(b"leaf", &one) {
+        Resolved::Ambiguous(v) => assert_eq!(f.qids(v.iter().map(|m| m.node)), strs(&["app.main:leaf"])),
+        r => panic!("{r:?}"),
+    }
+    assert_eq!(q.resolve(b"util.leaf", &one), Resolved::Unique(f.node("pkg.util:leaf")));
+    assert_eq!(q.resolve(b"pkg.core:Engine.run", &one), Resolved::Unique(f.node("pkg.core:Engine.run")));
+    assert!(matches!(q.resolve(b"helpr", &one), Resolved::NotFound(v) if v.len() == 1));
+    assert_eq!(q.resolve(b"leaf", &LookupOptions { limit: 0, ..one }), Resolved::NotFound(Vec::new()));
+}
+
+#[test]
+fn lookup_rejects_empty_segments() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let o = LookupOptions { fuzzy: false, ..LookupOptions::default() };
+    for s in ["pkg.", ".pkg", "pkg..core", "pkg.core.", "core..Engine", ":Engine.run", "Engine.run:", "."] {
+        assert!(q.lookup(s.as_bytes(), &o).is_empty(), "{s}");
+        assert!(!matches!(q.resolve(s.as_bytes(), &o), Resolved::Unique(_)), "{s}");
+    }
+    // Fuzzy suggestions still use the last segment.
+    let m = q.lookup(b".pkg", &LookupOptions::default());
+    assert!(m.iter().all(|m| m.kind == MatchKind::Fuzzy) && m[0].node == f.node("pkg"));
+}
+
+#[test]
 fn lookup_fuzzy() {
     let f = fx(PROJECT);
     let q = f.q();
@@ -279,6 +309,11 @@ fn symbol_view_and_locations() {
     assert_eq!(q.file_by_path(Path::new("core.py")), Some(file));
     assert_eq!(q.file_by_path(Path::new("__init__.py")), None, "ambiguous suffix");
     assert_eq!(q.file_by_path(Path::new("nope.py")), None);
+    // Leading `./` components are not part of the suffix.
+    assert_eq!(q.file_by_path(Path::new("./pkg/core.py")), Some(file));
+    assert_eq!(q.file_by_path(Path::new("././core.py")), Some(file));
+    assert_eq!(q.file_by_path(Path::new("./")), None);
+    assert_eq!(q.file_by_path(Path::new(".")), None);
 }
 
 // -- callers / callees / impact -------------------------------------------------------------
@@ -508,14 +543,15 @@ fn function_level_imports_count_for_def_targets() {
 fn import_cycles_containing_a_target() {
     let f = fx(PROJECT);
     let q = f.q();
-    let hits = q.import_cycles(f.node("cyc.a"));
+    let mut s = Scratch::default();
+    let hits = q.import_cycles(f.node("cyc.a"), &mut s);
     assert_eq!(hits.len(), 1);
     assert_eq!(f.qids(hits[0].members.iter().copied()), strs(&["cyc.a", "cyc.b"]));
     assert_eq!(hits[0].witness.len(), 2);
     // A def stands for its module; a package for its modules.
-    assert_eq!(q.import_cycles(f.node("cyc.a:fa")), hits);
-    assert_eq!(q.import_cycles(f.node("cyc")), hits);
-    assert!(q.import_cycles(f.node("pkg")).is_empty());
+    assert_eq!(q.import_cycles(f.node("cyc.a:fa"), &mut s), hits);
+    assert_eq!(q.import_cycles(f.node("cyc"), &mut s), hits);
+    assert!(q.import_cycles(f.node("pkg"), &mut s).is_empty());
 }
 
 #[test]
@@ -561,16 +597,34 @@ fn summary_counts_and_rankings() {
 // -- brute-force references on the corpus ---------------------------------------------------
 
 /// Adjacency of the kept call edges: node -> neighbours (forward or reverse).
-fn adjacency(f: &Fx, min_conf: Confidence, reverse: bool) -> HashMap<NodeId, Vec<NodeId>> {
+fn adjacency(f: &Fx, min_conf: Confidence, overrides: bool, reverse: bool) -> HashMap<NodeId, Vec<NodeId>> {
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for e in f.calls.edges() {
-        if e.conf == Confidence::Unresolved || e.conf > min_conf {
+        if e.conf == Confidence::Unresolved || e.conf > min_conf || (!overrides && e.reason == Reason::Override) {
             continue;
         }
         let (a, b) = if reverse { (e.dst, e.src) } else { (e.src, e.dst) };
         adj.entry(a).or_default().push(b);
     }
     adj
+}
+
+/// (best confidence, only an override edge is that sure) of every (src, dst) pair over the
+/// call edges with a target (override edges only when `overrides`).
+fn best_edges(f: &Fx, overrides: bool) -> HashMap<(NodeId, NodeId), (Confidence, bool)> {
+    let mut best: HashMap<(NodeId, NodeId), (Confidence, bool)> = HashMap::new();
+    for e in f.calls.edges() {
+        if e.conf == Confidence::Unresolved || (!overrides && e.reason == Reason::Override) {
+            continue;
+        }
+        let new = (e.conf, e.reason == Reason::Override);
+        let cur = best.entry((e.src, e.dst)).or_insert(new);
+        // Lower confidence first; at equal confidence a real call wins.
+        if new < *cur {
+            *cur = new;
+        }
+    }
+    best
 }
 
 /// Plain BFS distances from `s` (itself at 0).
@@ -656,18 +710,27 @@ fn walks_match_plain_bfs() {
     let q = f.q();
     let mut s = Scratch::default();
     let mut checked = 0;
-    for min_conf in [Confidence::Possible, Confidence::Likely, Confidence::Certain] {
-        let rev = adjacency(&f, min_conf, true);
-        let fwd = adjacency(&f, min_conf, false);
+    let mut dispatch = 0;
+    for (min_conf, overrides) in [Confidence::Possible, Confidence::Likely, Confidence::Certain].into_iter().flat_map(|c| [(c, true), (c, false)]) {
+        let rev = adjacency(&f, min_conf, overrides, true);
+        let fwd = adjacency(&f, min_conf, overrides, false);
+        let best = best_edges(&f, overrides);
         for v in 0..f.ix.node_count() {
             for (adj, callers) in [(&rev, true), (&fwd, false)] {
-                let o = WalkOptions { min_conf, scope: Scope::Node, ..WalkOptions::transitive() };
+                let o = WalkOptions { min_conf, overrides, scope: Scope::Node, ..WalkOptions::transitive() };
                 let w = if callers { q.callers(v, &o, &mut s) } else { q.callees(v, &o, &mut s) };
                 let mut want = distances(adj, v);
                 want.remove(&v);
                 let got: HashMap<NodeId, u32> = w.hops.iter().map(|h| (h.node, h.depth)).collect();
                 assert_eq!(got.len(), w.hops.len(), "each node once");
-                assert_eq!(got, want, "node {} callers={callers} {min_conf:?}", f.ix.qid_string(v));
+                assert_eq!(got, want, "node {} callers={callers} {min_conf:?} overrides={overrides}", f.ix.qid_string(v));
+                // Each hop reports the best edge between it and `via` among those followed.
+                for h in &w.hops {
+                    let pair = if callers { (h.node, h.via) } else { (h.via, h.node) };
+                    assert_eq!(Some(&(h.conf, h.dispatch)), best.get(&pair), "{pair:?} overrides={overrides}");
+                    assert!(overrides || !h.dispatch);
+                    dispatch += usize::from(h.dispatch);
+                }
                 // Depth-bounded walks are the prefix of the unbounded one.
                 let d2 = WalkOptions { depth: 2, ..o };
                 let w2 = if callers { q.callers(v, &d2, &mut s) } else { q.callees(v, &d2, &mut s) };
@@ -686,6 +749,7 @@ fn walks_match_plain_bfs() {
         }
     }
     assert!(checked > 100, "the corpus has call chains ({checked})");
+    assert!(dispatch > 10, "the corpus has override edges ({dispatch})");
 }
 
 #[test]
@@ -693,24 +757,29 @@ fn paths_match_plain_bfs() {
     let f = corpus_fx();
     let q = f.q();
     let mut s = Scratch::default();
-    let fwd = adjacency(&f, Confidence::Possible, false);
     let mut found = 0;
     let n = f.ix.node_count();
-    for a in 0..n {
-        let dist = distances(&fwd, a);
-        for b in (0..n).step_by(3) {
-            let o = PathOptions { scope: Scope::Node, ..PathOptions::default() };
-            let p = q.path(a, b, &o, &mut s);
-            match dist.get(&b) {
-                None => assert!(p.is_none(), "{} -> {}", f.ix.qid_string(a), f.ix.qid_string(b)),
-                Some(&d) => {
-                    let p = p.expect("reachable");
-                    assert_eq!(p.len() as u32, d);
-                    assert_eq!((p.nodes[0], *p.nodes.last().expect("end")), (a, b));
-                    for pair in p.nodes.windows(2) {
-                        assert!(fwd[&pair[0]].contains(&pair[1]));
+    for overrides in [true, false] {
+        let fwd = adjacency(&f, Confidence::Possible, overrides, false);
+        let best = best_edges(&f, overrides);
+        for a in 0..n {
+            let dist = distances(&fwd, a);
+            for b in (0..n).step_by(3) {
+                let o = PathOptions { overrides, scope: Scope::Node, ..PathOptions::default() };
+                let p = q.path(a, b, &o, &mut s);
+                match dist.get(&b) {
+                    None => assert!(p.is_none(), "{} -> {}", f.ix.qid_string(a), f.ix.qid_string(b)),
+                    Some(&d) => {
+                        let p = p.expect("reachable");
+                        assert_eq!(p.len() as u32, d);
+                        assert_eq!((p.nodes[0], *p.nodes.last().expect("end")), (a, b));
+                        for (i, pair) in p.nodes.windows(2).enumerate() {
+                            assert!(fwd[&pair[0]].contains(&pair[1]));
+                            let (conf, dispatch) = best[&(pair[0], pair[1])];
+                            assert_eq!((p.conf(i), p.dispatch(i)), (Some(conf), dispatch));
+                        }
+                        found += usize::from(d > 1);
                     }
-                    found += usize::from(d > 1);
                 }
             }
         }
@@ -723,26 +792,128 @@ fn call_cycles_match_tarjan() {
     let f = corpus_fx();
     let q = f.q();
     let mut s = Scratch::default();
-    let g = q.call_graph();
-    let scc = Scc::of(g);
-    let mut cyclic = 0;
-    for v in 0..f.ix.node_count() {
-        let c = scc.comp(v);
-        let hit = q.call_cycle(v, &WalkOptions::default(), &mut s);
-        if !scc.is_cyclic(g, c) {
-            assert!(hit.is_none());
-            continue;
+    let n = f.ix.node_count();
+    for overrides in [true, false] {
+        // Reference graph: plain (src, dst) pairs of the followed edges.
+        let g = Graph::build(n, || {
+            f.calls
+                .edges()
+                .iter()
+                .filter(move |e| e.conf != Confidence::Unresolved && (overrides || e.reason != Reason::Override))
+                .map(|e| (e.src, e.dst))
+        });
+        let scc = Scc::of(&g);
+        let mut cyclic = 0;
+        let o = WalkOptions { overrides, ..WalkOptions::default() };
+        for v in 0..n {
+            let c = scc.comp(v);
+            let hit = q.call_cycle(v, &o, &mut s);
+            if !scc.is_cyclic(&g, c) {
+                assert!(hit.is_none());
+                continue;
+            }
+            cyclic += 1;
+            let hit = hit.expect("cyclic");
+            let mut want = scc.members(c).to_vec();
+            want.sort_unstable();
+            assert_eq!(hit.members, want);
+            assert_eq!(hit.witness[0], v);
+            for i in 0..hit.witness.len() {
+                assert!(g.has_edge(hit.witness[i], hit.witness[(i + 1) % hit.witness.len()]));
+            }
         }
-        cyclic += 1;
-        let hit = hit.expect("cyclic");
-        let mut want = scc.members(c).to_vec();
-        want.sort_unstable();
-        assert_eq!(hit.members, want);
-        assert_eq!(hit.witness[0], v);
-        for i in 0..hit.witness.len() {
-            assert!(g.has_edge(hit.witness[i], hit.witness[(i + 1) % hit.witness.len()]));
+        assert!(cyclic > 10, "{cyclic}");
+    }
+}
+
+/// `Base.go` calls `Sub.go` for real at `Possible` (a local hint inside a lambda) and also
+/// dispatches to it (override edge, `Likely`); `A.run` only dispatches to `B.run`.
+const DISPATCH: &[(&str, &str)] = &[(
+    "m.py",
+    "class Base:\n\
+     \x20   def go(self):\n\
+     \x20       x = Sub()\n\
+     \x20       (lambda: x.go())()\n\
+     \x20       return 0\n\
+     \n\
+     class Sub(Base):\n\
+     \x20   def go(self):\n\
+     \x20       return 1\n\
+     \n\
+     class A:\n\
+     \x20   def run(self):\n\
+     \x20       return 0\n\
+     \n\
+     class B(A):\n\
+     \x20   def run(self):\n\
+     \x20       return 1\n",
+)];
+
+#[test]
+fn parallel_override_edge_keeps_the_weaker_real_call() {
+    let f = fx(DISPATCH);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let (base, sub) = (f.node("m:Base.go"), f.node("m:Sub.go"));
+    let kinds: Vec<(Confidence, Reason)> =
+        f.calls.edges().iter().filter(|e| (e.src, e.dst) == (base, sub)).map(|e| (e.conf, e.reason)).collect();
+    assert_eq!(kinds.len(), 2, "the fixture has a real call and an override edge: {kinds:?}");
+    assert!(kinds.contains(&(Confidence::Likely, Reason::Override)));
+    assert!(kinds.iter().any(|&(c, r)| c == Confidence::Possible && r != Reason::Override));
+
+    let find = |w: &Walk, v: NodeId| w.hops.iter().find(|h| h.node == v).map(|h| (h.conf, h.dispatch));
+    let o = WalkOptions { scope: Scope::Node, ..WalkOptions::default() };
+    let real = WalkOptions { overrides: false, ..o };
+    // With override edges: the best edge is the dispatch.
+    assert_eq!(find(&q.callees(base, &o, &mut s), sub), Some((Confidence::Likely, true)));
+    assert_eq!(find(&q.callers(sub, &o, &mut s), base), Some((Confidence::Likely, true)));
+    // Without: the weaker real call is still there.
+    assert_eq!(find(&q.callees(base, &real, &mut s), sub), Some((Confidence::Possible, false)));
+    assert_eq!(find(&q.callers(sub, &real, &mut s), base), Some((Confidence::Possible, false)));
+    assert_eq!(find(&q.callees(base, &WalkOptions { min_conf: Confidence::Likely, ..real }, &mut s), sub), None);
+    assert_eq!(find(&q.callees(base, &WalkOptions { min_conf: Confidence::Likely, ..o }, &mut s), sub), Some((Confidence::Likely, true)));
+    // A pure dispatch is dropped without override edges.
+    let (a, b) = (f.node("m:A.run"), f.node("m:B.run"));
+    assert_eq!(find(&q.callees(a, &o, &mut s), b), Some((Confidence::Likely, true)));
+    assert_eq!(find(&q.callees(a, &real, &mut s), b), None);
+    // Direct neighbours report the best edge.
+    assert!(q.direct_callees(base).any(|e| e == (sub, Confidence::Likely, true)));
+
+    // Paths report the edge as followed.
+    let po = PathOptions { scope: Scope::Node, ..PathOptions::default() };
+    let p = q.path(base, sub, &po, &mut s).expect("dispatch path");
+    assert_eq!((p.conf(0), p.dispatch(0)), (Some(Confidence::Likely), true));
+    let p = q.path(base, sub, &PathOptions { overrides: false, ..po }, &mut s).expect("real path");
+    assert_eq!((p.conf(0), p.dispatch(0)), (Some(Confidence::Possible), false));
+    assert!(q.path(a, b, &PathOptions { overrides: false, ..po }, &mut s).is_none());
+
+    // Most called counts real callers only.
+    let sm = q.summary(&SummaryOptions::default());
+    assert!(sm.most_called.contains(&Ranked { node: sub, value: 1 }), "{:?}", sm.most_called);
+    assert!(sm.most_called.iter().all(|r| r.node != b), "{:?}", sm.most_called);
+}
+
+#[test]
+fn call_labels_fold_per_kind() {
+    use Confidence::*;
+    let all = [Certain, Likely, Possible];
+    for &x in &all {
+        for &y in &all {
+            for (rx, ry) in [(Reason::Override, Reason::Override), (Reason::Override, Reason::UniqueMethod), (Reason::UniqueMethod, Reason::Override), (Reason::UniqueMethod, Reason::UniqueMethod)] {
+                let l = merge_labels(label(x, rx), label(y, ry));
+                assert_eq!(l, merge_labels(label(y, ry), label(x, rx)), "commutative");
+                let best = |want: Reason| [(x, rx), (y, ry)].iter().filter(|e| e.1 == want).map(|e| e.0).min();
+                let (real, ovr) = (best(Reason::UniqueMethod), best(Reason::Override));
+                assert_eq!(edge(l, false), real.map(|c| (c, false)));
+                let want = match (real, ovr) {
+                    (Some(r), Some(o)) if o < r => Some((o, true)),
+                    (Some(r), _) => Some((r, false)),
+                    (None, o) => o.map(|c| (c, true)),
+                };
+                assert_eq!(edge(l, true), want, "{x:?} {rx:?} {y:?} {ry:?}");
+            }
         }
-    }    assert!(cyclic > 10, "{cyclic}");
+    }
 }
 
 #[test]
@@ -757,11 +928,12 @@ fn import_cycles_match_the_analysis() {
         ("p/f.py", "import p.a\n"),
     ]);
     let q = f.q();
+    let mut s = Scratch::default();
     let all = crate::analysis::cycles::import_cycles(&f.ix, &f.imp, &CycleOptions::default());
     assert_eq!(all.len(), 2);
     for i in 0..all.len() {
         for &m in all.members(i) {
-            let hits = q.import_cycles(m);
+            let hits = q.import_cycles(m, &mut s);
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].members, all.members(i));
             assert!(hits[0].witness.contains(&m), "the witness goes through the target");
@@ -773,9 +945,9 @@ fn import_cycles_match_the_analysis() {
             }
         }
     }
-    assert!(q.import_cycles(f.node("p.f")).is_empty());
+    assert!(q.import_cycles(f.node("p.f"), &mut s).is_empty());
     // The package holds both cycles.
-    assert_eq!(q.import_cycles(f.node("p")).len(), 2);
+    assert_eq!(q.import_cycles(f.node("p"), &mut s).len(), 2);
 }
 
 #[test]

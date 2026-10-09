@@ -75,7 +75,7 @@ pub(super) fn query_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)>
     let defs = sample(&defs, 1000);
     let mods = sample(&module_nodes(&ix), 200);
     // The cycle import graph and its SCCs are built on the first cycle query.
-    timing::time("query.cycle_graph", || mods.first().map(|&m| q.import_cycles(m).len()));
+    timing::time("query.cycle_graph", || mods.first().map(|&m| q.import_cycles(m, &mut Scratch::default()).len()));
     run_batches(&ix, &q, &defs, &mods, &mut c);
     let s = ix.stats();
     let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
@@ -128,7 +128,7 @@ fn run_batches(ix: &Index, q: &Query<'_>, defs: &[NodeId], mods: &[NodeId], c: &
     let dop = DepOptions::default();
     batch("query.deps_out", "deps_out", mods, c, |&v| q.deps(v, Direction::Out, &dop, &mut s).deps.len());
     batch("query.deps_in", "deps_in", mods, c, |&v| q.deps(v, Direction::In, &dop, &mut s).deps.len());
-    batch("query.import_cycles", "import_cycles", mods, c, |&v| q.import_cycles(v).len());
+    batch("query.import_cycles", "import_cycles", mods, c, |&v| q.import_cycles(v, &mut s).len());
     batch("query.call_cycle", "call_cycle", defs, c, |&v| q.call_cycle(v, &d1, &mut s).map_or(0, |h| h.members.len()));
     batch("query.summary", "summary", &[()], c, |_| q.summary(&SummaryOptions::default()).cognitive.len());
     c.push(("scratch_kb".to_owned(), s.heap_bytes() as u64 / 1000));

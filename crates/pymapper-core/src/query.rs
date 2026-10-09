@@ -3,8 +3,8 @@
 //!
 //! ```text
 //!   Index + Imports + ResolvedCalls ──> Query::new     call graph over NodeIds (forward +
-//!                                       │              reverse CSR, label = best confidence
-//!                                       │              and an "override only" bit), built once
+//!                                       │              reverse CSR, label = best real-call and best
+//!                                       │              override confidence), built once
 //!                                       ├─ lazily ──> NameIndex      nodes sorted by name Sym
 //!                                       │                            (LSD radix, 4 B per node)
 //!                                       ├─ lazily ──> import graph   every module edge
@@ -81,22 +81,43 @@ use crate::index::{FileId, Index, NodeId, NodeKind};
 use crate::resolve::{Confidence, Imports, Reason, ResolvedCalls};
 use crate::roots::Origin;
 
-/// Bit 0 of a call graph label: every call edge behind it with the best confidence is an
-/// override edge (base method -> override, dynamic dispatch).
-const LABEL_OVERRIDE: u8 = 1;
+/// "No edge of this kind" in a call graph label field (`Unresolved` edges are never in the
+/// graph, so no real confidence uses it).
+const NO_CONF: u8 = Confidence::Unresolved as u8;
 
-/// Label of a call edge in the query call graph: `conf << 1 | override`. Parallel edges keep
-/// the minimum: the best confidence, preferring a real call over an override at equal
-/// confidence.
+/// Label of a call edge in the query call graph: bits 0-1 hold the best confidence of the
+/// real calls behind the edge, bits 2-3 the best confidence of its override edges (base
+/// method -> override, dynamic dispatch), [`NO_CONF`] when there is none. Parallel edges fold
+/// with [`merge_labels`], so a walk without override edges still sees the real calls.
 #[inline]
 fn label(conf: Confidence, reason: Reason) -> u8 {
-    ((conf as u8) << 1) | u8::from(reason == Reason::Override)
+    if reason == Reason::Override { NO_CONF | ((conf as u8) << 2) } else { (conf as u8) | (NO_CONF << 2) }
 }
 
-/// Confidence of a call graph label.
+/// Fold of two labels of one (caller, callee) pair: the best confidence per field.
+fn merge_labels(a: u8, b: u8) -> u8 {
+    (a & 3).min(b & 3) | (a & 12).min(b & 12)
+}
+
+/// A call graph label as followed by a query: `(confidence, dispatch)` of the best edge, a
+/// real call preferred at equal confidence (`dispatch`: only an override edge is that sure).
+/// Without `overrides` only real calls count; `None` when the label has none.
 #[inline]
-fn label_conf(l: u8) -> Confidence {
-    Confidence::from_u8(l >> 1)
+fn edge(l: u8, overrides: bool) -> Option<(Confidence, bool)> {
+    let (real, ovr) = (l & 3, l >> 2);
+    if overrides && ovr < real {
+        Some((Confidence::from_u8(ovr), true))
+    } else if real < NO_CONF {
+        Some((Confidence::from_u8(real), false))
+    } else {
+        None
+    }
+}
+
+/// Whether a query with these options follows an edge labelled `l`.
+#[inline]
+fn follows(l: u8, min_conf: Confidence, overrides: bool) -> bool {
+    edge(l, overrides).is_some_and(|(c, _)| c <= min_conf)
 }
 
 /// What a query target covers (see the module docs).
@@ -140,7 +161,7 @@ impl<'a> Query<'a> {
 
     pub fn with_options(ix: &'a Index, imp: &'a Imports, calls: &'a ResolvedCalls, opts: QueryOptions) -> Query<'a> {
         let edges = calls.edges();
-        let graph = Graph::build_labelled(ix.node_count(), || {
+        let graph = Graph::build_labelled_with(ix.node_count(), merge_labels, || {
             edges.iter().filter(|e| e.conf != Confidence::Unresolved).map(|e| (e.src, e.dst, label(e.conf, e.reason)))
         });
         Query { ix, imp, calls, opts, graph, names: OnceLock::new(), imports: OnceLock::new(), cycle: OnceLock::new() }
@@ -219,8 +240,8 @@ impl<'a> Query<'a> {
         if whole { self.ix.subtree(v) } else { v..v + 1 }
     }
 
-    /// Direct callers of `v`: (caller, best confidence, override only). Zero copy over the
-    /// reverse CSR row, callers ascending.
+    /// Direct callers of `v`: (caller, best confidence, only an override edge is that sure),
+    /// override edges included. Zero copy over the reverse CSR row, callers ascending.
     pub fn direct_callers(&self, v: NodeId) -> impl Iterator<Item = (NodeId, Confidence, bool)> + '_ {
         neighbours(self.graph.reverse(), v)
     }
@@ -251,7 +272,7 @@ fn neighbours(csr: &Csr, v: NodeId) -> impl Iterator<Item = (NodeId, Confidence,
     csr.neighbours(v)
         .iter()
         .zip(csr.neighbour_labels(v))
-        .map(|(&w, &l)| (w, label_conf(l), l & LABEL_OVERRIDE != 0))
+        .filter_map(|(&w, &l)| edge(l, true).map(|(c, d)| (w, c, d)))
 }
 
 /// One call site behind a call edge.
@@ -330,12 +351,12 @@ impl<'a> SymbolRef<'a> {
 
     /// Origin of the node's group.
     pub fn origin(&self) -> Origin {
-        let d = self.ix.ancestor_at(self.node, 0);
-        let g = self.ix.groups();
-        // Distribution nodes are in group order (sorted by origin, then name).
         match self.file() {
             Some(f) => self.ix.file_origin(f),
-            None => (0..g.len() as u32).find(|&i| self.ix.group_node(i) == d).map_or(Origin::FirstParty, |i| g[i as usize].origin),
+            None => {
+                let d = self.ix.ancestor_at(self.node, 0);
+                self.ix.dist_group(d).map_or(Origin::FirstParty, |g| self.ix.groups()[g as usize].origin)
+            }
         }
     }
 
@@ -409,11 +430,13 @@ pub struct Scratch {
     b: Marks,
     queue: Vec<u32>,
     buf: Vec<u32>,
+    /// BFS parents of the import cycle witness search, all `NONE` between queries.
+    parent: Vec<u32>,
 }
 
 impl Scratch {
     /// Heap bytes (capacity).
     pub fn heap_bytes(&self) -> usize {
-        self.a.heap_bytes() + self.b.heap_bytes() + (self.queue.capacity() + self.buf.capacity()) * 4
+        self.a.heap_bytes() + self.b.heap_bytes() + (self.queue.capacity() + self.buf.capacity() + self.parent.capacity()) * 4
     }
 }

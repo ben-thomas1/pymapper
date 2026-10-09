@@ -8,7 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::Query;
+use super::{Query, edge};
 use crate::analysis::hotspot::{Metric, top_functions};
 use crate::analysis::testfiles;
 use crate::index::{FileId, NodeId, NodeKind};
@@ -72,7 +72,8 @@ pub struct Summary {
     /// Functions with the highest cognitive / cyclomatic complexity.
     pub cognitive: Vec<Ranked>,
     pub cyclomatic: Vec<Ranked>,
-    /// Classes and functions with the most distinct callers.
+    /// Classes and functions with the most distinct callers (real calls only: a base method
+    /// that only dispatches to an override does not count).
     pub most_called: Vec<Ranked>,
     /// Packages and modules with the most importing modules.
     pub most_imported: Vec<Ranked>,
@@ -148,7 +149,8 @@ impl Query<'_> {
                 _ => c.functions += 1,
             }
             if kind.is_def() && ix.file(v).is_some_and(rankable) {
-                called.push(v, self.graph.reverse().degree(v));
+                let real = self.graph.reverse().neighbour_labels(v).iter().filter(|&&l| edge(l, false).is_some()).count();
+                called.push(v, real as u32);
             }
         }
         let ist = self.imp.stats();

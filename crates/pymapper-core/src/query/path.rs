@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use super::{LABEL_OVERRIDE, Marks, Query, Scope, Scratch, label_conf};
+use super::{Marks, Query, Scope, Scratch, edge, follows};
 use crate::graph::Csr;
 use crate::index::{NONE, NodeId};
 use crate::resolve::Confidence;
@@ -51,7 +51,8 @@ impl Default for PathOptions {
 pub struct ShortestPath {
     pub graph: PathGraph,
     pub nodes: Vec<NodeId>,
-    /// Label of each edge `nodes[i] -> nodes[i + 1]`.
+    /// Label of each edge `nodes[i] -> nodes[i + 1]`: calls `conf << 1 | dispatch` (the edge as
+    /// the search followed it), imports the edge flags.
     labels: Vec<u8>,
 }
 
@@ -68,12 +69,12 @@ impl ShortestPath {
 
     /// Best confidence of call edge `i` (`None` on an import path).
     pub fn conf(&self, i: usize) -> Option<Confidence> {
-        (self.graph == PathGraph::Calls).then(|| label_conf(self.labels[i]))
+        (self.graph == PathGraph::Calls).then(|| Confidence::from_u8(self.labels[i] >> 1))
     }
 
     /// Call edge `i` is only an override edge (dynamic dispatch).
     pub fn dispatch(&self, i: usize) -> bool {
-        self.graph == PathGraph::Calls && self.labels[i] & LABEL_OVERRIDE != 0
+        self.graph == PathGraph::Calls && self.labels[i] & 1 != 0
     }
 
     /// [`res_flags`](crate::resolve::res_flags) of import edge `i` (0 on a call path).
@@ -192,9 +193,15 @@ impl Query<'_> {
         match opts.graph {
             PathGraph::Calls => {
                 let g = &self.graph;
-                let keep = |l: u8| label_conf(l) <= opts.min_conf && (opts.overrides || l & LABEL_OVERRIDE == 0);
+                let keep = |l: u8| follows(l, opts.min_conf, opts.overrides);
                 let nodes = search(g.forward(), g.reverse(), self.target(from, opts.scope), self.target(to, opts.scope), keep, opts.max_len, scratch)?;
-                let labels = nodes.windows(2).map(|w| g.label(w[0], w[1]).unwrap_or(0)).collect();
+                let labels = nodes
+                    .windows(2)
+                    .map(|w| {
+                        let l = g.label(w[0], w[1]).unwrap_or(0);
+                        edge(l, opts.overrides).map_or(0, |(c, d)| ((c as u8) << 1) | u8::from(d))
+                    })
+                    .collect();
                 Some(ShortestPath { graph: PathGraph::Calls, nodes, labels })
             }
             PathGraph::Imports => {

@@ -318,12 +318,18 @@ impl Query<'_> {
                 if x.flags & opts.import_exclude != 0 {
                     continue;
                 }
-                match external.iter_mut().find(|e| e.kind == x.kind && e.key == x.key) {
-                    Some(e) => e.rows += x.rows,
-                    None => external.push(ExternalDep { kind: x.kind, key: x.key, rows: x.rows }),
-                }
+                external.push(ExternalDep { kind: x.kind, key: x.key, rows: x.rows });
             }
         }
+        // One entry per (kind, key): sort, then merge runs. O(k log k) for k edges.
+        external.sort_unstable_by_key(|e| (e.kind, e.key));
+        external.dedup_by(|later, kept| {
+            let same = (later.kind, later.key) == (kept.kind, kept.key);
+            if same {
+                kept.rows += later.rows;
+            }
+            same
+        });
     }
 
     /// Incoming import edges of the target's modules, from the reverse import graph.

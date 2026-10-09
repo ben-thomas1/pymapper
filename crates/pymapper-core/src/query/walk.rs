@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use super::{LABEL_OVERRIDE, Marks, Query, Scope, Scratch, label_conf};
+use super::{Marks, Query, Scope, Scratch, edge};
 use crate::analysis::testfiles;
 use crate::graph::Csr;
 use crate::index::{NONE, NodeId, NodeKind};
@@ -33,11 +33,6 @@ impl WalkOptions {
     /// Every edge with a target, unbounded depth.
     pub fn transitive() -> WalkOptions {
         WalkOptions { depth: u32::MAX, ..WalkOptions::default() }
-    }
-
-    #[inline]
-    fn keeps(&self, l: u8) -> bool {
-        label_conf(l) <= self.min_conf && (self.overrides || l & LABEL_OVERRIDE == 0)
     }
 }
 
@@ -109,15 +104,15 @@ fn bfs(csr: &Csr, seeds: Range<NodeId>, opts: &WalkOptions, marks: &mut Marks, o
     let mut expand = |u: NodeId, parent: u32, depth: u32, worst: Confidence, out: &mut Vec<Hop>| -> bool {
         let row = csr.range(u);
         for (&w, &l) in csr.targets()[row.clone()].iter().zip(&csr.labels()[row]) {
-            if seeds.contains(&w) || marks.seen(w) || !opts.keeps(l) {
+            if seeds.contains(&w) || marks.seen(w) {
                 continue;
             }
+            let Some((conf, dispatch)) = edge(l, opts.overrides).filter(|&(c, _)| c <= opts.min_conf) else { continue };
             if out.len() >= opts.limit {
                 return true;
             }
             marks.set(w, out.len() as u32);
-            let conf = label_conf(l);
-            out.push(Hop { node: w, via: u, parent, depth, conf, worst: worst.max(conf), dispatch: l & LABEL_OVERRIDE != 0 });
+            out.push(Hop { node: w, via: u, parent, depth, conf, worst: worst.max(conf), dispatch });
         }
         false
     };

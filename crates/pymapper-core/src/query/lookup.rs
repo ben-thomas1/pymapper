@@ -19,7 +19,7 @@
 
 use std::collections::BinaryHeap;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use rayon::prelude::*;
 
@@ -217,6 +217,12 @@ fn segments(q: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
     q.split(|&c| c == b'.' || c == b':')
 }
 
+/// Whether `q` has an empty `.`/`:` segment (`pkg.`, `.pkg`, `pkg..core`): malformed for the
+/// qualified and suffix forms.
+fn has_empty_segment(q: &[u8]) -> bool {
+    segments(q).any(<[u8]>::is_empty)
+}
+
 impl Query<'_> {
     /// Looks `q` up (see the module docs), best matches first.
     pub fn lookup(&self, q: &[u8], opts: &LookupOptions) -> Vec<Match> {
@@ -247,13 +253,22 @@ impl Query<'_> {
     }
 
     /// Resolves `q` to one node when the match is unambiguous (see [`Resolved`]).
+    /// The lists of [`Resolved::Ambiguous`] and [`Resolved::NotFound`] hold at most
+    /// `opts.limit` matches, but a second suffix match is always looked for, so a limit of 1
+    /// never turns an ambiguous name into [`Resolved::Unique`].
     pub fn resolve(&self, q: &[u8], opts: &LookupOptions) -> Resolved {
-        let m = self.lookup(q, opts);
-        match m.first() {
-            None => Resolved::NotFound(m),
-            Some(f) if f.kind == MatchKind::Fuzzy => Resolved::NotFound(m),
-            Some(f) if f.kind != MatchKind::Suffix || m.len() == 1 => Resolved::Unique(f.node),
-            Some(_) => Resolved::Ambiguous(m),
+        if opts.limit == 0 {
+            return Resolved::NotFound(Vec::new());
+        }
+        let mut m = self.lookup(q, &LookupOptions { limit: opts.limit.max(2), ..*opts });
+        let kind = m.first().map(|f| f.kind);
+        if kind.is_some_and(|k| k != MatchKind::Fuzzy && (k != MatchKind::Suffix || m.len() == 1)) {
+            return Resolved::Unique(m[0].node);
+        }
+        m.truncate(opts.limit);
+        match kind {
+            Some(MatchKind::Suffix) => Resolved::Ambiguous(m),
+            _ => Resolved::NotFound(m),
         }
     }
 
@@ -270,6 +285,9 @@ impl Query<'_> {
     /// The node of dotted name `q` (`pkg.mod.Class.method`): longest module prefix first.
     fn qualified(&self, q: &[u8]) -> Option<NodeId> {
         let ix = self.ix;
+        if has_empty_segment(q) {
+            return None;
+        }
         let mut cut = q.len();
         loop {
             let (module, rest) = (&q[..cut], q.get(cut + 1..).unwrap_or(&[]));
@@ -301,6 +319,9 @@ impl Query<'_> {
     /// Nodes whose qualified id ends with the segments of `q`, ascending.
     fn suffix(&self, q: &[u8]) -> Vec<NodeId> {
         let ix = self.ix;
+        if has_empty_segment(q) {
+            return Vec::new();
+        }
         // (name, dup) of every segment, last first; any unknown name means no match.
         let mut segs: Vec<(Sym, u16)> = Vec::new();
         for seg in segments(q).rev() {
@@ -383,16 +404,24 @@ impl Query<'_> {
     }
 
     /// The file at `path`: an exact match, else the only file whose path ends with `path`
-    /// (whole components). O(files).
+    /// (whole components; leading `./` components are ignored for the suffix). O(files).
     pub fn file_by_path(&self, path: &Path) -> Option<FileId> {
         let ix = self.ix;
         let mut found = None;
+        let mut rel = path.components();
+        while rel.as_path().starts_with(Component::CurDir) {
+            rel.next();
+        }
+        let rel = rel.as_path();
+        if rel.as_os_str().is_empty() {
+            return None;
+        }
         for f in 0..ix.file_count() {
             let p = ix.file_path(f);
             if p == path {
                 return Some(f);
             }
-            if p.ends_with(path) {
+            if p.ends_with(rel) {
                 if found.is_some() {
                     return None;
                 }
