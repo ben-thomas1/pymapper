@@ -20,7 +20,7 @@ use rayon::prelude::*;
 
 use super::level;
 use crate::extract::facts::evidence_hash;
-use crate::index::{FileId, Index, NodeId};
+use crate::index::{FileId, Index, NONE, NodeId};
 use crate::graph::{Graph, Scc};
 use crate::intern::{FxHashMap, Sym};
 use crate::reach::BitSet;
@@ -221,15 +221,15 @@ pub(super) fn scan(
     if nd + nm + ni == 0 {
         return hits;
     }
-    let mut is_cand = BitSet::new(ix.node_count());
-    for &d in c.defs {
-        is_cand.insert(d);
+    // Candidate index per node (4 bytes per node while the scan runs): every call edge is looked
+    // up a few times, so O(1) beats a binary search over the candidates.
+    let mut cand_of = vec![NONE; ix.node_count() as usize];
+    for (i, &d) in c.defs.iter().enumerate() {
+        cand_of[d as usize] = i as u32;
     }
     let def_idx = |v: NodeId| -> Option<u32> {
-        if !is_cand.contains(v) {
-            return None;
-        }
-        c.defs.binary_search(&v).ok().map(|i| i as u32)
+        let i = cand_of[v as usize];
+        (i != NONE).then_some(i)
     };
     let (explained, importers) = explained_and_importers(ix, imp, calls, over, included, c.defs, &def_idx);
     let name_hash = |d: NodeId| evidence_hash(ix.name(d));
@@ -380,7 +380,7 @@ fn explained_and_importers(
     over: &Graph,
     included: &[bool],
     defs: &[NodeId],
-    def_idx: &impl Fn(NodeId) -> Option<u32>,
+    def_idx: &(impl Fn(NodeId) -> Option<u32> + Sync),
 ) -> (Explained, Vec<(u32, FileId)>) {
     let edges = calls.edges();
     // Call cycles among the candidates.
@@ -399,18 +399,64 @@ fn explained_and_importers(
         }
     }
     bases.sort_unstable();
-    let cl = calls.classes();
-    let files = ix.file_count();
-    let mut ex = Explained { cands: Vec::new(), off: Vec::with_capacity(files as usize + 1) };
-    let mut importers: Vec<(u32, FileId)> = Vec::new();
-    let mut unresolved: Vec<Sym> = Vec::new();
-    for f in 0..files {
-        let at = ex.cands.len();
-        ex.off.push(at as u32);
-        if !included[f as usize] {
-            continue;
+    let cx = FileCx { ix, imp, calls, defs, def_idx, scc: &scc, bases: &bases, is_base: &is_base };
+    // Chunks of consecutive files in parallel, concatenated in file order.
+    let files = ix.file_count() as usize;
+    let chunks: Vec<ChunkOut> = included
+        .par_chunks(CHUNK)
+        .enumerate()
+        .map(|(c, inc)| {
+            let (mut cands, mut lens, mut importers, mut unresolved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (k, &on) in inc.iter().enumerate() {
+                let at = cands.len();
+                if on {
+                    cx.file((c * CHUNK + k) as FileId, &mut cands, &mut unresolved, &mut importers);
+                }
+                lens.push((cands.len() - at) as u32);
+            }
+            (cands, lens, importers)
+        })
+        .collect();
+    let mut ex = Explained { cands: Vec::new(), off: Vec::with_capacity(files + 1) };
+    let mut importers = Vec::new();
+    for (cands, lens, mut imps) in chunks {
+        let mut at = ex.cands.len() as u32;
+        for n in lens {
+            ex.off.push(at);
+            at += n;
         }
-        for e in calls.file_edges(f) {
+        ex.cands.extend_from_slice(&cands);
+        importers.append(&mut imps);
+    }
+    ex.off.push(ex.cands.len() as u32);
+    (ex, importers)
+}
+
+/// Files per parallel chunk of [`explained_and_importers`].
+const CHUNK: usize = 256;
+
+/// One chunk's explained candidates, run length per file, and direct importers.
+type ChunkOut = (Vec<u32>, Vec<u32>, Vec<(u32, FileId)>);
+
+/// Read-only context of the per-file explanation pass.
+struct FileCx<'a, F> {
+    ix: &'a Index,
+    imp: &'a Imports,
+    calls: &'a ResolvedCalls,
+    defs: &'a [NodeId],
+    def_idx: &'a F,
+    scc: &'a Scc,
+    bases: &'a [(NodeId, u32)],
+    is_base: &'a BitSet,
+}
+
+impl<F: Fn(NodeId) -> Option<u32>> FileCx<'_, F> {
+    /// Appends file `f`'s explained candidates (sorted, unique) to `out` and its direct
+    /// importers to `importers`.
+    fn file(&self, f: FileId, out: &mut Vec<u32>, unresolved: &mut Vec<Sym>, importers: &mut Vec<(u32, FileId)>) {
+        let (ix, def_idx, scc) = (self.ix, self.def_idx, self.scc);
+        let at = out.len();
+        for e in self.calls.file_edges(f) {
             if e.reason == Reason::Override {
                 continue;
             }
@@ -419,43 +465,44 @@ fn explained_and_importers(
             if let Some(i) = def_idx(e.dst)
                 && outside(i)
             {
-                ex.cands.push(i);
+                out.push(i);
             }
-            if is_base.contains(e.dst) {
-                let lo = bases.partition_point(|p| p.0 < e.dst);
-                for &(b, i) in &bases[lo..] {
+            if self.is_base.contains(e.dst) {
+                let lo = self.bases.partition_point(|p| p.0 < e.dst);
+                for &(b, i) in &self.bases[lo..] {
                     if b != e.dst {
                         break;
                     }
                     if outside(i) {
-                        ex.cands.push(i);
+                        out.push(i);
                     }
                 }
             }
         }
+        let cl = self.calls.classes();
         for k in cl.file_classes(f) {
             for &b in cl.bases(k) {
                 if let Some(i) = def_idx(cl.node(b)) {
-                    ex.cands.push(i);
+                    out.push(i);
                 }
             }
         }
-        ex.cands[at..].sort_unstable();
+        out[at..].sort_unstable();
         let mut w = at;
-        for r in at..ex.cands.len() {
-            if w == at || ex.cands[w - 1] != ex.cands[r] {
-                ex.cands[w] = ex.cands[r];
+        for r in at..out.len() {
+            if w == at || out[w - 1] != out[r] {
+                out[w] = out[r];
                 w += 1;
             }
         }
-        ex.cands.truncate(w);
+        out.truncate(w);
         if w > at {
             // A call of the same name that did not resolve (ambiguous receiver, parameter,
             // ...) is an occurrence no resolved call explains.
             unresolved.clear();
             let view = ix.file_view(f);
             for row in ix.file_facts(f).calls.range() {
-                if calls.call(row).0 == Confidence::Unresolved
+                if self.calls.call(row).0 == Confidence::Unresolved
                     && let Some(&s) = view.call_chain(row).last()
                 {
                     unresolved.push(s);
@@ -464,26 +511,24 @@ fn explained_and_importers(
             if !unresolved.is_empty() {
                 unresolved.sort_unstable();
                 let mut w = at;
-                for r in at..ex.cands.len() {
-                    let i = ex.cands[r];
-                    if unresolved.binary_search(&ix.name_sym(defs[i as usize])).is_err() {
-                        ex.cands[w] = i;
+                for r in at..out.len() {
+                    let i = out[r];
+                    if unresolved.binary_search(&ix.name_sym(self.defs[i as usize])).is_err() {
+                        out[w] = i;
                         w += 1;
                     }
                 }
-                ex.cands.truncate(w);
+                out.truncate(w);
             }
         }
         for row in ix.file_facts(f).imports.range() {
-            if let Some(t) = imp.target(row)
+            if let Some(t) = self.imp.target(row)
                 && let Some(i) = def_idx(t)
             {
                 importers.push((i, f));
             }
         }
     }
-    ex.off.push(ex.cands.len() as u32);
-    (ex, importers)
 }
 
 /// Aliased imports of a candidate (`from m import f as g` then `register(g)`): the alias in the

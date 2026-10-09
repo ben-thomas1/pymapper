@@ -602,19 +602,6 @@ fn name_groups_link_through_module_imports() {
 }
 
 #[test]
-#[ignore]
-fn tmp_dump_path() {
-    let p = std::env::var("PYMAPPER_DC_PATH").expect("path");
-    let f = load_dir(Path::new(&p));
-    let mode = if std::env::var("PYMAPPER_DC_LIB").is_ok() { Mode::Library } else { Mode::Application };
-    let (_, lines) = f.run_with(&DeadCodeOptions { mode, ..DeadCodeOptions::default() });
-    let rule = std::env::var("PYMAPPER_DC_RULE").unwrap_or_default();
-    for l in lines.iter().filter(|l| l.starts_with(&rule) && l.rsplit(' ').next().is_some_and(|c| c.parse::<u8>().is_ok_and(|c| c >= 80))) {
-        println!("{l}");
-    }
-}
-
-#[test]
 fn results_do_not_depend_on_the_thread_count() {
     let f = corpus();
     let run_on = |threads: usize| {
