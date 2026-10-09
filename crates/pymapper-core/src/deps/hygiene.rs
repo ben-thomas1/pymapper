@@ -8,8 +8,8 @@
 //!        not loaded:                        stdlib | ThirdParty(dist, by top_level.txt / RECORD) | external
 //!        third-party group without dist, external: built-in name table, else a guess (names.rs)
 //!     ──> PM603 private component (`pkg._internal`, `from pkg import _helper`)
-//!     ──> declared in the effective unit (any group; or in a development group of the uv
-//!         workspace root above it)?  no ──> PM604 if a declared dependency requires it
+//!     ──> declared in the effective unit (any group; for test code also a development group
+//!         of the uv workspace root above it)?  no ──> PM604 if a declared dependency requires it
 //!         (Requires-Dist closure, read lazily), else PM601; once per import statement and
 //!         distribution, at the module token
 //!     ──> mark (unit, distribution) used
@@ -33,6 +33,7 @@ use std::path::Path;
 use super::declared::{DeclStatus, Declarations, DepKind, display_path};
 use super::names::{self, Known, Mapping};
 use super::requires::RequiresCache;
+use crate::analysis::testfiles::is_test_file;
 use crate::extract::facts::import_flags;
 use crate::index::{FileId as IxFile, Index, NONE, NodeId};
 use crate::intern::{FxHashMap, FxHashSet, Interner, Sym};
@@ -270,6 +271,8 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 self.unit_files[eu as usize] += 1;
             }
             let view = ix.file_view(f);
+            // Test code sees the workspace root's development groups (a few byte compares).
+            let test = eu != NONE && self.cx.decls.workspace(eu) != NONE && is_test_file(ix, f);
             // Rows of one statement are consecutive and share the module token's position:
             // `from m import (a,\n b)` reports PM601/PM604 (and a private module) once per
             // distribution, at the module token, so a suppression on the statement's first
@@ -309,17 +312,17 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 let providers = if third.exact { &[][..] } else { self.cx.dists.providers(ix.str(top)) };
                 self.used.insert((eu, third.norm));
                 self.used_top.insert((eu, top));
-                let mut declared = self.declared(eu, third.norm);
+                let mut declared = self.declared(eu, third.norm, test);
                 for &d in providers {
                     let (n, _) = self.dist_names.get(self.cx.dists, d, names);
                     self.used.insert((eu, n));
-                    declared |= self.declared(eu, n);
+                    declared |= self.declared(eu, n, test);
                 }
                 for &(_, alt) in third.alts {
                     crate::roots::normalize_name(alt.as_bytes(), &mut self.scratch);
                     let n = names.intern(&self.scratch);
                     self.used.insert((eu, n));
-                    declared |= self.declared(eu, n);
+                    declared |= self.declared(eu, n, test);
                 }
                 let decl = self.cx.decls.unit(eu);
                 if declared || decl.status != DeclStatus::Declared || decl.dynamic_optional {
@@ -356,15 +359,17 @@ impl<'c, 'a> Analysis<'c, 'a> {
         }
     }
 
-    /// Whether unit `u` declares `norm` (or its uv workspace root does, in a development
-    /// group) or is (or contains) the project named `norm`.
+    /// Whether unit `u` declares `norm` or is (or contains) the project named `norm`. For test
+    /// code (`test`), a development group of the uv workspace root above `u` also declares it:
+    /// test tools are usually declared once there, while production code of a member must
+    /// declare what it imports itself.
     #[inline]
-    fn declared(&self, u: u32, norm: Sym) -> bool {
+    fn declared(&self, u: u32, norm: Sym, test: bool) -> bool {
         let decls = self.cx.decls;
         decls.find(u, norm).is_some()
             || self.projects.contains(&norm)
             || self.meta.contains_key(&(u, norm))
-            || (decls.workspace(u) != NONE && decls.declares_group(decls.workspace(u), norm))
+            || (test && decls.workspace(u) != NONE && decls.declares_group(decls.workspace(u), norm))
     }
 
     /// Declared dependencies that are installed but provide no importable name are

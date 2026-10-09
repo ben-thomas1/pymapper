@@ -36,7 +36,10 @@ pub(super) const RULES: &[RuleDef] = &[
 poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest \
 project unit that declares dependencies). The code works only because the package happens to be \
 installed. What a declared meta-package (installed, no importable name) requires directly \
-counts as declared. Units whose `dependencies` are `dynamic` are not checked.\n\n\
+counts as declared, and so do the development groups of a uv workspace root for the test code of \
+its members. Units whose `dependencies` are `dynamic` are not checked (unless Poetry lists them in \
+`[tool.poetry.dependencies]`). Reported once per import statement and distribution, at the \
+module (`from yaml import (a, b)` reports `yaml` once, on the statement's first line).\n\n\
 Fix: add the distribution to the project's dependencies.",
         severity: Severity::Error,
         default_enabled: true,
@@ -75,8 +78,9 @@ Fix: remove the dependency, or move it to the group that needs it.",
         args: &[ArgKind::Name, ArgKind::Name],
         explanation: "The import path contains a component starting with an underscore \
 (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders \
-(`__version__`) and the lone `_` (the gettext idiom) are not private. Private internals change \
-without notice between releases.\n\n\
+(`__version__`) and the lone `_` (the gettext idiom) are not private. A private module is \
+reported once per import statement, at the module; a private name at the name. Private internals \
+change without notice between releases.\n\n\
 Fix: use the package's public API, or pin the version and isolate the access in one module.",
         severity: Severity::Warning,
         default_enabled: true,

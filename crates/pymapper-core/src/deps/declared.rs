@@ -19,7 +19,7 @@
 //! `[project] dynamic` lists `dependencies` has unknown dependencies, so PM601, PM602 and PM604
 //! are not reported for it, unless it keeps them in `[tool.poetry.dependencies]` (Poetry 2).
 //! The development groups of a uv workspace root (`[tool.uv.workspace]`) count as declared for
-//! the files of the members below it. Cost: one TOML parse per unit, a few allocations per
+//! the test code of the members below it. Cost: one TOML parse per unit, a few allocations per
 //! dependency.
 
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ pub struct UnitDecl {
     /// `[project] name` (or poetry `name`), normalised.
     pub project: Option<Sym>,
     /// Has a `[tool.uv.workspace]` table: its development groups count as declared for the
-    /// files of the workspace members below it (see [`Declarations::workspace`]).
+    /// test code of the workspace members below it (see [`Declarations::workspace`]).
     pub workspace_root: bool,
     /// Dependencies: `deps[start..start + len]` of [`Declarations::deps`].
     deps_start: u32,

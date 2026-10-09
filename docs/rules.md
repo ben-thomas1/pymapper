@@ -499,7 +499,7 @@ Import of a third-party distribution not declared in `pyproject.toml`.
 - Cost: O(n)
 - Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. What a declared meta-package (installed, no importable name) requires directly counts as declared. Units whose `dependencies` are `dynamic` are not checked.
+First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. What a declared meta-package (installed, no importable name) requires directly counts as declared, and so do the development groups of a uv workspace root for the test code of its members. Units whose `dependencies` are `dynamic` are not checked (unless Poetry lists them in `[tool.poetry.dependencies]`). Reported once per import statement and distribution, at the module (`from yaml import (a, b)` reports `yaml` once, on the statement's first line).
 
 Fix: add the distribution to the project's dependencies.
 
@@ -531,7 +531,7 @@ Import of a private module or name of a third-party package.
 - Cost: O(n)
 - Confidence: always 100
 
-The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders (`__version__`) and the lone `_` (the gettext idiom) are not private. Private internals change without notice between releases.
+The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders (`__version__`) and the lone `_` (the gettext idiom) are not private. A private module is reported once per import statement, at the module; a private name at the name. Private internals change without notice between releases.
 
 Fix: use the package's public API, or pin the version and isolate the access in one module.
 

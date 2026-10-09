@@ -395,12 +395,19 @@ fn analyse_workspace_root_groups_and_poetry2() {
         "[project]\nname = \"a\"\ndynamic = [\"dependencies\"]\n[tool.poetry.dependencies]\npython = \"^3.10\"\nrequests = \"^2\"\n",
     )
     .file("libs/a/src/a/__init__.py", "import requests\n")
+    // Production code must declare its test tools itself (a pytest plugin, say).
+    .file("libs/a/src/a/plugin.py", "import pytest\n")
     .file("libs/a/tests/test_a.py", "import pytest\nimport numpy\n")
     .dist("pytest", &["pytest"], &[])
     .dist("requests", &["requests"], &[])
     .dist("numpy", &["numpy"], &[]);
+    // The member's poetry list is read although `[project] dependencies` is dynamic; its test
+    // code sees the workspace root's `dev` group.
     assert_eq!(
         p.analyse(),
-        ["libs/a/tests/test_a.py:2:8 PM601 100 `numpy` is provided by `numpy`, which is not a declared dependency"]
+        [
+            "libs/a/src/a/plugin.py:1:8 PM601 100 `pytest` is provided by `pytest`, which is not a declared dependency",
+            "libs/a/tests/test_a.py:2:8 PM601 100 `numpy` is provided by `numpy`, which is not a declared dependency",
+        ]
     );
 }
