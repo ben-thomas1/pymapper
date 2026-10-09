@@ -438,6 +438,7 @@ pub(crate) struct Emit {
 }
 
 impl Emit {
+    #[cfg(test)]
     pub(crate) const ALL: Emit = Emit { function: true, class: true, method: true, module: true, import: true };
 }
 

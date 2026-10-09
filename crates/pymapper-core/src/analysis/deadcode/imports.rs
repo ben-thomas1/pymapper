@@ -98,7 +98,7 @@ pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, library: bo
                     pen += penalty::INIT_SUBMODULE;
                 }
             }
-            if flags & import_flags::CONDITIONAL != 0 {
+            if flags & (import_flags::CONDITIONAL | import_flags::TYPE_CHECKING) == import_flags::CONDITIONAL {
                 pen += penalty::CONDITIONAL;
             }
             out.push(ImportCand { row: row as u32, file: f, name, penalty: pen });
