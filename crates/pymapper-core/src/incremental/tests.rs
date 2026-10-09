@@ -217,6 +217,9 @@ struct Editor {
     root: PathBuf,
     rng: Rng,
     counter: u32,
+    /// Only edit file contents (no new, removed or renamed files): every update takes the
+    /// carried-resolution path.
+    content_only: bool,
 }
 
 /// Names the generated code uses: common method names (unique-method and subclass fallbacks),
@@ -228,7 +231,7 @@ const NAMES: &[&str] = &[
 
 impl Editor {
     fn new(root: &Path, seed: u64) -> Editor {
-        Editor { root: root.to_path_buf(), rng: Rng(seed | 1), counter: 0 }
+        Editor { root: root.to_path_buf(), rng: Rng(seed | 1), counter: 0, content_only: false }
     }
 
     fn files(&self) -> Vec<PathBuf> {
@@ -341,7 +344,7 @@ impl Editor {
         for _ in 0..1 + self.rng.below(4) {
             let files = self.files();
             let modules = self.modules(&files);
-            let roll = self.rng.below(16);
+            let roll = if self.content_only { 16 } else { self.rng.below(16) };
             if files.is_empty() || roll == 0 {
                 // A new module, package or stub.
                 self.counter += 1;
@@ -399,19 +402,25 @@ impl Editor {
 /// Runs `steps` random steps on a copy of `src`, checking the incremental program against a
 /// full rebuild after every step.
 fn property(src: &Path, steps: usize, seed: u64, tag: &str) {
+    property_with(src, steps, seed, tag, false);
+}
+
+fn property_with(src: &Path, steps: usize, seed: u64, tag: &str, content_only: bool) {
     let tmp = TempDir::new(tag);
     assert!(copy_tree(src, tmp.path()) > 0, "corpus {} is empty", src.display());
     let mut prog = full(tmp.path());
     assert_same(&dump(&prog), &dump(&full(tmp.path())), "initial load");
     let mut ed = Editor::new(tmp.path(), seed);
+    ed.content_only = content_only;
     for step in 0..steps {
         let changed = ed.step();
         let before = Oracle::take(&prog);
         let (diff, st) = prog.update(inputs(tmp.path()), &changed);
         if std::env::var_os("INCR_DEBUG").is_some() {
             eprintln!(
-                "{tag} {step}: files={} re={} add={} rm={} nodes+{} -{} ~{} iedges={} cedges={} oedges={}",
-                st.files, st.reextracted, st.added, st.removed, diff.added.len(), diff.removed.len(), diff.changed.len(),
+                "{tag} {step}: files={} re={} add={} rm={} full={} rimp={} rcalls={} nodes+{} -{} ~{} iedges={} cedges={} oedges={}",
+                st.files, st.reextracted, st.added, st.removed, st.full_resolve, st.reresolved_imports, st.reresolved_calls,
+                diff.added.len(), diff.removed.len(), diff.changed.len(),
                 diff.import_edges.len(), diff.call_edges.len(), diff.override_edges.len()
             );
         }
@@ -581,6 +590,14 @@ fn corpus() -> PathBuf {
 }
 
 #[test]
+fn random_content_edits_on_corpus_match_full_rebuild() {
+    let extra: u64 = std::env::var("INCR_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    for seed in [2u64, 5, 77, 4321, 99_999].into_iter().chain(20_000..20_000 + extra) {
+        property_with(&corpus(), 30, seed, "content", true);
+    }
+}
+
+#[test]
 fn random_edits_on_corpus_match_full_rebuild() {
     // `INCR_SEEDS=N` runs N more seeds (soak testing).
     let extra: u64 = std::env::var("INCR_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -609,6 +626,9 @@ fn random_edits_on_stdlib_match_full_rebuild() {
     };
     for seed in [3u64, 99] {
         property(&dir, 12, seed, "stdlib");
+    }
+    for seed in [11u64, 12] {
+        property_with(&dir, 12, seed, "stdlib-content", true);
     }
 }
 
@@ -684,4 +704,154 @@ fn unlisted_changes_keep_old_facts() {
     let (d, _) = p.update(inputs(t.path()), &[] as &[&Path]);
     assert!(d.is_empty());
     assert!(p.index().find(b"a:f").is_some());
+}
+
+/// Timing probe (not a check): `cargo test --release -p pymapper-core --lib probe_stdlib_update
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn probe_stdlib_update() {
+    let Some(dir) = stdlib() else { return };
+    let tmp = TempDir::new("probe");
+    copy_tree(&dir, tmp.path());
+    let mut prog = full(tmp.path());
+    let target = tmp.path().join("typing.py");
+    let small = tmp.path().join("colorsys.py");
+    let orig = fs::read(&target).expect("read");
+    let orig_small = fs::read(&small).expect("read");
+    for round in 0..6 {
+        for (p, o) in [(&target, &orig), (&small, &orig_small)] {
+            let mut text = o.clone();
+            text.extend_from_slice(format!("\ndef _probe_{round}():\n    return 1\n").as_bytes());
+            fs::write(p, &text).expect("write");
+            let inp = inputs(tmp.path());
+            timing::enable(true);
+            let _ = timing::take();
+            let (_, st) = prog.update(inp, &[p]);
+            let phases = timing::take();
+            timing::enable(false);
+            let ph: Vec<String> = phases.iter().map(|ph| format!("{}={:.2}", ph.name, ph.elapsed.as_secs_f64() * 1e3)).collect();
+            eprintln!("{} total={:.2}ms {}", p.file_name().unwrap().to_string_lossy(), st.total.as_secs_f64() * 1e3, ph.join(" "));
+        }
+    }
+}
+
+/// Updates `p` after the files in `changed` were rewritten, checks it against a full rebuild
+/// and that resolution was carried (not redone for the whole program).
+fn step_matches(t: &TempDir, p: &mut Program, changed: &[PathBuf], what: &str) -> UpdateStats {
+    let (d, st) = p.update(inputs(t.path()), changed);
+    assert!(!st.full_resolve, "{what}: carried resolution expected");
+    assert_same(&dump(p), &dump(&full(t.path())), what);
+    check_diff(&d, p);
+    st
+}
+
+#[test]
+fn subclass_method_in_a_file_the_base_does_not_import() {
+    let t = TempDir::new("subclass");
+    t.write("base.py", "class Base:\n    def run(self):\n        self.hook()\n");
+    let sub = t.write("sub.py", "from base import Base\n\nclass Sub(Base):\n    pass\n");
+    t.write("other.py", "def unrelated():\n    raise Exception()\n");
+    let mut p = full(t.path());
+    t.write("sub.py", "from base import Base\n\nclass Sub(Base):\n    def hook(self):\n        pass\n");
+    let st = step_matches(&t, &mut p, std::slice::from_ref(&sub), "hook added in the subclass");
+    assert!(st.reresolved_calls >= 2, "base.py must be re-resolved: {st:?}");
+    assert!(st.reresolved_calls < 3, "other.py is unrelated: {st:?}");
+    // Same method, other base: only the subclass relation changes.
+    t.write("sub.py", "from base import Base\n\nclass Sub(Exception):\n    def hook(self):\n        pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&sub), "subclass no longer derives from Base");
+    t.write("sub.py", "from base import Base\n\nclass Sub(Base):\n    def hook(self):\n        pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&sub), "derives again");
+    t.write("sub.py", "from base import Base\n\nclass Sub(Base):\n    pass\n");
+    step_matches(&t, &mut p, &[sub], "hook removed again");
+}
+
+#[test]
+fn mro_change_through_a_re_export() {
+    let t = TempDir::new("mro");
+    t.write("g.py", "class Base:\n    def m(self):\n        pass\n");
+    t.write("g2.py", "class Base:\n    def other(self):\n        pass\n");
+    let h = t.write("h.py", "from g import Base\n");
+    t.write("c.py", "from h import Base\n\nclass C(Base):\n    pass\n");
+    t.write("y.py", "from c import C\n\nclass D(C):\n    def f(self):\n        self.m()\n        self.other()\n");
+    let mut p = full(t.path());
+    t.write("h.py", "from g2 import Base\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&h), "base re-exported from elsewhere");
+    t.write("h.py", "from g import Base\n");
+    step_matches(&t, &mut p, &[h], "and back");
+}
+
+#[test]
+fn unique_method_fallback_follows_method_names() {
+    let t = TempDir::new("unique");
+    t.write("x.py", "def use(obj):\n    obj.frob()\n    obj.twist()\n");
+    let z = t.write("z.py", "class Z:\n    def frob(self):\n        pass\n");
+    let w = t.write("w.py", "class W:\n    def twist(self):\n        pass\n");
+    let mut p = full(t.path());
+    // A second `frob`: the fallback becomes ambiguous.
+    t.write("w.py", "class W:\n    def twist(self):\n        pass\n    def frob(self):\n        pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&w), "second frob");
+    // `frob` moves down in its file (its node id shifts, the edge must follow).
+    t.write("z.py", "class Y:\n    def a(self):\n        pass\n\nclass Z:\n    def frob(self):\n        pass\n");
+    t.write("w.py", "class W:\n    def twist(self):\n        pass\n");
+    step_matches(&t, &mut p, &[z.clone(), w.clone()], "frob unique again, shifted");
+    t.write("z.py", "class Z:\n    def frob_renamed(self):\n        pass\n");
+    step_matches(&t, &mut p, &[z], "frob gone");
+}
+
+#[test]
+fn submodule_attribute_chains() {
+    let t = TempDir::new("submod");
+    t.write("pkg/__init__.py", "");
+    let sub = t.write("pkg/sub.py", "def f():\n    pass\n\nclass K:\n    def g(self):\n        pass\n");
+    t.write("user.py", "import pkg\n\ndef main():\n    pkg.sub.f()\n    k = pkg.sub.K()\n    k.g()\n");
+    t.write("alias.py", "import pkg.sub\nX = pkg.sub.K\n");
+    t.write("user2.py", "from alias import X\n\ndef h():\n    X().g()\n");
+    let mut p = full(t.path());
+    t.write("pkg/sub.py", "def g2():\n    pass\n\ndef f():\n    pass\n\nclass K:\n    pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&sub), "submodule defs shift and g goes");
+    t.write("pkg/sub.py", "class K:\n    def g(self):\n        pass\n");
+    step_matches(&t, &mut p, &[sub], "f goes, g back");
+}
+
+#[test]
+fn star_imports_and_all() {
+    let t = TempDir::new("star");
+    let a = t.write("a.py", "__all__ = ['f']\n\ndef f():\n    pass\n\ndef g():\n    pass\n");
+    t.write("b.py", "from a import *\n");
+    t.write("c.py", "from b import f, g\n\nf()\ng()\n");
+    let mut p = full(t.path());
+    t.write("a.py", "__all__ = ['f', 'g']\n\ndef f():\n    pass\n\ndef g():\n    pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&a), "g exported");
+    t.write("a.py", "def g():\n    pass\n");
+    step_matches(&t, &mut p, &[a], "no __all__, f gone");
+}
+
+#[test]
+fn base_class_change_seen_only_through_the_mro() {
+    // `x.py`'s import results do not change (`import m` binds the module), but its class's
+    // MRO does: the subclass lookup in `base.py` must see it.
+    let t = TempDir::new("mro-only");
+    t.write("base.py", "class Base:\n    def run(self):\n        self.hook()\n");
+    let m = t.write("m.py", "from base import Base\nParent = Base\n");
+    t.write("x.py", "import m\n\nclass K(m.Parent):\n    def hook(self):\n        pass\n");
+    let mut p = full(t.path());
+    t.write("m.py", "from base import Base\n\nclass Parent:\n    pass\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&m), "K no longer derives from Base");
+    t.write("m.py", "from base import Base\nParent = Base\n");
+    step_matches(&t, &mut p, &[m], "and again");
+}
+
+#[test]
+fn construction_hint_of_an_imported_variable() {
+    let t = TempDir::new("hint");
+    t.write("foo.py", "class Foo:\n    def m(self):\n        pass\n");
+    t.write("bar.py", "class Bar:\n    def m(self):\n        pass\n");
+    let v = t.write("v.py", "from foo import Foo\nfrom bar import Bar\nx = Foo()\n");
+    t.write("a.py", "from v import x\n\ndef f():\n    x.m()\n");
+    let mut p = full(t.path());
+    t.write("v.py", "from foo import Foo\nfrom bar import Bar\nx = Bar()\n");
+    step_matches(&t, &mut p, std::slice::from_ref(&v), "x is a Bar now");
+    t.write("v.py", "from foo import Foo\nfrom bar import Bar\nx = Foo\n");
+    step_matches(&t, &mut p, &[v], "x is an alias of Foo");
 }

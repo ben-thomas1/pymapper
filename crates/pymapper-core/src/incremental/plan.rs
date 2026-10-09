@@ -62,6 +62,8 @@ pub(super) fn plan<P: AsRef<Path>>(old: &Index, new: &Inputs, changed: &[P]) -> 
                 && old.file_status(f) == new.status(i as FileId)
                 && old.str(old.file_module(f)) == new.module(i as FileId)
                 && old.groups()[old.file_group(f) as usize] == new.groups()[new.group(i as FileId) as usize];
+        } else {
+            same_meta = false;
         }
         if f != u32::MAX && f >= next_old && !changed.contains(bytes) {
             next_old = f + 1;

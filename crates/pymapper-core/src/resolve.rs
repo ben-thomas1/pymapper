@@ -115,6 +115,7 @@ mod calls;
 mod classes;
 mod edges;
 mod imports;
+pub(crate) mod incr;
 mod lookup;
 mod modules;
 mod namespace;

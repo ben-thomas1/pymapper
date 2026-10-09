@@ -1,0 +1,152 @@
+//! `incremental`: single-file edit latency of `pymapper_core::incremental::Program::update`.
+//!
+//! The corpus is copied into a temporary directory (phase `copy`; corpora over
+//! [`MAX_COPY_BYTES`] are not copied and their files are re-extracted unchanged instead, counter
+//! `inplace`), loaded and resolved with calls (phases `load.*`, `resolve.*`), then a set of
+//! files is edited one at a time: a function is appended, the program updated, the file
+//! restored and the program updated again. The files are spread over the size distribution
+//! plus the stdlib's most imported modules when present. Phase `incremental.update` is the sum
+//! of all updates; counters give per-update medians.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::Context;
+use pymapper_core::incremental::{Program, UpdateStats};
+use pymapper_core::index::Inputs;
+use pymapper_core::resolve::Attribution;
+use pymapper_core::roots::Origin;
+use pymapper_core::timing;
+use pymapper_core::walk::PathList;
+
+use super::{Counters, ReadStats, corpus_options, walk_corpus};
+
+/// Corpora larger than this are edited in place without changing contents.
+const MAX_COPY_BYTES: u64 = 200_000_000;
+/// Rounds over the edited files (medians over all of them).
+const ROUNDS: usize = 3;
+/// Modules worth editing when present: imported by most of the stdlib.
+const HOT: &[&str] = &["typing.py", "os.py", "collections/__init__.py", "functools.py", "re/__init__.py"];
+
+/// A temporary copy of the corpus, removed on drop.
+struct Copy(PathBuf);
+
+impl Drop for Copy {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn median(v: &mut [Duration]) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    v[v.len() / 2].as_micros() as u64
+}
+
+pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let total: u64 = (0..files.len()).map(|i| fs::metadata(files.get(i)).map_or(0, |m| m.len())).sum();
+    let inplace = total > MAX_COPY_BYTES;
+    let (base, copy) = if inplace {
+        (root.to_path_buf(), None)
+    } else {
+        let dir = std::env::temp_dir().join(format!("pymapper-bench-incr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let copy = Copy(dir.clone());
+        timing::time("copy", || -> anyhow::Result<()> {
+            for p in files.iter() {
+                let dst = dir.join(p.strip_prefix(root).context("file outside the corpus")?);
+                fs::create_dir_all(dst.parent().context("no parent")?)?;
+                fs::copy(p, &dst).with_context(|| format!("copying {}", p.display()))?;
+            }
+            Ok(())
+        })?;
+        (dir, Some(copy))
+    };
+    let mut paths = PathList::default();
+    for p in files.iter() {
+        let rel = p.strip_prefix(root).context("file outside the corpus")?;
+        paths.push(base.join(rel).as_os_str().as_encoded_bytes()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    drop(files);
+    let inputs = |paths: &PathList| Inputs::from_root_dir(&base, paths, Origin::FirstParty, b"corpus");
+    let mut prog = Program::load(inputs(&paths), Attribution::new(), true);
+    let s = *prog.index().stats();
+    let heap_before = prog.heap_bytes();
+
+    // Files to edit: quantiles of the size distribution, then the hot modules.
+    let mut by_size: Vec<(u64, usize)> =
+        (0..paths.len()).map(|i| (fs::metadata(paths.get(i)).map_or(0, |m| m.len()), i)).collect();
+    by_size.sort_unstable();
+    let mut picks: Vec<usize> = Vec::new();
+    if !by_size.is_empty() {
+        for q in [10, 30, 50, 70, 90, 100] {
+            picks.push(by_size[((by_size.len() - 1) * q / 100).min(by_size.len() - 1)].1);
+        }
+    }
+    let mut hot = Vec::new();
+    for h in HOT {
+        if let Some(i) = (0..paths.len()).find(|&i| paths.get(i).strip_prefix(&base).is_ok_and(|r| r == Path::new(h))) {
+            picks.push(i);
+            hot.push(i);
+        }
+    }
+    picks.sort_unstable();
+    picks.dedup();
+
+    let was = timing::is_enabled();
+    timing::enable(false);
+    let mut all: Vec<UpdateStats> = Vec::new();
+    let mut hot_totals = Vec::new();
+    for round in 0..ROUNDS {
+        for &i in &picks {
+            let p = paths.get(i).to_path_buf();
+            let original = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+            for edit in [true, false] {
+                if !inplace {
+                    let mut text = original.clone();
+                    if edit {
+                        text.extend_from_slice(format!("\n\ndef _pymapper_bench_{round}():\n    return {round}\n").as_bytes());
+                    }
+                    fs::write(&p, &text)?;
+                }
+                let (_, st) = prog.update(inputs(&paths), &[&p]);
+                if hot.contains(&i) {
+                    hot_totals.push(st.total);
+                }
+                all.push(st);
+            }
+        }
+    }
+    timing::enable(was);
+    let sum: Duration = all.iter().map(|s| s.total).sum();
+    timing::record("incremental.update", sum);
+    let col = |f: fn(&UpdateStats) -> Duration| -> Vec<Duration> { all.iter().map(f).collect() };
+    let mut totals = col(|s| s.total);
+    let best = totals.iter().min().map_or(0, |d| d.as_micros() as u64);
+    let worst = totals.iter().max().map_or(0, |d| d.as_micros() as u64);
+    let counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("inplace".to_owned(), u64::from(inplace)),
+        ("updates".to_owned(), all.len() as u64),
+        ("update_median_us".to_owned(), median(&mut totals)),
+        ("update_best_us".to_owned(), best),
+        ("update_worst_us".to_owned(), worst),
+        ("hot_median_us".to_owned(), median(&mut hot_totals)),
+        ("plan_us".to_owned(), median(&mut col(|s| s.plan))),
+        ("extract_us".to_owned(), median(&mut col(|s| s.extract))),
+        ("patch_us".to_owned(), median(&mut col(|s| s.patch))),
+        ("resolve_imports_us".to_owned(), median(&mut col(|s| s.resolve_imports))),
+        ("resolve_calls_us".to_owned(), median(&mut col(|s| s.resolve_calls))),
+        ("diff_us".to_owned(), median(&mut col(|s| s.diff))),
+        ("heap_kb_before".to_owned(), heap_before as u64 / 1000),
+        ("heap_kb_after".to_owned(), prog.heap_bytes() as u64 / 1000),
+    ];
+    drop(prog);
+    drop(copy);
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors };
+    Ok((stats, counters))
+}

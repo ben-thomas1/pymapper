@@ -138,6 +138,11 @@ pub(super) struct OldSnap {
     fileless: Vec<NodeId>,
     /// Duplicate ordinal and parent of every old node (only when file metadata changed).
     structure: Option<(Vec<u16>, Vec<u32>)>,
+    /// Run starts per old file (`files + 1` entries) of the import, call and decorator tables:
+    /// translate rows of carried resolution results.
+    pub imports: Vec<u32>,
+    pub calls: Vec<u32>,
+    pub decorators: Vec<u32>,
 }
 
 /// Signature of def `v`: a hash of what it is (kind, flags, decorators, bases, params,
@@ -189,6 +194,9 @@ impl OldSnap {
             qid_of: FxHashMap::default(),
             fileless: Vec::new(),
             structure: None,
+            imports: run_starts(ix, |ff| (ff.imports.start, ff.imports.len), ix.facts().imports.len()),
+            calls: run_starts(ix, |ff| (ff.calls.start, ff.calls.len), ix.facts().calls.len()),
+            decorators: run_starts(ix, |ff| (ff.decorators.start, ff.decorators.len), ix.facts().decorators.len()),
         };
         let push_qid = |snap: &mut OldSnap, v: NodeId| {
             let start = snap.qids.len() as u32;
@@ -233,6 +241,11 @@ impl OldSnap {
             snap.structure = Some((dup, parent));
         }
         snap
+    }
+
+    /// Names of the defs of the old files that are re-extracted or removed.
+    pub fn dropped_names(&self) -> impl Iterator<Item = Sym> + '_ {
+        self.defs.iter().filter_map(|d| d.name)
     }
 
     /// Package/module node of every old file.
@@ -372,6 +385,17 @@ impl OldSnap {
             ..IndexDiff::default()
         }
     }
+}
+
+/// Start of every file's run of one table, plus the table length (`files + 1` entries).
+fn run_starts(ix: &Index, run: impl Fn(&crate::extract::facts::FileFacts) -> (u32, u32), len: u32) -> Vec<u32> {
+    let n = ix.file_count();
+    let mut v = Vec::with_capacity(n as usize + 1);
+    for f in 0..n {
+        v.push(run(ix.file_facts(f)).0);
+    }
+    v.push(len);
+    v
 }
 
 /// Old files that no new file comes from.
