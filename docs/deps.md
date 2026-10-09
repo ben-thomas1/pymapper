@@ -6,6 +6,10 @@ complexity, hotspots, maintainability, coupling and a letter grade. It is inform
 humans and agents choosing, auditing or replacing dependencies; it never produces findings and
 always exits 0 (2 only for usage and fatal errors, as `check`).
 
+`pymapper deps --check [PATHS]` instead runs the dependency-hygiene rules PM601-PM604
+(undeclared, unused, private and transitive-only dependencies) and reports findings exactly
+like `check`; see [Hygiene](#hygiene---check).
+
 ```
 $ pymapper deps --score
 distribution  version  grade  score      loc  hot/kloc    mi   cc  deps  importers  api used  loc reached
@@ -43,6 +47,8 @@ covering the project root filters nothing. A path that does not exist is a usage
 | `--score` | add the scorecard columns (JSON: a `scorecard` object per distribution) |
 | `--all` | list every distribution, not only those first-party code imports or calls |
 | `--format concise\|json` | output format (`--output-format`, config `output-format`); `sarif` and `github` are usage errors |
+| `--check` | run the dependency-hygiene rules PM601-PM604 instead of listing ([Hygiene](#hygiene---check)); all four formats |
+| `--baseline FILE`, `--save-baseline FILE` | with `--check`: as for `check` |
 | `--stats` | phase timings (`deps.usage`, `deps.score`, ...), counters and peak RSS on stderr |
 | configuration flags | as for `check` (`--venv`, `--cache-dir`, `--no-cache`, `-j`, `--set`, `--config`, ...) |
 
@@ -133,6 +139,89 @@ One document with the conventions of `check`'s JSON (schema `version` 2, `tool`,
 `scorecard` is present with `--score` (`null` for a distribution without loaded code), and so
 are the `scorecards_*` counters. Reals have at most two decimals; fields are only ever added
 within a version.
+
+## Hygiene (`--check`)
+
+```
+$ pymapper deps --check
+app/api.py:3:8: PM601 `yaml` is provided by `PyYAML`, which is not a declared dependency
+app/api.py:7:6: PM603 `requests._internal` is private to `requests`
+pyproject.toml:9:5: PM602 dependency `idle` is declared but never imported
+Found 3 findings in 2 files (41 files checked).
+```
+
+`--check` runs the PM6xx rules ([`rules.md`](rules.md#dependencies)) with everything `check`
+has: the formats (`concise`, `json`, `sarif`, `github`), the rule selection (`select`,
+`--select PM604`, ...), `per-file-ignores`, inline suppressions, the confidence gate,
+`--baseline` / `--save-baseline` / `baseline`, `--stats` and the exit codes (0 clean, 1
+findings at or above the gate, 2 usage or fatal error). Only the PM6xx rules run: selecting
+none of them is a usage error. `--check` conflicts with `--score` and `--all`. Positional
+`PATHS` filter the report as for `check`: the whole project is analysed, and findings in Python
+files and `pyproject.toml` files outside `PATHS` are dropped.
+
+The project is loaded as `check` loads it (third-party code only with `--deps`): imports are
+mapped to distributions through the venv's installed metadata either way, so `--check` needs
+no third-party parse and costs about as much as a `check` with only cheap rules.
+
+### Declarations
+
+Every project unit (the project root and each directory below it with a `pyproject.toml`)
+declares its own dependencies; a file is checked against the nearest unit that declares any
+(a `pyproject.toml` with only tool configuration declares nothing). Declared means listed in:
+
+| table | kind |
+|-------|------|
+| `[project] dependencies` | main (PM602 checks these) |
+| `[project.optional-dependencies]` | optional |
+| `[dependency-groups]` (PEP 735) | group |
+| `[tool.poetry.dependencies]` | main (`optional = true`: optional; `python` ignored) |
+| `[tool.poetry.dev-dependencies]`, `[tool.poetry.group.*.dependencies]` | group |
+| `[tool.uv] dev-dependencies`, `[tool.pdm.dev-dependencies]` | group |
+
+Requirement strings are PEP 508; names are compared PEP 503-normalised (`PyYAML` = `pyyaml`)
+and extras are kept (`requests[socks]`). A unit whose `[project] dynamic` lists
+`dependencies` is not checked by PM601, PM602 and PM604 (warning); one that lists
+`optional-dependencies` is not checked by PM601 and PM604. Without any declaration, these rules
+report nothing (warning); PM603 needs none. Imports of the project itself or of another unit
+(a workspace member) are never undeclared, and a workspace member imported through its
+first-party package counts as a used dependency of the importing unit.
+
+A `pyproject.toml` takes `# pymapper: ignore[PM602]` comments on the line of a requirement (a
+`#` inside a TOML string is not a comment), and `per-file-ignores` patterns match it like any
+file (`"pyproject.toml" = ["PM602"]`, `"libs/*/pyproject.toml" = [...]`).
+
+### Mapping imports to distributions
+
+Only absolute imports are mapped (relative imports are first-party). For each import row:
+
+1. a module that resolves to loaded code: first-party code is never a dependency, stdlib code is
+   ignored, a third-party group gives its distribution;
+2. otherwise the top-level name: the stdlib table, then the distributions whose
+   `top_level.txt` or `RECORD` (or editable-install mapping) list it; for a name several
+   distributions share (namespace packages such as `google`), the distribution whose `RECORD`
+   lists the imported module (`google/protobuf/__init__.py` -> `protobuf`), else any of them;
+3. otherwise a built-in table of import names whose distribution is named differently (`yaml`
+   -> `PyYAML`, `PIL` -> `Pillow`, `sklearn` -> `scikit-learn`, ... about 50 entries), else a guess
+   from the name itself.
+
+The confidence of PM601, PM602 and PM604 says which step answered: 100 for installed metadata,
+90 for the table, 60 for a guess (below the default gate of 80, so a project without a venv
+only sees the table's answers by default). An import guarded by `except ImportError` is an
+optional dependency: at most 50. A declared dependency that installs no importable name (a
+command-line tool, a meta-package) is reported unused with confidence 50; one that is not
+installed is matched by its table or guessed import names. `from m import a, b` on one line is
+one PM601.
+
+PM604 (off by default) follows `Requires-Dist` from the installed declared dependencies,
+transitively, honouring requested extras (`requests[socks]` pulls in `PySocks`; `requests`
+alone does not), and names the declared dependency that pulls the import in. The `METADATA`
+headers are read lazily, once per distribution reached, and only when an import is undeclared.
+
+PM603 flags a component starting with `_` in the import path or the imported name of
+third-party code (`pkg._internal`, `from pkg import _helper`), reported up to that component;
+dunders (`__version__`) and the lone `_` (`from pkg import _`, the gettext idiom) are not
+private. It needs the code to be known third-party (loaded, or attributed to an installed
+distribution), never a guess.
 
 ## Cost
 

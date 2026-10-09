@@ -161,7 +161,7 @@ that matches no rule (`PM999`, anywhere in the rule options) is a usage error (e
 
 Expensive rules also need their `[analysis]` toggle (\"needs ...\" below): turning the toggle on
 enables them unless they are ignored. `pymapper check` does not run the dependency rules (PM6xx,
-they belong to `pymapper deps`) or the contract rules PM302-PM304 without `[[contracts]]`. If
+`pymapper deps --check` runs them) or the contract rules PM302-PM304 without `[[contracts]]`. If
 none of the selected rules can run, `check` fails with exit 2 and says why; if some can, it warns
 about the skipped rules selected by code or category (`PM501`, `PM6`) and, whenever rules were
 selected explicitly (`ALL` included), its footer says how many rules ran and which were skipped

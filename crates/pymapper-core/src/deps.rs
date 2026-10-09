@@ -42,6 +42,8 @@ mod store;
 mod usage;
 
 #[cfg(test)]
+mod hygiene_tests;
+#[cfg(test)]
 mod tests;
 
 pub use declared::{DeclStatus, DeclaredDep, Declarations, DepKind, UnitDecl, parse_requirement, toml_suppressions};

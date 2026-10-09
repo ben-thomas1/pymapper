@@ -36,6 +36,7 @@ pymapper check --save-baseline .pymapper-baseline.json   # record today's findin
 pymapper check --baseline .pymapper-baseline.json        # report only new ones
 pymapper check --stats               # phase timings and peak RSS on stderr
 pymapper deps --score                # third-party distributions: use by first-party code, grades (docs/deps.md)
+pymapper deps --check                # dependency hygiene: undeclared, unused, private imports (PM6xx)
 pymapper config                      # the effective configuration
 pymapper config --template           # every option, commented, with its default and cost
 ```

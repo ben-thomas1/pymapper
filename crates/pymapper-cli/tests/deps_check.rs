@@ -297,6 +297,22 @@ fn workspace_members_declare_their_own_dependencies() {
 }
 
 #[test]
+fn namespace_packages_map_to_the_distribution_listing_the_module() {
+    let p = Project::new("namespace");
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"google-api-core\"]\n")
+        .file("app/__init__.py", "import google.protobuf\nfrom google.api_core import f\n")
+        .file(".venv/pyvenv.cfg", "version = 3.12.4\n")
+        .dist("google-api-core", "2.0", &["google/api_core"], &[])
+        .dist("protobuf", "5.0", &["google/protobuf"], &[]);
+    let want = ["app/__init__.py:1:8: PM601 `google.protobuf` is provided by `protobuf`, which is not a declared dependency"];
+    for args in [&[][..], &["--deps"][..]] {
+        let r = p.run(args);
+        r.expect_code(1);
+        assert_eq!(r.findings(), want, "{args:?}: {}", r.stdout);
+    }
+}
+
+#[test]
 fn no_venv_maps_by_name_below_the_gate() {
     let p = Project::new("novenv");
     p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = []\n").file("app/__init__.py", "import yaml\nimport requests\n");

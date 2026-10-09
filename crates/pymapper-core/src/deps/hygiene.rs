@@ -110,6 +110,10 @@ struct Third {
     /// The import is known to be third-party code (loaded in a third-party group, or attributed
     /// to an installed distribution), not just guessed from an unknown name.
     known: bool,
+    /// No other distribution may provide the module: the loaded group, the `RECORD` listing
+    /// the module, or the only provider of the top-level name. Otherwise (a namespace package
+    /// whose module no `RECORD` lists) any provider of the top-level name counts.
+    exact: bool,
 }
 
 /// Interned names per distribution, filled on first use.
@@ -259,7 +263,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 if eu == NONE {
                     continue;
                 }
-                let providers = self.cx.dists.providers(ix.str(top));
+                let providers = if third.exact { &[][..] } else { self.cx.dists.providers(ix.str(top)) };
                 self.used.insert((eu, third.norm));
                 self.used_top.insert((eu, top));
                 let mut declared = self.declared(eu, third.norm);
@@ -345,7 +349,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
             return match (grp.origin, grp.dist) {
                 (Origin::FirstParty, _) => ix.file(v).map(Provider::FirstParty),
                 (Origin::Stdlib, _) => None,
-                (Origin::ThirdParty, Some(d)) => Some(self.dist(d, names)),
+                (Origin::ThirdParty, Some(d)) => Some(self.dist(d, true, names)),
                 // Loaded from site-packages, but no RECORD claims it.
                 (Origin::ThirdParty, None) => self.by_name(chain, true, names),
             };
@@ -353,26 +357,27 @@ impl<'c, 'a> Analysis<'c, 'a> {
         match imp.status(row) {
             ImportStatus::ThirdParty => {
                 let d = imp.dist(row)?;
-                let d = self.refine(d, chain);
-                Some(self.dist(d, names))
+                let (d, exact) = self.refine(d, chain);
+                Some(self.dist(d, exact, names))
             }
             ImportStatus::External => self.by_name(chain, false, names),
             _ => None,
         }
     }
 
-    fn dist(&mut self, d: DistId, names: &mut Interner) -> Provider {
+    fn dist(&mut self, d: DistId, exact: bool, names: &mut Interner) -> Provider {
         let (norm, display) = self.dist_names.get(self.cx.dists, d, names);
-        Provider::Third(Third { norm, display, mapping: Mapping::Metadata, known: true })
+        Provider::Third(Third { norm, display, mapping: Mapping::Metadata, known: true, exact })
     }
 
     /// For a top-level name several distributions provide (namespace packages such as
-    /// `google`), the one whose `RECORD` lists the deepest module of `chain`; else `d`.
-    /// Only asked for shared names: a few O(1) lookups.
-    fn refine(&mut self, d: DistId, chain: &[Sym]) -> DistId {
+    /// `google`), the one whose `RECORD` lists the deepest module of `chain`, and whether
+    /// the answer is exact (see [`Third::exact`]); else `(d, false)`. Only asked for shared
+    /// names: a few O(1) lookups.
+    fn refine(&mut self, d: DistId, chain: &[Sym]) -> (DistId, bool) {
         let (ix, dists) = (self.cx.ix, self.cx.dists);
-        if chain.len() < 2 || dists.providers(ix.str(chain[0])).len() < 2 {
-            return d;
+        if dists.providers(ix.str(chain[0])).len() < 2 {
+            return (d, true);
         }
         let site = dists.site(d);
         for n in (2..=chain.len()).rev() {
@@ -388,11 +393,11 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 self.scratch.truncate(base);
                 self.scratch.extend_from_slice(suffix);
                 if let Some(owner) = dists.owner(site, &self.scratch) {
-                    return owner;
+                    return (owner, true);
                 }
             }
         }
-        d
+        (d, false)
     }
 
     /// Provider of a module that no loaded module of a distribution answers for: an installed
@@ -404,14 +409,14 @@ impl<'c, 'a> Analysis<'c, 'a> {
             return None;
         }
         if let Some(&d) = self.cx.dists.providers(top).first() {
-            let d = self.refine(d, chain);
-            return Some(self.dist(d, names));
+            let (d, exact) = self.refine(d, chain);
+            return Some(self.dist(d, exact, names));
         }
         let (dist, mapping) = names::distribution_of(top)?;
         crate::roots::normalize_name(dist, &mut self.scratch);
         let norm = names.intern(&self.scratch);
         let display = names.intern(dist);
-        Some(Provider::Third(Third { norm, display, mapping, known }))
+        Some(Provider::Third(Third { norm, display, mapping, known, exact: true }))
     }
 
     /// PM603 for `row` when a component of its path is private.

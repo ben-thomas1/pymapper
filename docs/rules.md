@@ -16,7 +16,7 @@ that matches no rule (`PM999`, anywhere in the rule options) is a usage error (e
 
 Expensive rules also need their `[analysis]` toggle ("needs ..." below): turning the toggle on
 enables them unless they are ignored. `pymapper check` does not run the dependency rules (PM6xx,
-they belong to `pymapper deps`) or the contract rules PM302-PM304 without `[[contracts]]`. If
+`pymapper deps --check` runs them) or the contract rules PM302-PM304 without `[[contracts]]`. If
 none of the selected rules can run, `check` fails with exit 2 and says why; if some can, it warns
 about the skipped rules selected by code or category (`PM501`, `PM6`) and, whenever rules were
 selected explicitly (`ALL` included), its footer says how many rules ran and which were skipped
@@ -495,9 +495,9 @@ Import of a third-party distribution not declared in `pyproject.toml`.
 - Severity: error
 - Enabled by default: yes
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]` or a `[dependency-groups]` group. The code works only because the package happens to be installed.
+First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. Units whose `dependencies` are `dynamic` are not checked.
 
 Fix: add the distribution to the project's dependencies.
 
@@ -511,9 +511,9 @@ Declared dependency that no first-party module imports.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-A distribution in `[project.dependencies]` provides no module that first-party code imports. Plugins, CLI tools and runtime-only extras are legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline suppression on the dependency line.
+A distribution in `[project.dependencies]` (or poetry's main dependencies) provides no module that the unit's first-party code imports. Optional and development groups are not checked. A distribution that installs no importable name (a command-line tool, a meta-package) is reported with confidence 50. Plugins, CLI tools and runtime-only extras are legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline suppression on the dependency line.
 
 Fix: remove the dependency, or move it to the group that needs it.
 
@@ -529,7 +529,7 @@ Import of a private module or name of a third-party package.
 - Cost: O(n)
 - Confidence: always 100
 
-The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution. Private internals change without notice between releases.
+The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders (`__version__`) and the lone `_` (the gettext idiom) are not private. Private internals change without notice between releases.
 
 Fix: use the package's public API, or pin the version and isolate the access in one module.
 
@@ -543,9 +543,9 @@ Import of a distribution installed only as a dependency of a dependency.
 - Severity: warning
 - Enabled by default: no (enable with `select` / `extend-select`)
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-A refinement of PM601: the imported distribution is not declared, but another declared dependency requires it. It may disappear when that dependency changes. When this rule is enabled such imports are reported as PM604 instead of PM601; it is off by default because PM601 already reports them.
+A refinement of PM601: the imported distribution is not declared, but a declared dependency requires it, directly or transitively (installed `Requires-Dist` metadata, extras honoured). It may disappear when that dependency changes. When this rule is enabled such imports are reported as PM604 instead of PM601; it is off by default because PM601 already reports them.
 
 Fix: declare the distribution directly.
 
