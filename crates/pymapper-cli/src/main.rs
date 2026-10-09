@@ -66,8 +66,22 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             // Ignore write failures: stderr may be closed and there is nowhere else to report.
-            let _ = writeln!(std::io::stderr().lock(), "pymapper: error: {err:#}");
+            let _ = writeln!(std::io::stderr().lock(), "pymapper: error: {}", error_chain(&err));
             ExitCode::from(EXIT_ERROR)
         }
     }
+}
+
+/// `err` and its causes joined by `: `, skipping a cause whose text the message already holds
+/// (errors that embed their source, such as `cannot read x: <io error>`).
+fn error_chain(err: &anyhow::Error) -> String {
+    let mut msg = err.to_string();
+    for cause in err.chain().skip(1) {
+        let c = cause.to_string();
+        if !msg.contains(&c) {
+            msg.push_str(": ");
+            msg.push_str(&c);
+        }
+    }
+    msg
 }

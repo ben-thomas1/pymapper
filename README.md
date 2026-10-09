@@ -67,8 +67,9 @@ Full reference (pipeline, every flag, output formats, baselines, `--stats`):
 
 Questions about the code, answered from the same whole-program load as `check` (same root,
 config, flags and cache). The output is meant for agents: one fact per line, at the
-`path:line:col` it is about, call edges tagged with their confidence, then one summary line;
-`--format json` gives one document with `check`'s conventions.
+`path:line:col` it is about (a call site, an import statement), call edges tagged with their
+confidence, then one summary line; `--format json` gives one document with `check`'s
+conventions.
 
 ```
 pymapper callers app.util:helper             # who calls it (--depth N, --transitive)
@@ -91,7 +92,8 @@ tests/test_util.py:5:12: tests.test_util:test_helper [certain]
 A symbol is a qualified id (`pkg.mod:Class.method`), a dotted name (`pkg.mod.Class.method`) or
 its last segments (`Class.method`, `method`). An ambiguous symbol lists its candidates on stdout
 and exits 2; an unknown one lists similar names and exits 2. Positional paths filter the rows
-(`pymapper callers helper src/api`), never what is loaded. Details:
+(`pymapper callers helper src/api`), never what is loaded; `path` takes `--root DIR` to query
+a project from outside it. Details:
 [`docs/cli.md`](docs/cli.md#query-subcommands).
 
 ## Configuration

@@ -6,9 +6,11 @@
 //!   ──> one line per edge at its call site / import line ──> exit 0 found, 1 no path
 //! ```
 //!
-//! There are no positional paths: a chain is one fact and is never filtered.
+//! There are no positional paths: a chain is one fact and is never filtered. `--root` points
+//! config and project-root discovery at another directory.
 
 use std::io;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use pymapper_core::index::NodeId;
@@ -40,12 +42,16 @@ pub struct Args {
     /// Longest chain searched, in edges (default: unbounded).
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     max_len: Option<u32>,
+    /// Start config and project-root discovery here (default: the working directory). Only
+    /// locates the project: the chain is never filtered.
+    #[arg(long, value_name = "DIR")]
+    root: Option<PathBuf>,
     #[command(flatten)]
     flags: QueryFlags,
 }
 
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
-    let s = Session::open("path", args.flags, Vec::new())?;
+    let s = Session::open_at("path", args.flags, args.root)?;
     let q = s.query();
     let from = match s.resolve(&q, "path", &args.from)? {
         Ok(v) => v,
@@ -194,7 +200,7 @@ fn write(q: &pymapper_core::query::Query<'_>, w: &mut Writer<'_>, from: NodeId, 
             if opts.max_len != u32::MAX {
                 w.str(" within ");
                 w.num(u64::from(opts.max_len));
-                w.str(" edges");
+                w.str(if opts.max_len == 1 { " edge" } else { " edges" });
             }
         }
     }

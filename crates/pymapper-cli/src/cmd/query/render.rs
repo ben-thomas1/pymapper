@@ -367,8 +367,8 @@ pub fn origin_str(ix: &Index, v: NodeId) -> &'static str {
     }
 }
 
-/// Where a node is defined: file, 1-based line and column of its name (packages and modules:
-/// line 1, column 0; nodes without a file: none).
+/// Where a node is defined: file, 1-based line and column of its name. Packages and modules
+/// have line 0 and column 0 (concise `path: `, JSON `null`); nodes without a file have none.
 #[derive(Clone, Copy)]
 pub struct SymbolLoc {
     pub file: Option<FileId>,

@@ -1400,6 +1400,15 @@ stdout line count (rows plus the summary line). `query.build` is the labelled ca
   module graphs) and the result. `locate` adds 12 bytes per row plus `V / 8` bytes.
 - The stdlib rows were measured before the bit set was added to `locate` (it only changes
   `output.sites`, at most 0.1 ms there).
+- **Import sites.** `imports` rows and `impact` importers were later placed at their import
+  statement (`output.sites` covers it). `Query::import_sites` makes one pass over the import
+  rows of the files `Query::deps` scans (a binary search per row); an `impact` importer scans
+  its own file's rows once (every importer is a distinct file). Measured afterwards (same
+  machine, other worktrees busy): `imports warnings --direction in --limit 0` on lectio
+  `--deps --stdlib` (12,935 rows) 1.0 ms of `output.sites`; `impact warnings:warn --limit 0`
+  there 108 ms of `output.sites` (was 88 ms: about 20 ms for 57,799 importers), total 0.97 s;
+  `impact posixpath:join --limit 0` on the stdlib 0.8 ms, total 14.8 ms, peak RSS 25.6 MB.
+  Peak RSS does not change (the sites of the shown rows only: 12 bytes per row).
 
 ### Coverage evidence (S6.3)
 

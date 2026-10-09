@@ -24,7 +24,7 @@ use super::{Query, Scratch};
 use crate::graph::CallFilter;
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::intern::Sym;
-use crate::resolve::{Confidence, ExtKind, Reason, res_flags};
+use crate::resolve::{Confidence, ExtKind, ModuleEdge, Reason, res_flags};
 use crate::roots::DistId;
 use crate::rollup::Level;
 
@@ -336,23 +336,7 @@ impl Query<'_> {
     fn imports_in(&self, target: NodeId, opts: &DepOptions, agg: &mut Agg<'_>, importers: &mut Vec<u32>) {
         let ix = self.ix;
         let inside = |v: NodeId| ix.is_descendant(target, v);
-        let mg = self.import_graph();
-        let range = ix.subtree(target);
-        let lo = mg.nodes().partition_point(|&v| v < range.start) as u32;
-        let hi = mg.nodes().partition_point(|&v| v < range.end) as u32;
-        importers.clear();
-        for m in lo..hi {
-            for &p in mg.graph().pred(m) {
-                let v = mg.node(p);
-                if !inside(v)
-                    && let Some(f) = ix.file(v)
-                {
-                    importers.push(f);
-                }
-            }
-        }
-        importers.sort_unstable();
-        importers.dedup();
+        self.importer_files(target, importers);
         for &f in importers.iter() {
             let r = representative(ix, opts.level, target, ix.file_node(f));
             for me in self.imp.module_edges(f) {
@@ -361,6 +345,29 @@ impl Query<'_> {
                 }
             }
         }
+    }
+
+    /// Files of the modules outside `target` importing a module in its subtree (from the
+    /// reverse import graph), ascending, into `out`.
+    fn importer_files(&self, target: NodeId, out: &mut Vec<u32>) {
+        let ix = self.ix;
+        let mg = self.import_graph();
+        let range = ix.subtree(target);
+        let lo = mg.nodes().partition_point(|&v| v < range.start) as u32;
+        let hi = mg.nodes().partition_point(|&v| v < range.end) as u32;
+        out.clear();
+        for m in lo..hi {
+            for &p in mg.graph().pred(m) {
+                let v = mg.node(p);
+                if !ix.is_descendant(target, v)
+                    && let Some(f) = ix.file(v)
+                {
+                    out.push(f);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
     }
 
     /// Files of the package/module nodes in `target`'s subtree (its file for a def), ascending.
@@ -384,6 +391,154 @@ impl Query<'_> {
         }
         out.sort_unstable();
         out
+    }
+}
+
+/// Where an import dependency is written: an import row behind it (12 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportSite {
+    pub file: FileId,
+    /// 1-based line and column of the import row.
+    pub line: u32,
+    pub col: u32,
+}
+
+/// First rows of one dependency in scan order: `best` is the first whose own flags avoid
+/// `import_exclude` (a runtime import under `--runtime`), `any` the first of all.
+#[derive(Clone, Copy, Default)]
+struct Pick {
+    best: Option<(FileId, usize)>,
+    any: Option<(FileId, usize)>,
+}
+
+impl Pick {
+    #[inline]
+    fn add(&mut self, f: FileId, row: usize, ok: bool) {
+        if self.any.is_none() {
+            self.any = Some((f, row));
+        }
+        if ok && self.best.is_none() {
+            self.best = Some((f, row));
+        }
+    }
+
+    #[inline]
+    fn done(&self) -> bool {
+        self.best.is_some()
+    }
+}
+
+/// Whether file `f`'s module edge to `dst` (`edges`: its module edges) exists and is counted
+/// with `exclude`.
+#[inline]
+fn edge_kept(edges: &[ModuleEdge], dst: NodeId, exclude: u8) -> bool {
+    edges.binary_search_by_key(&dst, |e| e.dst).ok().is_some_and(|i| edges[i].flags & exclude == 0)
+}
+
+impl Query<'_> {
+    /// The import row behind each of `deps` and `external`, which are rows (any subset) of
+    /// [`Query::deps`] for the same `target`, `dir` and `opts`: parallel vectors, `None` for a
+    /// row without import rows. The row is the dependency's first in (file, source) order:
+    /// for outgoing rows in the target's files, for incoming rows in the importer's files. A
+    /// row whose own flags intersect `opts.import_exclude` (a type-only row of an edge that
+    /// `--runtime` keeps) is used only when no other row qualifies. One pass over the import
+    /// rows of the files [`Query::deps`] scans for imports, with binary searches per row:
+    /// O(R log E) for R rows and E edges of those files.
+    pub fn import_sites(
+        &self,
+        target: NodeId,
+        dir: Direction,
+        opts: &DepOptions,
+        deps: &[Dependency],
+        external: &[ExternalDep],
+        scratch: &mut Scratch,
+    ) -> (Vec<Option<ImportSite>>, Vec<Option<ImportSite>>) {
+        let ix = self.ix;
+        let imp = self.imp;
+        let inside = |v: NodeId| ix.is_descendant(target, v);
+        let rep = |w: NodeId| representative(ix, opts.level, target, w);
+        let exclude = opts.import_exclude;
+        let mut picks = vec![Pick::default(); deps.len()];
+        let mut ext_picks = vec![Pick::default(); external.len()];
+        scratch.a.begin(ix.node_count() as usize);
+        for (i, d) in deps.iter().enumerate() {
+            if d.imports > 0 {
+                scratch.a.set(d.node, i as u32);
+            }
+        }
+        let mut ext_keys: Vec<(ExtKind, u32, u32)> =
+            external.iter().enumerate().map(|(i, e)| (e.kind, e.key, i as u32)).collect();
+        ext_keys.sort_unstable();
+        let marks = &scratch.a;
+        let is_def = ix.kind(target).is_def();
+        match dir {
+            Direction::Out if is_def => {
+                // As `imports_out`: rows inside the def, counted (and excluded) row by row.
+                if let Some(f) = ix.file(target) {
+                    let scope = &ix.facts().imports.scope;
+                    for row in ix.file_facts(f).imports.range() {
+                        let dst = imp.module_node(row);
+                        if dst == NONE || inside(dst) || imp.flags(row) & exclude != 0 || !inside(ix.def_node(f, scope[row])) {
+                            continue;
+                        }
+                        if let Some(i) = marks.get(rep(dst)) {
+                            picks[i as usize].add(f, row, true);
+                        }
+                    }
+                }
+            }
+            Direction::Out => {
+                for f in self.files_of(target) {
+                    let edges = imp.module_edges(f);
+                    for row in ix.file_facts(f).imports.range() {
+                        let ok = imp.flags(row) & exclude == 0;
+                        let dst = imp.module_node(row);
+                        if dst != NONE
+                            && !inside(dst)
+                            && let Some(i) = marks.get(rep(dst))
+                            && !picks[i as usize].done()
+                            && edge_kept(edges, dst, exclude)
+                        {
+                            picks[i as usize].add(f, row, ok);
+                        }
+                        if ext_keys.is_empty() {
+                            continue;
+                        }
+                        let Some(key) = imp.ext_key(row) else { continue };
+                        let lo = ext_keys.partition_point(|k| (k.0, k.1) < key);
+                        if let Some(&(_, _, i)) = ext_keys.get(lo).filter(|k| (k.0, k.1) == key)
+                            && !ext_picks[i as usize].done()
+                            && imp.ext_edges(f).iter().any(|x| (x.kind, x.key) == key && x.flags & exclude == 0)
+                        {
+                            ext_picks[i as usize].add(f, row, ok);
+                        }
+                    }
+                }
+            }
+            // A def target has no incoming import edges.
+            Direction::In if is_def => {}
+            Direction::In => {
+                let files = &mut scratch.buf;
+                self.importer_files(target, files);
+                for &f in files.iter() {
+                    let Some(i) = marks.get(rep(ix.file_node(f))) else { continue };
+                    let pick = &mut picks[i as usize];
+                    let edges = imp.module_edges(f);
+                    for row in ix.file_facts(f).imports.range() {
+                        if pick.done() {
+                            break;
+                        }
+                        let dst = imp.module_node(row);
+                        if dst != NONE && inside(dst) && edge_kept(edges, dst, exclude) {
+                            pick.add(f, row, imp.flags(row) & exclude == 0);
+                        }
+                    }
+                }
+            }
+        }
+        let st = &ix.facts().imports;
+        let site = |p: &Pick| p.best.or(p.any).map(|(file, row)| ImportSite { file, line: st.line[row], col: st.col[row] + 1 });
+        (picks.iter().map(site).collect(), ext_picks.iter().map(site).collect())
     }
 }
 

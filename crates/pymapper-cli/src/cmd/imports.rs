@@ -4,8 +4,11 @@
 //! ```text
 //!   load (as check) ──> Query ──> resolve SYMBOL ──> Query::deps (imports only, both
 //!   directions; other endpoint mapped to its module, or its ancestor at --depth) ──> PATHS
-//!   filter ──> concise | json
+//!   filter ──> Query::import_sites (shown rows) ──> concise | json
 //! ```
+//!
+//! Every row sits at the first import statement behind it (the target's files for `out`, the
+//! importer's for `in`), as `callers` rows sit at their first call site.
 //!
 //! A package or module target covers every module below it; a class or function covers the
 //! import statements inside it (outgoing only: imports name modules). Representatives never
@@ -18,7 +21,7 @@ use std::process::ExitCode;
 
 use pymapper_core::graph::CallFilter;
 use pymapper_core::index::{Index, NodeId};
-use pymapper_core::query::{DepOptions, Deps, Direction, ExternalDep, Query, Scratch};
+use pymapper_core::query::{DepOptions, Deps, Direction, ExternalDep, ImportSite, Query, Scratch};
 use pymapper_core::resolve::{Confidence, ExtKind, res_flags};
 use pymapper_core::rollup::Level;
 use pymapper_core::timing;
@@ -63,6 +66,9 @@ fn parse_direction(s: &str) -> Result<Direction, String> {
 struct Side {
     deps: Deps,
     counts: RowCounts,
+    /// Import statement of each shown row of `deps.deps` / `deps.external` (parallel).
+    sites: Vec<Option<ImportSite>>,
+    ext_sites: Vec<Option<ImportSite>>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
@@ -72,6 +78,14 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    // Imports name modules: nothing imports a class or function.
+    if args.direction == Some(Direction::In) && q.index().kind(target).is_def() {
+        anyhow::bail!(
+            "nothing imports a {} (imports name modules): `--direction in` needs a package or module, such as `{}`",
+            q.index().kind(target).as_str(),
+            q.index().qid_string(q.index().file(target).map_or(target, |f| q.index().file_node(f)))
+        );
+    }
     let opts = DepOptions {
         level: args.depth.map_or(Level::Module, Level::Depth),
         // Imports only: a filter that keeps no call edge.
@@ -91,7 +105,8 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         // Most rows first, then by name (interned ids depend on scheduling).
         let ix = q.index();
         deps.external.sort_by(|a, b| b.rows.cmp(&a.rows).then_with(|| ext_key(ix, &s, a).cmp(&ext_key(ix, &s, b))));
-        // Imports of code that is not loaded have no path: shown only without a filter.
+        // Imports of code that is not loaded have no module file to filter by: shown only
+        // without a filter.
         let outside_ext = if s.filtered() { std::mem::take(&mut deps.external).len() } else { 0 };
         let mut counts = RowCounts { outside: outside_ext, ..RowCounts::default() };
         deps.deps.retain(|d| {
@@ -101,7 +116,13 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         });
         counts.matched = deps.deps.len() + deps.external.len();
         counts.shown = counts.matched.min(limit);
-        Some(Side { deps, counts })
+        // Rows are written modules first, then imports of code that is not loaded.
+        let n = deps.deps.len().min(limit);
+        let n_ext = deps.external.len().min(limit - n);
+        let (sites, ext_sites) = timing::time("output.sites", || {
+            q.import_sites(target, dir, &opts, &deps.deps[..n], &deps.external[..n_ext], &mut scratch)
+        });
+        Some(Side { deps, counts, sites, ext_sites })
     };
     let out = side(Direction::Out);
     let inc = side(Direction::In);
@@ -131,6 +152,17 @@ fn ext_origin(e: &ExternalDep) -> &'static str {
     }
 }
 
+/// `,"site":{"path":..,"line":..,"col":..}` or `,"site":null`.
+fn json_site(w: &mut Writer<'_>, site: Option<ImportSite>) {
+    match site {
+        Some(st) => w.key_site("site", st.file, st.line, st.col),
+        None => {
+            w.key("site", false);
+            w.str("null");
+        }
+    }
+}
+
 fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, out: Option<&Side>, inc: Option<&Side>, limit: usize) {
     let ix = q.index();
     if w.json {
@@ -148,7 +180,7 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, 
     for (dir, side) in [("out", out), ("in", inc)] {
         let Some(side) = side else { continue };
         let mut n = 0;
-        for d in &side.deps.deps {
+        for (d, site) in side.deps.deps.iter().zip(&side.sites) {
             if n >= limit {
                 break;
             }
@@ -162,10 +194,13 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, 
                 w.key_str("origin", origin_str(ix, d.node));
                 w.key_num("rows", u64::from(d.imports));
                 w.import_flags(d.import_flags);
+                json_site(w, *site);
                 w.str("}");
             } else {
-                if let Some(f) = ix.file(d.node) {
-                    w.loc(f, 0, 0);
+                // At the import statement; without one (never expected), at the module.
+                match site {
+                    Some(st) => w.loc(st.file, st.line, st.col),
+                    None => w.node_loc(d.node),
                 }
                 w.str(if dir == "out" { "imports " } else { "imported by " });
                 w.qid(d.node);
@@ -179,11 +214,19 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, 
                 w.str(if d.imports == 1 { " row" } else { " rows" });
                 w.import_flags(d.import_flags);
                 w.str(")");
+                // Where the imported module is (the importer is where the statement is).
+                if dir == "out"
+                    && site.is_some()
+                    && let Some(f) = ix.file(d.node)
+                {
+                    w.str(" def ");
+                    w.file(f);
+                }
                 w.end_line();
             }
             i += 1;
         }
-        for e in &side.deps.external {
+        for (e, site) in side.deps.external.iter().zip(&side.ext_sites) {
             if n >= limit {
                 break;
             }
@@ -197,8 +240,12 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, 
                 w.external_name(e);
                 w.key_str("origin", ext_origin(e));
                 w.key_num("rows", u64::from(e.rows));
+                json_site(w, *site);
                 w.str("}");
             } else {
+                if let Some(st) = site {
+                    w.loc(st.file, st.line, st.col);
+                }
                 w.str("imports ");
                 w.external_name(e);
                 w.str(" (");

@@ -13,11 +13,12 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use pymapper_core::query::{Impact, Scratch};
+use pymapper_core::index::NodeId;
+use pymapper_core::query::{Impact, Query, Scratch};
 use pymapper_core::timing;
 
 use super::query::hops::{self, RowCounts, Side};
-use super::query::{QueryFlags, Session, WalkFlags, Writer, finish};
+use super::query::{QueryFlags, Session, WalkFlags, Writer, finish, import_site};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -67,7 +68,8 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         if w.json {
             w.close_array(rows.shown);
         }
-        let importers = write_importers(&s, &mut w, &imp, limit);
+        // One cap for both sections: importers get what the call rows left.
+        let importers = write_importers(&s, &q, &mut w, target, &imp, limit - rows.shown);
         if w.json {
             w.open_array("modules");
             for (i, &(m, n)) in imp.modules.iter().enumerate() {
@@ -101,14 +103,23 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Writes the transitive importers under the positional paths (concise
-/// `path: qid [importer]`; JSON an `importers` array).
-fn write_importers(s: &Session, w: &mut Writer<'_>, imp: &Impact, limit: usize) -> RowCounts {
+/// Writes the transitive importers under the positional paths, each at its first import
+/// statement of the module that brought it in (concise
+/// `path:line:col: qid [importer] imports qid +N rows`; JSON an `importers` array). Every
+/// importer is a distinct file, so locating them scans each file's import rows once.
+fn write_importers(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, imp: &Impact, limit: usize) -> RowCounts {
+    let ix = q.index();
     let mut c = RowCounts::default();
     if w.json {
         w.open_array("importers");
     }
-    for &m in &imp.importers {
+    // The target's modules (a def: its own module): their importers are direct.
+    let modules = match (ix.kind(target).is_def(), ix.file(target)) {
+        (true, Some(f)) => ix.file_node(f)..ix.file_node(f) + 1,
+        (true, None) => target..target,
+        (false, _) => ix.subtree(target),
+    };
+    for (&m, &via) in imp.importers.iter().zip(&imp.importer_via) {
         if !s.node_in_scope(m) {
             c.outside += 1;
             continue;
@@ -117,13 +128,40 @@ fn write_importers(s: &Session, w: &mut Writer<'_>, imp: &Impact, limit: usize) 
         if c.shown >= limit {
             continue;
         }
+        let site = timing::time("output.sites", || import_site(q, m, via));
+        let rows = ix.file(m).map_or(0, |f| {
+            let edges = q.imports().module_edges(f);
+            edges.binary_search_by_key(&via, |e| e.dst).map_or(0, |i| edges[i].rows)
+        });
         if w.json {
             w.item(c.shown);
-            w.symbol_object(m);
+            w.str("{");
+            w.symbol_fields(m, true);
+            w.key("imports", false);
+            w.qid(via);
+            w.key_bool("direct", modules.contains(&via));
+            match site {
+                Some((f, line, col)) => w.key_site("site", f, line, col),
+                None => {
+                    w.key("site", false);
+                    w.str("null");
+                }
+            }
+            w.key_num("rows", u64::from(rows));
+            w.str("}");
         } else {
-            w.node_loc(m);
+            match site {
+                Some((f, line, col)) => w.loc(f, line, col),
+                None => w.node_loc(m),
+            }
             w.qid(m);
-            w.str(" [importer]");
+            w.str(" [importer] imports ");
+            w.qid(via);
+            if rows > 1 {
+                w.str(" +");
+                w.num(u64::from(rows - 1));
+                w.str(if rows == 2 { " row" } else { " rows" });
+            }
             w.end_line();
         }
         c.shown += 1;

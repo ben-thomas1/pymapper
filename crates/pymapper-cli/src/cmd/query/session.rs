@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use pymapper_core::config::{Config, OutputFormat};
 use pymapper_core::analysis::cycles::CycleOptions;
-use pymapper_core::index::{FileId, NodeId};
+use pymapper_core::index::{FileId, Index, NodeId};
 use pymapper_core::query::{LookupOptions, Match, Query, QueryOptions, Resolved, Scope, WalkOptions};
 use pymapper_core::resolve::{Confidence, ResolvedCalls, resolve_calls};
 use pymapper_core::timing;
@@ -39,7 +39,8 @@ pub struct WalkFlags {
     /// node (the node only) or subtree.
     #[arg(long, value_name = "SCOPE", default_value = "auto", value_parser = parse_scope)]
     pub scope: Scope,
-    /// Rows printed (closest first); 0 prints every row.
+    /// Rows printed (closest first; `impact`: call rows and importers together); 0 prints
+    /// every row.
     #[arg(long, value_name = "N", default_value_t = 200)]
     pub limit: usize,
 }
@@ -86,6 +87,31 @@ pub struct Session {
     pub json: bool,
     /// Per file: under the positional paths (`None`: no filter).
     in_scope: Option<Vec<bool>>,
+    /// Bit set over nodes (with a filter): the package/module nodes with a file in scope at
+    /// or below them, so file-less nodes are answered in O(1).
+    nodes_in_scope: Vec<u64>,
+}
+
+/// The bit set of [`Session::nodes_in_scope`]: one bottom-up pass over the nodes (reverse
+/// pre-order: children before their parent), O(V) time and V / 8 bytes.
+fn scope_bits(ix: &Index, files: &[bool]) -> Vec<u64> {
+    let mut bits = vec![0u64; (ix.node_count() as usize).div_ceil(64)];
+    let has = |bits: &[u64], v: NodeId| bits[(v / 64) as usize] & (1 << (v % 64)) != 0;
+    for v in (0..ix.node_count()).rev() {
+        // Packages and modules only: no package or module lies below a class or function.
+        if ix.kind(v).is_def() {
+            continue;
+        }
+        if ix.file(v).is_some_and(|f| files[f as usize]) {
+            bits[(v / 64) as usize] |= 1 << (v % 64);
+        }
+        if has(&bits, v)
+            && let Some(p) = ix.parent(v)
+        {
+            bits[(p / 64) as usize] |= 1 << (p % 64);
+        }
+    }
+    bits
 }
 
 impl Session {
@@ -93,6 +119,16 @@ impl Session {
     /// the output only), then resolves calls. Configuration errors, paths that do not exist
     /// and the `sarif` / `github` formats are usage errors.
     pub fn open(name: &str, flags: QueryFlags, paths: Vec<PathBuf>) -> anyhow::Result<Session> {
+        Self::open_with(name, flags, paths, true)
+    }
+
+    /// As [`Session::open`] for a query whose output is never filtered (`path`): config and
+    /// project-root discovery start at `root` (default: the working directory).
+    pub fn open_at(name: &str, flags: QueryFlags, root: Option<PathBuf>) -> anyhow::Result<Session> {
+        Self::open_with(name, flags, root.into_iter().collect(), false)
+    }
+
+    fn open_with(name: &str, flags: QueryFlags, paths: Vec<PathBuf>, filter: bool) -> anyhow::Result<Session> {
         let t0 = Instant::now();
         if flags.stats {
             timing::enable(true);
@@ -117,7 +153,7 @@ impl Session {
             ));
         }
         // A path covering the whole project (`.` at the root) filters nothing.
-        if scope.iter().any(|s| root.starts_with(s)) {
+        if !filter || scope.iter().any(|s| root.starts_with(s)) {
             scope.clear();
         }
         let config = loaded.config;
@@ -138,7 +174,8 @@ impl Session {
             }
             warn(format_args!("no loaded Python files under {list}: every row is filtered out"));
         }
-        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, in_scope })
+        let nodes_in_scope = in_scope.as_deref().map_or_else(Vec::new, |s| scope_bits(&project.index, s));
+        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, in_scope, nodes_in_scope })
     }
 
     /// The query state (call graph built here, O(V + E)).
@@ -164,23 +201,10 @@ impl Session {
     pub fn node_in_scope(&self, v: NodeId) -> bool {
         let Some(s) = &self.in_scope else { return true };
         let ix = &self.project.index;
-        if let Some(f) = ix.file(v) {
-            return s[f as usize];
+        match ix.file(v) {
+            Some(f) => s[f as usize],
+            None => self.nodes_in_scope[(v / 64) as usize] & (1 << (v % 64)) != 0,
         }
-        // The packages and modules below `v`, jumping over def subtrees.
-        let end = ix.subtree(v).end;
-        let mut w = v;
-        while w < end {
-            if ix.kind(w).is_def() {
-                w = ix.subtree(w).end;
-                continue;
-            }
-            if ix.file(w).is_some_and(|f| s[f as usize]) {
-                return true;
-            }
-            w += 1;
-        }
-        false
     }
 
     /// A writer over stdout for this session's format.
@@ -214,7 +238,12 @@ impl Session {
         } else if matches.is_empty() {
             writeln!(err, "pymapper: error: no symbol matches `{text}`")
         } else {
-            writeln!(err, "pymapper: error: no symbol matches `{text}`; {} similar name(s) listed on stdout", matches.len())
+            writeln!(
+                err,
+                "pymapper: error: no symbol matches `{text}`; {} similar {} listed on stdout",
+                matches.len(),
+                if matches.len() == 1 { "name" } else { "names" }
+            )
         };
         self.report_stats(q, &[("candidates", matches.len() as u64)]);
         Ok(Err(ExitCode::from(crate::EXIT_ERROR)))

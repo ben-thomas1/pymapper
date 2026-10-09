@@ -154,6 +154,9 @@ pub struct Impact {
     /// Modules that import the target's modules, directly or transitively, in breadth-first
     /// order (every import edge, type-only and lazy ones included).
     pub importers: Vec<NodeId>,
+    /// Parallel to `importers`: the module whose import brought each importer in (one of the
+    /// target's modules for a direct importer, else an earlier importer).
+    pub importer_via: Vec<NodeId>,
 }
 
 impl Query<'_> {
@@ -210,13 +213,14 @@ impl Query<'_> {
             i = j;
         }
         out.modules.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        out.importers = self.importers(target, &mut scratch.b, &mut scratch.queue);
+        (out.importers, out.importer_via) = self.importers(target, &mut scratch.b, &mut scratch.queue);
         out.walk = walk;
         out
     }
 
-    /// Modules importing the modules of `target` (its own module for a def), transitively.
-    fn importers(&self, target: NodeId, marks: &mut Marks, queue: &mut Vec<u32>) -> Vec<NodeId> {
+    /// Modules importing the modules of `target` (its own module for a def), transitively,
+    /// with the module each one was reached from.
+    fn importers(&self, target: NodeId, marks: &mut Marks, queue: &mut Vec<u32>) -> (Vec<NodeId>, Vec<NodeId>) {
         let ix = self.ix;
         let mg = self.import_graph();
         let range = self.module_range(target);
@@ -230,7 +234,7 @@ impl Query<'_> {
             queue.push(m);
         }
         let mut head = 0;
-        let mut out = Vec::new();
+        let (mut out, mut via) = (Vec::new(), Vec::new());
         let rev = mg.graph().reverse();
         while head < queue.len() {
             let m = queue[head];
@@ -240,11 +244,12 @@ impl Query<'_> {
                     marks.set(p, 0);
                     queue.push(p);
                     out.push(mg.node(p));
+                    via.push(mg.node(m));
                 }
             }
         }
         debug_assert!(out.iter().all(|&v| !ix.is_descendant(target, v) || ix.kind(target).is_def()));
-        out
+        (out, via)
     }
 
     /// Package/module nodes standing for `target` in module graphs: its subtree for a

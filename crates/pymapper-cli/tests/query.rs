@@ -190,7 +190,7 @@ fn ambiguous_and_unknown_symbols_list_candidates_and_exit_2() {
     // Unknown: similar names, still exit 2.
     let r = p.run(&["callees", "hlper"]);
     r.expect_code(2).has_row("app/cli.py:13:5: app.cli:helper (function)");
-    assert!(r.stderr.contains("no symbol matches `hlper`; 2 similar name(s) listed on stdout"), "{}", r.stderr);
+    assert!(r.stderr.contains("no symbol matches `hlper`; 2 similar names listed on stdout"), "{}", r.stderr);
     let r = p.run(&["callees", "zzzzzzzz"]);
     r.expect_code(2);
     assert!(r.stdout.is_empty(), "{}", r.stdout);
@@ -270,8 +270,9 @@ fn impact_counts_affected_code_tests_and_importers() {
     r.expect_code(0)
         .has_row("app/main.py:6:9: app.main:run [certain] +1 site")
         .has_row("app/cli.py:10:12: app.cli:main [certain] depth 2 via app.main:run")
-        .has_row("app/main.py: app.main [importer]")
-        .has_row("app/cli.py: app.cli [importer]");
+        // Importers at the import statement of the module that brought them in.
+        .has_row("app/main.py:1:22: app.main [importer] imports app.util")
+        .has_row("app/cli.py:5:26: app.cli [importer] imports app.util");
     let s = r.summary();
     assert!(s.starts_with("impact of app.util:helper (function, app/util.py:1): 5 affected (4 symbols, 1 module level), 1 in tests, 4 files;"), "{s}");
     assert!(s.contains("importing modules; most affected: "), "{s}");
@@ -284,6 +285,24 @@ fn impact_counts_affected_code_tests_and_importers() {
     assert!(r.stdout.contains("],\"importers\":[\n"), "{}", r.stdout);
     assert!(r.stdout.contains("],\"modules\":[\n"), "{}", r.stdout);
     assert!(r.stdout.contains("\"summary\":{\"results\":5,\"symbols\":4,\"module_scopes\":1,\"tests\":1,\"files\":4,"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("\"symbol\":\"app.main\",\"kind\":\"module\",\"path\":\"app/main.py\",\"line\":null,\"col\":null,\"imports\":\"app.util\",\"direct\":true,\"site\":{\"path\":\"app/main.py\",\"line\":1,\"col\":22},\"rows\":1}"),
+        "{}",
+        r.stdout
+    );
+    // Transitive importers name the module that brought them in.
+    let r = p.run(&["impact", "app.core.db"]);
+    r.expect_code(0)
+        .has_row("app/core/engine.py:1:22: app.core.engine [importer] imports app.core.db")
+        .has_row("app/main.py:2:29: app.main [importer] imports app.core.engine")
+        .has_row("app/cli.py:9:26: app.cli [importer] imports app.main");
+    // --limit caps call rows and importer rows together.
+    let r = p.run(&["impact", "app.util:helper", "--limit", "1"]);
+    assert_eq!(r.expect_code(0).rows().len(), 1, "{}", r.stdout);
+    assert!(r.summary().ends_with("; first 1 shown (--limit 0 for all)"), "{}", r.summary());
+    let r = p.run(&["impact", "app.util:helper", "--limit", "6"]);
+    assert_eq!(r.expect_code(0).rows().len(), 6, "{}", r.stdout);
+    assert!(r.rows()[5].ends_with(" [importer] imports app.util"), "{}", r.stdout);
 }
 
 #[test]
@@ -300,7 +319,7 @@ fn path_finds_a_shortest_chain_or_exits_1() {
     r.expect_code(1);
     assert_eq!(r.stdout, "no call path from app.util:helper (function, app/util.py:1) to app.cli:main (function, app/cli.py:8)\n");
     let r = p.run(&["path", "app.cli:main", "app.util:helper", "--max-len", "1"]);
-    assert!(r.expect_code(1).stdout.ends_with(" within 1 edges\n"), "{}", r.stdout);
+    assert!(r.expect_code(1).stdout.ends_with(" within 1 edge\n"), "{}", r.stdout);
     // Imports: one line per import statement; a def stands for its module.
     let r = p.run(&["path", "app.cli", "app.core.db", "--imports"]);
     r.expect_code(0);
@@ -312,45 +331,69 @@ fn path_finds_a_shortest_chain_or_exits_1() {
     assert!(r.stdout.contains("\"graph\":\"imports\""), "{}", r.stdout);
     assert!(r.stdout.contains("\"found\":true"), "{}", r.stdout);
     assert!(r.stdout.contains("\"summary\":{\"length\":3,\"worst\":null}"), "{}", r.stdout);
+    // --root points discovery at a project outside the working directory.
+    let q = Project::new("path-root");
+    q.file("proj/pyproject.toml", "[project]\nname = \"m\"\n")
+        .file("proj/m.py", "def g():\n    return 1\n\n\ndef f():\n    return g()\n")
+        .file("other/notes.txt", "");
+    let r = q.run_in("other", &["path", "m:f", "m:g", "--root", "../proj"]);
+    assert_eq!(r.expect_code(0).rows(), ["m.py:6:12: m:f -> m:g [certain]"]);
+    q.run_in("other", &["path", "m:f", "m:g"]).expect_code(2);
 }
 
 #[test]
 fn imports_in_and_out_with_rollup() {
     let p = sample("imports");
     let r = p.run(&["imports", "app.cli"]);
+    // Every row at its import statement; out rows also name where the module is.
     r.expect_code(0)
-        .has_row("app/main.py: imports app.main (1 row, lazy)")
-        .has_row("app/util.py: imports app.util (1 row, type-only, conditional)")
-        .has_row("imports os (stdlib, not loaded, 1 row)")
-        .has_row("imports typing (stdlib, not loaded, 1 row)");
+        .has_row("app/cli.py:9:26: imports app.main (1 row, lazy) def app/main.py")
+        .has_row("app/cli.py:5:26: imports app.util (1 row, type-only, conditional) def app/util.py")
+        .has_row("app/cli.py:1:8: imports os (stdlib, not loaded, 1 row)")
+        .has_row("app/cli.py:2:20: imports typing (stdlib, not loaded, 1 row)");
     assert_eq!(r.summary(), "imports of app.cli (module, app/cli.py): 4 out (2 not loaded), 0 in");
     // --runtime drops imports only type checkers see.
     p.run(&["imports", "app.cli", "--runtime"]).expect_code(0).lacks("app.util");
     // A package covers its modules: imports between them are inside.
     let r = p.run(&["imports", "app.core"]);
     r.expect_code(0);
-    assert_eq!(r.rows(), ["app/main.py: imported by app.main (1 row)"]);
+    assert_eq!(r.rows(), ["app/main.py:2:29: imported by app.main (1 row)"]);
     // --depth rolls the other side up, never to an ancestor of the target.
     let r = p.run(&["imports", "app.main", "--depth", "1"]);
-    r.expect_code(0).has_row("app/util.py: imports app.util (1 row)").has_row("app/core/__init__.py: imports app.core (1 row)");
+    r.expect_code(0)
+        .has_row("app/main.py:1:22: imports app.util (1 row) def app/util.py")
+        .has_row("app/main.py:2:29: imports app.core (1 row) def app/core/__init__.py")
+        .has_row("app/cli.py:9:26: imported by app.cli (1 row, lazy)");
     assert!(r.summary().contains(" at depth 1: 2 out, 1 in"), "{}", r.summary());
     let r = p.run(&["imports", "test_util", "--depth", "1", "--direction", "out"]);
     r.expect_code(0);
-    assert_eq!(r.rows(), ["app/__init__.py: imports app (1 row)"]);
+    assert_eq!(r.rows(), ["tests/test_util.py:1:22: imports app (1 row) def app/__init__.py"]);
     assert!(r.summary().ends_with(": 1 out"), "{}", r.summary());
     // A function: the imports inside it, no incoming side.
     let r = p.run(&["imports", "app.cli:main"]);
     r.expect_code(0);
-    assert_eq!(r.stdout, "app/main.py: imports app.main (1 row, lazy)\nimports of app.cli:main (function, app/cli.py:8): 1 out\n");
+    assert_eq!(r.stdout, "app/cli.py:9:26: imports app.main (1 row, lazy) def app/main.py\nimports of app.cli:main (function, app/cli.py:8): 1 out\n");
+    // Nothing imports a def: asking for its importers is a usage error.
+    let r = p.run(&["imports", "app.cli:main", "--direction", "in"]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("nothing imports a function"), "{}", r.stderr);
+    // A runtime import is preferred over a type-only one of the same edge under --runtime.
+    let q = Project::new("imports-runtime");
+    q.file("pyproject.toml", "[project]\nname = \"rt\"\n")
+        .file("rt/__init__.py", "")
+        .file("rt/b.py", "X = 1\n")
+        .file("rt/a.py", "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from rt import b\n\nimport rt.b\n");
+    q.run(&["imports", "rt.a", "--direction", "out"]).expect_code(0).has_row("rt/a.py:4:20: imports rt.b (2 rows) def rt/b.py");
+    q.run(&["imports", "rt.a", "--direction", "out", "--runtime"]).expect_code(0).has_row("rt/a.py:6:8: imports rt.b (2 rows) def rt/b.py");
     // JSON.
     let r = p.run(&["imports", "app.core.db", "--format", "json", "--direction", "in"]);
     r.expect_code(0);
-    assert!(r.stdout.contains("\n  {\"direction\":\"in\",\"symbol\":\"app.core.engine\",\"kind\":\"module\",\"path\":\"app/core/engine.py\",\"line\":null,\"col\":null,\"origin\":\"first-party\",\"rows\":1,\"flags\":[]}\n"), "{}", r.stdout);
+    assert!(r.stdout.contains("\n  {\"direction\":\"in\",\"symbol\":\"app.core.engine\",\"kind\":\"module\",\"path\":\"app/core/engine.py\",\"line\":null,\"col\":null,\"origin\":\"first-party\",\"rows\":1,\"flags\":[],\"site\":{\"path\":\"app/core/engine.py\",\"line\":1,\"col\":22}}\n"), "{}", r.stdout);
     assert!(r.stdout.contains("\"summary\":{\"out\":null,\"external\":null,\"in\":1,"), "{}", r.stdout);
     // Paths filter the modules listed; imports of code that is not loaded have no path.
     let r = p.run(&["imports", "app.cli", "app/main.py"]);
     r.expect_code(0);
-    assert_eq!(r.rows(), ["app/main.py: imports app.main (1 row, lazy)"]);
+    assert_eq!(r.rows(), ["app/cli.py:9:26: imports app.main (1 row, lazy) def app/main.py"]);
     assert!(r.summary().ends_with("; 3 outside PATHS not shown"), "{}", r.summary());
 }
 
