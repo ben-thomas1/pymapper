@@ -678,10 +678,15 @@ fn matrix_scene_ids_and_marks() {
     assert_eq!(matrix_item(matrix_id(ID_ROW, 12345)), (ID_ROW, 12345));
     // Row labels start with the 1-based row number, then the qualified id.
     let ix = ix(&m);
-    let labelled: Vec<String> = (0..scene.rects.len()).filter(|&i| matrix_item(scene.rects.id[i]).0 == ID_ROW && !scene.label(i).is_empty()).map(|i| String::from_utf8_lossy(scene.label(i)).into_owned()).collect();
+    let labelled: Vec<usize> = (0..scene.rects.len()).filter(|&i| matrix_item(scene.rects.id[i]).0 == ID_ROW && !scene.label(i).is_empty()).collect();
     assert_eq!(labelled.len(), n);
-    let r0 = labelled.iter().find(|l| l.starts_with("1 ")).expect("row 1");
-    assert_eq!(&r0[2..], ix.qid_string(d.nodes[0]));
+    for i in labelled {
+        let r = matrix_item(scene.rects.id[i]).1 as usize;
+        assert_eq!(String::from_utf8_lossy(scene.label(i)), format!("{} {}", r + 1, ix.qid_string(d.nodes[r])));
+    }
+    // Label text is linear in the rows (no repeated prefixes).
+    let total: usize = d.nodes.iter().enumerate().map(|(r, &v)| format!("{} {}", r + 1, ix.qid_string(v)).len() + (r + 1).to_string().len()).sum();
+    assert_eq!(scene.text.len(), total);
     // Marks: the row band and the column band of a row.
     let [row, col] = geom.marks(2);
     assert_eq!(row.min[1], 2.0 * geom.cell);
@@ -960,5 +965,58 @@ fn views_focus_center(v: &super::Views) -> Option<NodeId> {
         Some(super::worker::Content::NodeLink { graph, focus, .. }) => focus.map(|f| graph.nodes[f as usize]),
         _ => None,
     }
+}
+
+#[test]
+fn view_tabs_and_controls_stay_idle_and_report_clicks() {
+    use super::ViewKind;
+    use crate::panels::{UiState, show};
+    use egui::{Event, PointerButton, RawInput, Rect, ViewportId, pos2, vec2};
+    let ctx = egui::Context::default();
+    let mut s = UiState::new("proj".to_owned(), "test".to_owned());
+    s.views.enabled = true;
+    s.views.selection = "app.a:fa".to_owned();
+    s.views.info = "12 nodes".to_owned();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+    for active in ViewKind::ALL {
+        s.views.active = active;
+        s.views.status = if active == ViewKind::CodeMap { String::new() } else { "laying out".to_owned() };
+        let mut last = None;
+        for _ in 0..4 {
+            let mut out = ctx.run_ui(RawInput { screen_rect: Some(screen), ..RawInput::default() }, |ui| show(ui, &mut s));
+            out.textures_delta.clear();
+            last = Some(out.viewport_output[&ViewportId::ROOT].repaint_delay);
+            assert!(s.views.tab.is_none() && !s.views.options_changed && !s.views.focus_selection);
+        }
+        assert_eq!(last, Some(std::time::Duration::MAX), "{active:?}: idle UI asks for no frame");
+    }
+    // A click on the "Matrix" tab reports it; a click on the canvas reports a canvas click.
+    s.views.active = ViewKind::CodeMap;
+    let canvas = s.canvas_rect;
+    let click = |at: egui::Pos2, s: &mut UiState| {
+        let events = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let mut found = (None, false);
+        for evs in [vec![Event::PointerMoved(at)], vec![events(true)], vec![events(false)], vec![]] {
+            let mut out = ctx.run_ui(RawInput { screen_rect: Some(screen), events: evs, ..RawInput::default() }, |ui| show(ui, s));
+            out.textures_delta.clear();
+            found.0 = found.0.or(s.views.tab);
+            found.1 |= s.canvas_input.click;
+        }
+        found
+    };
+    // Tabs: "Code map", "Graph", "Matrix", "Focus" left to right from the canvas corner; probe
+    // along the bar for the matrix tab.
+    let mut tab = None;
+    for dx in (10..400).step_by(6) {
+        if let (Some(t), _) = click(canvas.min + vec2(dx as f32, 18.0), &mut s) {
+            tab = Some(t);
+            if t == ViewKind::Matrix {
+                break;
+            }
+        }
+    }
+    assert_eq!(tab, Some(ViewKind::Matrix));
+    let (t, clicked) = click(canvas.center(), &mut s);
+    assert!(t.is_none() && clicked, "canvas click");
 }
 

@@ -250,7 +250,7 @@ pub fn matrix(cm: &CodeMap, d: &Dsm) -> (Scene, MatrixGeom) {
         let k = b.add_rect(matrix_id(ID_CELL, i as u32), 3, WorldRect::new(x0 + inset, y0 + inset, x0 + c - inset, y0 + c - inset), RectStyle { fill, stroke: Rgba::TRANSPARENT, radius: 1.0, stroke_width: 0.0 }, None);
         always(&mut b, k);
     }
-    let (mut qid, mut tmp, mut num) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut qid, mut num) = (Vec::new(), Vec::new());
     for (r, &v) in d.nodes.iter().enumerate() {
         let y = r as f32 * c;
         let k = b.add_rect(matrix_id(ID_ROW, r as u32), 2, WorldRect::new(y, y, y + c, y + c), RectStyle { fill: DIAG_COLOR, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 }, None);
@@ -261,8 +261,7 @@ pub fn matrix(cm: &CodeMap, d: &Dsm) -> (Scene, MatrixGeom) {
         qid.clear();
         qid.extend_from_slice(&num);
         qid.push(b' ');
-        ix.qid(v, &mut tmp);
-        qid.extend_from_slice(&tmp);
+        ix.qid(v, &mut qid);
         let mut fill = if r % 2 == 0 { Rgba::rgb(48, 52, 60) } else { Rgba::rgb(42, 46, 53) };
         if cm.layout.muted(v) {
             fill = muted(fill);
