@@ -45,11 +45,11 @@ shadowed by another file of the same module are not analysed, but every first-pa
 contributes dead-code name evidence; a name used only by test code gets the reason
 `used-only-in-tests`.
 
-The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them (see
-"Rules that cannot run" below).
+The PM6xx dependency-hygiene rules are run by `pymapper deps --check`, not `check` (see
+"Rules that cannot run" below and [`deps.md`](deps.md#hygiene---check)).
 
-`pymapper deps` (third-party distributions, their use by first-party code and `--score`
-scorecards) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
+`pymapper deps` (third-party distributions, their use by first-party code, `--score`
+scorecards and the `--check` dependency-hygiene rules) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
 `impact`, `path`, `cycles`, `summary`) are not implemented yet: they are hidden from
 `pymapper --help`, accept any operands and the configuration flags, and exit 2 with "not
 implemented".
@@ -158,8 +158,8 @@ own; a cache that cannot be written is only a warning.
 ## Rules that cannot run
 
 A selected rule does not run in `check` when its `[analysis]` toggle is off (PM501 needs
-`analysis.dupes = true`), when it is a dependency rule (PM6xx, owned by `pymapper deps`), or when
-it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
+`analysis.dupes = true`), when it is a dependency rule (PM6xx, run by `pymapper deps --check`),
+or when it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
 
 - If none of the selected rules can run (`--select PM6`, `--select PM601`, `--select PM501`
   without the toggle, `--select PM302` without contracts), `check` exits 2 and lists the rules
@@ -173,7 +173,7 @@ it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
   ```
   $ pymapper check --select ALL
   All checks passed! (128 files checked)
-  17 rules ran, 8 skipped (PM302-PM304: no [[contracts]]; PM501: needs `analysis.dupes = true`; PM601-PM604: run by `pymapper deps`, not `check`).
+  17 rules ran, 8 skipped (PM302-PM304: no [[contracts]]; PM501: needs `analysis.dupes = true`; PM601-PM604: run by `pymapper deps --check`).
   ```
 
 - The default selection skips these rules silently (that is what the defaults mean); `--stats`

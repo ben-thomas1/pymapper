@@ -64,6 +64,8 @@
 
 # Analyse third-party packages from the virtualenv, link first-party code to them and score
 # them (`pymapper deps --score`). Third-party findings never affect the `check` exit code.
+# Not needed by `pymapper deps --check` (dependency hygiene, PM6xx), which maps imports to
+# distributions through the venv's installed metadata.
 # (CLI: `--deps` / `--no-deps`.)
 # include-deps = false
 # cost: proportional to the size of site-packages (a large venv can be 60k files / 17M LOC);

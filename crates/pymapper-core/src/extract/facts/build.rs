@@ -639,7 +639,8 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         }
         let level = i.level.min(255) as u8;
         let scope = self.scope();
-        self.st.imports.push(scope, module.c, module.len, name, alias, level, flags, i.pos.line, i.pos.col);
+        let dline = (i.pos.line - i.module_pos.line).min(255) as u8;
+        self.st.imports.push(scope, module.c, module.len, name, alias, level, flags, i.pos.line, i.pos.col, dline, i.module_pos.col);
         if i.stmt_line != i.pos.line {
             self.sc.split_imports.push((i.stmt_line, i.pos.line));
         }

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!   selected rule ──> gate closed (analysis.dupes)     ──> skipped: Gate
-//!                 ──> PM6xx (run by `deps`)            ──> skipped: Deps
+//!                 ──> PM6xx (deps --check)             ──> skipped: Deps
 //!                 ──> PM302-PM304 without [[contracts]] ──> skipped: NoContracts
 //!                 ──> otherwise                         ──> runs
 //! ```
@@ -25,7 +25,7 @@ use crate::pipeline::warn;
 pub enum Skip {
     /// Expensive, and its `[analysis]` toggle (the key) is off.
     Gate(&'static str),
-    /// A dependency-hygiene rule: the `deps` step owns them.
+    /// A dependency-hygiene rule: `pymapper deps --check` runs them.
     Deps,
     /// A layering-contract rule without any `[[contracts]]`.
     NoContracts,
@@ -45,7 +45,7 @@ impl fmt::Display for SkipShort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Skip::Gate(key) => write!(f, "needs `{key} = true`"),
-            Skip::Deps => f.write_str("run by `pymapper deps`, not `check`"),
+            Skip::Deps => f.write_str("run by `pymapper deps --check`"),
             Skip::NoContracts => f.write_str("no [[contracts]]"),
         }
     }
@@ -58,7 +58,7 @@ impl fmt::Display for SkipWhy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Skip::Gate(key) => write!(f, "expensive, needs `{key} = true` (e.g. --set '{key} = true')"),
-            Skip::Deps => f.write_str("dependency rules are not run by `check` (they belong to `pymapper deps`, not implemented yet)"),
+            Skip::Deps => f.write_str("dependency rules are run by `pymapper deps --check`, not `check`"),
             Skip::NoContracts => f.write_str("no [[contracts]] are configured"),
         }
     }
