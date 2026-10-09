@@ -287,7 +287,10 @@
 # getattr) keeps a definition possibly live; it is reported with lower confidence instead of
 # as certainly dead. Turning this off reports more, less reliable findings.
 # name-fallback = true
-# cost: O(n) hashing during extraction. TBD (benchmark).
+# cost: O(n): the evidence hashes are taken during extraction anyway; the fallback probes each
+#       once against the names still in doubt (parallel). Measured: 3 ms on the stdlib (437k
+#       LOC), 50-130 ms on a 17M-LOC venv (library / application mode) out of 0.18-0.25 s for
+#       the whole dead-code pass.
 
 # Call resolution: link a call on an unknown receiver (`obj.method()`) to the only method with
 # that name in the program, with confidence "possible".

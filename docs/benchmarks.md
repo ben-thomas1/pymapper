@@ -67,6 +67,7 @@ entered, and symlinks are not followed.
 | `rollup`     | `calls` phases, `rollup.build`, `rollup.aggregates`, `rollup.levels` | `calls`, then `pymapper_core::rollup`: `rollup.build` = `Rollup::build` (all call edges with a target, all import edges), `rollup.aggregates` = `Aggregates::build`, `rollup.levels` = `Rollup::level_with` for every `Level::Depth(k)` from 0 to the deepest node, then `Level::Module`, with one reused scratch and output buffer. Counters `total_loc` (aggregated LOC of the distributions), `nodes`, `call_edges`, `call_pairs`, `sites`, `multi_sites`, `import_edges`, `levels`, `rollup_kb` (base tables), `agg_kb`, `scratch_kb`, `level_max_kb` (output buffer at its largest), `calls_kb`, `index_kb`, and per level `d{k}_edges` / `d{k}_us`, `module_edges` / `module_us` |
 | `hotspot`    | `load` phases, `hotspot.scan`, `hotspot.top` | `load`, then `pymapper_core::analysis::hotspot::analyse` with the default config (`hotspot.scan`: PM101-PM107 findings plus the per-module aggregates) and `top_functions` for the 100 worst functions by cognitive complexity (`hotspot.top`). Counters `loc`, `functions`, `classes`, `flagged` (functions over any function threshold), `findings`, `top_len`, `top_cognitive`, `hotspot_kb` = `ModuleHotspots::heap_bytes`, `index_kb` |
 | `coupling`   | `calls` phases, `graph.build`, `coupling.analyse` | `calls`, then the call graph over every node (all edges with a target) and `pymapper_core::analysis::coupling::analyse` with the default config (module Ca/Ce, abstractness, PM201-PM204). Counters `loc`, `modules` (files), `import_edges` (counted edges = sum of Ce), `class_candidates` (classes above `max-class-wmc`), `findings`, `coupling_kb` = `ModuleCoupling::heap_bytes`, `callgraph_kb`, `calls_kb`, `index_kb` |
+| `deadcode`   | `calls` phases, `deadcode.roots`, `deadcode.graph`, `deadcode.propagate`, `deadcode.evidence`, `deadcode.findings` | `calls`, then `pymapper_core::analysis::deadcode::analyse` with every PM4xx rule and the name fallback, in application mode with no entrypoints (the fewest roots, so the most candidates; `XTASK_DEADCODE_MODE=library` or `auto` changes the mode): roots, the call and override graphs plus seeds, the level propagation of defs and modules (module graphs included), the evidence scan plus the second propagation, the findings. Counters `loc`, `nodes`, `library`, `roots`, `live` (nodes at level 100), `candidates` (defs, modules and imports probed by the name fallback), `probes` (evidence hashes scanned), `expansions`, `pm401`..`pm405`, `findings` (emitted, confidence >= 10), `reported` (confidence >= 80), `graph_kb` (call + override graphs and seeds), `deadcode_kb` = `DeadCode::heap_bytes`, `calls_kb`, `index_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -859,6 +860,46 @@ Tarjan, one BFS per cyclic component), the contract check is parallel per chunk 
   independence). Peak RSS is that of the index and the import resolution.
 - Witnesses are short even in large components (3,415 modules, witness of at most 10
   modules): the BFS finds a shortest cycle through the component's lowest module.
+
+### Dead code (S4.3c)
+
+`deadcode` target (after `calls`), 14-core M4 Pro, release, warm cache, best of 3 (RSS worst of
+3), other worktrees running. Every corpus is one first-party group, so the stdlib and the venv
+are judged like project code. Application mode (the default of the target) has the fewest roots
+(`<module>` scopes, tests, `__main__` guards) and so the most candidates for the name fallback;
+library mode adds the public API.
+
+| corpus / mode | roots | live | candidates | probes | `deadcode.roots` | `.graph` | `.propagate` | `.evidence` | `.findings` | sum | findings (>= 10 / >= 80) | `graph_kb` | peak RSS MB (`calls` / `deadcode`) |
+|---------------|-------|------|------------|--------|------------------|----------|--------------|-------------|-------------|-----|--------------------------|------------|------------------------------------|
+| stdlib, application | 1,043   | 5,384   | 12,864  | 75,145    | 0.12ms | 1.21ms | 1.03ms | 2.85ms  | 0.08ms | 5.3ms  | 6,710 / 192        | 749    | 28.7 / 31.1  |
+| stdlib, library     | 11,389  | 15,872  | 3,557   | 75,145    | 0.17ms | 1.24ms | 1.11ms | 1.01ms  | 0.05ms | 3.6ms  | 2,736 / 27         | 749    | 28.7 / 29.9  |
+| venv, application   | 167,516 | 287,259 | 555,209 | 3,898,127 | 7.99ms | 52.6ms | 56.4ms | 129.0ms | 4.30ms | 250ms  | 306,983 / 70,727   | 30,829 | 584.6 / 685.9 |
+| venv, library       | 683,698 | 816,480 | 197,658 | 3,898,127 | 11.8ms | 55.2ms | 63.8ms | 50.4ms  | 2.74ms | 184ms  | 147,356 / 51,662   | 30,829 | 584.6 / 638.3 |
+
+- **Time**: 250 ms for the 17M-LOC venv in application mode against 3.2 s for the pipeline up
+  to resolved calls. `deadcode.graph` is the call graph without override edges plus the
+  override graph and the seed pass; `deadcode.propagate` the bucket-queue propagation over defs
+  (1.16M expansions for 1M nodes: each node is expanded about once per distinct level it
+  takes) plus the module import and module call graphs and their propagation;
+  `deadcode.evidence` the candidate tables, the explanation pass (parallel per chunk of files,
+  plus an SCC over the call edges between candidates), the probe of 3.9M evidence hashes
+  (parallel per file) and the second propagation. The first version of the evidence scan
+  probed every candidate of a name for every file mentioning it: 17.3 s on the venv (common
+  method names are shared by thousands of candidates and mentioned by thousands of files);
+  grouping candidates by name and bounding each probe by the smaller side of its intersection
+  brought it to 0.54 s sequential, 0.11-0.13 s in parallel.
+- **Memory**: the level and why bytes (2 per node, `deadcode_kb` with the module levels and
+  roots) are what the result keeps. The transient peak on the venv is about 100 MB above
+  `calls`: the call graph (31 MB, which a full run could share with the other graph
+  analyses), the module graphs, the evidence tables (a 4-byte candidate index per node, about
+  40 bytes per candidate, the candidate SCC) and the 307k findings.
+- **Findings**: the venv is not an application, so application mode reports most of its
+  public API; library mode is the meaningful setting there. On the stdlib in library mode, the
+  27 findings at the default gate were checked by hand: most are code called only from C
+  (`_strptime._strptime_time`, `sqlite3.dump._iterdump`, `_pylong`), public names of private
+  modules that nothing imports (confidence 80), and genuinely unused private methods. See the
+  module docs of `analysis::deadcode` for the known blind spots (calls from C, dispatch by
+  computed names in other modules, dead recursive functions).
 
 ### Output (S4.4)
 
