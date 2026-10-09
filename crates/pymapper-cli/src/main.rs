@@ -3,6 +3,8 @@
 //! Exit codes: 0 clean, 1 findings, 2 usage or fatal error.
 
 mod cmd;
+mod pipeline;
+mod stats;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -22,7 +24,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run rule checks and report findings.
-    Check(cmd::check::Args),
+    Check(Box<cmd::check::Args>),
     /// List callers of a symbol.
     Callers(cmd::callers::Args),
     /// List callees of a symbol.
@@ -44,7 +46,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Check(args) => cmd::check::run(&args),
+        Command::Check(args) => cmd::check::run(*args),
         Command::Callers(args) => cmd::callers::run(&args),
         Command::Callees(args) => cmd::callees::run(&args),
         Command::Impact(args) => cmd::impact::run(&args),

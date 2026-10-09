@@ -154,6 +154,30 @@ python-source = "python"
 }
 
 #[test]
+fn pyproject_entry_point_scripts() {
+    let text = r#"
+[project]
+name = "app"
+
+[project.scripts]
+app = "app.cli:main"
+tool = "app.tools:run [extra]"
+
+[project.gui-scripts]
+gui = "app.gui:start"
+
+[project.entry-points."pytest11"]
+plug = "app.plugin"
+
+[project.entry-points.weird]
+bad = 3
+"#;
+    let info = parse_pyproject(text).expect("valid");
+    assert_eq!(info.scripts, ["app.cli:main", "app.tools:run [extra]", "app.gui:start", "app.plugin"]);
+    assert!(parse_pyproject("[project]\nscripts = 1\n").expect("valid").scripts.is_empty());
+}
+
+#[test]
 fn metadata_header_parsing() {
     let m = b"Metadata-Version: 2.4\r\nName: PyYAML\r\nSummary: x\r\nVersion: 6.0.2\r\n\r\nName: body\n";
     let h = metadata_headers(m);

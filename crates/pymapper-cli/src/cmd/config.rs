@@ -39,10 +39,10 @@ pub struct ConfigArgs {
     #[arg(long, value_delimiter = ',', value_name = "PRESETS", help_heading = "Configuration")]
     pub preset: Vec<Preset>,
     /// Output format: concise, json, sarif, github.
-    #[arg(long, value_name = "FORMAT", help_heading = "Configuration")]
+    #[arg(long, visible_alias = "format", value_name = "FORMAT", help_heading = "Configuration")]
     pub output_format: Option<OutputFormat>,
     /// Minimum finding confidence (0-100) to report.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=100), help_heading = "Configuration")]
+    #[arg(long, visible_alias = "confidence", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=100), help_heading = "Configuration")]
     pub min_confidence: Option<u8>,
     /// Cache directory.
     #[arg(long, value_name = "DIR", help_heading = "Configuration")]
