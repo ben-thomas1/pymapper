@@ -861,6 +861,46 @@ Tarjan, one BFS per cyclic component), the contract check is parallel per chunk 
 - Witnesses are short even in large components (3,415 modules, witness of at most 10
   modules): the BFS finds a shortest cycle through the component's lowest module.
 
+### Dead code (S4.3c)
+
+`deadcode` target (after `calls`), 14-core M4 Pro, release, warm cache, best of 3 (RSS worst of
+3), other worktrees running. Every corpus is one first-party group, so the stdlib and the venv
+are judged like project code. Application mode (the default of the target) has the fewest roots
+(`<module>` scopes, tests, `__main__` guards) and so the most candidates for the name fallback;
+library mode adds the public API.
+
+| corpus / mode | roots | live | candidates | probes | `deadcode.roots` | `.graph` | `.propagate` | `.evidence` | `.findings` | sum | findings (>= 10 / >= 80) | `graph_kb` | peak RSS MB (`calls` / `deadcode`) |
+|---------------|-------|------|------------|--------|------------------|----------|--------------|-------------|-------------|-----|--------------------------|------------|------------------------------------|
+| stdlib, application | 1,043   | 5,384   | 12,864  | 75,145    | 0.12ms | 1.21ms | 1.03ms | 2.85ms  | 0.08ms | 5.3ms  | 6,710 / 192        | 749    | 28.7 / 31.1  |
+| stdlib, library     | 11,389  | 15,872  | 3,557   | 75,145    | 0.17ms | 1.24ms | 1.11ms | 1.01ms  | 0.05ms | 3.6ms  | 2,736 / 27         | 749    | 28.7 / 29.9  |
+| venv, application   | 167,516 | 287,259 | 555,209 | 3,898,127 | 7.99ms | 52.6ms | 56.4ms | 129.0ms | 4.30ms | 250ms  | 306,983 / 70,727   | 30,829 | 584.6 / 685.9 |
+| venv, library       | 683,698 | 816,480 | 197,658 | 3,898,127 | 11.8ms | 55.2ms | 63.8ms | 50.4ms  | 2.74ms | 184ms  | 147,356 / 51,662   | 30,829 | 584.6 / 638.3 |
+
+- **Time**: 250 ms for the 17M-LOC venv in application mode against 3.2 s for the pipeline up
+  to resolved calls. `deadcode.graph` is the call graph without override edges plus the
+  override graph and the seed pass; `deadcode.propagate` the bucket-queue propagation over defs
+  (1.16M expansions for 1M nodes: each node is expanded about once per distinct level it
+  takes) plus the module import and module call graphs and their propagation;
+  `deadcode.evidence` the candidate tables, the explanation pass (parallel per chunk of files,
+  plus an SCC over the call edges between candidates), the probe of 3.9M evidence hashes
+  (parallel per file) and the second propagation. The first version of the evidence scan
+  probed every candidate of a name for every file mentioning it: 17.3 s on the venv (common
+  method names are shared by thousands of candidates and mentioned by thousands of files);
+  grouping candidates by name and bounding each probe by the smaller side of its intersection
+  brought it to 0.54 s sequential, 0.11-0.13 s in parallel.
+- **Memory**: the level and why bytes (2 per node, `deadcode_kb` with the module levels and
+  roots) are what the result keeps. The transient peak on the venv is about 100 MB above
+  `calls`: the call graph (31 MB, which a full run could share with the other graph
+  analyses), the module graphs, the evidence tables (a 4-byte candidate index per node, about
+  40 bytes per candidate, the candidate SCC) and the 307k findings.
+- **Findings**: the venv is not an application, so application mode reports most of its
+  public API; library mode is the meaningful setting there. On the stdlib in library mode, the
+  27 findings at the default gate were checked by hand: most are code called only from C
+  (`_strptime._strptime_time`, `sqlite3.dump._iterdump`, `_pylong`), public names of private
+  modules that nothing imports (confidence 80), and genuinely unused private methods. See the
+  module docs of `analysis::deadcode` for the known blind spots (calls from C, dispatch by
+  computed names in other modules, dead recursive functions).
+
 ### Output (S4.4)
 
 Sorting, every format and the baseline round trip on synthetic findings (`cargo bench -p
