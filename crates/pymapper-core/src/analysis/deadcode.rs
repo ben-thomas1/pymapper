@@ -499,14 +499,16 @@ pub(crate) fn run(
         ModuleProp::new(ix, imp, calls, &roots, &info.included)
     });
     let mut stats = DeadCodeStats { library, roots: u64::from(roots.len()), ..DeadCodeStats::default() };
-    let icands = if emit.import { imports::candidates(ix, imp, &info, library) } else { Vec::new() };
-    let mut ihits = vec![evidence::import_hit::NONE; icands.len()];
-    if opts.name_fallback {
-        timing::time("deadcode.evidence", || {
-            let defs = def_candidates(ix, &info.included, &lv.level);
-            let mods = module_candidates(ix, &info.included, &mp);
-            let keys: Vec<(u32, FileId)> =
-                icands.iter().map(|c| (evidence_hash(ix.str(c.name)), c.file)).collect();
+    // Without the name fallback only the imports are probed (`module.name` uses by importers).
+    let (icands, ihits) = timing::time("deadcode.evidence", || {
+        let icands = if emit.import { imports::candidates(ix, imp, &info, library) } else { Vec::new() };
+        let (defs, mods) = if opts.name_fallback {
+            (def_candidates(ix, &info.included, &lv.level), module_candidates(ix, &info.included, &mp))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let keys: Vec<(u32, FileId)> = icands.iter().map(|c| (evidence_hash(ix.str(c.name)), c.file)).collect();
+        {
             let cands = evidence::Candidates { defs: &defs, modules: &mods, imports: &keys };
             let hits = evidence::scan(ix, imp, calls, &g.over, &info.included, &cands);
             stats.candidates = (defs.len() + mods.len() + keys.len()) as u64;
@@ -523,10 +525,10 @@ pub(crate) fn run(
                     mp.raise(m, level::EVIDENCE, Why::Evidence);
                 }
             }
-            ihits = hits.imports;
             lv.run(&g);
-        });
-    }
+            (icands, hits.imports)
+        }
+    });
     let (modules, mexp) = mp.finish();
     stats.graph_bytes = g.heap_bytes() as u64;
     drop(g);
