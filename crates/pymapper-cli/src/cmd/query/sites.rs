@@ -37,9 +37,18 @@ pub fn locate(q: &Query<'_>, pairs: &[Pair]) -> Vec<Sites> {
         pairs.iter().filter_map(|p| ix.file(if p.dispatch { p.dst } else { p.src })).collect();
     files.sort_unstable();
     files.dedup();
+    // Callers of the pairs as a bit set over nodes (V / 8 bytes): most edges of a scanned file
+    // start elsewhere and skip the binary search.
+    let mut srcs = vec![0u64; (ix.node_count() as usize).div_ceil(64)];
+    for p in pairs {
+        srcs[(p.src / 64) as usize] |= 1 << (p.src % 64);
+    }
     let calls = q.calls();
     for &f in &files {
         for e in calls.file_edges(f) {
+            if srcs[(e.src / 64) as usize] & (1 << (e.src % 64)) == 0 {
+                continue;
+            }
             let lo = keys.partition_point(|k| (k.0, k.1) < (e.src, e.dst));
             for k in keys[lo..].iter().take_while(|k| (k.0, k.1) == (e.src, e.dst)) {
                 let i = k.2 as usize;

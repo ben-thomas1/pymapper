@@ -203,6 +203,7 @@ impl Session {
         } else {
             writeln!(err, "pymapper: error: no symbol matches `{text}`; {} similar name(s) listed on stdout", matches.len())
         };
+        self.report_stats(q, &[("candidates", matches.len() as u64)]);
         Ok(Err(ExitCode::from(crate::EXIT_ERROR)))
     }
 

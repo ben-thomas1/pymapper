@@ -63,7 +63,7 @@ pub fn write_rows(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, walk: &Walk, s
             Side::Callees => Pair { src: h.via, dst: h.node, dispatch: h.dispatch },
         })
         .collect();
-    let sites = locate(q, &pairs);
+    let sites = pymapper_core::timing::time("output.sites", || locate(q, &pairs));
     for (i, (h, st)) in shown.iter().zip(&sites).enumerate() {
         if w.json {
             w.item(i);
