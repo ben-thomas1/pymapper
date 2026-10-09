@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::args::MeasureOpts;
+use crate::codemap::CodeMap;
 use crate::map::MapState;
 use crate::map::gpu::GpuMemory;
 use crate::stats::{Samples, Summary, process_usage};
@@ -249,6 +250,24 @@ pub fn map_report(out: &mut String, map: &MapState, gpu: GpuMemory, scene_build:
         mib(gpu.buffers),
         mib(gpu.atlas)
     );
+}
+
+/// Appends the code map's load and build phases and sizes to a report.
+pub fn codemap_report(out: &mut String, cm: &CodeMap) {
+    let a = &cm.analysis;
+    let _ = writeln!(
+        out,
+        "code map: {} files, {} nodes, {} call pairs, {} edges in {} zoom bands; code map heap {:.1} MiB",
+        a.index.file_count(),
+        a.index.node_count(),
+        a.rollup.stats().call_pairs,
+        cm.edges.len(),
+        cm.reveal.change_bands().len(),
+        cm.heap_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    for (name, d) in a.phases.iter().chain(&cm.phases) {
+        let _ = writeln!(out, "  {name:<22} {:>9.1} ms", ms(*d));
+    }
 }
 
 fn ms(d: Duration) -> f64 {

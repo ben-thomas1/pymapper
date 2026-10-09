@@ -6,8 +6,8 @@ codes, config, suppressions, baselines and exit codes. ruff and ty check one fil
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. `pymapper check` and `pymapper config` work end to end; the query
-subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are not
+**Status:** under rewrite. `pymapper check`, `pymapper deps` and `pymapper config` work end to
+end; the query subcommands (`callers`, `callees`, `impact`, `path`, `cycles`, `summary`) are not
 implemented yet (hidden from `--help`; running one exits 2).
 See [`docs/design.md`](docs/design.md) for the design.
 
@@ -35,6 +35,7 @@ pymapper check --deps --stdlib       # link first-party code to the venv and the
 pymapper check --save-baseline .pymapper-baseline.json   # record today's findings
 pymapper check --baseline .pymapper-baseline.json        # report only new ones
 pymapper check --stats               # phase timings and peak RSS on stderr
+pymapper deps --score                # third-party distributions: use by first-party code, grades (docs/deps.md)
 pymapper config                      # the effective configuration
 pymapper config --template           # every option, commented, with its default and cost
 ```
@@ -132,8 +133,9 @@ application-mode unit with no entry point at all gets a warning, since everythin
 look unused. Functions a framework loads by name from non-Python configuration (YAML tool
 lists, plugin registries) are found through config-file evidence (`analysis.config-evidence`,
 on by default): `*.yaml`, `*.yml`, `*.toml`, `*.json`, `*.cfg` and `*.ini` files of the
-first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles and pymapper /
-coverage.py reports are skipped) are tokenized once and cached. A full dotted path
+first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles, pymapper /
+coverage.py JSON reports and the configured `analysis.coverage` report are skipped) are
+tokenized once and cached. A full dotted path
 (`pkg.mod.func`, `pkg.mod:Class`) keeps a definition or module; a bare name lowers the
 confidence to 50 (10 when the file also names the module). Cost: one read per config file on a
 cold cache (a few ms for hundreds of files), a stat per file when warm. Rules you know better
@@ -169,7 +171,7 @@ Each rule's explanation, thresholds, cost class and confidence model:
 [`docs/rules.md`](docs/rules.md).
 
 Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`tests/`, `test/`,
-`testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
+`testing/`, `_tests/`, `_testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
 `analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
 tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
 structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a
@@ -180,7 +182,15 @@ route pymapper knows; lower values mean only weak evidence (a matching attribute
 string elsewhere, dynamic dispatch) keeps it possibly alive. `check` reports findings at or
 above `min-confidence`. Each finding names its evidence: the message says "is never used"
 only when nothing refers to the symbol, and the reasons are listed, e.g.
-`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON.
+`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON. Every
+first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
+is test-only API, reported below the gate as `used-only-in-tests`.
+
+Runtime evidence from a test run sharpens the scores: pass a coverage.py JSON report with
+`pymapper check --coverage coverage.json` (or `analysis.coverage`). Code that ran is never
+reported; code that never ran and has only weak static evidence of use moves above the gate
+(`(confidence 84: name-elsewhere, never-executed)`). Create the report with
+`coverage run -m pytest && coverage json`.
 
 ## Performance
 

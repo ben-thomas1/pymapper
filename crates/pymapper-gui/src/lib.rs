@@ -16,6 +16,8 @@
 //! render.rs   one frame: canvas pass + egui pass into a texture view
 //! canvas.rs   canvas: background + map renderer, logical -> physical pixel rects
 //! map/        instanced code-map renderer: scene, grid, LOD bands, camera, text, GPU
+//! codemap/    the code map: in-process analysis, semantic zoom, bundled edges, scenes
+//! mapui.rs    code map controls and legend (egui)
 //! panels.rs   egui panel layout (left search/tree, right details, bottom findings)
 //! schedule.rs render-on-demand scheduler (pure)
 //! stats.rs    frame-time samples, process CPU time / peak RSS
@@ -25,8 +27,10 @@
 pub mod app;
 pub mod args;
 pub mod canvas;
+pub mod codemap;
 pub mod gpu;
 pub mod map;
+pub mod mapui;
 pub mod measure;
 pub mod panels;
 pub mod render;

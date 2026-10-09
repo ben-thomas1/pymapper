@@ -88,6 +88,11 @@ fn vs_rect(@builtin(vertex_index) vi: u32, r: RectIn) -> RectOut {
     o.stroke_width = max(r.stroke_width * cam.ppp, 0.0);
     o.fill = r.fill;
     o.stroke = r.stroke;
+    // Fully transparent rects only carry a label (see `scene::RectStyle::label_only`):
+    // no fragments.
+    if r.fill.a <= 0.0 && r.stroke.a <= 0.0 {
+        o.pos = CULLED;
+    }
     return o;
 }
 

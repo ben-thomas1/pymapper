@@ -924,6 +924,23 @@ impl FactStore {
     /// patched with one pass of [`splice_col`]; headers of the files after an edit must be
     /// rebased by the caller. `plan` is a reused buffer.
     pub(crate) fn splice(&mut self, edits: &[(FileFacts, FileFacts)], src: &FactStore, plan: &mut Vec<Splice>) {
+        // Exhaustive on purpose: a new table must be spliced too (compile error until it is).
+        let FactStore {
+            defs: _,
+            decorators: _,
+            bases: _,
+            params: _,
+            imports: _,
+            calls: _,
+            bindings: _,
+            decls: _,
+            names: _,
+            exports: _,
+            evidence: _,
+            diags: _,
+            suppressions: _,
+            scratch: _,
+        } = self;
         macro_rules! table {
             ($t:ident, $apply:expr) => {{
                 plan.clear();

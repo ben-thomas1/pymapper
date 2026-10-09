@@ -53,7 +53,7 @@ entered, and symlinks are not followed.
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 | `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
 | `metrics-mem` | `walk`, `load`, `parse` | like `parse-mem`, with `pymapper_core::extract::metrics` teed into the same pass; every metrics row is kept to the end (extra counters `metric_rows`, `metrics_kb` = heap of the kept tables) |
-| `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
+| `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage; `XTASK_EXTRACT_REPS=N` repeats the in-memory pass N times and reports the fastest (peak RSS then holds two passes). On macOS it adds `parse_kinstr` / `parse_kcycles`: instructions and CPU cycles (thousands) of the fastest-cycles pass, from `proc_pid_rusage` |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
 | `dupes`      | `walk`, `load.*`, `dupes.seeds`, `dupes.relex`, `dupes.extend`, `dupes.locate`, `dupes.group` | `load` with duplication fingerprints taken in the extraction pass (`index::load_with`, every file first-party), then `analysis::dupes::analyse` with the default thresholds. Counters: `load_peak_rss_mb` (peak RSS before matching: matching's own cost is the run's peak minus this), `fingerprints`, `fingerprints_kb`, `seeds` (= `extended` + `covered` + `unverified`: seeds that failed verification, e.g. after a parse error shifted the token stream), `tokens_cached` (tokens held while extending, 2 B each), `files_reread`, `bytes_reread_kb`, `pairs`, `copies`, `groups`, `duplicated_lines`, `findings` |
@@ -68,6 +68,7 @@ entered, and symlinks are not followed.
 | `hotspot`    | `load` phases, `hotspot.scan`, `hotspot.top` | `load`, then `pymapper_core::analysis::hotspot::analyse` with the default config (`hotspot.scan`: PM101-PM107 findings plus the per-module aggregates) and `top_functions` for the 100 worst functions by cognitive complexity (`hotspot.top`). Counters `loc`, `functions`, `classes`, `flagged` (functions over any function threshold), `findings`, `top_len`, `top_cognitive`, `hotspot_kb` = `ModuleHotspots::heap_bytes`, `index_kb` |
 | `coupling`   | `calls` phases, `graph.build`, `coupling.analyse` | `calls`, then the call graph over every node (all edges with a target) and `pymapper_core::analysis::coupling::analyse` with the default config (module Ca/Ce, abstractness, PM201-PM204). Counters `loc`, `modules` (files), `import_edges` (counted edges = sum of Ce), `class_candidates` (classes above `max-class-wmc`), `findings`, `coupling_kb` = `ModuleCoupling::heap_bytes`, `callgraph_kb`, `calls_kb`, `index_kb` |
 | `deadcode`   | `calls` phases, `deadcode.roots`, `deadcode.graph`, `deadcode.propagate`, `deadcode.evidence`, `deadcode.findings` | `calls`, then `pymapper_core::analysis::deadcode::analyse` with every PM4xx rule and the name fallback, in application mode with no entrypoints (the fewest roots, so the most candidates; `XTASK_DEADCODE_MODE=library` or `auto` changes the mode): roots, the call and override graphs plus seeds, the level propagation of defs and modules (module graphs included), the evidence scan plus the second propagation, the findings. Counters `loc`, `nodes`, `library`, `roots`, `live` (nodes at level 100), `candidates` (defs, modules and imports probed by the name fallback), `probes` (evidence hashes scanned), `expansions`, `pm401`..`pm405`, `findings` (emitted, confidence >= 10), `reported` (confidence >= 80), `graph_kb` (call + override graphs and seeds), `deadcode_kb` = `DeadCode::heap_bytes`, `calls_kb`, `index_kb` |
+| `query`      | `calls` phases, `query.build`, `query.names`, `query.imports`, `query.cycle_graph`, then one `query.<kind>` phase per batch | `calls`, then `pymapper_core::query`: `query.build` = `Query::new` (the labelled call graph), `query.names` = the name index, `query.imports` = the import graph, `query.cycle_graph` = the cycle import graph and its SCCs (all lazy in the API, forced here), then batches over up to 1000 evenly spaced defs and 200 packages/modules with one reused `Scratch`: `lookup_exact` (each def's qid), `lookup_name` (its last segment), `lookup_suffix2` (last two segments), `lookup_fuzzy` (the name minus its first byte, 100 samples), `callers1`, `callees3` (depth 3), `callers_all` (unbounded), `impact`, `path` (from the deepest transitive caller of each def to the def: a path exists), `path_random` (def `i` to def `n - 1 - i`: mostly no path), `deps_out` / `deps_in` (module level), `import_cycles`, `call_cycle`, `summary` (once). Counters `loc`, `nodes`, `call_edges`, `query_kb` (`Query::heap_bytes`), `names_kb`, `calls_kb`, `index_kb`, per kind `<kind>_queries`, `<kind>_avg_ns`, `<kind>_max_us`, `<kind>_avg_items` (mean result size), and `scratch_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 | `incremental` | `walk`, `copy`, `load.*`, `resolve.*`, `incremental.update` | single-file edit latency of `pymapper_core::incremental::Program::update`: the corpus is copied to `$TMPDIR` (`copy`; corpora over 200 MB are not copied and their files are re-extracted with unchanged contents instead, counter `inplace`), loaded and resolved with dependency tracking (`load.*`, `resolve.*`), then 6 files across the size distribution (plus `typing.py`, `os.py`, `collections/__init__.py`, `functools.py`, `re/__init__.py` when present) are each edited (a function appended) and restored, one update per edit, 3 rounds. `incremental.update` is the sum of all updates. Counters: `updates`, `update_median_us` / `update_best_us` / `update_worst_us`, `hot_median_us` (the hot stdlib modules), per-phase medians `plan_us`, `extract_us`, `patch_us` (splice + hierarchy + node map), `resolve_imports_us`, `resolve_calls_us`, `diff_us`, `reresolved_imports_median` / `reresolved_calls_median` (files resolved again per update), `deps_imports` / `deps_calls` (recorded (file, file read) pairs), `tracking_kb`, `heap_kb_before` / `heap_kb_after` (`Program::heap_bytes` before and after the updates) |
@@ -415,6 +416,109 @@ global merge (S2.3) deduplicates them. Peak RSS of `parse-only` above the retain
 per-thread tables' doubling slack and the interners; `extract-mem` also holds the whole
 corpus in memory.
 
+### Front-end speed (S1.6)
+
+Goal: move the front end towards 400 MB/s/core without changing any result. 14-core M4 Pro,
+release build. The machine was shared with other worktrees the whole time (load average 5 to
+40), so single-process best-of-N wall times moved by up to 10% between runs. Every increment
+was therefore judged by an **interleaved A/B**: the old and new binaries alternate, each run
+does `XTASK_EXTRACT_REPS=10` in-memory passes of `extract-mem -j 1` on the stdlib, and the
+fewest CPU cycles of one pass (`parse_kcycles`, from `proc_pid_rusage`) is compared. Cycles
+only count time on a core and repeat within about 0.3%. A change was kept only if it saved
+more than about 1.5% of cycles.
+
+Equivalence: `xtask facts-digest DIR` hashes, for every file, each fact column (evidence
+hashes too), the rendered facts with resolved names, the interned strings, every metrics row,
+and the lexer's token streams (parser mode and trivia mode) plus suppressions. The digests
+were taken before this step and still match after every kept change:
+
+| corpus | files  | digest             |
+|--------|--------|--------------------|
+| tests/corpus | 29 | `db9257ab008f0205` |
+| stdlib | 1,043  | `e9853f071b4e8acf` |
+| venv   | 60,529 | `cdbc7e7ace54d802` |
+
+`diff-ruff` still finds 0 mismatches on tests/corpus, the stdlib and the venv (927,531 defs,
+901,139 imports, 3,496,134 calls). `xtask fuzz` ran 300 s per target with 0 crashes and 0
+hangs: `extract` 291M inputs, `lex` 1,096M inputs.
+
+Increments (stdlib, `extract-mem -j 1`; cycles and instructions of one pass, change against
+the build before the step; "kept" means the change is in the tree):
+
+| increment | cycles | instructions | verdict |
+|-----------|--------|--------------|---------|
+| line index: the parser's forward line cursor (a SWAR newline count per query) replaced by a line-start index built in one NEON pass (SSE2 on x86_64, SWAR elsewhere) in a per-thread reused buffer; lookups walk from the last line, binary search for long jumps | -2.1% | -3.9% | kept |
+| docstring line count by a vectorised `\n` count instead of a byte loop with lookahead; suppression lines from the parser's line index instead of a second byte-wise scan in the fact builder | -1.7% | -2.5% | kept |
+| string evidence: one table-driven pass classifies a literal as path / type expression / other, instead of up to four (`:` count, split + validate, `[`/`\|` search, charset check) | -1.7% | -2.1% | kept |
+| hash each identifier once: the lexer hashes every `Name`, the parser passes the hash with `token`/`name`/`attribute` events, the fact builder reuses it for evidence and (through a 64-slot cache by token start) for interning, metrics for Halstead operands | +1.1% | +6.6% | dropped |
+| same, hashed lazily by the parser on first use instead of in the lexer | +2.5% | +7.3% | dropped |
+| line index filled branch-free (count first, two unconditional stores per 16-byte block) | -0.2% | +5.3% | dropped |
+| parser ring refill (`fill`) out of line | +1.4% | +5.3% | dropped |
+| metrics: operator kinds gathered in one register-like field and folded into the frame on scope changes; docstring tracking skipped by a flag | -0.4% | -1.1% | dropped |
+| interner: 512-entry direct-mapped cache of recent strings in front of the index | +0.6% (venv +0.6%) | -0.2% | dropped |
+| lexer: one "special work" flag instead of testing four state fields per token | -1.3% (parse stage +2.0%) | -3.7% | dropped (not consistent) |
+
+Hashing once did not pay. Most likely it was never three hashes in practice: both visitors
+are inlined into the parser through `Tee`, so the evidence and Halstead hashes of the same
+token can be one computation already (not verified in the assembly), and hashing every `Name`
+up front (lookahead rescans included) plus carrying the hash through the ring buffer and the
+events costs more than the interner hashes it saves. SIMD went only where the profile showed a hot scalar
+loop: the newline scan. The identifier scan (`skip_ident`, about 1.2% of samples), the
+indentation scan (`line_start`, 1.5%) and comment/string body searches (`find2`/`find4`,
+under 1%) are already word-at-a-time and too short per call (identifiers average under 8
+bytes) for 16-byte vectors to help.
+
+Before / after (interleaved A/B of the binaries before and after this step, `extract-mem -j 1`,
+in-memory passes; best of 6 alternations for the stdlib `all` row, 2 for the stage rows and
+the venv):
+
+| corpus | stages (`XTASK_EXTRACT_STAGES`) | cycles before | cycles after | change | cycles/byte after | MB/s/core before -> after |
+|--------|-----------------|---------|---------|-------|-------|-----------|
+| stdlib | `parse` (lexer + parser) | 167.1M | 158.8M | -4.9% | 10.07 | 369 -> 384 |
+| stdlib | `metrics`        | 231.9M  | 219.0M  | -5.6% | 13.89 | 272 -> 291 |
+| stdlib | `facts-spans`    | 220.5M  | 209.4M  | -5.0% | 13.28 | 285 -> 300 |
+| stdlib | `facts`          | 245.2M  | 230.5M  | -6.0% | 14.62 | 256 -> 271 |
+| stdlib | `all` (the real front end) | 305.4M | 286.5M | -6.2% | 18.17 | 206 -> 222 |
+| venv   | `all`            | 12,098M | 11,307M | -6.5% | 17.39 | 200 -> 225 |
+
+Instructions dropped 8.3% (stdlib) and 10.1% (venv). The clock ran at about 3.9-4.0 GHz, so
+400 MB/s/core needs about 9.8 cycles per byte; the lexer + parser with a no-op visitor alone
+take 10.1.
+
+Final numbers, standard `cargo xtask bench` (single-process best of N; load average 14 to 33
+during these runs, so they are lower than the A/B passes above):
+
+| corpus | target        | threads | walk    | load / read+parse | parse phase | total   | MB/s/core | peak RSS MB |
+|--------|---------------|---------|---------|-------------------|-------------|---------|-----------|-------------|
+| stdlib | `extract-mem` | 1       | 16.3ms  | 99.1ms            | 78.6ms      | 195.8ms | 197       | 36.2        |
+| stdlib | `extract-mem` | 14      | 5.92ms  | 33.8ms            | 9.54ms      | 50.2ms  | 134       | 40.3        |
+| stdlib | `parse-only`  | 1       | 12.7ms  | 166.4ms           | -           | 179.1ms | 186       | 20.1        |
+| stdlib | `parse-only`  | 14      | 6.12ms  | 45.3ms            | -           | 51.7ms  | 166       | 23.6        |
+| venv   | `extract-mem` | 1       | 2.67s   | 5.47s             | 2.76s       | 11.21s  | 229       | 991.8       |
+| venv   | `extract-mem` | 14      | 993ms   | 2.21s             | 292ms       | 3.62s   | 130       | 1240.0      |
+| venv   | `parse-only`  | 1       | 2.71s   | 9.12s             | -           | 12.03s  | 200       | 351.1       |
+| venv   | `parse-only`  | 14      | 891ms   | 2.81s             | -           | 3.70s   | 167       | 452.1       |
+
+On 14 threads the venv front end extracts 650 MB in 292ms from memory (2.2 GB/s); MB/s/core
+there averages performance and efficiency cores competing with the other worktrees' load.
+
+Memory is unchanged: facts are identical, so retained bytes per LOC stay at 13.75 (facts) +
+1.47 (metrics) = 15.22 on the venv and 12.96 + 1.51 = 14.46 on the stdlib. (The 14.95 B/LOC
+of S1.5 above predates the `doc_lines` metrics column, 4 B per def, added after S1.5.) The
+line index adds one per-thread buffer of 4 bytes per line of the largest file seen (buffers
+above 4 MiB are not kept).
+
+Verdict: **400 MB/s/core is not reached.** The full front end went from about 206 to 222
+MB/s/core on the stdlib and from 200 to 225 on the venv (6-6.5% fewer cycles, 8-10% fewer
+instructions). The profile stays flat: lexer about a quarter, parser and expression scanner
+about a fifth, metrics about 12%, interning about 7% (mostly probing a large per-thread
+table), fact building about 10%; no function is above 6% self time. Reaching 400 would need
+the whole extractor to cost what the lexer + parser alone cost today (about 10 cycles per
+byte, 77 per token), i.e. halving the per-token work of every stage, not removing a hot
+spot. Candidates for a redesign rather than tuning: a lexer emitting tokens into a small
+batch buffer that the parser consumes without per-token state reloads, and folding the
+metrics token pass into the parser's own dispatch.
+
 ### Load / index (S2.3)
 
 End-to-end `pymapper_core::index::load` (`load` target): walk, then parallel read -> extract
@@ -667,6 +771,59 @@ Per level on the venv (edges, time with a warm scratch):
   counts distinct call sites and not edges.
 - Correctness: `stdlib_rollup_matches_reference` (ignored test) checks every level, under three
   call/import filters, against a hash-set brute force, and the aggregates against subtree walks.
+
+### Treemap layout (S7.3)
+
+`cargo bench -p pymapper-core --bench layout -- [--third DIR] [--stdlib DIR] [--first DIR]
+[--synthetic NODES] [--reps R]`. `--third` makes every top-level entry of a `site-packages`
+one distribution. Loading is not part of the layout numbers. Times are best of R, release
+build, Apple M4 Pro (14 cores).
+
+| input                                        | nodes     | levels | tree build | all levels | per node | rects   | tree    | cache save / load  |
+|----------------------------------------------|-----------|--------|------------|------------|----------|---------|---------|--------------------|
+| stdlib 3.13 (631 files, 305k LOC)            | 18 779    | 7      | 0.31 ms    | 0.43 ms    | 22.7 ns  | 0.3 MB  | 0.3 MB  | 0.71 / 0.10 ms     |
+| venv + stdlib + crates/ (55k files, 16.9M LOC, 482 groups) | 912 128 | 25 | 25.8 ms | 5.8 ms | 6.4 ns | 14.6 MB | 16.4 MB | 7.4 / 4.5 ms |
+| synthetic venv-like, 14 threads              | 2 001 421 | 5      | 24.3 ms    | 6.9 ms     | 3.4 ns   | 32.0 MB | 36.0 MB | 16.1 / 11.7 ms     |
+| synthetic venv-like, 1 thread                | 2 001 421 | 5      | 23.9 ms    | 42.0 ms    | 21.0 ns  | 32.0 MB | 36.0 MB |                    |
+
+Observations:
+
+- The layout itself is a few milliseconds even for the whole venv; the deepest level a
+  semantic zoom asks for is computed on the layout thread in well under a frame. The
+  largest venv level (226k nodes at depth 5) takes about 1 ms.
+- `LayoutTree::from_index` (25.8 ms on the venv) is dominated by hashing every node name for
+  the hierarchy hash; it runs once per index.
+- Memory is 16 B per laid-out node plus 18 B per node for the tree. Peak RSS (460 MB on the
+  venv) is the index, not the layout.
+- Loading the cache costs about as much as recomputing on these inputs (4.5 ms against
+  5.8 ms on the venv). The layout is deterministic, so positions are stable across runs
+  either way; the cache (keyed by hierarchy hash and config) only pays off if the layout gets
+  costlier. It is written on the layout thread when idle, so it never delays a frame.
+
+### Code map (S7.4)
+
+`cargo run --release -p pymapper-gui --example codemap_bench -- PATH [--deps] [--isolated]
+[--cache-dir DIR]`: loads the project in-process, builds the code map (layout, semantic-zoom
+reveal bands, edge table) and its scenes, then renders offscreen at 2880x1800 px (2x) and
+waits for the GPU after every frame. Release build, Apple M4 Pro (Metal), warm index cache.
+Details and scenario tables: [docs/gui.md](gui.md#results-s74).
+
+| input                                    | nodes     | load    | code map build | edges (bands) | scene build | fit frame p50 | zoom sweep p95 / max | code map + scene heap | peak RSS |
+|------------------------------------------|-----------|---------|----------------|---------------|-------------|---------------|----------------------|-----------------------|----------|
+| aiml-lectio + venv (`--deps`, 62k files) | 1 023 762 | 679 ms  | 88 ms          | 91 266 (16)   | 92-107 ms   | 1.51 ms       | 5.5 / 10.8 ms        | 38 + 100 MiB          | 1.1 GiB  |
+| aiml-lectio first party                  | 24 866    | 191 ms  | 7.7 ms         | 70 325 (11)   | 4-14 ms     | 1.43 ms       | 3.2 / 5.7 ms         | 3.3 + 16.6 MiB        | 180 MiB  |
+| stdlib 3.13 as a project                 | 18 755    | 73 ms   | 8.0 ms         | 48 078 (10)   | 1.4-6.2 ms  | 1.20 ms       | 4.0 / 7.3 ms         | 2.3 + 6.9 MiB         | 81 MiB   |
+
+Observations:
+
+- Edges for all 16 bands of the venv take 44 ms (4 workers, one rollup pass and one call-pair
+  pass per band). Stopping edges into external code at depth 1 keeps the venv's table at
+  91k edges; the first-party map alone has 70k.
+- A scene build (100 ms on the venv: 1.38M rect instances, cells plus label carriers, and
+  380k curve segments, sorted into grid order) runs on the map thread, never in a frame. It
+  has not been profiled further.
+- Peak RSS on the venv is the index (about 660 MiB after loading) plus a transient second
+  scene while a new one is built.
 
 ### Hotspots and coupling (S4.3a)
 
@@ -1002,6 +1159,157 @@ Observations:
   cache benchmarks); warm 1.36 s / 0.66 s / 0.52 s.
 - **dupes** is the only gated analysis: +20-30 ms on 305k LOC, +3.1 s matching and +0.2 s of
   fingerprinting on 17M LOC (peak 0.70 -> 1.0 GB), which is why it is off by default.
+
+### Query API (S5.1)
+
+`query` target: `calls`, then `pymapper_core::query` (see the target table). 14-core M4 Pro,
+release, warm cache, best of 3 (RSS worst of 3), other worktrees busy. Per-query latencies
+are means over the batch with one reused `Scratch`. The worst case is the slowest single query
+of the best run. Only the fuzzy lookup uses more than one thread.
+
+Query state, built once (lazy tables forced in their own phases):
+
+| corpus | nodes   | call edges | query.build | query.names | query.imports | query.cycle_graph | `query_kb` (of which names) | `scratch_kb` | peak RSS MB (`calls` / `query`) |
+|--------|---------|------------|-------------|-------------|---------------|-------------------|-----------------------------|--------------|---------------------------------|
+| stdlib | 25,441  | 31,873     | 0.71ms      | 0.13ms      | 0.12ms        | 0.13ms            | 734 (101)                   | 416          | 28.1 / 30.3                     |
+| venv   | 998,345 | 1,382,184  | 33.8ms      | 5.99ms      | 12.1ms        | 13.9ms            | 35,181 (3,993)              | 16,055       | 595.3 / 646.9                   |
+
+Per query (mean / worst; mean result size in brackets):
+
+| query                         | stdlib (437k LOC)       | venv (17M LOC)            |
+|-------------------------------|-------------------------|---------------------------|
+| lookup exact qid              | 0.78us / 6us            | 10.6us / 149us            |
+| lookup bare name (suffix)     | 1.9us / 23us (6)        | 60us / 1.0ms (9)          |
+| lookup two segments (suffix)  | 0.63us / 3us (1)        | 10.5us / 141us (2)        |
+| lookup fuzzy (one edit)       | 130us / 293us (10)      | 4.7ms / 13.7ms (11)       |
+| callers, depth 1              | 0.06us / 7us (1)        | 0.62us / 432us (1)        |
+| callees, depth 3              | 0.13us / 3us (5)        | 2.1us / 63us (350)        |
+| callers, transitive           | 0.48us / 66us (36)      | 6.1us / 480us (752)       |
+| impact, transitive            | 3.2us / 166us (36)      | 93us / 2.1ms (752)        |
+| path, reachable pair          | 0.47us / 8us (5 nodes)  | 4.5us / 294us (5 nodes)   |
+| path, random pair (no path)   | 0.12us / 4us            | 0.94us / 58us             |
+| deps out, module level        | 0.80us / 24us (6)       | 3.0us / 77us (10)         |
+| deps in, module level         | 1.3us / 14us (4)        | 3.1us / 94us (4)          |
+| import cycles of a module     | 0.51us / 5us            | 2.3us / 103us             |
+| call cycle through a def      | 0.28us / 14us           | 4.8us / 172us (96)        |
+| summary                       | 0.96ms                  | 46.3ms                    |
+
+- **Time**: every query except summary and fuzzy lookup answers in microseconds on 17M LOC.
+  The cost tracks what the query visits, not the program size: a bounded walk reads a few CSR
+  rows. A bidirectional path search grows the smaller frontier and stops at the first meet.
+  `deps` scans only the target's files plus the files of its callers or callees. Building the
+  query state costs 34 ms (two passes over the 2.2M call edges into a labelled CSR). The lazy
+  tables add 6 ms (name index: an LSD radix sort of node ids by name), 12 ms (import graph) and
+  14 ms (cycle import graph plus Tarjan).
+- **Lookup**: an exact or dotted qid is one hash lookup per module prefix plus a child scan
+  per def segment. A bare name is a binary search in the name index plus a ranking of all its
+  candidates (`__init__` alone has over 20k, hence the 1 ms worst case). Fuzzy matching only
+  runs when nothing else matched. It scans the 403k distinct venv names (8 MB) in parallel
+  chunks. A byte-set prefilter drops most names after one pass over their bytes, and the edit
+  distance is banded (O(len x budget)) and stops as soon as a whole row exceeds the budget.
+  Sequential and unfiltered, it took 67 ms per query (201 ms worst).
+- **impact** is the transitive callers plus a per-module count (sort and run-length), a
+  test-file check per distinct file, and a breadth-first walk of the reverse import graph for
+  the transitive importers. The importer walk is most of the gap to plain callers (6 us).
+- **summary** is O(V + E): one pass over the nodes and files, the resolution counters already
+  kept, the cycle SCCs, and bounded heaps for the rankings, including two `top_functions` passes
+  over every def row.
+- **Memory**: the query state is 35 MB on the venv: the labelled call graph (forward and
+  reverse CSR, `8 (V + 1) + 10 E` bytes) and a 4 MB name index (4 B per node), plus the module
+  graphs. A scratch is 8 B per node per side and the long-lived queries use both sides (16 MB).
+  Its zeroed pages are only touched where queries go. Peak RSS is 52 MB above `calls`, which is
+  the query state plus the scratch. Results hold node ids and small `Copy` rows, never strings.
+- Correctness: `query::tests` compares walks, paths, deps (three filters, modules and classes)
+  and call cycles against plain BFS, Tarjan and hash-map brute force. It runs them on the test
+  corpus plus a generated project with dense cross-module calls, cycles and cross-file
+  overrides.
+
+### Deps (S6.1)
+
+`pymapper deps [--score] --stats` on `lectio` (1,803 first-party files) with its venv (491
+distributions, 62,331 files, 17.5M LOC in total; the stdlib off), cache in a temporary
+directory. 14-core Apple M4 Pro, release build, warm OS file cache. "Cold" = cache directory
+removed (every file extracted, every scorecard computed); "warm facts, cold scores" =
+`scores.pmc` deleted, facts cached; "warm" = everything cached. Phases from `--stats`; peak RSS
+is `ru_maxrss`. Warm rows: 2-3 runs, range shown.
+
+| run | threads | total | resolve.calls | deps.usage | deps.score | scorecards | peak RSS |
+|-----|---------|-------|---------------|------------|------------|------------|----------|
+| `--score`, cold | 14 | 6.96 s (load.extract 5.74 s) | 59.9 ms | 20.4 ms | 4.5 ms | 491 computed | 634 MB |
+| `--score`, warm facts, cold scores | 14 | 428 ms | | 19.9 ms | 5.4 ms | 491 computed | 655 MB |
+| `--score`, warm facts, cold scores | 1 | 1.34 s | 471 ms | 20.4 ms | 18.8 ms | 491 computed | 566 MB |
+| `--score`, warm | 14 | 503-748 ms | 52-79 ms | 20.4-22.0 ms | 0.1 ms (+0.1-0.9 ms read) | 490 cached, 1 computed | 628-656 MB |
+| no `--score`, warm | 14 | 575-593 ms | | 20.0-20.1 ms | - | - | 625-635 MB |
+| `check --deps`, warm (reference) | 14 | 732-787 ms | 54-60 ms | - | - | - | 659-686 MB |
+
+The cold `load.extract` (5.7 s) was I/O-bound in that session; "Check (S4.5)" measured 2.16 s
+for the same files. `scores.pmc` holds 491 scorecards in 47 KB. The one scorecard computed on
+every warm run is a distribution without a `RECORD` hash (no cache key).
+
+Observations:
+
+- **Scorecards are cheap**: one pass over the definitions and module edges of 491
+  distributions costs 18.8 ms on one thread and 5.4 ms on 14 (parallel per distribution). The
+  cache turns that into a 0.1 ms lookup plus reading a 47 KB file.
+- **Usage** (one pass over the first-party imports and all call edges, a forward CSR of the
+  call and import graphs, a BFS from the first-party nodes that reached 109k of 1.02M nodes,
+  then summing exclusive lines per distribution) is 20 ms, sequential. Its transient memory is,
+  by construction, 4 bytes per node and per edge for the forward CSR, 4 bytes per node of line
+  weights, two bits per node (BFS and used-symbol sets) and the BFS queue (4 bytes per reached
+  node); it is freed before the report and stays below the load's peak, so peak RSS is that of
+  loading the venv (as `check --deps`).
+- **Whole-run cost** is the venv load plus call resolution, as for `check --deps`: `deps` is
+  15-25% faster than `check --deps` warm because it runs no rule analyses.
+
+### Test-code evidence (S4.6)
+
+`deadcode` target, 14-core M4 Pro, release, warm, best of 3-5 (RSS worst), before (rewrite
+`394d5b6`) and after. The evidence scan now reads every first-party `.py` file (not only the
+importable ones) and keeps test-code occurrences in a second slot per name group.
+
+| corpus | candidates | findings (>= 10) | `deadcode.evidence` | peak RSS MB |
+|--------|------------|------------------|---------------------|-------------|
+| stdlib, before | 12,883 | 6,877 | 4.55ms | 32.0 |
+| stdlib, after  | 18,004 | 10,141 | 6.68ms | 35.7 |
+| venv, before   | 572,011 | 313,846 | 277.1ms | 751.9 |
+| venv, after    | 572,124 | 313,917 | 273.1ms | 754.7 |
+
+- The stdlib corpus contains `site-packages/pip` (411 files, not importable below the stdlib
+  root, so not analysed before): those files account for the extra candidates and findings.
+  In `check`, `site-packages` is third-party and never analysed.
+- A first version filtered each group's explained-file events by slot while scanning them and
+  took 311 ms on the venv; sorting the events by (group, slot, file) so each slot scans only
+  its own run, and skipping the test slot once production code links a def, brought it back
+  to the baseline.
+- `check --select PM4` on aiml-lectio (1,803 first-party files, 741 of them not importable,
+  warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
+  analysed files; peak RSS +1.5 MB.
+
+### Coverage evidence (S6.3)
+
+`deadcode` target with `XTASK_DEADCODE_COVERAGE=synthetic`, 14-core M4 Pro, release, warm, best
+of 3 (RSS worst), other worktrees benchmarking at the same time. The target generates a
+coverage.py JSON report for every file of the corpus (absolute paths; every line executed
+except the bodies of every third function, which are missing; lines stand in for statements,
+so the report is larger than a real one), maps it with `Coverage::parse` (`coverage.parse`),
+drops the report bytes (as `check` does) and runs the analysis with it.
+
+| corpus | report MB | files matched | `coverage.parse` | executed / not executed nodes | levels lowered | `deadcode.*` sum (without -> with) | peak RSS MB (without -> with) |
+|--------|-----------|---------------|------------------|-------------------------------|----------------|------------------------------------|-------------------------------|
+| stdlib | 2.4  | 1,043 / 1,043   | 1.82ms | 15,024 / 7,072    | 2,679  | 10.4ms -> 5.4ms | 34.1 -> 33.4 |
+| venv   | 97.8 | 52,122 / 60,529 | 86.2ms | 471,496 / 213,103 | 64,696 | 482ms -> 289ms  | 752.1 -> 751.4 |
+
+- **Time**: about 1.1-1.3 GB/s of report: one pass of the pull reader (no tree, reused
+  buffers), one hash lookup per file path, a binary search per def and line list. The 8,407
+  venv entries that match no analysed file (stubs, shadowed files) go through the suffix
+  fallback (one sorted basename table, built once) and stay unmatched. The analysis itself got
+  faster here because executed code is live: fewer name-fallback candidates (572k -> 163k on
+  the venv) mean a cheaper evidence scan. The synthetic split is arbitrary, so the finding
+  counts of these runs say nothing about precision.
+- **Memory**: the result is two bit sets over the nodes (`coverage_kb`: 249 KB for 1M nodes).
+  The report bytes are held only while they are mapped (`Coverage::load` reads, maps and drops
+  them), so they add to the peak only when the report is larger than what the analysis
+  allocates later; here the peak did not move.
 
 ### Incremental updates (S3.6)
 

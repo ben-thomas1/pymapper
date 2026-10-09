@@ -122,8 +122,18 @@ pub enum Target {
     /// (`deadcode.propagate`), the evidence scan plus the second propagation
     /// (`deadcode.evidence`) and the findings (`deadcode.findings`). Application mode with no
     /// entrypoints (the fewest roots: the most candidates); `XTASK_DEADCODE_MODE=library` for
-    /// library mode. Peak RSS includes the index, the import resolution and the resolved calls.
+    /// library mode; `XTASK_DEADCODE_COVERAGE=synthetic` adds a generated coverage report
+    /// (`coverage.generate`, `coverage.parse`). Peak RSS includes the index, the import
+    /// resolution and the resolved calls.
     Deadcode,
+    /// `calls`, then the query API (`pymapper_core::query`): the query state (`query.build`:
+    /// call graph; `query.names`: name index; `query.imports`: import graph;
+    /// `query.cycle_graph`: cycle import graph + SCCs), then batches of
+    /// queries over up to 1000 evenly spaced defs and 200 packages/modules with one reused
+    /// scratch, one phase per batch (`query.<kind>`). Counters per kind: queries, mean and
+    /// worst latency (`<kind>_avg_ns`, `<kind>_max_us`) and mean result size. Peak RSS
+    /// includes the index, the resolutions and the query state.
+    Query,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -167,6 +177,7 @@ impl Target {
             Target::Hotspot => "hotspot",
             Target::Coupling => "coupling",
             Target::Deadcode => "deadcode",
+            Target::Query => "query",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
             Target::Incremental => "incremental",
@@ -503,6 +514,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Hotspot => hotspot_target(root)?,
         Target::Coupling => coupling_target(root)?,
         Target::Deadcode => deadcode_target(root)?,
+        Target::Query => super::query::query_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Incremental => incremental::incremental_target(root)?,
         Target::Read
@@ -542,18 +554,18 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
 }
 
 /// Named counters of a run, in a fixed order.
-type Counters = Vec<(String, u64)>;
+pub(super) type Counters = Vec<(String, u64)>;
 
 /// Walk options for the benchmark corpora: every Python file outside `__pycache__` and `.git`,
 /// hidden directories included, no gitignore (the same file set as the sequential reference
 /// walker, so `walk` and `walk-seq` are comparable).
-fn corpus_options() -> WalkOptions {
+pub(super) fn corpus_options() -> WalkOptions {
     WalkOptions::everything()
 }
 
 /// Runs the core walker as phase `walk`: files, non-fatal error count and walk counters. An
 /// unreadable root is an error.
-fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64, Counters)> {
+pub(super) fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64, Counters)> {
     let w = timing::time("walk", || core_walk::walk(&[root], opts));
     if let Some(d) = w.diagnostics.iter().find(|d| d.kind == DiagnosticKind::Root || d.path == root) {
         anyhow::bail!("walking {}: {d}", root.display());
@@ -1130,7 +1142,16 @@ fn deadcode_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let calls = resolve_calls(&ix, &imp);
     let config = Config::new(root);
     let engine = RuleEngine::new(&config);
-    let opts = DeadCodeOptions { mode, ..DeadCodeOptions::default() };
+    // `XTASK_DEADCODE_COVERAGE=synthetic`: a generated coverage.py report as evidence.
+    let report = (std::env::var("XTASK_DEADCODE_COVERAGE").as_deref() == Ok("synthetic"))
+        .then(|| timing::time("coverage.generate", || synthetic_coverage(&ix)));
+    let cov = match &report {
+        Some(r) => Some(timing::time("coverage.parse", || deadcode::coverage::Coverage::parse(&ix, r, &[]))?),
+        None => None,
+    };
+    // The CLI drops the report bytes once mapped.
+    let report_bytes = report.map_or(0, |r| r.len() as u64);
+    let opts = DeadCodeOptions { mode, coverage: cov.as_ref(), ..DeadCodeOptions::default() };
     let mut out = Findings::new();
     let dc = deadcode::analyse(&ix, &imp, &calls, &opts, &engine, &mut out);
     let s = ix.stats();
@@ -1159,7 +1180,65 @@ fn deadcode_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ]);
+    if let Some(c) = &cov {
+        let cs = c.stats();
+        counters.extend([
+            ("coverage_report_kb".to_owned(), report_bytes / 1000),
+            ("coverage_matched".to_owned(), u64::from(cs.matched)),
+            ("coverage_executed".to_owned(), u64::from(cs.executed)),
+            ("coverage_not_executed".to_owned(), u64::from(cs.not_executed)),
+            ("coverage_kb".to_owned(), c.heap_bytes() as u64 / 1000),
+            ("deadcode_executed".to_owned(), st.executed),
+            ("deadcode_lowered".to_owned(), st.not_executed),
+        ]);
+    }
     Ok((stats, counters))
+}
+
+/// A coverage.py JSON report for every file of `ix` (absolute paths): every line executed
+/// except the bodies of every third function, which are missing. Lines stand in for
+/// statements, so the report is somewhat larger than a real one.
+fn synthetic_coverage(ix: &pymapper_core::index::Index) -> Vec<u8> {
+    use pymapper_core::extract::facts::DefKind;
+    use std::fmt::Write as _;
+    let defs = &ix.facts().defs;
+    let mut s = String::from("{\"meta\": {\"format\": 3, \"version\": \"7.6.1\"}, \"files\": {");
+    let mut missing: Vec<bool> = Vec::new();
+    let list = |s: &mut String, missing: &[bool], want: bool| {
+        let mut first = true;
+        for (l, &m) in missing.iter().enumerate().skip(1) {
+            if m == want {
+                let _ = write!(s, "{}{l}", if first { "" } else { ", " });
+                first = false;
+            }
+        }
+    };
+    for f in 0..ix.file_count() {
+        let ff = ix.file_facts(f);
+        missing.clear();
+        missing.resize(ff.lines as usize + 1, false);
+        let mut k = 0;
+        for row in ff.defs.range() {
+            if DefKind::from_u8(defs.kind[row]) == DefKind::Function {
+                k += 1;
+                if k % 3 == 0 {
+                    for l in defs.name_line[row] + 1..=defs.end_line[row].min(ff.lines) {
+                        missing[l as usize] = true;
+                    }
+                }
+            }
+        }
+        if f > 0 {
+            s.push_str(", ");
+        }
+        let _ = write!(s, "\"{}\": {{\"executed_lines\": [", ix.file_path(f).display());
+        list(&mut s, &missing, false);
+        s.push_str("], \"missing_lines\": [");
+        list(&mut s, &missing, true);
+        s.push_str("], \"excluded_lines\": []}");
+    }
+    s.push_str("}, \"totals\": {}}");
+    s.into_bytes()
 }
 
 /// Cache directory of the `load-cold` / `load-warm` targets for `root`.
@@ -1416,6 +1495,7 @@ mod tests {
             Target::Hotspot,
             Target::Coupling,
             Target::Deadcode,
+            Target::Query,
             Target::LoadCold,
             Target::LoadWarm,
             Target::Incremental,
@@ -1498,6 +1578,15 @@ mod tests {
                     "deadcode.graph", "deadcode.propagate", "deadcode.evidence", "deadcode.referenced",
                     "deadcode.findings",
                 ],
+                Target::Query => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "query.build", "query.names",
+                    "query.imports", "query.cycle_graph", "query.lookup_exact", "query.lookup_name",
+                    "query.lookup_suffix2", "query.lookup_fuzzy", "query.callers1", "query.callees3",
+                    "query.callers_all", "query.impact", "query.path", "query.path_random", "query.deps_out",
+                    "query.deps_in",
+                    "query.import_cycles", "query.call_cycle", "query.summary",
+                ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
                 }
@@ -1526,14 +1615,27 @@ mod tests {
                 assert_eq!(counter("metric_rows"), if target == Target::MetricsMem { counter("defs") } else { None });
             } else if matches!(target, Target::ParseOnly | Target::ExtractMem) {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
-                assert_eq!(names, [
+                let mut want = vec![
                     "loc", "defs", "calls", "diagnostics", "parse_cpu_ms", "parse_MBps_core", "facts_B_per_kLOC",
-                    "metrics_B_per_kLOC", "facts_kb", "metrics_kb", "intern_kb"
-                ]);
+                    "metrics_B_per_kLOC", "facts_kb", "metrics_kb", "intern_kb",
+                ];
+                // `extract-mem` adds the in-process CPU counters where the OS has them (macOS).
+                if target == Target::ExtractMem && super::super::rusage::cpu_counters().is_some() {
+                    want.extend(["parse_kinstr", "parse_kcycles"]);
+                }
+                assert_eq!(names, want);
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("defs").unwrap() > 0 && counter("calls").unwrap() > 0);
                 assert!(counter("facts_B_per_kLOC").unwrap() > 1000);
                 assert!(counter("metrics_B_per_kLOC").unwrap() > 0);
+            } else if target == Target::Query {
+                assert!(counter("nodes").unwrap() > 0 && counter("loc").unwrap() > rec.files);
+                // Every sampled def is found by its own qualified id, and only it.
+                assert!(counter("lookup_exact_queries").unwrap() > 0);
+                assert_eq!(counter("lookup_exact_avg_items"), Some(1));
+                for kind in ["callers1", "impact", "path", "deps_in", "import_cycles", "summary"] {
+                    assert!(counter(&format!("{kind}_avg_ns")).is_some(), "{kind}");
+                }
             } else if target == Target::Load {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
                 assert_eq!(names, [

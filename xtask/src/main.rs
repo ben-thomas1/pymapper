@@ -5,6 +5,7 @@
 mod bench;
 mod build;
 mod diff_ruff;
+mod digest;
 mod fuzz;
 mod lexdump;
 
@@ -32,6 +33,8 @@ enum Command {
     BenchRun(bench::RunArgs),
     /// Compare extracted facts/metrics against ruff's parser.
     DiffRuff(diff_ruff::Args),
+    /// Hash everything the front end extracts from a corpus (equivalence check for optimisations).
+    FactsDigest(digest::Args),
     /// Dump lexer tokens in CPython tokenize categories (for xtask/scripts/lexdiff.py).
     #[command(hide = true)]
     LexDump(lexdump::Args),
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         Command::BenchRun(args) => bench::run_child(args),
         Command::DiffRuff(args) => diff_ruff::run(args),
         Command::LexDump(args) => lexdump::run(args),
+        Command::FactsDigest(args) => digest::run(args),
         Command::Fuzz(args) => fuzz::run(args),
     };
     match result {

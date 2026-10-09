@@ -639,7 +639,7 @@ impl<V: Visitor> Parser<'_, V> {
         };
         for r in &self.tgt_recs[from..to] {
             let target = &self.tgt[r.start as usize..(r.start + r.len) as usize];
-            let pos = self.lines.pos(self.src, target[0].start);
+            let pos = self.lines.pos(target[0].start);
             self.v.assign(&Assign { kind, target, unpacked: r.unpacked, starred: r.starred, op, value, pos });
         }
     }

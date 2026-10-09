@@ -42,6 +42,26 @@ pub(crate) enum Src {
 
 /// `ff` with every run restarted at the running table lengths `at` (which advance).
 fn rebase(ff: &FileFacts, at: &mut TableBases) -> FileFacts {
+    // Exhaustive on purpose: a new run must be rebased too (compile error until it is).
+    let FileFacts {
+        defs: _,
+        decorators: _,
+        bases: _,
+        params: _,
+        imports: _,
+        calls: _,
+        bindings: _,
+        decls: _,
+        names: _,
+        exports: _,
+        evidence: _,
+        diags: _,
+        suppressions: _,
+        lines: _,
+        flags: _,
+        doc_lines: _,
+        main_line: _,
+    } = *ff;
     let mut out = *ff;
     macro_rules! runs {
         ($($t:ident),+) => {$(
@@ -213,7 +233,7 @@ impl Index {
     pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index, same_meta: bool) -> (Index, Option<NodeShift>) {
         assert_eq!(src.len(), inputs.len(), "one source per input file");
         let t0 = Instant::now();
-        let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, nodes, group_node, modules, .. } = self;
+        let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, nodes, group_node, groups_by_node, modules, .. } = self;
         let old_ff = files.facts;
         let old_n = old_ff.len();
 
@@ -314,7 +334,7 @@ impl Index {
         let _ = stats;
         let t1 = Instant::now();
         if !same_meta {
-            drop((nodes, group_node, modules));
+            drop((nodes, group_node, groups_by_node, modules));
             let mut ix = timing::time("incremental.build", || build::build(inputs, strings, store, metrics, headers, errors, st));
             ix.stats.build = t1.elapsed();
             return (ix, None);
@@ -335,7 +355,22 @@ impl Index {
         }
         let Inputs { paths, groups, group, status, .. } = inputs;
         let files = Files { facts: headers, group, status, module: files.module, node };
-        let mut ix = Index { strings, paths, groups, files, facts: store, metrics, nodes, chain, group_node, modules, read_errors: errors, stats: st };
+        // Distribution nodes keep their order (they only move by offsets), so the groups do too.
+        let mut ix = Index {
+            strings,
+            paths,
+            groups,
+            files,
+            facts: store,
+            metrics,
+            nodes,
+            chain,
+            group_node,
+            groups_by_node,
+            modules,
+            read_errors: errors,
+            stats: st,
+        };
         ix.stats.build = t1.elapsed();
         (ix, Some(shift))
     }

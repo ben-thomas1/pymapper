@@ -172,6 +172,19 @@ impl MetricsTable {
     /// [`super::splice`]).
     pub(crate) fn splice(&mut self, plan: &[super::splice::Splice], src: &MetricsTable) {
         use super::splice::splice_col;
+        // Exhaustive on purpose: a new column must be spliced too (compile error until it is).
+        let MetricsTable {
+            cyclomatic: _,
+            cognitive: _,
+            max_nesting: _,
+            loc: _,
+            distinct_operators: _,
+            distinct_operands: _,
+            operators: _,
+            operands: _,
+            params: _,
+            doc_lines: _,
+        } = self;
         splice_col(&mut self.cyclomatic, plan, &src.cyclomatic);
         splice_col(&mut self.cognitive, plan, &src.cognitive);
         splice_col(&mut self.max_nesting, plan, &src.max_nesting);
@@ -483,7 +496,7 @@ impl DocTrack {
     fn confirm(&mut self, src: &[u8]) {
         if self.state == DOC_CAND {
             let text = src.get(self.from as usize..self.last_end as usize).unwrap_or(&[]);
-            let breaks = text.iter().enumerate().filter(|&(i, &b)| b == b'\n' || (b == b'\r' && text.get(i + 1) != Some(&b'\n'))).count();
+            let breaks = super::lines::count_line_ends(text);
             self.lines = breaks as u32 + 1;
         }
         self.state = DOC_DONE;

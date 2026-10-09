@@ -21,7 +21,7 @@ struct Cli {
     command: Command,
 }
 
-/// Subcommands. The query and `deps` / `cycles` / `summary` subcommands are hidden from
+/// Subcommands. The query and `cycles` / `summary` subcommands are hidden from
 /// `--help` until they are implemented; running them reports "not implemented" (exit 2).
 #[derive(Subcommand)]
 enum Command {
@@ -39,9 +39,9 @@ enum Command {
     /// Find a call/import path between two symbols.
     #[command(hide = true)]
     Path(cmd::path::Args),
-    /// Analyse third-party dependencies.
-    #[command(hide = true)]
-    Deps(cmd::deps::Args),
+    /// List third-party distributions, how much first-party code uses each, and (--score)
+    /// their scorecards.
+    Deps(Box<cmd::deps::Args>),
     /// Report import cycles.
     #[command(hide = true)]
     Cycles(cmd::cycles::Args),
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
         Command::Callees(args) => cmd::callees::run(&args),
         Command::Impact(args) => cmd::impact::run(&args),
         Command::Path(args) => cmd::path::run(&args),
-        Command::Deps(args) => cmd::deps::run(&args),
+        Command::Deps(args) => cmd::deps::run(*args),
         Command::Cycles(args) => cmd::cycles::run(&args),
         Command::Summary(args) => cmd::summary::run(&args),
         Command::Config(args) => cmd::config::run(*args),

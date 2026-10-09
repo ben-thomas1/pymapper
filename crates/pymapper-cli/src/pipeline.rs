@@ -84,6 +84,8 @@ pub struct Project {
     pub walk_errors: usize,
     /// Dead-code evidence from config files (`analysis.config-evidence`).
     pub config_evidence: Option<ConfigEvidence>,
+    /// The import roots and distributions the project was loaded with.
+    pub roots: Roots,
 }
 
 /// Loads the project described by `config` (rooted at `project_root`).
@@ -95,7 +97,10 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, pyprojects, configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (files, pyprojects, mut configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    if let Some(report) = &config.analysis.coverage {
+        exclude_file(&mut configs, report);
+    }
     let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
     drop(pyprojects);
     for d in &diags {
@@ -131,7 +136,24 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
     let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
         .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
-    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence }
+    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
+}
+
+/// Removes `file` from `paths`: the same path, or another path to the same file (symlinks,
+/// hard links, `..`), compared by device and inode among the paths with the same file name.
+/// Used to keep the coverage report (`analysis.coverage`) out of the config-evidence files,
+/// whatever its contents: it names every function, executed or not.
+fn exclude_file(paths: &mut PathList, file: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let id = std::fs::metadata(file).ok().map(|m| (m.dev(), m.ino()));
+    let name = file.file_name();
+    paths.remove_if(|p| {
+        if p == file {
+            return true;
+        }
+        let Some(id) = id else { return false };
+        p.file_name() == name && std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == id)
+    });
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).

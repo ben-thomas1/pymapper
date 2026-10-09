@@ -5,6 +5,7 @@
 
 mod corpus;
 mod extract;
+mod query;
 mod report;
 mod rusage;
 mod targets;

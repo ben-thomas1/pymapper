@@ -155,6 +155,8 @@ pub(super) fn build(
         nodes,
         chain,
         group_node,
+        // Distribution nodes are pushed in `group_order`, so node ids ascend along it.
+        groups_by_node: group_order,
         modules,
         read_errors,
         stats,
