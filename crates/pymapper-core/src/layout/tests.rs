@@ -523,3 +523,182 @@ fn toggling_external_code_keeps_first_party_geography() {
         assert!((fa - fb).abs() <= 1e-4 * fa.max(1e-3), "node {v}: {fa} vs {fb}");
     }
 }
+
+// -- store --------------------------------------------------------------------------------
+
+fn medium() -> (Arc<LayoutTree>, Layout) {
+    let (depths, metric) = gen_tree(5, 3, 8, 5);
+    let regions = regions_for(&depths, &[Region::Main, Region::Stdlib]);
+    let t = Arc::new(LayoutTree::from_preorder(&depths, &metric, &regions, 1));
+    let mut l = Layout::new(Arc::clone(&t), LayoutConfig::default());
+    l.ensure(u32::MAX);
+    (t, l)
+}
+
+#[test]
+fn store_round_trip_and_partial_levels() {
+    let dir = TempDir::new("store");
+    let (t, l) = medium();
+    let cfg = *l.config();
+    let path = cache_path(&dir.path().join("sub"), &t, &cfg);
+    let name = path.file_name().and_then(|n| n.to_str()).expect("name").to_owned();
+    assert!(name.starts_with("layout-") && name.ends_with(".pml") && name.len() == 7 + 16 + 4, "{name}");
+    save_levels(&path, &t, &cfg, l.levels()).expect("save");
+    let back = load_levels(&path, &t, &cfg).expect("load");
+    let lb = Layout::with_levels(Arc::clone(&t), cfg, back);
+    assert!(lb.is_complete());
+    assert_eq!(bits(&lb), bits(&l));
+    // Only the first two levels stored: the rest is computed on demand, identically.
+    save_levels(&path, &t, &cfg, &l.levels()[..2]).expect("save");
+    let mut part = Layout::with_levels(Arc::clone(&t), cfg, load_levels(&path, &t, &cfg).expect("load"));
+    assert_eq!(part.computed(), 2);
+    part.ensure(u32::MAX);
+    assert_eq!(bits(&part), bits(&l));
+}
+
+#[test]
+fn store_rejects_stale_or_damaged_files() {
+    let dir = TempDir::new("store-bad");
+    let (t, l) = medium();
+    let cfg = *l.config();
+    let path = cache_path(dir.path(), &t, &cfg);
+    save_levels(&path, &t, &cfg, l.levels()).expect("save");
+    // Another config or tree: another key (and file name).
+    let other = LayoutConfig { pad: 3.0, ..cfg };
+    assert_ne!(cache_key(&t, &other), cache_key(&t, &cfg));
+    assert_ne!(cache_path(dir.path(), &t, &other), path);
+    assert!(matches!(load_levels(&path, &t, &other), Err(StoreError::Invalid("key"))));
+    let t2 = LayoutTree::from_preorder(&[0, 1], &[0, 1], &[Region::Main], 1);
+    assert!(matches!(load_levels(&path, &t2, &cfg), Err(StoreError::Invalid("key"))));
+    // A flipped rect byte fails the checksum; a truncated file fails to read.
+    let good = fs::read(&path).expect("read");
+    let mut bad = good.clone();
+    let mid = bad.len() / 2;
+    bad[mid] ^= 0x40;
+    fs::write(&path, &bad).expect("write");
+    assert!(matches!(load_levels(&path, &t, &cfg), Err(StoreError::Invalid("checksum"))));
+    fs::write(&path, &good[..good.len() - 3]).expect("write");
+    assert!(matches!(load_levels(&path, &t, &cfg), Err(StoreError::Io(_))));
+    let mut long = good.clone();
+    long.push(0);
+    fs::write(&path, &long).expect("write");
+    assert!(matches!(load_levels(&path, &t, &cfg), Err(StoreError::Invalid("trailing bytes"))));
+    fs::write(&path, b"garbage").expect("write");
+    assert!(load_levels(&path, &t, &cfg).is_err());
+    assert!(matches!(load_levels(&dir.path().join("missing.pml"), &t, &cfg), Err(StoreError::Io(_))));
+}
+
+// -- worker -------------------------------------------------------------------------------
+
+#[test]
+fn worker_computes_lazily_and_matches_the_sync_layout() {
+    let (t, l) = medium();
+    let notified = Arc::new(AtomicUsize::new(0));
+    let n2 = Arc::clone(&notified);
+    let w = LayoutWorker::spawn(Arc::clone(&t), *l.config(), None, 1, Box::new(move || {
+        n2.fetch_add(1, Ordering::Relaxed);
+    }))
+    .expect("spawn");
+    assert_eq!(w.region(Region::Main), l.region(Region::Main));
+    assert!(w.wait_for(1) >= 2);
+    // Nothing deeper than requested is computed.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(w.computed(), 2);
+    assert!(w.level(2).is_none());
+    assert_eq!(w.wait_for(u32::MAX), t.levels());
+    assert_eq!(bits(&w.snapshot()), bits(&l));
+    assert_eq!(notified.load(Ordering::Relaxed), t.levels() as usize);
+    assert_eq!(w.from_cache(), 0);
+    assert_eq!(&w.levels()[0][..], &l.levels()[0][..]);
+}
+
+#[test]
+fn worker_saves_and_reuses_the_cache() {
+    let dir = TempDir::new("worker");
+    let (t, l) = medium();
+    let cfg = *l.config();
+    {
+        let w = LayoutWorker::spawn(Arc::clone(&t), cfg, Some(dir.path().to_path_buf()), 2, Box::new(|| {})).expect("spawn");
+        assert_eq!(w.wait_for(2), 3);
+        // Saved once idle; drop joins the thread, so poll for the file first.
+        let path = cache_path(dir.path(), &t, &cfg);
+        for _ in 0..500 {
+            if load_levels(&path, &t, &cfg).is_ok_and(|lv| lv.len() == 3) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    let w = LayoutWorker::spawn(Arc::clone(&t), cfg, Some(dir.path().to_path_buf()), 0, Box::new(|| {})).expect("spawn");
+    assert!(w.wait_for(0) >= 3);
+    assert_eq!(w.from_cache(), 3);
+    assert_eq!(w.wait_for(u32::MAX), t.levels());
+    assert_eq!(bits(&w.snapshot()), bits(&l));
+}
+
+#[test]
+fn worker_on_empty_tree_and_early_drop() {
+    let t = Arc::new(LayoutTree::from_preorder(&[], &[], &[], 1));
+    let w = LayoutWorker::spawn(t, LayoutConfig::default(), None, 5, Box::new(|| {})).expect("spawn");
+    assert_eq!(w.wait_for(5), 0);
+    drop(w);
+    let (t, _) = medium();
+    let w = LayoutWorker::spawn(t, LayoutConfig::default(), None, u32::MAX, Box::new(|| {})).expect("spawn");
+    drop(w);
+}
+
+// -- from an index ------------------------------------------------------------------------
+
+#[test]
+fn tree_from_index_follows_the_hierarchy() {
+    let dir = TempDir::new("index");
+    let mut inp = Inputs::new();
+    let proj = inp.add_group(b"proj", Origin::FirstParty, None);
+    let lib = inp.add_group(b"lib", Origin::ThirdParty, None);
+    let std = inp.add_group(b"stdlib", Origin::Stdlib, None);
+    let big = "def f():\n    x = 1\n    return x\n\n\nclass C:\n    def m(self):\n        pass\n\n    def n(self):\n        pass\n";
+    let files = [
+        (dir.file("p/pkg/__init__.py", ""), proj, "pkg"),
+        (dir.file("p/pkg/a.py", big), proj, "pkg.a"),
+        (dir.file("p/pkg/b.py", "def g():\n    pass\n"), proj, "pkg.b"),
+        (dir.file("l/lib.py", big), lib, "lib"),
+        (dir.file("s/os.py", "def getcwd():\n    pass\n"), std, "os"),
+    ];
+    for (p, g, m) in &files {
+        inp.push(p.as_bytes(), *g, m.as_bytes(), FileStatus::Active).expect("push");
+    }
+    let ix = load(inp);
+    let agg = Aggregates::build(&ix);
+    let t = LayoutTree::from_index(&ix, &agg, TreeOptions::default());
+    assert_eq!(t.len(), ix.node_count() as usize);
+    for v in 0..ix.node_count() {
+        assert_eq!(t.depth(v), ix.depth(v));
+        assert_eq!(t.subtree(v), ix.subtree(v));
+        assert!(t.weight(v) >= agg.loc()[v as usize].max(1));
+    }
+    let a = ix.file_node(1);
+    assert_eq!(t.weight(a), 11);
+    let mut l = Layout::new(Arc::new(t), LayoutConfig::default());
+    l.ensure(u32::MAX);
+    check_layout(&l);
+    for g in 0..3 {
+        let v = ix.group_node(g);
+        let want = Region::of(ix.groups()[g as usize].origin);
+        assert_eq!(l.region_of(v), want);
+        assert_eq!(l.muted(v), want != Region::Main);
+    }
+    assert!(!l.muted(a) && l.muted(ix.file_node(3)) && l.muted(ix.file_node(4)));
+    // Hash: stable for the same index, changes with the metric.
+    let again = LayoutTree::from_index(&ix, &agg, TreeOptions::default());
+    assert_eq!(again.hash(), l.tree().hash());
+    let uni = LayoutTree::from_index(&ix, &agg, TreeOptions { metric: SizeMetric::Uniform, min_weight: 1 });
+    assert_ne!(uni.hash(), l.tree().hash());
+    // Uniform: a parent weighs as many units as it has leaves (here: f, m, n under pkg.a).
+    assert_eq!(uni.weight(a), 3);
+    for m in [SizeMetric::Symbols, SizeMetric::CcSum, SizeMetric::CogSum] {
+        let t = Arc::new(LayoutTree::from_index(&ix, &agg, TreeOptions { metric: m, min_weight: 1 }));
+        let mut l = Layout::new(t, LayoutConfig::default());
+        l.ensure(u32::MAX);
+        check_layout(&l);
+    }
+}

@@ -52,8 +52,9 @@
 //! every parent writes only its children's cells). The same hierarchy gives bit-identical
 //! rects on every run and machine with IEEE `f64`. [`LayoutTree::hash`] covers shape, names,
 //! kinds, weights and origins; with [`LayoutConfig::fingerprint`] it keys the on-disk cache
-//! ([`store`]), so a restart with an unchanged hierarchy loads the levels it had instead of
-//! computing them.
+//! ([`cache_path`], [`load_levels`], [`save_levels`]), so a restart with an unchanged
+//! hierarchy loads the levels it had instead of computing them. Any change of a weight
+//! changes the hash: the cache never serves positions of another hierarchy.
 //!
 //! # Levels and laziness
 //!
@@ -65,8 +66,9 @@
 //! shows, so function-level rects of a venv are computed only when someone zooms that far.
 //!
 //! Cost: O(n log d) per level (sorting each parent's `d` children), parallel over parents for
-//! large levels. Memory: 16 bytes per laid-out node (rects) plus 14 bytes per node in the tree
-//! (end, depth, weight, slot).
+//! levels above 32k nodes. Memory: 16 bytes per laid-out node (rects) plus 18 bytes per node
+//! in the tree (end, depth, weight, slot, by-level order). Measured (`benches/layout.rs`, see
+//! docs/benchmarks.md): the venv + stdlib (912k nodes) in 5.8 ms on 14 cores.
 
 mod engine;
 mod squarify;
@@ -199,7 +201,7 @@ impl Default for LayoutConfig {
 }
 
 impl LayoutConfig {
-    /// A 64-bit fingerprint of every field (cache key part; see [`store`]).
+    /// A 64-bit fingerprint of every field (part of [`cache_key`]).
     pub fn fingerprint(&self) -> u64 {
         let mut h = crate::intern::FxHasher::default();
         let f = [

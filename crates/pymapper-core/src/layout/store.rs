@@ -65,7 +65,7 @@ pub fn cache_path(dir: &Path, tree: &LayoutTree, cfg: &LayoutConfig) -> PathBuf 
 
 #[inline]
 fn fold(acc: u64, h: u64) -> u64 {
-    (acc.rotate_left(5) ^ h).wrapping_mul(0x51_7cc1_b727_220a_95)
+    (acc.rotate_left(5) ^ h).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
 
 /// Writes the levels of `tree` (laid out with `cfg`) to `path` atomically, creating its
@@ -147,7 +147,7 @@ pub fn load_levels(path: &Path, tree: &LayoutTree, cfg: &LayoutConfig) -> Result
         sum = fold(sum, hash_bytes(&buf));
         let mut lv = super::engine::new_level(len);
         let rects = Arc::get_mut(&mut lv).ok_or(StoreError::Invalid("shared level"))?;
-        for (c, r) in buf.chunks_exact(16).zip(rects.iter_mut()) {
+        for (c, r) in buf.as_chunks::<16>().0.iter().zip(rects.iter_mut()) {
             let v = |o: usize| f32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);
             *r = Rect::new(v(0), v(4), v(8), v(12));
         }
