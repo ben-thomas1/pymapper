@@ -103,13 +103,15 @@
 //! Defs, modules and imports of first-party `.py` files (stubs, shadowed and non-importable
 //! files are skipped) with confidence at least [`MIN_EMIT`]. Not reported: `@overload`
 //! signatures, defs under `if TYPE_CHECKING:`, dunder methods (live with their class) and
-//! module-level dunder functions (`__getattr__`, `__dir__`: always live). A finding is dropped
-//! when an enclosing def or the module has a finding of at least the same confidence (the
-//! methods of an unused class, the defs of an unused module): deleting the container deletes
-//! them. Defs are reported at their name; PM404 at line 1, column 1; PM405 at the imported
-//! name. Suppressions, baselines and `per-file-ignores` apply through
-//! [`RuleEngine::filter`](crate::rules::RuleEngine::filter) (design (i)); entrypoint `names`
-//! globs are the whitelist.
+//! module-level dunder functions (`__getattr__`, `__dir__`: always live). Packages
+//! (`__init__.py`) never get a PM404 finding. A finding is dropped when an enclosing def or the
+//! module has an emitted finding of at least the same confidence (the methods of an unused
+//! class, the defs and imports of an unused module): deleting the container deletes them. Only
+//! containers whose rule is enabled count, so with PM404 or PM402 turned off their contents are
+//! reported. Defs are reported at their name; PM404 at line 1, column 1; PM405 at the imported
+//! name. Suppressions, baselines and `per-file-ignores` apply afterwards through
+//! [`RuleEngine::filter`](crate::rules::RuleEngine::filter) (design (i)), so suppressing a
+//! container finding also hides what it contains; entrypoint `names` globs are the whitelist.
 //!
 //! # Cost class: O(V + E) (`CostClass::Graph`)
 //!
@@ -538,7 +540,7 @@ pub(crate) fn run(
     timing::time("deadcode.findings", || {
         findings(ix, &info, &mut dc, emit, out);
         if emit.import {
-            import_findings(ix, &icands, &ihits, &mut dc, out);
+            import_findings(ix, &icands, &ihits, &mut dc, emit.module, out);
         }
     });
     dc
@@ -600,8 +602,9 @@ fn findings(ix: &Index, info: &seeds::FileInfo, dc: &mut DeadCode, emit: Emit, o
         }
         let file = rules::FileId(f);
         let m = ix.file_node(f);
-        let mconf = module_confidence(ix, dc, f);
-        if mconf > 0 && emit.module {
+        // A PM404 finding contains the module's defs and imports only when PM404 is emitted.
+        let mconf = if emit.module { module_confidence(ix, dc, f) } else { 0 };
+        if mconf > 0 {
             out.push(UNUSED_MODULE, Location::new(file, 1, 1), SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m))]);
             dc.stats.findings[3] += 1;
         }
@@ -621,13 +624,14 @@ fn findings(ix: &Index, info: &seeds::FileInfo, dc: &mut DeadCode, emit: Emit, o
             if mconf.max(stack.last().map_or(0, |&(_, c)| c)) >= conf {
                 continue;
             }
-            stack.push((ix.subtree(v).end, conf));
             let (rule, on, slot) = match DefKind::from_u8(defs.kind[row]) {
                 DefKind::Class => (UNUSED_CLASS, emit.class, 1),
                 _ if defs.flags[row] & def_flags::METHOD != 0 => (UNUSED_METHOD, emit.method, 2),
                 _ => (UNUSED_FUNCTION, emit.function, 0),
             };
+            // Only a finding that is emitted contains the defs below it.
             if on {
+                stack.push((ix.subtree(v).end, conf));
                 let at = Location::new(file, defs.name_line[row], defs.name_col[row] + 1);
                 out.push(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v))]);
                 dc.stats.findings[slot] += 1;
@@ -642,12 +646,13 @@ fn import_findings(
     cands: &[imports::ImportCand],
     hits: &[u8],
     dc: &mut DeadCode,
+    module_on: bool,
     out: &mut Findings,
 ) {
     let st = &ix.facts().imports;
     for (c, &hit) in cands.iter().zip(hits) {
         let Some(conf) = imports::confidence(c, hit) else { continue };
-        if conf < MIN_EMIT || module_confidence(ix, dc, c.file) >= conf {
+        if conf < MIN_EMIT || (module_on && module_confidence(ix, dc, c.file) >= conf) {
             continue;
         }
         let row = c.row as usize;

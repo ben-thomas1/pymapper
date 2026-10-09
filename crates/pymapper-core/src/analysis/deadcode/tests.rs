@@ -52,8 +52,13 @@ impl Fx {
     /// Runs with `opts` and every rule; returns the result and `CODE qid conf` per finding
     /// (`CODE qid:name conf` for PM405), in emission order.
     pub fn run_with(&self, opts: &DeadCodeOptions<'_>) -> (DeadCode, Vec<String>) {
+        self.run_emit(opts, Emit::ALL)
+    }
+
+    /// [`Fx::run_with`] with only the rules of `emit`.
+    pub fn run_emit(&self, opts: &DeadCodeOptions<'_>, emit: Emit) -> (DeadCode, Vec<String>) {
         let mut out = Findings::new();
-        let dc = run(&self.ix, &self.imp, &self.calls, opts, Emit::ALL, &mut out);
+        let dc = run(&self.ix, &self.imp, &self.calls, opts, emit, &mut out);
         let lines = out
             .iter()
             .map(|(f, args)| {
@@ -388,6 +393,36 @@ fn unused_modules() {
     assert_eq!(ml("app.plugins.loaded"), (level::EVIDENCE, Why::Evidence));
     // The defs of an unused module are covered by its finding.
     assert!(!lines.iter().any(|l| l.contains("app.orphan:")), "{lines:?}");
+}
+
+#[test]
+fn disabled_containers_do_not_hide_their_contents() {
+    let f = fx(&[
+        ("app/__init__.py", ""),
+        ("app/main.py", "from app.cls import Live\n\nif __name__ == '__main__':\n    x = Live()\n    x.run()\n"),
+        ("app/orphan.py", "import os\n\ndef g():\n    pass\n"),
+        (
+            "app/cls.py",
+            "class Live:\n    def run(self):\n        pass\n\n\
+             class Dead:\n    def meth(self):\n        pass\n",
+        ),
+    ]);
+    let opts = DeadCodeOptions { mode: Mode::Application, ..DeadCodeOptions::default() };
+    let (_, all) = f.run_with(&opts);
+    assert_eq!(all, ["PM402 app.cls:Dead 100", "PM404 app.orphan 100"]);
+    // Without PM404 / PM402 their contents are reported.
+    let (_, lines) = f.run_emit(&opts, Emit { module: false, class: false, ..Emit::ALL });
+    assert_eq!(lines, [
+        "PM403 app.cls:Dead.meth 100",
+        "PM401 app.orphan:g 100",
+        "PM405 app.orphan:os@1 100",
+    ]);
+    // Only PM404 off: the class finding still contains its method.
+    let (_, lines) = f.run_emit(&opts, Emit { module: false, ..Emit::ALL });
+    assert_eq!(lines, ["PM402 app.cls:Dead 100", "PM401 app.orphan:g 100", "PM405 app.orphan:os@1 100"]);
+    // Only PM402 off.
+    let (_, lines) = f.run_emit(&opts, Emit { class: false, ..Emit::ALL });
+    assert_eq!(lines, ["PM403 app.cls:Dead.meth 100", "PM404 app.orphan 100"]);
 }
 
 #[test]

@@ -68,8 +68,9 @@ Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`)
         message: "class `{0}` is never used",
         args: SYMBOL,
         explanation: "No live code instantiates, subclasses or references the class, and no \
-entry-point rule (base class, decorator, name) marks it as used. Its methods are not reported \
-separately.\n\n\
+entry-point rule (base class, decorator, name) marks it as used. While PM402 is enabled, its \
+methods are not reported separately unless they look less live than the class (higher \
+confidence); suppressing the class finding (inline or `per-file-ignores`) hides them too.\n\n\
 Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`).",
         severity: Severity::Warning,
         default_enabled: true,
@@ -105,7 +106,10 @@ Fix: delete it, or declare how it is used.",
         args: SYMBOL,
         explanation: "No first-party module imports it, it is not a script or `__main__` module, \
 not an entry point, and (in library mode) not part of the public package. Test modules are \
-usually entry points via the `pytest` preset.\n\n\
+usually entry points via the `pytest` preset. Packages (`__init__.py`) are never reported. \
+While PM404 is enabled, the module's defs and imports are reported only when they look less \
+live than the module (higher confidence); suppressing the module finding (`ignore[PM404]` on \
+line 1 or `per-file-ignores`) hides them too.\n\n\
 Fix: delete the module, or declare it as an entry point.",
         severity: Severity::Warning,
         default_enabled: true,

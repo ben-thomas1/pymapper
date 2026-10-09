@@ -231,13 +231,11 @@ fn file_seeds(
                     mark |= PROTOCOL;
                 }
             }
-            if let Some(c) = g.classes.id(ix, v)
-                && g.classes.flags(c) & class_flags::INCOMPLETE != 0
-            {
-                mark |= INCOMPLETE;
-            }
             if let Some(c) = g.classes.id(ix, v) {
                 let cl = g.classes;
+                if cl.flags(c) & class_flags::INCOMPLETE != 0 {
+                    mark |= INCOMPLETE;
+                }
                 let dyn_ancestor = cl.mro(c).iter().skip(1).any(|&a| ix.file(cl.node(a)).is_some_and(|af| dynamic_files[af as usize]));
                 if dyn_ancestor {
                     mark |= DYNAMIC_BASE;
