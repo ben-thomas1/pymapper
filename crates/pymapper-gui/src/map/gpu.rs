@@ -149,7 +149,8 @@ pub struct MapRenderer {
     /// (scene generation, band generation) uploaded per batch: rects, lines, curves.
     uploaded_band: [Option<(u64, u64)>; 3],
     uploaded_labels: Option<(u64, u64)>,
-    uploaded_hover: Option<Option<super::hit::Hit>>,
+    /// Hover and selection marks (generation) last uploaded to the overlay buffers.
+    uploaded_hover: Option<(Option<super::hit::Hit>, u64)>,
     glyph_count: u32,
     draws: Vec<DrawCmd>,
     ranges: Vec<Range<u32>>,
@@ -353,7 +354,7 @@ impl MapRenderer {
         self.uploaded_band = gens;
         self.sync_overlays(device, queue, state);
         self.sync_labels(device, queue, state);
-        if self.uploaded_hover != Some(state.hover) || band_changed {
+        if self.uploaded_hover != Some((state.hover, state.marks_generation)) || band_changed {
             self.sync_hover(device, queue, state);
         }
         self.write_uniform(queue, state, rect, target);
@@ -425,6 +426,7 @@ impl MapRenderer {
     fn sync_hover(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &MapState) {
         self.overlay_rects.clear();
         self.overlay_edges.clear();
+        self.overlay_rects.extend_from_slice(&state.marks);
         if let Some(h) = state.hover {
             let scene = &*state.scene;
             match h.kind {
@@ -441,7 +443,7 @@ impl MapRenderer {
         }
         upload_slice(device, queue, &mut self.overlay_rect, &self.overlay_rects);
         upload_slice(device, queue, &mut self.overlay_edge, &self.overlay_edges);
-        self.uploaded_hover = Some(state.hover);
+        self.uploaded_hover = Some((state.hover, state.marks_generation));
     }
 
     fn write_uniform(&mut self, queue: &wgpu::Queue, state: &MapState, rect: PhysicalRect, target: [u32; 2]) {

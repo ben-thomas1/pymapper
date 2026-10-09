@@ -16,7 +16,7 @@ that matches no rule (`PM999`, anywhere in the rule options) is a usage error (e
 
 Expensive rules also need their `[analysis]` toggle ("needs ..." below): turning the toggle on
 enables them unless they are ignored. `pymapper check` does not run the dependency rules (PM6xx,
-they belong to `pymapper deps`) or the contract rules PM302-PM304 without `[[contracts]]`. If
+`pymapper deps --check` runs them) or the contract rules PM302-PM304 without `[[contracts]]`. If
 none of the selected rules can run, `check` fails with exit 2 and says why; if some can, it warns
 about the skipped rules selected by code or category (`PM501`, `PM6`) and, whenever rules were
 selected explicitly (`ALL` included), its footer says how many rules ran and which were skipped
@@ -391,7 +391,7 @@ Module-level or nested function that is never used.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
-- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. `check` reports findings at or above `min-confidence` (default 80).
+- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
 
 The function is not reachable from any root: nothing live calls it, references it, re-exports it or registers it (decorator entry points, presets).
 
@@ -407,7 +407,7 @@ Class that is never instantiated, subclassed or referenced.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
-- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. `check` reports findings at or above `min-confidence` (default 80).
+- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
 
 No live code instantiates, subclasses or references the class, and no entry-point rule (base class, decorator, name) marks it as used. While PM402 is enabled, its methods are not reported separately unless they look less live than the class (higher confidence); suppressing the class finding (inline or `per-file-ignores`) hides them too.
 
@@ -423,7 +423,7 @@ Method of a live class that is never called.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
-- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. `check` reports findings at or above `min-confidence` (default 80).
+- Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
 
 The class is live but this method is never called through the class, its instances, `self` / `cls` / `super()`, or as an override of a live method in a base class. Dunder and protocol methods are always live.
 
@@ -439,7 +439,7 @@ First-party module that nothing imports and that is not an entry point.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
-- Confidence: 100 when no live module imports it or calls into it; 50 when reached only through `possible` calls or when its name occurs in another file (for instance `importlib.import_module("pkg.plugins.x")`; `used-only-in-tests` when only test code names it); 40 for a module outside any regular package (it may be run as a script) and for modules imported only from such modules.
+- Confidence: 100 when no live module imports it or calls into it; 50 when reached only through `possible` calls or when its name occurs in another file (for instance `importlib.import_module("pkg.plugins.x")`; `used-only-in-tests` when only test code names it); 40 for a module outside any regular package (it may be run as a script) and for modules imported only from such modules. With a coverage report, a module that was imported is never reported and the doubt of one that never was is divided by 3 (40 becomes 80; reason `never-executed`).
 
 No first-party module imports it, it is not a script or `__main__` module, not an entry point, and (in library mode) not part of the public package. Test modules are usually entry points via the `pytest` preset. Packages (`__init__.py`) are never reported. While PM404 is enabled, the module's defs and imports are reported only when they look less live than the module (higher confidence); suppressing the module finding (`ignore[PM404]` on line 1 or `per-file-ignores`) hides them too.
 
@@ -497,9 +497,9 @@ Import of a third-party distribution not declared in `pyproject.toml`.
 - Severity: error
 - Enabled by default: yes
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]` or a `[dependency-groups]` group. The code works only because the package happens to be installed.
+First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. What a declared meta-package (installed, no importable name) requires directly counts as declared, and so do the development groups of a uv workspace root for the test code of its members. Units whose `dependencies` are `dynamic` are not checked (unless Poetry lists them in `[tool.poetry.dependencies]`). Reported once per import statement and distribution, at the module (`from yaml import (a, b)` reports `yaml` once, on the statement's first line).
 
 Fix: add the distribution to the project's dependencies.
 
@@ -513,9 +513,9 @@ Declared dependency that no first-party module imports.
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-A distribution in `[project.dependencies]` provides no module that first-party code imports. Plugins, CLI tools and runtime-only extras are legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline suppression on the dependency line.
+A distribution in `[project.dependencies]` (or poetry's main dependencies) provides no module that the unit's first-party code imports. Optional and development groups are not checked. A distribution that installs no importable name (a command-line tool, a meta-package) is reported with confidence 50. Plugins, CLI tools and runtime-only extras are legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline suppression on the dependency line.
 
 Fix: remove the dependency, or move it to the group that needs it.
 
@@ -531,7 +531,7 @@ Import of a private module or name of a third-party package.
 - Cost: O(n)
 - Confidence: always 100
 
-The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution. Private internals change without notice between releases.
+The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders (`__version__`) and the lone `_` (the gettext idiom) are not private. A private module is reported once per import statement, at the module; a private name at the name. Private internals change without notice between releases.
 
 Fix: use the package's public API, or pin the version and isolate the access in one module.
 
@@ -545,9 +545,9 @@ Import of a distribution installed only as a dependency of a dependency.
 - Severity: warning
 - Enabled by default: no (enable with `select` / `extend-select`)
 - Cost: O(n)
-- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata; lower when the mapping comes from the built-in name table or a name guess.
+- Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
 
-A refinement of PM601: the imported distribution is not declared, but another declared dependency requires it. It may disappear when that dependency changes. When this rule is enabled such imports are reported as PM604 instead of PM601; it is off by default because PM601 already reports them.
+A refinement of PM601: the imported distribution is not declared, but a declared dependency requires it, directly or transitively (installed `Requires-Dist` metadata, extras honoured). It may disappear when that dependency changes. When this rule is enabled such imports are reported as PM604 instead of PM601; it is off by default because PM601 already reports them.
 
 Fix: declare the distribution directly.
 

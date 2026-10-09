@@ -6,6 +6,10 @@ complexity, hotspots, maintainability, coupling and a letter grade. It is inform
 humans and agents choosing, auditing or replacing dependencies; it never produces findings and
 always exits 0 (2 only for usage and fatal errors, as `check`).
 
+`pymapper deps --check [PATHS]` instead runs the dependency-hygiene rules PM601-PM604
+(undeclared, unused, private and transitive-only dependencies) and reports findings exactly
+like `check`; see [Hygiene](#hygiene---check).
+
 ```
 $ pymapper deps --score
 distribution  version  grade  score      loc  hot/kloc    mi   cc  deps  importers  api used  loc reached
@@ -43,6 +47,8 @@ covering the project root filters nothing. A path that does not exist is a usage
 | `--score` | add the scorecard columns (JSON: a `scorecard` object per distribution) |
 | `--all` | list every distribution, not only those first-party code imports or calls |
 | `--format concise\|json` | output format (`--output-format`, config `output-format`); `sarif` and `github` are usage errors |
+| `--check` | run the dependency-hygiene rules PM601-PM604 instead of listing ([Hygiene](#hygiene---check)); all four formats |
+| `--baseline FILE`, `--save-baseline FILE` | with `--check`: as for `check` |
 | `--stats` | phase timings (`deps.usage`, `deps.score`, ...), counters and peak RSS on stderr |
 | configuration flags | as for `check` (`--venv`, `--cache-dir`, `--no-cache`, `-j`, `--set`, `--config`, ...) |
 
@@ -134,10 +140,133 @@ One document with the conventions of `check`'s JSON (schema `version` 2, `tool`,
 are the `scorecards_*` counters. Reals have at most two decimals; fields are only ever added
 within a version.
 
+## Hygiene (`--check`)
+
+```
+$ pymapper deps --check
+...
+apps/aiml-ais-backend/aiml_ais_backend/listeners.py:10:6: PM601 `sqlalchemy` is provided by `SQLAlchemy`, which is not a declared dependency
+...
+apps/aiml-ais-backend/pyproject.toml:14:5: PM602 dependency `gunicorn` is declared but never imported
+...
+src/cogito-evaluations/cogito_evaluations/_legacy/datasets/hypothesis_verification/data.py:5:6: PM603 `numpy.random._generator` is private to `numpy`
+...
+Found 490 findings in 262 files (1803 files checked).
+Not shown: 30 below min-confidence.
+```
+
+(Lines taken from a real run on a uv workspace of 15 project units; most of its PM601 findings
+are imports of distributions that a workspace member pulls in, which `--extend-select PM604`
+reports as transitive instead.)
+
+`--check` runs the PM6xx rules ([`rules.md`](rules.md#dependencies)) with everything `check`
+has: the formats (`concise`, `json`, `sarif`, `github`), the rule selection (`select`,
+`--select PM604`, ...), `per-file-ignores`, inline suppressions, the confidence gate,
+`--baseline` / `--save-baseline` / `baseline`, `--stats` and the exit codes (0 clean, 1
+findings at or above the gate, 2 usage or fatal error). Only the PM6xx rules run: selecting
+none of them is a usage error. `--check` conflicts with `--score` and `--all`. Positional
+`PATHS` filter the report as for `check`: the whole project is analysed, and findings in Python
+files and `pyproject.toml` files outside `PATHS` are dropped.
+
+`--check` reads the same `baseline` config key as `check`. The two commands report disjoint
+rules, so pointing both at one file makes `--save-baseline` from either overwrite the other's
+entries: give `deps --check` its own file on the command line (`--baseline deps-baseline.txt`)
+when `baseline` is set. Malformed `# pymapper: ignore[...]` comments in Python files are
+warned about by `check` only (`--check` applies the valid codes silently); those in
+`pyproject.toml` files are warned about by `--check`.
+
+The project is loaded as `check` loads it (third-party code only with `--deps`): imports are
+mapped to distributions through the venv's installed metadata either way, so `--check` needs
+no third-party parse and costs about as much as a `check` with only cheap rules.
+
+### Declarations
+
+Every project unit (the project root and each directory below it with a `pyproject.toml`)
+declares its own dependencies; a file is checked against the nearest unit that declares any
+(a `pyproject.toml` with only tool configuration declares nothing). Declared means listed in:
+
+| table | kind |
+|-------|------|
+| `[project] dependencies` | main (PM602 checks these) |
+| `[project.optional-dependencies]` | optional |
+| `[dependency-groups]` (PEP 735) | group |
+| `[tool.poetry.dependencies]` | main (`optional = true`: optional; `python` ignored) |
+| `[tool.poetry.dev-dependencies]`, `[tool.poetry.group.*.dependencies]` | group |
+| `[tool.uv] dev-dependencies`, `[tool.pdm.dev-dependencies]` | group |
+
+Requirement strings are PEP 508; names are compared PEP 503-normalised (`PyYAML` = `pyyaml`)
+and extras are kept (`requests[socks]`). A unit whose `[project] dynamic` lists
+`dependencies` is not checked by PM601, PM602 and PM604 (warning), unless it keeps them in
+`[tool.poetry.dependencies]` (Poetry 2), which are then read as its main dependencies; one that lists
+`optional-dependencies` is not checked by PM601 and PM604. Without any declaration, these rules
+report nothing (warning); PM603 needs none. A declared dependency that is installed but
+provides no importable name is a meta-package (`pydantic-ai` installs nothing and requires
+`pydantic-ai-slim`, which provides `pydantic_ai`): what it requires directly (with the
+requested extras) counts as declared, and it is used when one of those is imported (editable
+installs and project units are never meta-packages). Imports of the project itself or of another unit
+(a workspace member) are never undeclared, and a workspace member imported through its
+first-party package counts as a used dependency of the importing unit. The development groups
+(`[dependency-groups]`, `[tool.uv] dev-dependencies`, ...) of a uv workspace root (a
+`pyproject.toml` with `[tool.uv.workspace]`) count as declared for the test code (as
+`analysis.include-tests-in-metrics` defines it: `tests` packages, `test_*.py`, `conftest.py`,
+...) of every unit below it: tools such as `pytest` are usually declared once there and
+installed for the whole workspace. They do not count for production code, and the root's main
+and optional dependencies never do: a member must declare what it imports at run time.
+
+A `pyproject.toml` takes `# pymapper: ignore[PM602]` comments on the line of a requirement (a
+`#` inside a TOML string is not a comment), and `per-file-ignores` patterns match it like any
+file (`"pyproject.toml" = ["PM602"]`, `"libs/*/pyproject.toml" = [...]`).
+
+### Mapping imports to distributions
+
+Only absolute imports are mapped (relative imports are first-party). For each import row:
+
+1. a module that resolves to loaded code: first-party code is never a dependency, stdlib code is
+   ignored, a third-party group gives its distribution;
+2. otherwise the top-level name: the stdlib table, then the distributions whose
+   `top_level.txt` or `RECORD` (or editable-install mapping) list it; for a name several
+   distributions share (namespace packages such as `google`), the distribution whose `RECORD`
+   lists the imported module (`google/protobuf/__init__.py` -> `protobuf`), else any of them;
+3. otherwise a built-in table of import names whose distribution is named differently (`yaml`
+   -> `PyYAML`, `PIL` -> `Pillow`, `sklearn` -> `scikit-learn`, ... about 60 entries), else a guess
+   from the name itself. A name several distributions provide (`cv2`: `opencv-python`,
+   `opencv-python-headless`, `opencv-contrib-python`, ...; `faiss`; `Crypto`) is declared by any
+   of them; a finding names the first.
+
+The confidence of PM601, PM602 and PM604 says which step answered: 100 for installed metadata,
+90 for the table, 60 for a guess (below the default gate of 80, so a project without a venv
+only sees the table's answers by default). An import guarded by `except ImportError` is an
+optional dependency: at most 50. A declared dependency that installs no importable name (a
+command-line tool, a meta-package none of whose requirements is imported) is reported unused
+with confidence 50; one that is not
+installed is matched by its table entries and its guessed import name (`attrs`: `attr` and
+`attrs`). PM601 and PM604 are reported once per import statement and distribution, at the
+module token: `from yaml import (\n    safe_load,\n    dump,\n)` is one PM601 on its first
+line, where one `# pymapper: ignore[PM601]` suppresses it.
+
+PM604 (off by default) follows `Requires-Dist` from the installed declared dependencies,
+transitively, honouring requested extras (`requests[socks]` pulls in `PySocks`; `requests`
+alone does not), and names the declared dependency that pulls the import in. The `METADATA`
+headers are read lazily, once per distribution reached, and only when an import is undeclared.
+
+PM603 flags a component starting with `_` in the import path or the imported name of
+third-party code (`pkg._internal`, `from pkg import _helper`), reported up to that component
+(a private module once per statement, at the module; a private name at the name);
+dunders (`__version__`) and the lone `_` (`from pkg import _`, the gettext idiom) are not
+private. It needs the code to be known third-party (loaded, or attributed to an installed
+distribution), never a guess.
+
 ## Cost
 
-Measured numbers are in [`benchmarks.md`](benchmarks.md#deps-s61). Scorecards cost one pass over
+Measured numbers are in [`benchmarks.md`](benchmarks.md#deps-s61) (hygiene:
+[`benchmarks.md`](benchmarks.md#dependency-hygiene-s62)). Scorecards cost one pass over
 the definitions and module edges of the scored distributions (19 ms on one thread, 5 ms on 14,
 for 491 distributions and 16.2M lines; 0.1 ms warm), usage one pass over the first-party imports and the call
 edges plus a BFS over the call and import graphs (20 ms). Loading the venv and resolving calls
 dominate, as for `check --deps`.
+
+`--check` costs one pass over the first-party import rows (O(1) per row: 1 ms for 1,803 files,
+7.6 ms for 901k import rows) plus one TOML parse per unit; it loads no third-party code unless
+`--deps` is given, so a warm run takes about as long as a warm `check` (107-158 ms against
+170 ms). PM604 adds the parallel reads of the `METADATA` of the distributions reachable from the
+declared ones (16 ms for 394 files).

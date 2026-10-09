@@ -51,6 +51,8 @@ crates/pymapper-gui/src/
                 (see "Code map")
   interact/     hover neighbourhood, selection, search, path, overlays, findings,
                 details and source pane (see "Interaction")
+  views/        secondary views linked to the code map by selection: force-directed
+                graph, dependency matrix, N-hop focus (see "Secondary views")
   mapui.rs      code map controls (details panel) and legend (canvas overlay)
   panels.rs     egui panel layout (left search/tree, right details, bottom findings),
                 canvas input (pan / zoom / hover)
@@ -64,6 +66,8 @@ crates/pymapper-gui/examples/canvas_bench.rs
                 offscreen frame-time benchmark of the map on the stress scene
 crates/pymapper-gui/examples/interact_bench.rs
                 interaction benchmark (search, highlights, marks, paths, source reads)
+crates/pymapper-gui/examples/views_bench.rs
+                CPU benchmark of the secondary views on a real project
 ```
 
 ## Canvas renderer
@@ -399,7 +403,9 @@ The renderer gained overlay slots (`map::OVERLAYS`): small `Scene`s in the map's
 their own band filter, grid culling and GPU buffers, drawn over the labels and under the hover
 outline: first the marks (`OVERLAY_MARKS`), then the highlight (`OVERLAY_HIGHLIGHT`). Every
 overlay item carries a LOD band range, so panning and zooming never rebuild them; they are
-rebuilt only when the hovered / selected item, the path, a toggle or the scene changes.
+rebuilt only when the hovered / selected item, the path, a toggle or the scene changes
+(including the same scene shown again, e.g. back from another view: any `set_scene` clears the
+overlays and bumps `scene_generation`).
 
 - Hover neighbourhood: a veil dims the map; every drawn edge with an endpoint in the focused
   node's subtree (pre-order range: two binary searches over the edges sorted by source and by
@@ -422,7 +428,9 @@ rebuilt only when the hovered / selected item, the path, a toggle or the scene c
 - Origin (map controls): hide first-party, third-party or stdlib cells and their edges. The
   layout is kept (stable geography), so hidden code leaves its region empty.
 - Finding confidence (left panel): the findings list and the badges count only findings at or
-  above it (default: the configured `min-confidence`; badges are recounted on the worker).
+  above it. It starts at the configured `min-confidence` of each analysis (as `pymapper
+  check`) until the user moves it; badges are recounted on the worker whenever they are shown
+  at another threshold than the slider's (also when they are turned on after the slider moved).
 
 Both map filters rebuild the scene on the map worker (the scene build time, see Results (S7.4)).
 
@@ -430,9 +438,10 @@ Both map filters rebuild the scene on the map worker (the scene build time, see 
 
 `findings::analyse` runs the analyses of `pymapper check` once, in the background, with the
 project's configuration: complexity, import cycles, contracts, coupling (with the call graph
-for god classes) and dead code (with config-file evidence), then the inline suppressions and
+for god classes, reusing the query's call graph) and dead code (with config-file evidence), then the inline suppressions and
 `per-file-ignores`. Below-confidence findings are kept for the confidence slider. Each finding
-is attached to its symbol, else to the innermost def at its line. Duplication (PM501) is not
+is attached to its symbol, else to the innermost def at its line; a by-node permutation (4
+bytes per finding) gives a node's findings in O(log findings). Duplication (PM501) is not
 run: its fingerprints are only taken by an index load that asks for them, and the GUI's load
 does not (it would cost every start); use `pymapper check` for it.
 
@@ -445,7 +454,9 @@ and callees (from the core query, clickable) and the path controls. The source p
 the symbol's byte span from disk (from the start of its first line, at most 256 KiB), lexes it
 with `pymapper_core::lex` in trivia mode (comments kept) and colours keywords, defined names,
 builtins, decorators, strings (f/t-strings included), numbers, comments and operators. The
-laid-out text is cached per selection, so an idle source pane costs nothing per frame.
+laid-out text is cached per source result, so an idle source pane costs nothing per frame.
+A character the lexer splits across tokens (non-ASCII outside names and strings) is carried
+to the next token, not replaced.
 
 ### Memory
 
@@ -483,6 +494,160 @@ PATH [--deps] --isolated` (no GPU; warm index cache). Times per action:
 - Windowed (`pymapper-gui --measure --frames 240 --isolated` on aiml-lectio first party):
   119.8 fps vsync-bound, CPU work p50 0.42 ms, idle 5 s: 0.6 ms CPU and 0 frames with the
   interaction worker started; peak RSS 189 MiB. GPU cost of a large highlight: not measured.
+## Secondary views
+
+`src/views/` adds three views next to the code map, as tabs over the canvas's top-left
+corner: **Graph**, **Matrix** and **Focus**. They use the same instanced renderer and the
+same `MapState`. Switching views swaps the scene and restores that view's own camera. A
+selection made in any view is shown in all of them.
+
+```
+views/
+  quadtree.rs  own Barnes-Hut quadtree: flat SoA cells, rebuilt per iteration, fixed-size
+               query stack (no recursion, no allocation), parallel queries on a shared tree
+  force.rs     force-directed layout: ForceAtlas2 forces, FR-style cooling, one step at a time
+  graph.rs     view graphs: the code map's current level, N-hop focus, weighted CSR
+               adjacency, radial layout
+  dsm.rs       dependency matrix: SCC condensation, sink-first Kahn order, Eades-Lin-Smyth
+               inside cycles
+  scene.rs     node-link and matrix scenes for the renderer, selection outlines
+  worker.rs    background thread: requests -> scenes (progressive for the graph)
+  ui.rs        egui: tabs, per-view options; text.rs: hover details, panel texts, marks
+```
+
+```
+  UI thread                              pymapper-views thread
+  tab / option / click ── Request ─────> Graph : cut current level -> ForceLayout::step ...
+     │                    (newest wins)          snapshot at once, then every 50 ms, final
+     │                                   Matrix: Level::Module rollup -> order -> scene
+     │                                   Focus : adjacency (once) -> N-hop walk -> radial
+     ▼ Published { seq, scene, content } <── notify (repaint request)
+  MapState::show_scene / replace_scene (camera kept for snapshots of the same request)
+```
+
+The thread starts the first time a secondary view is opened. Requests coalesce. A force
+layout checks for a newer request between iterations and gives way to it, but keeps its
+state, so opening the graph again resumes the layout where it stopped. Stale results are
+ignored by sequence number.
+
+### Graph: force-directed, current level
+
+The graph is the code map's *current level*: the cells the code map shows at its camera's
+band (the semantic-zoom cut) that intersect its view, at the moment you leave the code map.
+Collapsed cells are always nodes. Open cells (their children are shown) become nodes only
+when their own code has an edge. The edges are the rolled-up dependencies between the nodes
+(`Rollup::map_with` under the cut). At most 3 000 nodes are kept, the largest by lines of
+code first. The panel shows how many were left out. Zoom the code map into a package, then
+open Graph to see that package's structure.
+
+- Start layout: the treemap centres of the cells, so the graph begins in the same geography
+  as the code map, plus a tiny deterministic offset per node to break symmetry.
+- Forces (mass `1 + degree`): repulsion `k_r m_i m_j / d` from every node through
+  Barnes-Hut (`theta` 0.9 by default, adjustable as "Accuracy"); linear attraction
+  `w d` along each edge, with `w` the log of the edge weight relative to the heaviest
+  edge; constant gravity `k_g m_i` towards the origin.
+- Each step moves a node by at most the temperature, which starts at a tenth of the extent
+  and decays by 1.5% per step. The layout stops below 2% of the start temperature
+  (259 steps), at 400 steps, or when the mean move drops below 0.002 edge lengths.
+- Repulsion runs in parallel from 1 024 nodes. Every node's force is summed by one thread in
+  a fixed order, so the result does not depend on the thread count.
+- Drawing: circles sized by lines of code (radius 0.12-0.5 edge lengths), coloured with
+  the code map's colour metric (external code muted). Straight edges are trimmed to the
+  circles, offset sideways so `a -> b` and `b -> a` stay apart, and have a two-stroke
+  arrowhead. Width and alpha follow the log of the weight (imports + call sites,
+  imports, or call sites). Names sit to the right of the nodes and appear once a node is
+  about one text line tall (the shader's label LOD).
+
+### Matrix: dependency structure matrix
+
+Packages and modules (plus third-party / stdlib ones and their distributions when
+"Third-party / stdlib modules" is on, and only the selection's subtree when "Only modules
+under the selection" is on: the scope is the selection at the moment the box is ticked, so clicking rows of a scoped
+matrix does not rescope it). Cell `(r, c)` is marked when row `r` depends on column `c`
+(imports and/or calls rolled up with `Level::Module`). The order exposes layering:
+
+1. strongly connected components (core Tarjan) and their condensation;
+2. components sink-first by Kahn's algorithm, ties broken by the smallest node id (pre-order),
+   so a package's modules stay together where the layering allows;
+3. inside a cycle, members in reverse Eades-Lin-Smyth order (a greedy minimum feedback arc
+   set heuristic, `O((V + E) log V)` with a lazy heap).
+
+A layered system is then strictly lower triangular. Marks above the diagonal (red) are
+feedback dependencies. They lie only inside the cycles' diagonal blocks (tinted red). Rows
+carry `number qualified.name` labels, and columns carry the row number. Cells are drawn at
+every zoom. Labels appear once a row is a text line tall.
+
+### Focus: N-hop neighbourhood
+
+The neighbourhood of the selection within 1-6 hops, following callers, callees or both. A
+class or function walks the node-level call graph (weights: call sites). A package, module or
+distribution walks the module graph (imports and calls rolled up to modules). Hop by hop,
+the next ring's candidates are the unseen neighbours, each with its heaviest link. When they
+exceed the node budget (default 400), the heaviest win. The layout is radial: the focus is
+at the centre, hop `k` is on ring `k`, and each ring is ordered by its parents' angles, so
+subtrees stay together. Clicking a node refocuses on it. Both adjacencies are weighted
+forward + reverse CSRs, built the first time they are needed (from the rollup's base pairs,
+without materialising them) and kept for the analysis.
+
+### Linked selection
+
+- A click selects what is under the pointer: a code map cell, a graph or focus node, a
+  matrix row header or column header (that module), or a matrix cell (its row). A click on
+  empty space clears the selection. Edges and cycle blocks keep it.
+- The selection is the interaction's selection (see "Interaction"): a click, search jump or
+  findings click on the code map selects there and the views follow
+  (`Views::set_selection`); a click in another view selects there and the interaction
+  follows (details, callers / callees, source). Escape clears it in every view. On the code
+  map, clicks, Shift-clicks and double clicks are the interaction's; in the other views a
+  double click fits. A search or findings jump from another view returns to the code map.
+- Every view outlines the selection in the overlay pass (`MapState::set_marks`, no scene
+  rebuild): the code map outlines the cell at any zoom (in the app the interaction's highlight
+  overlay does it, with its screen-size markers, so `Views::codemap_marks` is off), the graph and focus views outline
+  the node of the selection's deepest shown ancestor-or-self, and the matrix bands that
+  module's row and column.
+- On returning to the code map after selecting elsewhere, the camera moves to the
+  selection if its cell is off screen or smaller than 24 px.
+- The details panel shows the selection's qualified id and a "Focus view on it" button,
+  plus a summary of the active view (nodes, edges, layout progress; matrix size, cycles,
+  feedback cells). Hovering shows node, edge, cell or cycle details.
+
+### Cost
+
+| view   | build                                                         | memory                                     |
+|--------|---------------------------------------------------------------|--------------------------------------------|
+| graph  | cut O(visible hierarchy + n + m); O(n log n) per step          | 4 B/node + 16 B/edge, layout ~20 B/node + tree |
+| matrix | O(n + m) rollup + O(V + E) components + O((V + E) log V) order | 4 B/row + 16 B/cell (+ 8 B/row index)      |
+| focus  | adjacency O(n + m) once; walk O(degrees of expanded nodes)    | adjacency 8 B/node + 16 B/pair             |
+
+### Results (S7.6)
+
+Release build, Apple M4 Pro, index cache in `target/bench-cache`
+(`cargo run --release -p pymapper-gui --example views_bench -- --isolated [--deps]
+--cache-dir DIR PATH`). Zoom levels are relative to the fit zoom of a 2880x1800 canvas; the
+view is the canvas centred on the map.
+
+| input (nodes / call pairs)                         | graph at fit: cut, nodes / edges, layout (steps) | graph at 8x | matrix (modules, cells, cycles) | focus walk + scene (2 hops) |
+|----------------------------------------------------|--------------------------------------------------|-------------|---------------------------------|-----------------------------|
+| stdlib 3.13 as a project (18.8k / 25.3k)           | 0.3 ms, 963 / 3 842, 83 ms (259)                 | 279 nodes, 13 ms | 0.5 ms build + 0.2 ms scene; 632, 2 988, 7 (largest 297) | mean 0.05 ms, max 0.14 ms |
+| aiml-lectio first party (24.9k / 35.5k)            | 0.3 ms, 818 / 3 653, 70 ms (259)                 | 250 nodes, 11 ms | 0.9 ms + 0.5 ms; 1 934, 6 251, 12 (largest 192) | mean 0.06 ms, max 0.16 ms |
+| aiml-lectio + venv (1.02M / 1.43M)                 | 6.0 ms, 1 521 / 10 388, 117 ms (259)             | 316 nodes, 17 ms | first party 17 ms + 0.5 ms; with external 57 ms + 30 ms: 73 227, 427 836, 436 (largest 13 077) | mean 0.16 ms, max 1.4 ms |
+
+- Graph cut on the venv: 6 ms at the fit zoom, 13 ms at 8x and 24 ms at 64x. The O(n + m)
+  rollup under the cut dominates. Node-link scenes take 0.9 ms (1.5k nodes, 31k lines
+  incl. arrowheads), so a snapshot every 50 ms costs under 2% of the layout thread.
+- Synthetic force layouts (clustered, 3 edges per node): 0.42 ms per step at 1k nodes,
+  1.4-2.0 ms at 10k, 8.3-9.0 ms at 50k (quadtree build 4.8 ms of it, single-threaded). The
+  graph's default budget of 3 000 nodes converges in well under a second.
+- Focus adjacencies on the venv: call graph 5.1 ms (29.6 MiB), module graph 14.8 ms
+  (14.7 MiB), built on first use.
+- Matrix with every venv module: 648k rects, a 37.8 MiB scene. The order (with a 13k-module
+  cycle) takes 57 ms in total.
+- Peak RSS of the bench: 50 MiB (stdlib), 78 MiB (aiml-lectio first party), 847 MiB with
+  the venv, of which about 670 MiB is the loaded index.
+
+Not measured: frame times of the secondary views. Their scenes go through the same renderer
+and are far smaller than the code map's (at most about 650k rects for the full-venv matrix,
+30k lines for the graph), so the code map numbers above bound them.
 
 ## Render on demand
 

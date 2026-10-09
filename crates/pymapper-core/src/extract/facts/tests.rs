@@ -46,7 +46,7 @@ fn row_sizes_match_the_documented_layout() {
     assert_eq!(Decorators::ROW_BYTES, 10);
     assert_eq!(Bases::ROW_BYTES, 14);
     assert_eq!(Params::ROW_BYTES, 5);
-    assert_eq!(Imports::ROW_BYTES, 27);
+    assert_eq!(Imports::ROW_BYTES, 32);
     assert_eq!(Calls::ROW_BYTES, 18);
     assert_eq!(Bindings::ROW_BYTES, 20);
     assert_eq!(Decls::ROW_BYTES, 9);
@@ -603,6 +603,28 @@ fn with_view<R>(src: &str, f: impl FnOnce(FileView<'_>) -> R) -> R {
     let mut spans = SpanStrs::new();
     let ff = extract(src.as_bytes(), &mut st, &mut spans);
     f(st.file(&ff))
+}
+
+#[test]
+fn import_module_pos_is_shared_by_the_names_of_a_statement() {
+    let src = "import a, b.c\nfrom d.e import (\n    f,\n    g as h,\n)\nfrom . import (\n  i)\nfrom d.e import *\n";
+    with_view(src, |v| {
+        let rows = v.ff.imports.range();
+        let st = &v.store.imports;
+        let got: Vec<((u32, u32), (u32, u32))> = rows.map(|r| ((st.line[r], st.col[r]), v.import_module_pos(r))).collect();
+        assert_eq!(
+            got,
+            [
+                ((1, 7), (1, 7)),
+                ((1, 10), (1, 10)),
+                ((3, 4), (2, 5)),
+                ((4, 4), (2, 5)),
+                // An empty module: the `from` keyword.
+                ((7, 2), (6, 0)),
+                ((8, 16), (8, 5)),
+            ]
+        );
+    });
 }
 
 #[test]

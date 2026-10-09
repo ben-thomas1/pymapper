@@ -25,6 +25,7 @@ use crate::measure::{self, FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
+use crate::views::{ViewKind, Views};
 
 /// Events sent to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,8 @@ pub struct App {
     worker: Option<MapWorker>,
     /// The code map of the scene shown (hover details).
     codemap: Option<Arc<CodeMap>>,
+    /// Secondary views (graph, matrix, focus) and the shared selection.
+    views: Views,
     /// Last status shown (the status line is rewritten only when it changes).
     status: Option<Status>,
     /// `--measure` with a project: measuring starts once the first scene is shown.
@@ -121,6 +124,10 @@ impl App {
             (Some(m), None) => (Some(Measure::new(m.clone(), launched)), None),
             (None, _) => (None, None),
         };
+        let ctx = egui_ctx.clone();
+        let mut views = Views::new(Arc::new(move || ctx.request_repaint()));
+        // The interaction's highlight overlay outlines the selection on the code map.
+        views.codemap_marks = false;
         Self {
             opts,
             title: format!("pymapper - {name}"),
@@ -133,6 +140,7 @@ impl App {
             scene_build,
             worker,
             codemap: None,
+            views,
             status,
             pending_measure,
             win: None,
@@ -217,7 +225,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, status, pending_measure, scene_build, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, views, status, pending_measure, scene_build, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -270,7 +278,7 @@ impl App {
             if let Some(p) = wk.take() {
                 let ctx = egui_ctx.clone();
                 let notify = Arc::new(move || ctx.request_repaint());
-                apply_published(p, map, codemap, &mut w.ui, scene_build, notify);
+                apply_published(p, map, codemap, views, &mut w.ui, scene_build, notify);
                 if let Some(m) = pending_measure.take() {
                     *measure = Some(Measure::new(m, t1));
                 }
@@ -296,12 +304,42 @@ impl App {
         {
             wk.request(req);
         }
+        let color = w.ui.map_request.map_or(Default::default(), |r| r.scene.color);
+        // A jump requested in the panels (search, findings) shows the code map.
+        if w.ui.interact.focus_request.is_some() && views.active != ViewKind::CodeMap {
+            w.ui.views.tab = Some(ViewKind::CodeMap);
+        }
+        // Selections made in the panels are the views' selection too.
+        views.set_selection(w.ui.interact.selected);
+        let mut views_changed = views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+        let on_codemap = views.active == ViewKind::CodeMap;
         let mut input = w.ui.canvas_input;
-        // A double click on a cell zooms to it; on empty canvas it fits the map.
+        // On the code map a double click on a cell zooms to it; on empty canvas (or in another
+        // view) it fits.
         let hovered_node = map.hover.filter(|h| h.kind == HitKind::Rect).map(|h| h.id);
-        input.fit |= input.double_click && hovered_node.is_none();
-        let hover_changed = map.apply_input(&input, full.pixels_per_point);
-        let interacted = interact(&mut w.ui.interact, map, &input, hover_changed);
+        input.fit |= input.double_click && (!on_codemap || hovered_node.is_none());
+        let mut hover_changed = map.apply_input(&input, full.pixels_per_point);
+        let interacted = if on_codemap {
+            interact(&mut w.ui.interact, map, &input, hover_changed)
+        } else {
+            // Hits refer to another view's scene: no code map hover, clicks go to the views.
+            w.ui.interact.set_hover(None);
+            if input.click || input.escape {
+                let hit = if input.escape { None } else { map.hover };
+                views.on_click(hit, map, codemap.as_ref(), color);
+                hover_changed = true;
+            }
+            let changed = views.selection != w.ui.interact.selected;
+            if changed {
+                w.ui.interact.select(views.selection);
+            }
+            changed
+        };
+        if interacted {
+            // Apply the new selection (marks, texts) in this frame.
+            views.set_selection(w.ui.interact.selected);
+            views_changed |= views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+        }
         if let Some(t) = measure.as_ref().and_then(Measure::progress)
             && map.scene.bounds.is_positive()
         {
@@ -355,13 +393,15 @@ impl App {
                 st.label_rebuilds.count
             );
         }
-        if interacted {
-            // Panels were laid out before the click: show the new selection next frame.
+        if interacted || views_changed {
+            // The panels were laid out before the click and before the views updated their
+            // texts: show the new selection next frame.
             sched.request(t3, Duration::ZERO);
         }
         if hover_changed {
             // The details panel was laid out before the hit test: show the new hover next frame.
             match (codemap.as_ref(), map.hover) {
+                (_, Some(h)) if views.describe(h, &mut w.ui.hover_text) => {}
                 (Some(cm), Some(h)) if h.kind == HitKind::Rect => cm.describe_node(h.id, &mut w.ui.hover_text),
                 (Some(cm), Some(h)) if h.kind == HitKind::Curve => cm.describe_edge(h.id, &mut w.ui.hover_text),
                 _ => map.describe_hover(&mut w.ui.hover_text),
@@ -408,19 +448,25 @@ fn interact(it: &mut Interaction, map: &mut MapState, input: &CanvasInput, hover
     if let Some(r) = it.focus_request.take()
         && r.is_positive()
     {
-        map.camera.fit(&r, FOCUS_FILL);
+        // `frame` fits the camera to the scene first if it never was (e.g. just switched to).
+        map.frame(&r, FOCUS_FILL);
     }
-    before != (it.selected, it.path.is_some()) || it.path_pending()
+    // A pending path needs no redraws: the worker's notify wakes the UI when it arrives.
+    before != (it.selected, it.path.is_some())
 }
 
 /// Shows a published code map scene: keeps the camera when replacing a scene of the same
 /// world, and seeds the controls from the first request.
-fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, ui: &mut UiState, scene_build: &mut Option<Duration>, notify: Arc<dyn Fn() + Send + Sync>) {
-    if map.scene.bounds.is_positive() {
-        map.replace_scene(Arc::clone(&p.scene));
-    } else {
-        map.set_scene(Arc::clone(&p.scene));
-    }
+fn apply_published(
+    p: Published,
+    map: &mut MapState,
+    codemap: &mut Option<Arc<CodeMap>>,
+    views: &mut Views,
+    ui: &mut UiState,
+    scene_build: &mut Option<Duration>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) {
+    views.show_codemap_scene(map, Arc::clone(&p.scene));
     ui.interact.set_scene(SceneCtx { map: Arc::clone(&p.map), scene: p.scene, index: p.index }, true, notify);
     *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
     *codemap = Some(p.map);

@@ -134,6 +134,8 @@ macro_rules! fact_columns {
             62: imports.flags @ imports => P,
             63: imports.line @ imports => P,
             64: imports.col @ imports => P,
+            65: imports.module_dline @ imports => P,
+            66: imports.module_col @ imports => P,
             72: calls.scope @ calls => P,
             73: calls.chain @ calls => C(calls.chain_len),
             74: calls.chain_len @ calls => P,
@@ -212,7 +214,7 @@ fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
         decorators: Decorators { owner: _, chain: _, chain_len: _, flags: _ },
         bases: Bases { owner: _, chain: _, chain_len: _, keyword: _, flags: _ },
         params: Params { name: _, flags: _ },
-        imports: Imports { scope: _, module: _, module_len: _, name: _, alias: _, level: _, flags: _, line: _, col: _ },
+        imports: Imports { scope: _, module: _, module_len: _, name: _, alias: _, level: _, flags: _, line: _, col: _, module_dline: _, module_col: _ },
         calls: Calls { scope: _, chain: _, chain_len: _, flags: _, line: _, col: _ },
         bindings:
             Bindings { scope: _, target: _, target_len: _, kind: _, flags: _, value_chain: _, value_len: _, line: _ },

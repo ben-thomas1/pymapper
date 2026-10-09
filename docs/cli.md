@@ -45,11 +45,11 @@ shadowed by another file of the same module are not analysed, but every first-pa
 contributes dead-code name evidence; a name used only by test code gets the reason
 `used-only-in-tests`.
 
-The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them (see
-"Rules that cannot run" below).
+The PM6xx dependency-hygiene rules are run by `pymapper deps --check`, not `check` (see
+"Rules that cannot run" below and [`deps.md`](deps.md#hygiene---check)).
 
-`pymapper deps` (third-party distributions, their use by first-party code and `--score`
-scorecards) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
+`pymapper deps` (third-party distributions, their use by first-party code, `--score`
+scorecards and the `--check` dependency-hygiene rules) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
 `impact`, `path`, `cycles`, `summary`) are not implemented yet: they are hidden from
 `pymapper --help`, accept any operands and the configuration flags, and exit 2 with "not
 implemented".
@@ -114,6 +114,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root (see below) |
 | `--threads N` / `-j N` | `threads` | 0 = one per logical CPU |
 | `--mode` | `mode` | dead code: `auto` (per `pyproject.toml` unit), `application`, `library` (every unit) |
+| `--coverage FILE` / `--no-coverage` | `analysis.coverage` | coverage.py JSON report (`coverage json`) as dead-code evidence (see below); accepted by every command, read only by `check` |
 | `--preset` | `presets` | flask, fastapi, django, click, pytest, pydantic |
 | `--exclude GLOB` | `extend-exclude` | gitignore syntax, relative to the project root |
 | `--set 'KEY = VALUE'` | any | TOML fragment, e.g. `--set 'analysis.dupes = true'` |
@@ -134,6 +135,20 @@ paths and suppress nothing; they never change the exit code. An application-mode
 (`__main__` guard, scripts, entrypoint rules, tests) prints one warning per unit, or one for
 the project when `--mode application` is forced and no unit has one.
 
+With a coverage report (`--coverage FILE` or `analysis.coverage`), code the report shows
+executed is live (never reported, nor what it calls), and the remaining doubt of code below
+confidence 100 that never ran is divided by 3, with the reason `never-executed` (`name-elsewhere`
+50 becomes 84). Statically reachable code that never ran (untested) is not affected. Report
+paths are matched to files absolute, relative to the report's directory or the project root,
+or by their longest unique path suffix (a report made in another checkout, such as CI). A
+report that cannot be read or is not a coverage.py JSON report is an error (exit 2), checked
+before the project is loaded when it is missing; one that matches no analysed file, or has line
+numbers past the end of a file (stale), prints a warning. The report is read only when a PM4xx
+rule runs. The report is never config-file evidence (`analysis.config-evidence`), even inside
+the project tree, where `coverage json` writes it by default: it names every function, run or
+not. `--stats` adds `coverage_files`, `coverage_matched`, `coverage_executed`,
+`coverage_not_executed`, `deadcode.executed` (seeds) and `deadcode.lowered`.
+
 The default cache directory is `.pymapper_cache` in the project root (see "Project root").
 So `pymapper check /some/dir` with no config and no marker above it writes
 `/some/dir/.pymapper_cache`, even from another working directory (pointing it at an interpreter's stdlib would write into
@@ -143,8 +158,8 @@ own; a cache that cannot be written is only a warning.
 ## Rules that cannot run
 
 A selected rule does not run in `check` when its `[analysis]` toggle is off (PM501 needs
-`analysis.dupes = true`), when it is a dependency rule (PM6xx, owned by `pymapper deps`), or when
-it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
+`analysis.dupes = true`), when it is a dependency rule (PM6xx, run by `pymapper deps --check`),
+or when it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
 
 - If none of the selected rules can run (`--select PM6`, `--select PM601`, `--select PM501`
   without the toggle, `--select PM302` without contracts), `check` exits 2 and lists the rules
@@ -158,7 +173,7 @@ it is a contract rule (PM302-PM304) and no `[[contracts]]` are configured.
   ```
   $ pymapper check --select ALL
   All checks passed! (128 files checked)
-  17 rules ran, 8 skipped (PM302-PM304: no [[contracts]]; PM501: needs `analysis.dupes = true`; PM601-PM604: run by `pymapper deps`, not `check`).
+  17 rules ran, 8 skipped (PM302-PM304: no [[contracts]]; PM501: needs `analysis.dupes = true`; PM601-PM604: run by `pymapper deps --check`).
   ```
 
 - The default selection skips these rules silently (that is what the defaults mean); `--stats`

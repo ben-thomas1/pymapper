@@ -249,6 +249,18 @@ impl PathList {
         self.push_parts(&[path])
     }
 
+    /// Removes the paths for which `drop` returns true, keeping the order of the others.
+    pub fn remove_if(&mut self, mut drop: impl FnMut(&Path) -> bool) {
+        let mut out = PathList::default();
+        for p in self.iter() {
+            if !drop(p) {
+                // Cannot fail: `out` is no larger than `self`.
+                let _ = out.push(p.as_os_str().as_bytes());
+            }
+        }
+        *self = out;
+    }
+
 }
 
 /// Files found by one worker: each path relative to its root (the root's output prefix is

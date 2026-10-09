@@ -64,6 +64,8 @@
 
 # Analyse third-party packages from the virtualenv, link first-party code to them and score
 # them (`pymapper deps --score`). Third-party findings never affect the `check` exit code.
+# Not needed by `pymapper deps --check` (dependency hygiene, PM6xx), which maps imports to
+# distributions through the venv's installed metadata.
 # (CLI: `--deps` / `--no-deps`.)
 # include-deps = false
 # cost: proportional to the size of site-packages (a large venv can be 60k files / 17M LOC);
@@ -323,7 +325,7 @@
 # Dead code: read the non-Python config files of the first-party walk (matching
 # `config-evidence-globs`; .gitignore and excludes apply; files over 1 MiB and lockfiles such as
 # uv.lock / poetry.lock / package-lock.json are skipped, as are pymapper and coverage.py JSON
-# reports) and treat what they name as evidence:
+# reports and the `coverage` report below, whatever its contents) and treat what they name as evidence:
 # a definition or module whose full dotted path (`pkg.mod.func`, `pkg.mod:Class`) appears is
 # kept (reason `config-reference`); one whose bare name appears gets confidence 50 (10 when
 # the same file also names its module, e.g. `module_name: pkg.tools` + `source_name: func`).
@@ -353,9 +355,18 @@
 # cost: none (one name check per file; excluding tests makes duplication cheaper, as their
 #       fingerprints are dropped before matching).
 
-# coverage.py JSON report (`coverage json`) used as runtime evidence for dead-code confidence.
+# coverage.py JSON report (`coverage json`) used as runtime evidence for dead-code confidence
+# (relative to this file; `check --coverage FILE` / `--no-coverage` override it). A function
+# whose body ran, or a module that was imported, is live (never reported, nor what it calls).
+# Code with only weak evidence of use (confidence below 100) that never ran has its doubt
+# divided by 3, reason `never-executed` (50 -> 84, 80 -> 94); reachable code that never ran
+# (untested) is unchanged. Report paths may be absolute, relative to the report or the project
+# root, or from another checkout (matched by unique path suffix). A missing or invalid report
+# is an error.
 #   coverage = "coverage.json"
-# cost: O(size of report) to load.
+# cost: O(report bytes) to read and map, plus 2 bits per node. Measured on synthetic reports:
+#       1.8 ms for 2.4 MB (stdlib, 437k LOC), 86 ms for 98 MB (17M-LOC venv); the report
+#       bytes are freed once mapped.
 
 # ---------------------------------------------------------------------------------------------
 # Import contracts

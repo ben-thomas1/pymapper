@@ -1260,6 +1260,73 @@ Observations:
 - **Whole-run cost** is the venv load plus call resolution, as for `check --deps`: `deps` is
   15-25% faster than `check --deps` warm because it runs no rule analyses.
 
+### Dependency hygiene (S6.2)
+
+`pymapper deps --check --stats` (PM601-PM603 by default, PM604 with `--extend-select PM604`)
+on `lectio` (1,803 first-party files in 15 project units, 267 declared dependencies, 4,435
+third-party import rows; venv of 491 distributions), cache in a temporary directory. 14-core
+Apple M4 Pro, release build, warm OS file cache, other worktrees busy (load average not
+controlled). "Cold" = cache directory removed; "warm" = facts cached, 2-3 runs, range shown.
+Phases from `--stats`; peak RSS is `ru_maxrss`.
+
+| run | threads | total | deps.declarations | deps.hygiene | metadata reads | findings | peak RSS |
+|-----|---------|-------|-------------------|--------------|----------------|----------|----------|
+| default rules, cold | 14 | 195 ms (load.extract 69 ms) | 0.5 ms | 1.0 ms | 2 | 535 | 43.9 MB |
+| default rules, warm | 14 | 107-158 ms | 0.6 ms | 1.0-1.1 ms | 2 | 535 | 47.4-48.7 MB |
+| `--deps`, cold facts | 14 | 3.24 s (load.extract 2.74 s) | 2.0 ms | 1.1 ms | 2 | 535 | 563 MB |
+| `--deps`, warm | 14 | 328-375 ms | 1.6-1.8 ms | 1.1-1.3 ms | 2 | 535 | 544-551 MB |
+| `+PM604`, warm | 14 | 112-133 ms | 0.5 ms | 15.4-16.2 ms | 394 | 535 | 43.7-46.8 MB |
+| `+PM604`, warm | 1 | 311-315 ms | - | 36.4-37.2 ms | 394 | 535 | 37.0-37.9 MB |
+| `check`, warm (reference) | 14 | 170-174 ms | - | - | - | - | 49.4-49.8 MB |
+
+Stress test: the venv's site-packages checked as first-party code (60,529 files, about 901k
+import rows; the config of "Check (S4.5)"; no venv of its own, so every import is mapped by
+name): `deps.hygiene` 7.5-7.6 ms (cold and warm), whole run 3.55 s cold / 1.15-1.21 s warm,
+peak RSS 571 MB cold / 747-751 MB warm. `tests/corpus`: 3.8 ms warm, 5.4 MB; the stdlib as a
+project (630 files): 11.6 ms warm, 24.3 MB.
+
+Observations:
+
+- **The hygiene pass is negligible**: one pass over the import rows of first-party files with
+  O(1) hash lookups per row (about 8 ns per row on the venv) and nothing allocated or interned
+  per row; then one pass over the declared dependencies. Declarations are one TOML parse per
+  unit (15 files, 0.5 ms).
+- **No third-party parse is needed**: imports map to distributions through the venv's
+  installed metadata (`top_level.txt`, `RECORD`), which the import roots read anyway, so
+  `--check` costs what a `check` with cheap rules costs (it runs no analyses, so it is
+  slightly faster). `--deps` gives the same findings at the cost of loading the venv.
+- **PM604** reads the `METADATA` header block of every distribution reachable from the
+  declared dependencies (394 of 491 here), one breadth-first level at a time with the reads of a
+  level in parallel: 16 ms on 14 threads, 37 ms on one. Without PM604 only declared
+  meta-packages (dependencies that install no module) are read: 2 files.
+- **Memory**: the per-run tables are a hash set of `(unit, distribution)` pairs used, one of
+  `(unit, top-level name)` pairs, the interned names of findings and, with PM604, the parsed
+  requirements of the distributions read; all far below the load's peak.
+
+Review fixes (same machine and setup, load average not controlled): PM601-PM604 are now
+reported once per import statement, at the module token, so each import row carries the module
+token's position (`module_dline` u8 + `module_col` u32: import rows grow from 27 to 32 bytes,
+cache `FACTS_VERSION` 5). The development groups of a uv workspace root count as declared for
+the test code of its members. On `lectio` the findings drop from 535 to 490 (one parenthesised
+`from pydantic import (...)` of six names was six PM601s, now one).
+
+| run | total | deps.hygiene | metadata reads | findings | peak RSS |
+|-----|-------|--------------|----------------|----------|----------|
+| default rules, cold | 315 ms (load.extract 110 ms) | 0.9 ms | 2 | 490 | 43.5 MB |
+| default rules, warm | 104-141 ms | 0.7-0.8 ms | 2 | 490 | 48.2-49.5 MB |
+| `+PM604`, warm | 110-135 ms | 15.0-15.2 ms | 394 | 490 | 45.3-47.3 MB |
+
+`load` target (`cargo xtask bench -t load`, best of 3), before -> after the facts column:
+
+| corpus | load.extract | total | facts_kb | peak RSS MB |
+|--------|--------------|-------|----------|-------------|
+| stdlib | 45.5 -> 40.3 ms | 53.1 -> 48.4 ms | 5,531 -> 5,582 | 27.8 -> 27.8 |
+| venv   | 3.59 -> 2.02 s  | 5.41 -> 2.94 s  | 227,038 -> 231,543 | 496.8 -> 505.3 |
+
+The venv times are dominated by machine load (the walk alone went from 1.73 s to 0.79 s
+between the runs); the memory cost is the 4.5 MB of the new columns (+2% of the facts) for
+901k import rows.
+
 ### Test-code evidence (S4.6)
 
 `deadcode` target, 14-core M4 Pro, release, warm, best of 3-5 (RSS worst), before (rewrite
@@ -1283,3 +1350,29 @@ importable ones) and keeps test-code occurrences in a second slot per name group
 - `check --select PM4` on aiml-lectio (1,803 first-party files, 741 of them not importable,
   warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
   analysed files; peak RSS +1.5 MB.
+
+### Coverage evidence (S6.3)
+
+`deadcode` target with `XTASK_DEADCODE_COVERAGE=synthetic`, 14-core M4 Pro, release, warm, best
+of 3 (RSS worst), other worktrees benchmarking at the same time. The target generates a
+coverage.py JSON report for every file of the corpus (absolute paths; every line executed
+except the bodies of every third function, which are missing; lines stand in for statements,
+so the report is larger than a real one), maps it with `Coverage::parse` (`coverage.parse`),
+drops the report bytes (as `check` does) and runs the analysis with it.
+
+| corpus | report MB | files matched | `coverage.parse` | executed / not executed nodes | levels lowered | `deadcode.*` sum (without -> with) | peak RSS MB (without -> with) |
+|--------|-----------|---------------|------------------|-------------------------------|----------------|------------------------------------|-------------------------------|
+| stdlib | 2.4  | 1,043 / 1,043   | 1.82ms | 15,024 / 7,072    | 2,679  | 10.4ms -> 5.4ms | 34.1 -> 33.4 |
+| venv   | 97.8 | 52,122 / 60,529 | 86.2ms | 471,496 / 213,103 | 64,696 | 482ms -> 289ms  | 752.1 -> 751.4 |
+
+- **Time**: about 1.1-1.3 GB/s of report: one pass of the pull reader (no tree, reused
+  buffers), one hash lookup per file path, a binary search per def and line list. The 8,407
+  venv entries that match no analysed file (stubs, shadowed files) go through the suffix
+  fallback (one sorted basename table, built once) and stay unmatched. The analysis itself got
+  faster here because executed code is live: fewer name-fallback candidates (572k -> 163k on
+  the venv) mean a cheaper evidence scan. The synthetic split is arbitrary, so the finding
+  counts of these runs say nothing about precision.
+- **Memory**: the result is two bit sets over the nodes (`coverage_kb`: 249 KB for 1M nodes).
+  The report bytes are held only while they are mapped (`Coverage::load` reads, maps and drops
+  them), so they add to the peak only when the report is larger than what the analysis
+  allocates later; here the peak did not move.

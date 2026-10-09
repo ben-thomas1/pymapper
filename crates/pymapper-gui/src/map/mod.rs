@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use band::QueryScratch;
 use camera::Camera;
 use hit::{Bands, Hit, HitKind, HitScratch};
-use scene::{Band, GlyphInstance, Rgba, Scene, WorldRect, band_zoom};
+use scene::{Band, GlyphInstance, RectInstance, Rgba, Scene, WorldRect, band_zoom};
 use text::TextSystem;
 
 /// Label font size in points (scaled by the DPI factor).
@@ -167,6 +167,11 @@ pub struct MapState {
     pub pixels_per_point: f32,
     /// When set, every item is drawn regardless of LOD (stress worst case).
     pub force_all: bool,
+    /// Selection outlines drawn over the scene with the hover highlight (see
+    /// [`Self::set_marks`]).
+    pub marks: Vec<RectInstance>,
+    /// Bumped by [`Self::set_marks`].
+    pub marks_generation: u64,
     needs_fit: bool,
     /// Inputs of the last hover hit test: (pointer, camera, band and scene generation, ppp).
     hover_key: Option<HoverKey>,
@@ -202,6 +207,8 @@ impl MapState {
             stats: MapStats::default(),
             pixels_per_point: 1.0,
             force_all: false,
+            marks: Vec::new(),
+            marks_generation: 0,
             needs_fit: true,
             hover_key: None,
             query: QueryScratch::default(),
@@ -241,6 +248,48 @@ impl MapState {
         if keep && self.scene.bounds.is_positive() {
             self.camera.set_limits(&self.scene.bounds);
             self.needs_fit = false;
+        }
+    }
+
+    /// Shows `scene` with `camera` (saved by [`Self::fitted_camera`] while this scene's world
+    /// was shown before), or fits it on the next update when `None`. The viewport is kept.
+    pub fn show_scene(&mut self, scene: Arc<Scene>, camera: Option<Camera>) {
+        self.set_scene(scene);
+        if let Some(c) = camera
+            && self.scene.bounds.is_positive()
+        {
+            let viewport = self.camera.viewport;
+            self.camera = c;
+            self.camera.viewport = viewport;
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+    }
+
+    /// The camera, if it has been fitted to the current scene (to restore it later).
+    pub fn fitted_camera(&self) -> Option<Camera> {
+        (!self.needs_fit && self.scene.bounds.is_positive()).then_some(self.camera)
+    }
+
+    /// Centres the camera on `r` and zooms so it fills about `fill` of the view (within the
+    /// zoom limits).
+    pub fn frame(&mut self, r: &WorldRect, fill: f32) {
+        if !r.is_positive() {
+            return;
+        }
+        if self.needs_fit && self.scene.bounds.is_positive() {
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+        self.camera.fit(r, fill);
+    }
+
+    /// Replaces the selection outlines (drawn in the overlay pass, no scene rebuild).
+    pub fn set_marks(&mut self, marks: &[RectInstance]) {
+        if self.marks != marks {
+            self.marks.clear();
+            self.marks.extend_from_slice(marks);
+            self.marks_generation += 1;
         }
     }
 

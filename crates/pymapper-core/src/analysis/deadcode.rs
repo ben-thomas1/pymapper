@@ -1,10 +1,11 @@
-//! Cross-module dead code analysis (design: Checks / CLI, Dead code (a)-(g), (i); rules
+//! Cross-module dead code analysis (design: Checks / CLI, Dead code (a)-(i); rules
 //! PM401-PM405).
 //!
 //! ```text
-//!   Index + Imports + ResolvedCalls + options (mode, entrypoints, presets, scripts)
+//!   Index + Imports + ResolvedCalls + options (mode, entrypoints, presets, scripts, coverage)
 //!     ├─> reach::roots          RootSet: <module> scopes, __main__, tests, entrypoint
-//!     │                         decorators / bases / names, scripts, public API (library mode)
+//!     │                         decorators / bases / names, scripts, public API (library mode);
+//!     │                         plus defs and modules a coverage report shows executed
 //!     ├─> seeds                 per def: a conditional "child seed" (dunder / protocol member,
 //!     │                         unknown decorator, external base, dynamic module, exported,
 //!     │                         library public) and same-name sibling rings
@@ -14,6 +15,7 @@
 //!     ├─> name fallback         one scan over the evidence hashes of every file, probing the
 //!     │   (evidence)            names of the defs, modules and imports still in doubt
 //!     ├─> levels (phase 2)      propagation continued from the evidence seeds
+//!     ├─> coverage              levels below 100 of code the report shows never ran: / 3
 //!     └─> findings              PM401 / PM402 / PM403 per def, PM404 per module, PM405 per
 //!                               import; confidence = 100 - level
 //! ```
@@ -72,6 +74,8 @@
 //! | name fallback: its name and its module's dotted path occur in the same config file | [`level::LINKED`] |
 //! | name fallback: the name occurs anywhere else (attribute, identifier, string, quoted type, config file) | [`level::EVIDENCE`] |
 //! | name fallback, test code only (no production file or config file mentions the name): as above, linked or elsewhere | [`level::LINKED`] / [`level::EVIDENCE`], reason `used-only-in-tests` |
+//! | coverage: its own code ran ([`coverage`]; a seed, like a root) | 100, why [`Why::Executed`] |
+//! | coverage: its code never ran and its final level is below 100 (applied last, not propagated) | level / [`NOT_EXECUTED_DIVISOR`], reason `never-executed` |
 //!
 //! Name evidence comes from every first-party `.py` file, importable or not: tests in
 //! directories that are not package names (`tests/my-service/pkg/test_x.py`, run by pytest's
@@ -114,6 +118,21 @@
 //!
 //! A file that both calls a def from dead code and references it from live code without a
 //! call (`register(f)`) is the case this misses.
+//!
+//! # Coverage evidence (design (h))
+//!
+//! With a coverage.py JSON report (`analysis.coverage`, `check --coverage FILE`), each def and
+//! module of a listed file is *executed*, *not executed* or unknown (see [`coverage`] for the
+//! line rules). Executed code is live: it seeds the propagation at level 100 (why
+//! [`Why::Executed`]) before phase 1, so what it calls and its class are live too. Statically
+//! live code that never ran (untested) keeps level 100: a report never lowers a reachable node.
+//! A node below 100 that never ran has its final level divided by [`NOT_EXECUTED_DIVISOR`]:
+//! unreachable and never executed stays at confidence 100; weak evidence of use goes up (name
+//! elsewhere or `possible` call 50 -> 84, unknown decorator 40 -> 80, dynamic access 70 -> 90,
+//! library public name 80 -> 94, script-like module 40 -> 80, name in an importer 10 -> 70).
+//! The division comes after propagation and is not propagated: what such a node reaches is
+//! lowered only when the report shows that it never ran either. Findings of never-executed
+//! nodes carry the reason `never-executed`. A report built for another index is ignored.
 //!
 //! # Modules (PM404)
 //!
@@ -191,14 +210,21 @@
 //!   index) plus about 40 bytes per candidate. Nothing is allocated per edge during
 //!   propagation; no string is built (names are compared as interned ids and hashes).
 //!
-//! See "Dead code (S4.3c)" in `docs/benchmarks.md` for measured costs.
+//! - Coverage (when given): the report is read and mapped by [`coverage`] (O(report bytes));
+//!   seeding and lowering are one pass over its two bit sets (2 bits per node).
+//!
+//! See "Dead code (S4.3c)" and "Coverage evidence (S6.3)" in `docs/benchmarks.md` for measured
+//! costs.
 
+pub mod coverage;
 mod evidence;
 mod imports;
 mod modules;
 mod prop;
 mod seeds;
 
+#[cfg(test)]
+mod coverage_tests;
 #[cfg(test)]
 mod evidence_tests;
 #[cfg(test)]
@@ -218,6 +244,7 @@ use crate::resolve::{Confidence, Imports, ResolvedCalls};
 use crate::rules::codes::{UNUSED_CLASS, UNUSED_FUNCTION, UNUSED_IMPORT, UNUSED_METHOD, UNUSED_MODULE};
 use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId};
 use crate::timing;
+use coverage::Coverage;
 use evidence::extra;
 use modules::ModuleProp;
 use prop::{DefGraph, Levels};
@@ -258,6 +285,10 @@ pub mod level {
 
 /// Findings below this confidence are not emitted (the node is almost certainly live).
 pub const MIN_EMIT: u8 = 10;
+
+/// The level of a node below [`level::LIVE`] that the coverage report shows never ran is
+/// divided by this ([`coverage`]; see the module docs).
+pub const NOT_EXECUTED_DIVISOR: u8 = 3;
 
 /// Why a node has its level: the step that last raised it (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -325,10 +356,12 @@ pub enum Why {
     TestLinked = 29,
     /// Name evidence only from test code, elsewhere.
     TestEvidence = 30,
+    /// The coverage report shows that its own code ran ([`coverage`]).
+    Executed = 31,
 }
 
 impl Why {
-    const ALL: [Why; 31] = [
+    const ALL: [Why; 32] = [
         Why::Dead,
         Why::Root,
         Why::Call,
@@ -360,6 +393,7 @@ impl Why {
         Why::DynamicBase,
         Why::TestLinked,
         Why::TestEvidence,
+        Why::Executed,
     ];
 
     #[inline]
@@ -415,6 +449,7 @@ impl Why {
             Why::DynamicBase => "dynamic-base",
             Why::TestLinked => "test-linked",
             Why::TestEvidence => "test-evidence",
+            Why::Executed => "executed",
         }
     }
 }
@@ -436,11 +471,14 @@ pub struct DeadCodeOptions<'a> {
     pub scripts: &'a [&'a [u8]],
     /// Config-file evidence (`analysis.config-evidence`; see [`crate::extract::config`]).
     pub config: Option<&'a ConfigEvidence>,
+    /// Coverage evidence (`analysis.coverage`; see [`coverage`]). Ignored unless it was built
+    /// for the analysed index.
+    pub coverage: Option<&'a Coverage>,
 }
 
 impl Default for DeadCodeOptions<'_> {
     fn default() -> Self {
-        DeadCodeOptions { mode: Mode::Auto, units: None, name_fallback: true, entrypoints: None, scripts: &[], config: None }
+        DeadCodeOptions { mode: Mode::Auto, units: None, name_fallback: true, entrypoints: None, scripts: &[], config: None, coverage: None }
     }
 }
 
@@ -461,6 +499,7 @@ impl<'a> DeadCodeOptions<'a> {
             entrypoints: Some(entrypoints),
             scripts,
             config: None,
+            coverage: None,
         }
     }
 
@@ -468,6 +507,11 @@ impl<'a> DeadCodeOptions<'a> {
     /// off or the name fallback is).
     pub fn with_config_evidence(self, config: Option<&'a ConfigEvidence>) -> DeadCodeOptions<'a> {
         DeadCodeOptions { config, ..self }
+    }
+
+    /// These options with coverage evidence (`analysis.coverage`).
+    pub fn with_coverage(self, coverage: Option<&'a Coverage>) -> DeadCodeOptions<'a> {
+        DeadCodeOptions { coverage, ..self }
     }
 }
 
@@ -492,6 +536,10 @@ pub struct DeadCodeStats {
     pub findings: [u64; 5],
     /// Heap bytes of the def graph (call and override graphs, seeds) at its peak.
     pub graph_bytes: u64,
+    /// Coverage: defs and modules seeded as executed, and nodes whose level the report
+    /// lowered (never executed, below [`level::LIVE`]).
+    pub executed: u64,
+    pub not_executed: u64,
 }
 
 /// Result of the dead-code analysis: a level per node and per module.
@@ -673,13 +721,32 @@ pub(crate) fn run(
         let info = seeds::fill(ix, imp, &mut g, &modes, opts.entrypoints, |f| analysed_file(ix, f));
         (g, info)
     });
+    let cov = opts.coverage.filter(|c| c.node_count() == ix.node_count());
     let mut lv = Levels::new(ix.node_count());
+    let mut seeded = 0u64;
     let mut mp = timing::time("deadcode.propagate", || {
         for v in roots.iter() {
             lv.raise(v, level::LIVE, Why::Root);
         }
+        if let Some(c) = cov {
+            for v in c.executed_nodes() {
+                if ix.kind(v).is_def() {
+                    lv.raise(v, level::LIVE, Why::Executed);
+                    seeded += 1;
+                }
+            }
+        }
         lv.run(&g);
-        ModuleProp::new(ix, imp, calls, &roots, &info.included)
+        let mut mp = ModuleProp::new(ix, imp, calls, &roots, &info.included);
+        if let Some(c) = cov {
+            for v in c.executed_nodes() {
+                if !ix.kind(v).is_def() && mp.raise(v, level::LIVE, Why::Executed) {
+                    seeded += 1;
+                }
+            }
+            mp.lv.run(&mp.g);
+        }
+        mp
     });
     let uflags = unit_flags_of(ix, &roots, &modes, &info.included);
     let with_files = |lib: bool| (0..modes.units()).filter(|&u| uflags[u as usize] != 0 && modes.unit_is_library(u) == lib).count() as u32;
@@ -759,7 +826,11 @@ pub(crate) fn run(
             (icands, hits.imports)
         }
     });
-    let (modules, mexp) = mp.finish();
+    let (mut modules, mexp) = mp.finish();
+    stats.executed = seeded;
+    if let Some(c) = cov {
+        stats.not_executed = lower_not_executed(ix, c, &mut lv.level, &mut modules);
+    }
     stats.graph_bytes = g.heap_bytes() as u64;
     let referenced = timing::time("deadcode.referenced", || referenced_defs(ix, imp, &g, &lv.level, &info.included));
     drop(g);
@@ -767,12 +838,31 @@ pub(crate) fn run(
     stats.live = lv.live_count();
     let mut dc = DeadCode { level: lv.level, why: lv.why, origin: lv.origin, modules, roots, modes, unit_flags: uflags, stats };
     timing::time("deadcode.findings", || {
-        findings(ix, &info, &referenced, &mut dc, emit, out);
+        findings(ix, &info, &referenced, cov, &mut dc, emit, out);
         if emit.import {
             import_findings(ix, &icands, &ihits, &mut dc, emit.module, out);
         }
     });
     dc
+}
+
+/// Divides the level of every def and module below [`level::LIVE`] that `cov` shows never
+/// ran by [`NOT_EXECUTED_DIVISOR`] (after propagation: what such a node reaches is lowered
+/// only when the report shows that it never ran either). Returns the number of nodes lowered.
+fn lower_not_executed(ix: &Index, cov: &Coverage, level: &mut [u8], modules: &mut modules::ModuleLevels) -> u64 {
+    let mut n = 0;
+    for v in cov.not_executed_nodes() {
+        if ix.kind(v).is_def() {
+            let l = &mut level[v as usize];
+            if *l < level::LIVE && *l > 0 {
+                *l /= NOT_EXECUTED_DIVISOR;
+                n += 1;
+            }
+        } else if modules.lower(v, NOT_EXECUTED_DIVISOR) {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// [`unit_flags`] per unit: analysed files, and entry-point roots (any root kind but
@@ -914,7 +1004,14 @@ fn origin_reason(o: Why) -> (u32, u32) {
 /// "is never used" only when nothing refers to it at all, "is only used by unused code" when
 /// something refers to it from code that is not live (or "... code that may be unused" when its
 /// level is inherited from doubtful callers), else the evidence its confidence is due to.
-fn def_wording(dc: &DeadCode, v: NodeId, referenced: bool) -> (u32, u32) {
+fn def_wording(dc: &DeadCode, v: NodeId, referenced: bool, not_executed: bool) -> (u32, u32) {
+    use crate::rules::dead_code::reason as r;
+    let (phrase, bits) = def_phrase(dc, v, referenced);
+    (phrase, if not_executed { bits | r::NEVER_EXECUTED } else { bits })
+}
+
+/// [`def_wording`] without the coverage reason.
+fn def_phrase(dc: &DeadCode, v: NodeId, referenced: bool) -> (u32, u32) {
     use crate::rules::dead_code::{reason as r, *};
     let used = if referenced { r::ONLY_USED_BY_UNUSED_CODE } else { 0 };
     if dc.level(v) == level::DEAD {
@@ -934,8 +1031,15 @@ fn def_wording(dc: &DeadCode, v: NodeId, referenced: bool) -> (u32, u32) {
 }
 
 /// Phrase and reasons of the PM404 finding of module `m` (same rules as [`def_wording`], with
-/// imports as the references).
-fn module_wording(dc: &DeadCode, m: NodeId) -> (u32, u32) {
+/// imports as the references), plus `never-executed` when the coverage report says so.
+fn module_wording(dc: &DeadCode, m: NodeId, not_executed: bool) -> (u32, u32) {
+    use crate::rules::dead_code::reason as r;
+    let (phrase, bits) = module_phrase(dc, m);
+    (phrase, if not_executed { bits | r::NEVER_EXECUTED } else { bits })
+}
+
+/// [`module_wording`] without the coverage reason.
+fn module_phrase(dc: &DeadCode, m: NodeId) -> (u32, u32) {
     use crate::rules::dead_code::{reason as r, *};
     let imported = dc.modules.imported(m);
     let used = if imported { r::ONLY_USED_BY_UNUSED_CODE } else { 0 };
@@ -965,7 +1069,16 @@ fn module_wording(dc: &DeadCode, m: NodeId) -> (u32, u32) {
 
 /// PM401-PM404 findings, files in FileId order (module first, then defs in source order).
 /// `referenced`: see [`referenced_defs`] (the wording of PM401-PM403).
-fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut DeadCode, emit: Emit, out: &mut Findings) {
+fn findings(
+    ix: &Index,
+    info: &seeds::FileInfo,
+    referenced: &BitSet,
+    cov: Option<&Coverage>,
+    dc: &mut DeadCode,
+    emit: Emit,
+    out: &mut Findings,
+) {
+    let not_executed = |v: NodeId| cov.is_some_and(|c| c.not_executed(v));
     let defs = &ix.facts().defs;
     // Nearest reported ancestor defs: (subtree end, confidence).
     let mut stack: Vec<(NodeId, u8)> = Vec::new();
@@ -978,7 +1091,7 @@ fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut De
         // A PM404 finding contains the module's defs and imports only when PM404 is emitted.
         let mconf = if emit.module { module_confidence(ix, dc, f) } else { 0 };
         if mconf > 0 {
-            let (phrase, reasons) = module_wording(dc, m);
+            let (phrase, reasons) = module_wording(dc, m, not_executed(m));
             let at = Location::new(file, 1, 1);
             out.push_with_reasons(UNUSED_MODULE, at, SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m)), Arg::Phrase(phrase)], reasons);
             dc.stats.findings[3] += 1;
@@ -1008,7 +1121,7 @@ fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut De
             if on {
                 stack.push((ix.subtree(v).end, conf));
                 let at = Location::new(file, defs.name_line[row], defs.name_col[row] + 1);
-                let (phrase, reasons) = def_wording(dc, v, referenced.contains(v));
+                let (phrase, reasons) = def_wording(dc, v, referenced.contains(v), not_executed(v));
                 out.push_with_reasons(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)], reasons);
                 dc.stats.findings[slot] += 1;
             }
