@@ -31,7 +31,9 @@ pub struct SceneParams {
     /// Most edges first shown in one band (the heaviest win); bounds memory and fill.
     pub max_edges_per_band: usize,
     /// Confidence filter: call edges are drawn only if at least one call behind them is this
-    /// sure or surer (`Confidence as u8`; `Unresolved` = no filter). Import edges are kept.
+    /// sure or surer (`Confidence as u8`; `Unresolved` = no filter). Under the import edge
+    /// metric nothing is filtered; under call metrics import-only edges are dropped too
+    /// (harmless: they weigh nothing there).
     pub min_conf: u8,
     /// Origin filter: bit `Region as u8` set = cells and edges of that origin are drawn
     /// ([`ORIGINS_ALL`] = no filter).

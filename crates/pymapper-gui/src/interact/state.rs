@@ -62,12 +62,20 @@ pub struct Interaction {
     // Worker results.
     pub neighbours: Option<Neighbours>,
     pub source: Option<SourceResult>,
+    /// Bumped per source result (a re-read of the same node invalidates its layout).
+    pub source_gen: u64,
     pub insights: Option<Arc<Insights>>,
     pub badges: Option<Arc<Badges>>,
     /// Time to build the query state, once ready.
     pub query_ready: Option<Duration>,
     // Overlays.
     pub marks: MarksSpec,
+    /// The user moved the confidence slider (otherwise it follows the configured
+    /// `min-confidence` of each analysis).
+    min_conf_user: bool,
+    /// `MapState::scene_generation` the overlays were last built for (a scene swap clears
+    /// them, e.g. returning from another view).
+    overlay_scene_gen: Option<u64>,
     pub marks_stats: MarksStats,
     pub highlight_stats: HighlightStats,
     highlight_dirty: bool,
@@ -98,10 +106,13 @@ impl Default for Interaction {
             path_pending: false,
             neighbours: None,
             source: None,
+            source_gen: 0,
             insights: None,
             badges: None,
             query_ready: None,
             marks: MarksSpec::default(),
+            min_conf_user: false,
+            overlay_scene_gen: None,
             marks_stats: MarksStats::default(),
             highlight_stats: HighlightStats::default(),
             highlight_dirty: false,
@@ -125,6 +136,10 @@ impl Interaction {
                 Err(e) => self.worker_error = Some(format!("cannot start the interaction thread: {e}")),
             }
             self.reset_results();
+            // Findings and badges start at the configured threshold, as `pymapper check`.
+            if !self.min_conf_user {
+                self.marks.min_conf = ctx.map.analysis.config.min_confidence;
+            }
         }
         self.ctx = Some(ctx);
         // Hover ids refer to the old scene's edges.
@@ -170,18 +185,38 @@ impl Interaction {
             && Some(s.node) == self.selected
         {
             self.source = Some(s);
+            self.source_gen += 1;
         }
         if let Some(p) = r.path {
             self.path_pending = false;
-            self.path = Some(p);
-            self.highlight_dirty = true;
+            // A path from a node no longer selected (cleared or changed meanwhile) is stale.
+            if Some(p.job.from) == self.selected {
+                self.path = Some(p);
+                self.highlight_dirty = true;
+            }
         }
         if let Some(i) = r.insights {
+            if !self.min_conf_user {
+                self.marks.min_conf = i.badges.min_conf;
+            } else if self.marks.badges
+                && i.badges.min_conf != self.marks.min_conf
+                && let Some(w) = &self.worker
+            {
+                // The slider moved before the findings were ready.
+                w.badges(self.marks.min_conf);
+            }
             self.badges = Some(Arc::clone(&i.badges));
             self.insights = Some(i);
             self.marks_dirty = true;
         }
         if let Some(b) = r.badges {
+            if self.marks.badges
+                && b.min_conf != self.marks.min_conf
+                && let Some(w) = &self.worker
+            {
+                // The slider moved back while this recount ran.
+                w.badges(self.marks.min_conf);
+            }
             self.badges = Some(b);
             self.marks_dirty = true;
         }
@@ -298,11 +333,14 @@ impl Interaction {
         if m == self.marks {
             return;
         }
-        let conf_changed = m.min_conf != self.marks.min_conf;
+        self.min_conf_user |= m.min_conf != self.marks.min_conf;
         self.marks = m;
         self.marks_dirty = true;
-        if conf_changed
-            && m.badges
+        // Recount whenever the badges shown would be at another threshold, including when
+        // they are turned on after the slider moved (before the findings are ready, the
+        // insights' arrival does it).
+        if m.badges
+            && self.badges.as_ref().is_some_and(|b| b.min_conf != m.min_conf)
             && let Some(w) = &self.worker
         {
             w.badges(m.min_conf);
@@ -324,6 +362,11 @@ impl Interaction {
         // Only overlays of the scene shown (a scene published but not yet set is ignored).
         if !Arc::ptr_eq(&c.scene, &map.scene) {
             return false;
+        }
+        if self.overlay_scene_gen != Some(map.scene_generation) {
+            self.overlay_scene_gen = Some(map.scene_generation);
+            self.highlight_dirty = true;
+            self.marks_dirty = true;
         }
         let base = Base { scene: &c.scene, sx: &c.index, edges: &c.map.edges, ix: &c.map.analysis.index };
         let mut changed = false;

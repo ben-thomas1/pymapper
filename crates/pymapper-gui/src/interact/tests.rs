@@ -314,6 +314,17 @@ fn findings_map_to_nodes_with_badges() {
     }
     assert!(b.list.windows(2).all(|w| w[0].node < w[1].node));
     assert!(b.get(node(ix, "app")).is_some());
+    // Findings per node: the same as a scan, in order.
+    for v in 0..ix.node_count() {
+        let scan: Vec<u32> = (0..ins.nodes.len() as u32).filter(|&i| ins.nodes[i as usize] == v).collect();
+        assert_eq!(ins.on_node(v).collect::<Vec<_>>(), scan);
+    }
+    assert!(ins.on_node(u32::MAX).next().is_none() && ins.on_node(NO_NODE).next().is_none());
+    // Coupling reuses the query's call graph: the same edges as check's call graph.
+    let cg = pymapper_core::graph::call_graph(ix, &a.calls, pymapper_core::graph::CallFilter::default());
+    for v in 0..ix.node_count() {
+        assert_eq!(cg.succ(v), q.call_graph().succ(v));
+    }
     // A threshold above every confidence leaves no badges.
     assert!(ins.badges_at(ix, 101).list.is_empty());
     assert!(ins.heap_bytes() > 0);
@@ -444,6 +455,20 @@ fn interaction_state_end_to_end() {
     // Clearing the selection drops the path.
     it.select(None);
     assert!(it.path.is_none() && it.selected_qid.is_empty());
+    // A path still running when the selection is cleared is dropped on arrival.
+    it.select(Some(node(ix, "app.main:run")));
+    it.path_to(node(ix, "app.a:helper"));
+    it.select(None);
+    pump(&mut it, |it| !it.path_pending());
+    assert!(it.path.is_none());
+    // The same scene shown again (back from another view) clears the map's overlays: they are
+    // rebuilt without any interaction change.
+    it.sync_overlays(&mut map);
+    map.show_scene(Arc::clone(&scene), None);
+    assert!(map.overlays[OVERLAY_MARKS].scene.rects.is_empty());
+    assert!(it.sync_overlays(&mut map));
+    assert!(!map.overlays[OVERLAY_MARKS].scene.rects.is_empty());
+    assert!(!it.sync_overlays(&mut map), "nothing left to rebuild");
     // A new scene of the same analysis keeps the worker; overlays of another scene are not
     // applied to the map.
     let other = Arc::new(Scene::default());
@@ -498,4 +523,64 @@ fn panels_render_every_interaction_view_and_settle() {
     state.interact.select(None);
     let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), ..RawInput::default() };
     let _ = ctx.run_ui(raw, |ui| panels::show(ui, &mut state));
+}
+
+/// With the default `min-confidence`, the slider, the findings list and the badges all start
+/// at the configured threshold; moving the slider with badges off and turning them on later
+/// recounts the badges at the new threshold.
+#[test]
+fn default_min_confidence_drives_slider_findings_and_badges() {
+    use crate::interact::panel::BottomTab;
+    use crate::panels::{self, UiState};
+    use egui::{RawInput, Rect, pos2, vec2};
+    use pymapper_core::config::DEFAULT_MIN_CONFIDENCE;
+    let mut f = files();
+    f[0].1 = PYPROJECT.replace("min-confidence = 0\n", "");
+    assert!(!f[0].1.contains("min-confidence"));
+    let refs: Vec<(&str, &str)> = f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let p = TempProject::new(&refs);
+    let m = Arc::new(CodeMap::build(p.analysis(), MapParams::default()));
+    assert_eq!(m.analysis.config.min_confidence, DEFAULT_MIN_CONFIDENCE);
+    let (scene, _, drawn) = m.scene(&SceneParams::default());
+    let sx = Arc::new(SceneIndex::build(&scene, m.analysis.index.node_count(), &m.edges, &drawn));
+    let mut state = UiState::new("proj".to_owned(), "test".to_owned());
+    let it = &mut state.interact;
+    it.set_scene(SceneCtx { map: Arc::clone(&m), scene: Arc::new(scene), index: sx }, true, Arc::new(|| {}));
+    assert_eq!(it.marks.min_conf, DEFAULT_MIN_CONFIDENCE, "slider default");
+    pump(it, |it| it.insights.is_some());
+    assert_eq!(it.marks.min_conf, DEFAULT_MIN_CONFIDENCE);
+    let ins = Arc::clone(it.insights.as_ref().expect("insights"));
+    let all = ins.findings.as_slice();
+    assert!(all.iter().any(|f| f.confidence < DEFAULT_MIN_CONFIDENCE), "fixture: some findings below the threshold");
+    let expected: Vec<u32> = (0..all.len() as u32).filter(|&i| all[i as usize].confidence >= DEFAULT_MIN_CONFIDENCE).collect();
+    assert!(!expected.is_empty(), "fixture: some findings at the threshold");
+    // Badges count exactly the findings the list shows.
+    let b = Arc::clone(it.badges.as_ref().expect("badges"));
+    assert_eq!(b.min_conf, DEFAULT_MIN_CONFIDENCE);
+    let on_nodes = expected.iter().filter(|&&i| ins.nodes[i as usize] != NO_NODE).count();
+    assert_eq!(b.list.iter().map(|x| x.direct as usize).sum::<usize>(), on_nodes);
+    // The findings tab lists the same findings.
+    state.panel.tab = BottomTab::Findings;
+    let ctx = egui::Context::default();
+    let frame = |state: &mut UiState| {
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))), ..RawInput::default() };
+        let mut out = ctx.run_ui(raw, |ui| panels::show(ui, state));
+        out.textures_delta.clear();
+    };
+    frame(&mut state);
+    assert_eq!(state.panel.findings_view(), &expected[..]);
+    // Slider to 0 with badges off: nothing recounted yet; turning badges on recounts at 0.
+    let it = &mut state.interact;
+    assert!(!it.marks.badges);
+    it.set_marks(MarksSpec { min_conf: 0, ..it.marks });
+    it.set_marks(MarksSpec { badges: true, ..it.marks });
+    pump(it, |it| it.badges.as_ref().is_some_and(|b| b.min_conf == 0));
+    let b0 = it.badges.as_ref().expect("badges");
+    let all_on_nodes = ins.nodes.iter().filter(|&&n| n != NO_NODE).count();
+    assert_eq!(b0.list.iter().map(|x| x.direct as usize).sum::<usize>(), all_on_nodes);
+    assert!(all_on_nodes > on_nodes);
+    // A later analysis keeps the user's threshold.
+    let m2 = Arc::new(CodeMap::build(p.analysis(), MapParams::default()));
+    it.set_scene(SceneCtx { map: m2, scene: Arc::new(Scene::default()), index: Arc::new(SceneIndex::default()) }, true, Arc::new(|| {}));
+    assert_eq!(it.marks.min_conf, 0);
 }

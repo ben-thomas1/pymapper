@@ -46,10 +46,17 @@ pub struct PanelState {
     /// Findings shown (indices into the insights), for (insights pointer, min confidence).
     view: Vec<u32>,
     view_key: Option<(usize, u8)>,
-    /// Laid-out source: (node, pixels per point, dark mode) and its galley.
-    galley: Option<((NodeId, u32, bool), Arc<Galley>)>,
+    /// Laid-out source: (source generation, pixels per point, dark mode) and its galley.
+    galley: Option<((u64, u32, bool), Arc<Galley>)>,
     text: String,
     bytes: Vec<u8>,
+}
+
+impl PanelState {
+    /// The findings listed by the last findings tab layout (indices into the insights).
+    pub fn findings_view(&self) -> &[u32] {
+        &self.view
+    }
 }
 
 impl std::fmt::Debug for PanelState {
@@ -497,7 +504,7 @@ fn source_pane(ui: &mut egui::Ui, it: &mut Interaction, ps: &mut PanelState) {
         }
     };
     let dark = ui.visuals().dark_mode;
-    let key = (v, ui.ctx().pixels_per_point().to_bits(), dark);
+    let key = (it.source_gen, ui.ctx().pixels_per_point().to_bits(), dark);
     let galley = match &ps.galley {
         Some((k, g)) if *k == key => Arc::clone(g),
         _ => {

@@ -2,7 +2,7 @@
 //! once in the background after loading, mapped to nodes and aggregated for badges.
 //!
 //! ```text
-//!   RuleEngine ─> hotspot, cycles, layers, coupling (+ call graph), dead code   (as check)
+//!   RuleEngine ─> hotspot, cycles, layers, coupling (+ the query's call graph), dead code   (as check)
 //!             ─> suppressions + per-file-ignores filter (below-confidence findings kept:
 //!                the panel's confidence slider filters them)
 //!             ─> node per finding (its symbol, else the innermost def at its line)
@@ -24,7 +24,6 @@ use pymapper_core::analysis::deadcode::{self, DeadCodeOptions};
 use pymapper_core::analysis::{coupling, cycles, hotspot, layers};
 use pymapper_core::config::Config;
 use pymapper_core::extract::facts::sup_kind;
-use pymapper_core::graph::{CallFilter, call_graph};
 use pymapper_core::index::{Index, NodeId};
 use pymapper_core::intern::Sym;
 use pymapper_core::query::Query;
@@ -67,6 +66,9 @@ pub struct Insights {
     pub findings: Findings,
     /// Node of each finding ([`NO_NODE`] when it has none).
     pub nodes: Vec<NodeId>,
+    /// Indices of the findings with a node, ordered by (node, index): the findings of one
+    /// node are a contiguous run (see [`Self::on_node`]).
+    pub by_node: Vec<u32>,
     /// Badges at the configured `min-confidence`.
     pub badges: Arc<Badges>,
     /// Indices into `findings` of import cycles (PM301).
@@ -89,14 +91,16 @@ impl Insights {
     /// Heap bytes (approximate: the findings' argument buffers are not counted).
     pub fn heap_bytes(&self) -> usize {
         self.findings.len() * std::mem::size_of::<Finding>()
-            + self.nodes.capacity() * 4
+            + (self.nodes.capacity() + self.by_node.capacity()) * 4
             + self.badges.heap_bytes()
             + (self.cycles.capacity() + self.layer_violations.capacity()) * 4
     }
 
-    /// Indices of the findings on node `v` exactly. O(findings) (only for the selected node).
+    /// Indices of the findings on node `v` exactly, worst first. O(log findings).
     pub fn on_node(&self, v: NodeId) -> impl Iterator<Item = u32> + '_ {
-        self.nodes.iter().enumerate().filter(move |&(_, &n)| n == v).map(|(i, _)| i as u32)
+        let lo = self.by_node.partition_point(|&i| self.nodes[i as usize] < v);
+        let hi = lo + self.by_node[lo..].partition_point(|&i| self.nodes[i as usize] == v);
+        self.by_node[lo..hi].iter().copied()
     }
 
     /// The badges of the findings with confidence >= `min_conf`. O(findings x depth) plus a
@@ -146,8 +150,10 @@ pub fn analyse(a: &Analysis, q: &Query<'_>) -> Insights {
         passes.push("contracts");
     }
     if engine.should_run(Pass::Coupling) {
-        let cg = engine.is_enabled(GOD_CLASS).then(|| call_graph(ix, &a.calls, CallFilter::default()));
-        coupling::analyse(ix, imp, cg.as_ref(), &engine, &mut out);
+        // The query's call graph has exactly `call_graph(.., CallFilter::default())`'s edges
+        // (every edge with a target, parallel edges folded); coupling reads only adjacency.
+        let cg = engine.is_enabled(GOD_CLASS).then(|| q.call_graph());
+        coupling::analyse(ix, imp, cg, &engine, &mut out);
         passes.push("coupling");
     }
     if engine.should_run(Pass::DeadCode) {
@@ -181,7 +187,9 @@ pub fn analyse(a: &Analysis, q: &Query<'_>) -> Insights {
     }
     let min_conf = config.min_confidence;
     let badges = Arc::new(Badges { min_conf, list: badges(ix, &out, &nodes, min_conf) });
-    Insights { findings: out, nodes, badges, cycles: cycles_ix, layer_violations: layer_ix, filter, passes, elapsed: t.elapsed() }
+    let mut by_node: Vec<u32> = (0..nodes.len() as u32).filter(|&i| nodes[i as usize] != NO_NODE).collect();
+    by_node.sort_unstable_by_key(|&i| (nodes[i as usize], i));
+    Insights { findings: out, nodes, by_node, badges, cycles: cycles_ix, layer_violations: layer_ix, filter, passes, elapsed: t.elapsed() }
 }
 
 /// The module an argument names: a symbol, or an interned dotted name of a loaded module.

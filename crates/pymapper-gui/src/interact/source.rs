@@ -146,6 +146,9 @@ pub fn highlight(src: &[u8], first_line: u32, truncated: bool) -> Highlighted {
     // continue the decorator until another token.
     let mut after_def = false;
     let mut in_decorator = false;
+    // A character split across tokens (the lexer may cut non-ASCII bytes outside names and
+    // strings one by one): its leading bytes wait here for the rest.
+    let mut carry = Vec::new();
     loop {
         let t = lx.next_token();
         if t.kind == TokenKind::EndOfFile {
@@ -156,7 +159,7 @@ pub fn highlight(src: &[u8], first_line: u32, truncated: bool) -> Highlighted {
         }
         let (s, e) = (t.start as usize, t.end() as usize);
         if s > pos {
-            push(&mut out, &src[pos..s], Style::Plain);
+            push(&mut out, &mut carry, &src[pos..s], Style::Plain);
         }
         let text = &src[s..e];
         let style = match t.kind {
@@ -183,11 +186,15 @@ pub fn highlight(src: &[u8], first_line: u32, truncated: bool) -> Highlighted {
                 token_style(k)
             }
         };
-        push(&mut out, text, style);
+        push(&mut out, &mut carry, text, style);
         pos = e;
     }
     if pos < src.len() {
-        push(&mut out, &src[pos..], Style::Plain);
+        push(&mut out, &mut carry, &src[pos..], Style::Plain);
+    }
+    if !carry.is_empty() {
+        // Truncated input: the incomplete character is replaced.
+        append(&mut out, &String::from_utf8_lossy(&carry), Style::Plain);
     }
     out
 }
@@ -198,10 +205,46 @@ fn lx_at_line_start(src: &[u8], at: usize) -> bool {
     src[..at].iter().rev().take_while(|&&c| c != b'\n').all(|&c| c == b' ' || c == b'\t' || c == b'\x0c')
 }
 
-/// Appends `bytes` with `style`, merging with the previous run when the style is equal.
-fn push(out: &mut Highlighted, bytes: &[u8], style: Style) {
+/// Number of trailing bytes of `b` that start a UTF-8 character but do not complete it.
+fn incomplete_tail(b: &[u8]) -> usize {
+    for k in 1..=b.len().min(3) {
+        let c = b[b.len() - k];
+        if c & 0xC0 == 0x80 {
+            continue; // continuation byte: look further back for the lead
+        }
+        let need = match c {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        return if k < need { k } else { 0 };
+    }
+    0
+}
+
+/// Appends `bytes` with `style` (after any bytes carried over from the previous call; an
+/// incomplete trailing character is carried to the next one).
+fn push(out: &mut Highlighted, carry: &mut Vec<u8>, bytes: &[u8], style: Style) {
+    if carry.is_empty() {
+        let keep = incomplete_tail(bytes);
+        let (head, tail) = bytes.split_at(bytes.len() - keep);
+        append(out, &String::from_utf8_lossy(head), style);
+        carry.extend_from_slice(tail);
+        return;
+    }
+    let mut joined = std::mem::take(carry);
+    joined.extend_from_slice(bytes);
+    let keep = incomplete_tail(&joined);
+    let (head, tail) = joined.split_at(joined.len() - keep);
+    append(out, &String::from_utf8_lossy(head), style);
+    carry.extend_from_slice(tail);
+}
+
+/// Appends `text` with `style`, merging with the previous run when the style is equal.
+fn append(out: &mut Highlighted, text: &str, style: Style) {
     let start = out.text.len() as u32;
-    out.text.push_str(&String::from_utf8_lossy(bytes));
+    out.text.push_str(text);
     let end = out.text.len() as u32;
     if end == start {
         return;
@@ -277,6 +320,25 @@ mod tests {
         }
         let h = highlight(b"x = \xff\n", 1, false);
         assert!(h.text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn non_ascii_outside_names_and_strings_survives() {
+        for src in ["a = b \u{2192} c  # caf\u{e9}\n", "x = 1 \u{b7} 2 \u{1F600}\n", "\u{e9}t\u{e9} = '\u{2603}'\n"] {
+            let h = highlight(src.as_bytes(), 1, false);
+            assert_eq!(h.text, src);
+            let total: u32 = h.runs.iter().map(|r| r.end - r.start).sum();
+            assert_eq!(total as usize, h.text.len());
+        }
+        // A character cut by truncation is replaced, not dropped silently.
+        let h = highlight(&"x \u{2192}".as_bytes()[..3], 1, true);
+        assert_eq!(h.text, "x \u{fffd}");
+        let h = highlight(&"x \u{2192}".as_bytes()[..4], 1, true);
+        assert_eq!(h.text, "x \u{fffd}");
+        assert_eq!(incomplete_tail(b"ab"), 0);
+        assert_eq!(incomplete_tail(b"a\xe2\x86"), 2);
+        assert_eq!(incomplete_tail("a\u{2192}".as_bytes()), 0);
+        assert_eq!(incomplete_tail(b"\xff"), 0);
     }
 
     #[test]
