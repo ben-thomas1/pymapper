@@ -15,15 +15,17 @@
 //!     │                run starts to translate rows)
 //!     └─> extract      only the re-extracted files, with the normal parallel loader
 //!     └─> patch        fresh strings merged into the interner (old Syms stay valid); facts and
-//!     │                metrics spliced in place (one memmove pass per column); hierarchy and
-//!     │                lookup tables rebuilt
+//!     │                metrics spliced in place (one memmove pass per column); hierarchy
+//!     │                copied in runs with the def blocks of re-extracted files rebuilt (or
+//!     │                rebuilt whole when the file set or module names changed)
 //!     └─> compaction   the interner keeps strings of removed rows as tombstones; once it has
 //!     │                doubled since the last compaction, live strings are marked and the
 //!     │                interner is rebuilt (amortised O(1) per added string)
-//!     └─> nodes        old node -> new node (file identity, def path, qualified id)
+//!     └─> nodes        old node -> new node (by offset outside re-extracted files, def path
+//!     │                inside them; file identity and qualified id when files changed)
 //!     └─> resolve      only the files that read a changed file (recorded dependencies: the
 //!     │                reverse import graph made exact, see [`crate::resolve::incr`]); the
-//!     │                results of every other file are carried over with translated ids
+//!     │                results of every other file are translated in place
 //!     └─> diff         added / removed / changed / moved nodes, import, call and override
 //!                      edge deltas (see [`IndexDiff`])
 //! ```
@@ -44,11 +46,13 @@
 //!
 //! Reading and extracting, the dominant cost of a load, is paid only for re-extracted files,
 //! and per-file resolution only for affected files. The rest is linear in the size of the
-//! index with small constants: the splice moves the rows behind the first changed file once
-//! (memmove), the hierarchy and the global resolution tables (module trie, namespaces,
-//! classes, MROs, method index) are rebuilt, carried results are copied with translated ids,
-//! and the diff translates old nodes by offset. Dependency tracking costs 4 bytes per
-//! (file, file read) pair; see [`Program::tracking_bytes`].
+//! index with small constants, mostly memory-bound and parallel: the splice moves the rows
+//! behind the first changed file once (memmove), the hierarchy is copied in runs, carried
+//! resolution results are translated in place, the module trie and namespaces are patched,
+//! and the node map is filled by offset. The class table, MROs and method index are rebuilt
+//! (the largest remaining share on very large programs). Dependency tracking costs 4 bytes
+//! per (file, file read) pair; see [`Program::tracking_bytes`]. Measured numbers:
+//! `docs/benchmarks.md`, "Incremental updates (S3.6)".
 
 mod diff;
 mod edges;

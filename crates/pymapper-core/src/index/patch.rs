@@ -8,7 +8,12 @@
 //!                           ├─> facts + metrics: one in-place splice pass per column
 //!                           │   (removed runs dropped, fresh runs inserted, rows between
 //!                           │   moved once), headers rebased by running sums
-//!                           └─> hierarchy + lookup tables rebuilt from the patched tables
+//!                           └─> hierarchy: when only contents changed (same files, order,
+//!                               names, statuses), the old nodes are copied in runs with the
+//!                               def block of every re-extracted file rebuilt, parents
+//!                               translated, subtree ends and ancestor paths recomputed
+//!                               ([`NodeShift`] translates the kept nodes); otherwise the
+//!                               hierarchy and lookup tables are rebuilt from the tables
 //! ```
 //!
 //! The result is the index [`super::load`] builds for the new inputs (same rows, nodes and

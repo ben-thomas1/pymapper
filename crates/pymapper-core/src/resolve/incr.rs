@@ -21,13 +21,14 @@
 //!
 //! This is the reverse import graph made exact: a file depends on what its lookups actually
 //! visited, not on every module it imports, and transitively through re-export chains (the
-//! visits of a lookup include every hop). Results of files that are not affected are copied
-//! with node ids and rows translated; a carried result that would point at a node that is
+//! visits of a lookup include every hop). A carried result that would point at a node that is
 //! gone makes its file affected instead (a safety net; the property tests check that it never
 //! changes the outcome).
 //!
-//! Global tables (module trie, namespaces, classes and MROs, method index) are rebuilt; they
-//! are a small share of the resolution (see `docs/benchmarks.md`).
+//! Results of files that are not affected are translated in place (node ids by offset, rows
+//! by their file's shift) and the affected files' rows are spliced in, so the old and new
+//! tables never coexist. The module trie only moves its nodes and namespaces only shift rows;
+//! the class table, MROs and method index are rebuilt (see `docs/benchmarks.md`).
 //!
 //! Preconditions of the incremental entry points: the old and new index have the same files
 //! in the same order with the same module names and statuses (only contents changed), and the
