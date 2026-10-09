@@ -36,3 +36,4 @@ pub mod panels;
 pub mod render;
 pub mod schedule;
 pub mod stats;
+pub mod views;
