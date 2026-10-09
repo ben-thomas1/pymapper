@@ -22,6 +22,7 @@ use crate::measure::{self, FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
+use crate::views::Views;
 
 /// Events sent to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +48,8 @@ pub struct App {
     worker: Option<MapWorker>,
     /// The code map of the scene shown (hover details).
     codemap: Option<Arc<CodeMap>>,
+    /// Secondary views (graph, matrix, focus) and the shared selection.
+    views: Views,
     /// Last status shown (the status line is rewritten only when it changes).
     status: Option<Status>,
     /// `--measure` with a project: measuring starts once the first scene is shown.
@@ -118,6 +121,8 @@ impl App {
             (Some(m), None) => (Some(Measure::new(m.clone(), launched)), None),
             (None, _) => (None, None),
         };
+        let ctx = egui_ctx.clone();
+        let views = Views::new(Arc::new(move || ctx.request_repaint()));
         Self {
             opts,
             title: format!("pymapper - {name}"),
@@ -130,6 +135,7 @@ impl App {
             scene_build,
             worker,
             codemap: None,
+            views,
             status,
             pending_measure,
             win: None,
@@ -214,7 +220,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, status, pending_measure, scene_build, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, views, status, pending_measure, scene_build, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -265,7 +271,7 @@ impl App {
 
         if let Some(wk) = worker.as_ref() {
             if let Some(p) = wk.take() {
-                apply_published(p, map, codemap, &mut w.ui, scene_build);
+                apply_published(p, map, codemap, views, &mut w.ui, scene_build);
                 if let Some(m) = pending_measure.take() {
                     *measure = Some(Measure::new(m, t1));
                 }
@@ -290,7 +296,15 @@ impl App {
         {
             wk.request(req);
         }
-        let hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
+        let color = w.ui.map_request.map_or(Default::default(), |r| r.scene.color);
+        let mut views_changed = views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+        let mut hover_changed = map.apply_input(&w.ui.canvas_input, full.pixels_per_point);
+        if w.ui.canvas_input.click {
+            views.on_click(map.hover, map, codemap.as_ref(), color);
+            // Apply the new selection (marks, texts) in this frame.
+            views_changed |= views.frame(&mut w.ui.views, map, codemap.as_ref(), color);
+            hover_changed = true;
+        }
         if let Some(t) = measure.as_ref().and_then(Measure::progress)
             && map.scene.bounds.is_positive()
         {
@@ -342,9 +356,14 @@ impl App {
                 st.label_rebuilds.count
             );
         }
+        if views_changed {
+            // The panels were laid out before the views updated their texts.
+            sched.request(t3, Duration::ZERO);
+        }
         if hover_changed {
             // The details panel was laid out before the hit test: show the new hover next frame.
             match (codemap.as_ref(), map.hover) {
+                (_, Some(h)) if views.describe(h, &mut w.ui.hover_text) => {}
                 (Some(cm), Some(h)) if h.kind == HitKind::Rect => cm.describe_node(h.id, &mut w.ui.hover_text),
                 (Some(cm), Some(h)) if h.kind == HitKind::Curve => cm.describe_edge(h.id, &mut w.ui.hover_text),
                 _ => map.describe_hover(&mut w.ui.hover_text),
@@ -362,12 +381,8 @@ impl App {
 
 /// Shows a published code map scene: keeps the camera when replacing a scene of the same
 /// world, and seeds the controls from the first request.
-fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, ui: &mut UiState, scene_build: &mut Option<Duration>) {
-    if map.scene.bounds.is_positive() {
-        map.replace_scene(p.scene);
-    } else {
-        map.set_scene(p.scene);
-    }
+fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, views: &mut Views, ui: &mut UiState, scene_build: &mut Option<Duration>) {
+    views.show_codemap_scene(map, p.scene);
     *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
     *codemap = Some(p.map);
     ui.legend = Some(p.legend);

@@ -17,6 +17,8 @@ use crate::codemap::scene::Legend;
 use crate::codemap::worker::Request;
 use crate::map::CanvasInput;
 use crate::mapui;
+use crate::views::ViewKind;
+use crate::views::ui::{self as views_ui, ViewsUi};
 
 pub const LEFT_ID: &str = "pm_left";
 pub const RIGHT_ID: &str = "pm_right";
@@ -53,6 +55,8 @@ pub struct UiState {
     pub legend: Option<Legend>,
     /// Input: code map status over the canvas (loading phase or error; empty: none).
     pub map_status: String,
+    /// The secondary views' tabs, options and texts.
+    pub views: ViewsUi,
 }
 
 impl UiState {
@@ -70,6 +74,7 @@ impl UiState {
             map_request_changed: false,
             legend: None,
             map_status: String::new(),
+            views: ViewsUi::default(),
         }
     }
 }
@@ -98,8 +103,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
         let rect = ui.max_rect();
         let response = ui.interact(rect, ui.id().with("pm_canvas"), Sense::click_and_drag());
         state.canvas_input = canvas_input(ui, &response, rect);
+        let codemap = state.views.active == ViewKind::CodeMap;
         if !state.map_status.is_empty() {
             mapui::status(ui, rect, &state.map_status);
+        } else if !codemap {
+            if !state.views.status.is_empty() {
+                mapui::status(ui, rect, &state.views.status);
+            }
         } else if state.map_empty {
             ui.painter().text(
                 rect.center(),
@@ -109,9 +119,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
                 ui.visuals().weak_text_color(),
             );
         }
-        if let Some(l) = &state.legend {
+        if let Some(l) = &state.legend
+            && codemap
+        {
             mapui::legend(ui, rect, l);
         }
+        views_ui::tabs(ui, rect, &mut state.views);
     });
     state.canvas_rect = central.response.rect;
 }
@@ -127,6 +140,7 @@ fn canvas_input(ui: &egui::Ui, response: &egui::Response, rect: Rect) -> CanvasI
     }
     input.hover = response.hover_pos().map(rel);
     input.fit = response.double_clicked();
+    input.click = response.clicked();
     if !response.hovered() {
         return input;
     }
@@ -178,6 +192,7 @@ fn right(ui: &mut egui::Ui, state: &mut UiState) {
         state.map_request_changed = mapui::controls(ui, req);
         ui.separator();
     }
+    views_ui::controls(ui, &mut state.views);
     ui.strong("Details");
     if state.hover_text.is_empty() {
         ui.weak("Nothing selected.");
