@@ -12,8 +12,9 @@ fn pymapper(args: &[&str]) -> Output {
 }
 
 #[test]
-fn every_subcommand_is_a_stub_that_exits_2() {
-    for name in SUBCOMMANDS {
+fn unimplemented_subcommands_are_stubs_that_exit_2() {
+    // `check` is implemented (see tests/check.rs).
+    for name in SUBCOMMANDS.into_iter().filter(|&n| n != "check") {
         let out = pymapper(&[name]);
         assert_eq!(out.status.code(), Some(2), "{name}: wrong exit code");
         let stderr = String::from_utf8_lossy(&out.stderr);

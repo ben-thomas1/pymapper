@@ -27,6 +27,9 @@ pub struct PyprojectInfo {
     /// found: setuptools `package-dir` / `packages.find.where`, poetry `packages.from`, hatch
     /// wheel `packages` parents, uv `module-root`, pdm `package-dir`, maturin `python-source`.
     pub source_dirs: Vec<PathBuf>,
+    /// Entry point targets (`pkg.mod:attr`, extras kept verbatim) of `[project.scripts]`,
+    /// `[project.gui-scripts]` and every group of `[project.entry-points]`, in file order.
+    pub scripts: Vec<String>,
 }
 
 type Table<'i> = DeTable<'i>;
@@ -68,6 +71,23 @@ pub fn parse_pyproject(text: &str) -> Option<PyprojectInfo> {
     if let Some(project) = table(doc, &["project"]) {
         info.name = string(get(project, "name")).map(str::to_owned);
         info.requires_python = string(get(project, "requires-python")).and_then(requires_python_floor);
+        let mut targets = |t: &Table<'_>| {
+            for (_, v) in t.iter() {
+                info.scripts.extend(string(Some(v.get_ref())).map(str::to_owned));
+            }
+        };
+        for key in ["scripts", "gui-scripts"] {
+            if let Some(DeValue::Table(t)) = get(project, key) {
+                targets(t);
+            }
+        }
+        if let Some(DeValue::Table(groups)) = get(project, "entry-points") {
+            for (_, g) in groups.iter() {
+                if let DeValue::Table(t) = g.get_ref() {
+                    targets(t);
+                }
+            }
+        }
     }
     let mut dirs: Vec<&str> = Vec::new();
     if let Some(st) = table(doc, &["tool", "setuptools"]) {

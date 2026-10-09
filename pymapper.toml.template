@@ -22,9 +22,9 @@
 # indented further (`#   key = ...`) are examples only. Relative paths are resolved against the
 # directory of this file; globs are relative to the project root.
 #
-# Cost notes give the asymptotic class of the work an option enables. Measured numbers will be
-# filled in from `cargo xtask bench` on the stdlib and a large venv; until then they read
-# "TBD (benchmark)".
+# Cost notes give the asymptotic class of the work an option enables, with numbers measured by
+# `pymapper check --stats` on a 14-core Apple M4 Pro, release build, warm OS file cache (see
+# "Check (S4.5)" in docs/benchmarks.md). "Uncached" = first run, "cached" = later runs.
 
 # ---------------------------------------------------------------------------------------------
 # Files
@@ -33,7 +33,8 @@
 # Files and directories to analyse. Positional CLI paths replace this list.
 # Default: the project root.
 #   paths = ["src", "tests"]
-# cost: O(files + bytes) - the walk, read and parse of everything listed. TBD (benchmark).
+# cost: O(files + bytes) - the walk, read and parse of everything listed. Measured: 305k LOC
+#       in 54 ms uncached / 20 ms cached; 17M LOC (60k files) in 3.4 s / 1.5 s, 0.7 GB peak.
 
 # Extra first-party import roots (where `import pkg` is resolved from). Empty = auto-detect:
 # the project root plus a `src/` layout, namespace packages and editable installs.
@@ -63,12 +64,16 @@
 # them (`pymapper deps --score`). Third-party findings never affect the `check` exit code.
 # (CLI: `--deps` / `--no-deps`.)
 # include-deps = false
-# cost: proportional to the size of site-packages (a large venv can be 50k files / 16M LOC);
-#       cached per distribution, so only the first run pays. TBD (benchmark).
+# cost: proportional to the size of site-packages (a large venv can be 60k files / 17M LOC);
+#       cached per distribution, so only the first run pays. Measured on a 478k-LOC project
+#       with a 17M-LOC venv (and the stdlib): 2.8 s uncached, 0.5 s cached, 0.7 GB peak RSS,
+#       vs 0.16 s / 0.10 s and 45 MB without them. Third-party files come from RECORD file
+#       lists (no walk).
 
 # Analyse the standard library of the target interpreter. (CLI: `--stdlib` / `--no-stdlib`.)
 # include-stdlib = false
-# cost: ~440k LOC for CPython 3.13; cached per Python version. TBD (benchmark).
+# cost: ~300-440k LOC for CPython 3.13 (305k measured for an install without the test
+#       suite: 54 ms uncached, 20 ms cached, 25 MB peak); cached per Python version.
 
 # Virtualenv to use. Unset = $VIRTUAL_ENV, then `.venv` or `venv` under the project root.
 # (CLI: `--venv`.)
@@ -87,7 +92,9 @@
 # Use the on-disk cache (first-party per file, third-party per distribution, stdlib per
 # version). (CLI: `--no-cache`.)
 # cache = true
-# cost: saves time on every run after the first; disk usage TBD (benchmark).
+# cost: saves time on every run after the first (17M LOC: 3.4 s -> 1.5 s; 305k LOC: 54 ms ->
+#       20 ms); disk usage about 0.43 bytes per source byte (4.6 MB for 11 MB of stdlib,
+#       270 MB for a 650 MB venv; +10% with analysis.dupes fingerprints).
 
 # Cache directory. (CLI: `--cache-dir`.)
 # cache-dir = ".pymapper_cache"
@@ -95,7 +102,9 @@
 
 # Worker threads; 0 = one per logical CPU. (CLI: `--threads` / `-j`.)
 # threads = 0
-# cost: peak memory grows with threads (one bump arena per thread). TBD (benchmark).
+# cost: peak memory grows with threads (one bump arena per thread). Measured on 17.8M LOC:
+#       1 thread 10.4 s uncached / 1.4 s cached, 0.60-0.63 GB; 4 threads 3.5 s / 0.67 s,
+#       0.64-0.66 GB; 14 threads 2.8 s / 0.52 s, 0.68-0.70 GB.
 
 # Dead-code mode:
 #   "application" - only code reachable from entry points is live.
@@ -268,7 +277,8 @@
 # Duplicate-code detection (token-window hashing across all first-party files).
 # dupes = false
 # cost: EXPENSIVE - O(tokens) time with a large hash table; memory grows with codebase size
-#       and falls as dupes-min-tokens rises. TBD (benchmark).
+#       and falls as dupes-min-tokens rises. Measured: 305k LOC +20-30 ms, +6 MB peak;
+#       17M LOC +0.2 s extraction and +3.1 s matching, peak 0.7 -> 1.0 GB.
 
 # Exact transitive reachability ("LOC reached", impact sizes) instead of HyperLogLog
 # estimates (3.25% relative standard error; sets of at most 256 symbols and 4,096 lines are

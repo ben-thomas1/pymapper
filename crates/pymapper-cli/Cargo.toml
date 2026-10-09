@@ -15,6 +15,9 @@ path = "src/main.rs"
 pymapper-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+# Worker pool size (--threads) and peak RSS for --stats (getrusage).
+libc.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true
