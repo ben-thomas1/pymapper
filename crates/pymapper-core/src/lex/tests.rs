@@ -839,7 +839,7 @@ fn suppression_comments() {
     assert!(sups("y  # pymapper: ignore  # why\n")[0].2);
     assert_eq!(sups("y  #\tpymapper:\tignore[PM9]\n")[0].1, ["PM9"]);
     // After another tool's directive in the same comment.
-    assert_eq!(sups("z  # noqa: E501  # pymapper: ignore[PM3]\n")[0].1, ["PM3"]);
+    assert_eq!(sups("z  # noqa: E501  # pymapper: ignore[PM3]\n")[1].1, ["PM3"]);
     // Recorded in comment-only lines, inside brackets and in f-string fields; and in trivia mode.
     assert_eq!(sups("# pymapper: ignore[A]\nf(\n  1,  # pymapper: ignore[B]\n)\n").len(), 2);
     assert_eq!(sups("f'''{\nx  # pymapper: ignore[C]\n}'''\n")[0].1, ["C"]);
@@ -856,6 +856,41 @@ fn suppression_comments() {
     let (_, s) = Lexer::new(src.as_bytes()).tokenize();
     assert_eq!(s[0].start, 5);
     assert_eq!(s[0].codes(src.as_bytes()).collect::<Vec<_>>(), [b"Q"]);
+}
+
+/// (codes, bare) of every `noqa` directive in `src`.
+fn noqas(src: &str) -> Vec<(Vec<String>, bool)> {
+    let (_, s) = Lexer::new(src.as_bytes()).tokenize();
+    s.iter()
+        .filter(|x| x.noqa)
+        .map(|x| (x.codes(src.as_bytes()).map(|c| String::from_utf8_lossy(c).into_owned()).collect(), x.all))
+        .collect()
+}
+
+#[test]
+fn noqa_comments() {
+    let codes = |s: &str| noqas(s).into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    // Bare, any case, own comment or after other text, before another directive.
+    for s in ["import a  # noqa\n", "import a #NOQA\n", "import a  # type: ignore  # noqa\n", "x  # noqa  # pymapper: ignore[PM1]\n"] {
+        assert_eq!(noqas(s), [(vec![], true)], "{s:?}");
+    }
+    // Code lists: commas and/or whitespace, spaces around `:`, any case; the list ends at the
+    // first word that is not a code.
+    assert_eq!(codes("import a  # noqa: F401\n"), [["F401"]]);
+    assert_eq!(codes("import a  # noqa:F401,E501\n"), [["F401", "E501"]]);
+    assert_eq!(codes("import a  # noqa: F401 E501\n"), [["F401", "E501"]]);
+    assert_eq!(codes("import a  # noqa : F401, E501\n"), [["F401", "E501"]]);
+    assert_eq!(codes("import a  # NOQA: f401\n"), [["f401"]]);
+    assert_eq!(codes("import a  # noqa: F401  registers converters\n"), [["F401"]]);
+    assert_eq!(codes("import a  # noqa: F401# pymapper: ignore[PM1]\n"), [["F401"]]);
+    assert_eq!(sups("import a  # noqa: F401  # pymapper: ignore[PM1]\n")[1].1, ["PM1"]);
+    // Not directives.
+    for s in [
+        "# noqanything\n", "# noqa:\n", "# noqa: registers\n", "# noqa: 401\n", "s = '# noqa'\n", "# no qa\n",
+        "x  # noqa: F401x\n",
+    ] {
+        assert!(noqas(s).is_empty(), "{s:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

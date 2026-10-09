@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use pymapper_core::analysis::dupes::{DupesParams, Fingerprints};
 use pymapper_core::cache::{self, Cache, CacheStats};
 use pymapper_core::config::Config;
+use pymapper_core::extract::facts::sup_kind;
 use pymapper_core::index::{self, Index, Inputs, LoadOptions};
 use pymapper_core::resolve::{Attribution, Imports, resolve_imports};
-use pymapper_core::roots::{self, RootOptions, Roots, Source};
+use pymapper_core::roots::{self, ProjectUnits, RootOptions, Roots, Source};
 use pymapper_core::rules::{self, Suppressions, SuppressionsBuilder};
 use pymapper_core::timing;
 use pymapper_core::walk::{self, PathList, WalkOptions};
@@ -68,7 +69,9 @@ pub fn require_paths(paths: &[PathBuf], explicit: bool, config_file: Option<&Pat
 
 /// The loaded project.
 pub struct Project {
-    pub roots: Roots,
+    /// The project root and the directories below it with a `pyproject.toml` (found by the
+    /// first-party walk).
+    pub units: ProjectUnits,
     pub index: Index,
     pub imports: Imports,
     /// Duplication fingerprints of first-party files, when requested.
@@ -88,7 +91,12 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (files, pyprojects, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
+    drop(pyprojects);
+    for d in &diags {
+        warn(format_args!("{d}"));
+    }
     let inputs = Inputs::from_roots(&roots, &files);
     drop(files);
     let opts = LoadOptions { dupes };
@@ -115,7 +123,7 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
         ));
     }
     let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
-    Project { roots, index, imports, fingerprints, cache, walk_errors }
+    Project { units, index, imports, fingerprints, cache, walk_errors }
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).
@@ -126,14 +134,17 @@ fn same_opts(a: &WalkOptions, b: &WalkOptions) -> bool {
         && a.sort == b.sort
         && a.excludes == b.excludes
         && a.exclude_base == b.exclude_base
+        && a.projects == b.projects
 }
 
 /// Every file to load, in a deterministic order: walks of the sources (consecutive walks with
 /// the same options merged into one walk), and the `RECORD` files of third-party
-/// distributions. Returns the files and the number of walk diagnostics (each printed).
-pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (PathList, usize) {
+/// distributions. Returns the files, the `pyproject.toml` files of the first-party walks and
+/// the number of walk diagnostics (each printed).
+pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (PathList, PathList, usize) {
     let first_party = WalkOptions::first_party(config, project_root);
     let mut files = PathList::default();
+    let mut projects = PathList::default();
     let mut errors = 0;
     let mut full = false;
     // Pending walk: roots sharing one set of options.
@@ -144,13 +155,13 @@ pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (Pa
         match src {
             Source::Walk { path, opts, .. } => {
                 if !pending_opts.as_ref().is_some_and(|p| same_opts(p, &opts)) {
-                    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut errors, &mut full);
+                    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
                     pending_opts = Some(opts);
                 }
                 pending.push(path);
             }
             Source::Record { dist } => {
-                flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut errors, &mut full);
+                flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
                 let site = roots.dists.site_path(dist).as_os_str().as_encoded_bytes();
                 for rel in roots.dists.owned_files(dist) {
                     buf.clear();
@@ -165,17 +176,25 @@ pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (Pa
             }
         }
     }
-    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut errors, &mut full);
+    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
     if full {
         warn(format_args!("more than 4 GiB of file paths: the remaining files were dropped"));
         errors += 1;
     }
-    (files, errors)
+    (files, projects, errors)
 }
 
 /// Walks the pending roots (if any) with `opts`, appends the files to `files` (setting `full`
-/// when the list overflows) and prints the diagnostics.
-fn flush_walk(pending: &mut Vec<PathBuf>, opts: Option<&WalkOptions>, files: &mut PathList, errors: &mut usize, full: &mut bool) {
+/// when the list overflows) and the `pyproject.toml` files to `projects`, and prints the
+/// diagnostics.
+fn flush_walk(
+    pending: &mut Vec<PathBuf>,
+    opts: Option<&WalkOptions>,
+    files: &mut PathList,
+    projects: &mut PathList,
+    errors: &mut usize,
+    full: &mut bool,
+) {
     let Some(opts) = opts else { return };
     if pending.is_empty() {
         return;
@@ -191,11 +210,16 @@ fn flush_walk(pending: &mut Vec<PathBuf>, opts: Option<&WalkOptions>, files: &mu
             break;
         }
     }
+    for i in 0..w.projects.len() {
+        if projects.push(w.projects.get_bytes(i)).is_err() {
+            break;
+        }
+    }
     pending.clear();
 }
 
-/// Inline `# pymapper: ignore[...]` suppressions of every file, from the facts. Malformed codes
-/// are skipped (they suppress nothing).
+/// Inline `# pymapper: ignore[...]` and F401 `# noqa` suppressions of every file, from the facts.
+/// Malformed codes are skipped (they suppress nothing).
 pub fn suppressions(ix: &Index) -> Suppressions {
     let mut b = SuppressionsBuilder::new();
     let st = &ix.facts().suppressions;
@@ -208,7 +232,11 @@ pub fn suppressions(ix: &Index) -> Suppressions {
         entries.clear();
         let view = ix.file_view(f);
         for r in range {
-            if st.all[r] != 0 {
+            if st.kind[r] == sup_kind::NOQA_F401 {
+                entries.push(rules::noqa_f401(st.line[r]));
+                continue;
+            }
+            if st.kind[r] == sup_kind::ALL {
                 rules::parse_codes(st.line[r], None, &mut entries, |_| {});
             }
             for &s in view.chain(st.codes[r]) {

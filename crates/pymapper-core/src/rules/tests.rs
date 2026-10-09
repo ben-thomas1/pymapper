@@ -319,6 +319,7 @@ fn every_rule_renders_with_sample_args() {
                 ArgKind::Name => Arg::Name(i as u32),
                 ArgKind::File => Arg::File(FileId(i as u32)),
                 ArgKind::Contract => Arg::Contract(i as u32),
+                ArgKind::Phrase(words) => Arg::Phrase(words.len() as u32 - 1),
             })
             .collect();
         assert!(d.accepts(&args), "PM{}", d.code);

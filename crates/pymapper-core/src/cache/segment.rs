@@ -159,7 +159,7 @@ macro_rules! fact_columns {
             106: diags.col @ diags => P,
             112: suppressions.line @ suppressions => P,
             113: suppressions.codes @ suppressions => R,
-            115: suppressions.all @ suppressions => P,
+            115: suppressions.kind @ suppressions => P,
         )
     };
 }
@@ -220,7 +220,7 @@ fn every_column_is_listed(s: &FactStore, m: &MetricsTable) {
         exports: _,
         evidence: _,
         diags: Diags { kind: _, line: _, col: _ },
-        suppressions: Suppressions { line: _, codes: _, all: _ },
+        suppressions: Suppressions { line: _, codes: _, kind: _ },
         // The extractor's private scratch. New tables are caught by `TableBases` below.
         ..
     } = s;

@@ -57,7 +57,7 @@
 //!   ├── exports     Sym           `__all__` contents                            4 B/row
 //!   ├── evidence    u32           sorted unique name hashes per file            4 B/row
 //!   ├── diags       kind u8 | line,col u32                                      9 B/row
-//!   └── suppressions line u32 | codes Run | all u8                             13 B/row
+//!   └── suppressions line u32 | codes Run | kind u8                            13 B/row
 //!   FileFacts (one per file): a Run per table + line count + flags            112 B
 //! ```
 //!
@@ -91,7 +91,8 @@
 //!   `pkg`, `mod`, `func`). Bare names are included (in addition to the design's
 //!   attributes and strings) so that a function passed as a value
 //!   (`register(handler)`) has evidence too.
-//! - Diagnostics and `# pymapper: ignore[...]` suppressions with their lines.
+//! - Diagnostics, `# pymapper: ignore[...]` suppressions and F401 `# noqa` comments with
+//!   their lines.
 
 mod build;
 mod render;
@@ -669,15 +670,27 @@ soa! {
 }
 
 soa! {
-    /// `# pymapper: ignore[...]` comments.
+    /// `# pymapper: ignore[...]` comments, and `# noqa` comments that cover F401.
     Suppressions {
-        /// Line the comment is on (it suppresses findings on that line).
+        /// Line the directive applies to (it suppresses findings on that line).
         line: u32,
-        /// File-relative run of `names`: the listed codes.
+        /// File-relative run of `names`: the listed codes ([`sup_kind::CODES`] only).
         codes: Run,
-        /// 1 for a bare `ignore` (every code).
-        all: u8,
+        /// [`sup_kind`] constant.
+        kind: u8,
     }
+}
+
+/// Kinds of [`Suppressions`] rows.
+pub mod sup_kind {
+    /// `# pymapper: ignore[CODES]`: the codes are in `codes`.
+    pub const CODES: u8 = 0;
+    /// Bare `# pymapper: ignore`: every rule.
+    pub const ALL: u8 = 1;
+    /// A bare `# noqa` or a `# noqa: ...` listing F401 (ruff's unused import): PM405 only.
+    /// Recorded on the directive's line and, when that line starts a multi-line import
+    /// statement, on the line of each name the statement imports.
+    pub const NOQA_F401: u8 = 2;
 }
 
 /// Longest name chain stored (longer chains are cut, see the builder).

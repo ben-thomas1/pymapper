@@ -3,3 +3,6 @@ module 0:<module> L1-3 b0-172
 import 0:<module> L1:24 from models.base import BaseModel as BaseModel
 import 0:<module> L2:24 from models.user import User as User
 import 0:<module> L3:27 from models.product import Product as Product
+suppress L1 noqa-F401
+suppress L2 noqa-F401
+suppress L3 noqa-F401

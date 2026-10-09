@@ -41,15 +41,27 @@ reached only through `possible` calls or when its name occurs in another file (f
 `importlib.import_module(\"pkg.plugins.x\")`); 40 for a module outside any regular package (it \
 may be run as a script) and for modules imported only from such modules.";
 
-const SYMBOL: &[ArgKind] = &[ArgKind::Symbol];
+/// Wordings of PM401-PM403 ([`USE_NEVER`], [`USE_ONLY_UNUSED`]).
+const USE: &[&str] = &["is never used", "is only used by unused code"];
+/// Wordings of PM404 ([`USE_NEVER`]: no import of the module at all, [`USE_ONLY_UNUSED`]:
+/// imported, but only by unused modules).
+const IMPORTED: &[&str] = &["is never imported", "is only imported by unused modules"];
+
+/// Phrase argument: nothing refers to the definition (no call, decorator, import or subclass;
+/// no import for a module).
+pub const USE_NEVER: u32 = 0;
+/// Phrase argument: something refers to it, but only from code that is itself unused.
+pub const USE_ONLY_UNUSED: u32 = 1;
+
+const SYMBOL_USE: &[ArgKind] = &[ArgKind::Symbol, ArgKind::Phrase(USE)];
 
 pub(super) const RULES: &[RuleDef] = &[
     RuleDef {
         code: codes::UNUSED_FUNCTION.0,
         name: "unused-function",
         summary: "Module-level or nested function that is never used",
-        message: "function `{0}` is never used",
-        args: SYMBOL,
+        message: "function `{0}` {1}",
+        args: SYMBOL_USE,
         explanation: "The function is not reachable from any root: nothing live calls it, references \
 it, re-exports it or registers it (decorator entry points, presets).\n\n\
 Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`).",
@@ -65,8 +77,8 @@ Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`)
         code: codes::UNUSED_CLASS.0,
         name: "unused-class",
         summary: "Class that is never instantiated, subclassed or referenced",
-        message: "class `{0}` is never used",
-        args: SYMBOL,
+        message: "class `{0}` {1}",
+        args: SYMBOL_USE,
         explanation: "No live code instantiates, subclasses or references the class, and no \
 entry-point rule (base class, decorator, name) marks it as used. While PM402 is enabled, its \
 methods are not reported separately unless they look less live than the class (higher \
@@ -84,8 +96,8 @@ Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`)
         code: codes::UNUSED_METHOD.0,
         name: "unused-method",
         summary: "Method of a live class that is never called",
-        message: "method `{0}` is never used",
-        args: SYMBOL,
+        message: "method `{0}` {1}",
+        args: SYMBOL_USE,
         explanation: "The class is live but this method is never called through the class, its \
 instances, `self` / `cls` / `super()`, or as an override of a live method in a base class. \
 Dunder and protocol methods are always live.\n\n\
@@ -102,8 +114,8 @@ Fix: delete it, or declare how it is used.",
         code: codes::UNUSED_MODULE.0,
         name: "unused-module",
         summary: "First-party module that nothing imports and that is not an entry point",
-        message: "module `{0}` is never imported",
-        args: SYMBOL,
+        message: "module `{0}` {1}",
+        args: &[ArgKind::Symbol, ArgKind::Phrase(IMPORTED)],
         explanation: "No first-party module imports it, it is not a script or `__main__` module, \
 not an entry point, and (in library mode) not part of the public package. Test modules are \
 usually entry points via the `pytest` preset. Packages (`__init__.py`) are never reported. \

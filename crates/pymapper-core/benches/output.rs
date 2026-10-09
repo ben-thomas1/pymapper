@@ -84,7 +84,7 @@ fn findings(n: u32, files: u32) -> Findings {
         let loc = Location::new(FileId(file), s / files + 1, 5);
         match s % 3 {
             0 => f.push(COMPLEX_FUNCTION, loc, SymbolId(s), 100, &[Arg::Symbol(SymbolId(s)), Arg::U32(17), Arg::U32(10)]),
-            1 => f.push(UNUSED_FUNCTION, loc, SymbolId(s), 85, &[Arg::Symbol(SymbolId(s))]),
+            1 => f.push(UNUSED_FUNCTION, loc, SymbolId(s), 85, &[Arg::Symbol(SymbolId(s)), Arg::Phrase(0)]),
             _ => f.push(UNUSED_IMPORT, loc, SymbolId(file), 90, &[Arg::Name(s)]),
         }
     }

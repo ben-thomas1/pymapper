@@ -675,6 +675,36 @@ def f():  # noqa: E501  # pymapper: ignore
     );
 }
 
+#[test]
+fn noqa_f401_is_recorded_on_its_line_and_import_continuations() {
+    let src = "\
+import a  # noqa
+import b  # noqa: E501
+import c  # NOQA:e501,f401
+s = '# noqa'
+from d import (  # noqa: F401
+    e, f,
+    g,  # noqa: E501
+)
+from h import (
+    i,  # noqa:F401
+    j,
+)
+";
+    // E501-only and the string are not recorded; the first line of `from d` covers `e, f`
+    // (line 6, once) and `g` (line 7).
+    check_lines(
+        src,
+        "suppress",
+        "suppress L1 noqa-F401
+         suppress L3 noqa-F401
+         suppress L5 noqa-F401
+         suppress L6 noqa-F401
+         suppress L7 noqa-F401
+         suppress L10 noqa-F401",
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Store: several files, merging, interning
 // ---------------------------------------------------------------------------------------------

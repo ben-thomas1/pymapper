@@ -20,6 +20,8 @@ pub(super) struct ModuleLevels {
     nodes: Vec<NodeId>,
     level: Vec<u8>,
     why: Vec<u8>,
+    /// Some other module imports it (live or not).
+    imported: Vec<bool>,
 }
 
 impl ModuleLevels {
@@ -36,8 +38,13 @@ impl ModuleLevels {
         self.local(v).map(|i| Why::from_u8(self.why[i]))
     }
 
+    /// Whether another module has an import edge to `v` (from live or unused code).
+    pub fn imported(&self, v: NodeId) -> bool {
+        self.local(v).is_some_and(|i| self.imported[i])
+    }
+
     pub fn heap_bytes(&self) -> usize {
-        self.nodes.capacity() * 4 + self.level.capacity() + self.why.capacity()
+        self.nodes.capacity() * 4 + self.level.capacity() + self.why.capacity() + self.imported.capacity()
     }
 }
 
@@ -131,6 +138,8 @@ impl<'a> ModuleProp<'a> {
         self.lv.run(&self.g);
         let ModGraph { imports, .. } = self.g;
         let nodes = imports.nodes().to_vec();
-        (ModuleLevels { nodes, level: self.lv.level, why: self.lv.why }, self.lv.expansions)
+        let g = imports.graph();
+        let imported = (0..nodes.len() as u32).map(|m| g.pred(m).iter().any(|&w| w != m)).collect();
+        (ModuleLevels { nodes, level: self.lv.level, why: self.lv.why, imported }, self.lv.expansions)
     }
 }

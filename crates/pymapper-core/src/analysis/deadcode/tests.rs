@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
 use crate::config::{Config, Preset};
+use crate::extract::facts::sup_kind;
 use crate::index::{Inputs, load};
 use crate::intern::Sym;
 use crate::resolve::{Attribution, resolve_calls, resolve_imports};
@@ -481,7 +482,7 @@ fn declarative_entrypoints_presets_and_scripts() {
     cfg.entrypoints.names.push(crate::config::Glob::new("keep_*").expect("glob"));
     let m = cfg.entrypoint_matcher();
     let scripts: &[&[u8]] = &[b"proj.cli:main"];
-    let opts = DeadCodeOptions::from_config(&cfg, &m, scripts);
+    let opts = DeadCodeOptions::from_config(&cfg, &m, None, scripts);
     let (dc, lines) = f.run_with(&DeadCodeOptions { mode: Mode::Auto, ..opts });
     // Scripts make `auto` application mode.
     assert!(!dc.stats().library);
@@ -492,7 +493,7 @@ fn declarative_entrypoints_presets_and_scripts() {
     assert_eq!(dc.module_level(f.node("proj.views")), Some(level::LIVE));
     // `project-scripts = false` drops the script targets.
     cfg.entrypoints.project_scripts = false;
-    let opts = DeadCodeOptions::from_config(&cfg, &m, scripts);
+    let opts = DeadCodeOptions::from_config(&cfg, &m, None, scripts);
     assert!(opts.scripts.is_empty());
 }
 
@@ -570,7 +571,11 @@ fn suppressions(ix: &Index) -> crate::rules::Suppressions {
         entries.clear();
         let view = ix.file_view(f);
         for r in ix.file_facts(f).suppressions.range() {
-            if st.all[r] != 0 {
+            if st.kind[r] == sup_kind::NOQA_F401 {
+                entries.push(crate::rules::noqa_f401(st.line[r]));
+                continue;
+            }
+            if st.kind[r] == sup_kind::ALL {
                 crate::rules::parse_codes(st.line[r], None, &mut entries, |_| {});
             }
             for &s in view.chain(st.codes[r]) {
@@ -596,7 +601,7 @@ fn engine_selection_and_suppressions() {
     let mut cfg = Config::new(Path::new("/"));
     cfg.mode = Mode::Application;
     let m = cfg.entrypoint_matcher();
-    let opts = DeadCodeOptions::from_config(&cfg, &m, &[]);
+    let opts = DeadCodeOptions::from_config(&cfg, &m, None, &[]);
     let engine = RuleEngine::new(&cfg);
     let mut out = Findings::new();
     analyse(&f.ix, &f.imp, &f.calls, &opts, &engine, &mut out);
@@ -619,6 +624,37 @@ fn engine_selection_and_suppressions() {
     let mut out = Findings::new();
     analyse(&f.ix, &f.imp, &f.calls, &opts, &engine, &mut out);
     assert!(out.iter().all(|(x, _)| x.rule == UNUSED_IMPORT) && out.len() == 2);
+}
+
+#[test]
+fn noqa_f401_suppresses_unused_imports_only() {
+    let f = fx(&[(
+        "app.py",
+        "import a1  # noqa\n\
+         import a2  # noqa: F401  registers converters\n\
+         import a3  # noqa:F401,E501\n\
+         import a4  # NOQA: f401\n\
+         import a5  # noqa: E501\n\
+         import a6; s = '# noqa'\n\
+         from m import (\n    b1,  # noqa: F401\n    b2,\n)\n\
+         from m import (  # noqa: F401\n    c1,\n    c2,\n)\n\
+         import a7  # noqa: E501  # pymapper: ignore[PM405]\n\
+         import a8  # pymapper: ignore[PM401]  # noqa\n\
+         def dead():  # noqa\n    pass\n\n\
+         if __name__ == '__main__':\n    pass\n",
+    )]);
+    let mut cfg = Config::new(Path::new("/"));
+    cfg.mode = Mode::Application;
+    let m = cfg.entrypoint_matcher();
+    let opts = DeadCodeOptions::from_config(&cfg, &m, None, &[]);
+    let engine = RuleEngine::new(&cfg);
+    let mut out = Findings::new();
+    analyse(&f.ix, &f.imp, &f.calls, &opts, &engine, &mut out);
+    engine.filter(&mut out, &suppressions(&f.ix), false, |_, _| false);
+    let left: Vec<(crate::rules::Rule, u32)> = out.iter().map(|(x, _)| (x.rule, x.loc.line)).collect();
+    // `a5` (E501 only), `a6` (noqa in a string) and `b2` (no noqa on its line or the
+    // statement's first line) are reported; a bare noqa does not hide PM401 on `dead`.
+    assert_eq!(left, [(UNUSED_FUNCTION, 17), (UNUSED_IMPORT, 5), (UNUSED_IMPORT, 6), (UNUSED_IMPORT, 9)]);
 }
 
 #[test]
@@ -679,4 +715,39 @@ fn imports_used_anywhere_in_expressions() {
     let (_, lines) = f.app();
     let imports: Vec<&String> = lines.iter().filter(|l| l.starts_with("PM405")).collect();
     assert_eq!(imports, ["PM405 app:Unused@1 100"]);
+}
+
+#[test]
+fn one_unit_resolves_like_the_whole_index() {
+    let units = crate::roots::ProjectUnits::single(Path::new("/nowhere"), None);
+    let app = fx(&[("main.py", "def dead():\n    pass\n\nif __name__ == '__main__':\n    pass\n"), ("lib.py", "def api():\n    pass\n")]);
+    for f in [corpus(), app] {
+        for mode in [Mode::Auto, Mode::Application, Mode::Library] {
+            let (a, la) = f.run_with(&DeadCodeOptions { mode, ..DeadCodeOptions::default() });
+            let (b, lb) = f.run_with(&DeadCodeOptions { mode, units: Some(&units), ..DeadCodeOptions::default() });
+            assert_eq!(la, lb, "{mode:?}");
+            assert_eq!(a.stats().library, b.stats().library, "{mode:?}");
+            assert_eq!(b.stats().units, 1);
+            assert_eq!(a.roots(), b.roots());
+        }
+    }
+}
+
+#[test]
+fn units_without_entry_points() {
+    let units = crate::roots::ProjectUnits::single(Path::new("/nowhere"), None);
+    let opts = |mode| DeadCodeOptions { mode, units: Some(&units), ..DeadCodeOptions::default() };
+    let none = fx(&[("a.py", "import b\n\ndef f():\n    b.g()\n"), ("b.py", "def g():\n    pass\n")]);
+    let (dc, _) = none.run_with(&opts(Mode::Application));
+    assert_eq!(dc.units_without_entry_points().collect::<Vec<_>>(), [0]);
+    assert!(dc.modes().forced());
+    // Library mode, or any entry point, silences it.
+    let (dc, _) = none.run_with(&opts(Mode::Library));
+    assert_eq!(dc.units_without_entry_points().count(), 0);
+    let guard = fx(&[("a.py", "def f():\n    pass\n\nif __name__ == '__main__':\n    f()\n")]);
+    let (dc, _) = guard.run_with(&opts(Mode::Application));
+    assert_eq!(dc.units_without_entry_points().count(), 0);
+    let test = fx(&[("a.py", "def f():\n    pass\n"), ("tests/test_a.py", "def test_f():\n    pass\n")]);
+    let (dc, _) = test.run_with(&opts(Mode::Application));
+    assert_eq!(dc.units_without_entry_points().count(), 0);
 }

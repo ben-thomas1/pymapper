@@ -68,6 +68,10 @@ pub struct WalkOptions {
     /// Sort the output component-wise (deterministic order). Default `true`. Costs one sort
     /// and one copy of the path bytes (a few ms for 60k files).
     pub sort: bool,
+    /// Also list the `pyproject.toml` files found below directory roots in
+    /// [`Walk::projects`] (project units, see [`crate::roots::ProjectUnits`]). Default `false`;
+    /// on for first-party code. Ignore files and excludes apply to them as to sources.
+    pub projects: bool,
 }
 
 impl Default for WalkOptions {
@@ -79,6 +83,7 @@ impl Default for WalkOptions {
             excludes: Vec::new(),
             exclude_base: None,
             sort: true,
+            projects: false,
         }
     }
 }
@@ -91,6 +96,7 @@ impl WalkOptions {
             gitignore: config.respect_gitignore,
             excludes: config.all_excludes().map(str::to_owned).collect(),
             exclude_base: Some(project_root.to_path_buf()),
+            projects: true,
             ..WalkOptions::default()
         }
     }
@@ -173,6 +179,9 @@ impl WalkStats {
 #[derive(Debug, Default)]
 pub struct Walk {
     pub files: PathList,
+    /// `pyproject.toml` files, sorted component-wise, without duplicates (only with
+    /// [`WalkOptions::projects`]).
+    pub projects: PathList,
     pub diagnostics: Vec<Diagnostic>,
     pub stats: WalkStats,
 }
@@ -378,6 +387,9 @@ fn joined_cmp(a0: &[u8], a1: &[u8], b0: &[u8], b1: &[u8]) -> Ordering {
     }
 }
 
+/// File name of a project unit's metadata ([`WalkOptions::projects`]).
+const PYPROJECT: &[u8] = crate::config::PYPROJECT_FILE.as_bytes();
+
 /// Whether a file name is a Python source or stub.
 #[inline]
 pub fn is_python(name: &[u8]) -> bool {
@@ -436,6 +448,8 @@ struct Worker {
     key: Vec<u8>,
     ex_key: Vec<u8>,
     found: Found,
+    /// Full paths of the `pyproject.toml` files found ([`WalkOptions::projects`]; rare).
+    projects: Vec<Box<[u8]>>,
     diags: Vec<Diagnostic>,
     stats: WalkStats,
 }
@@ -522,12 +536,20 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
     });
     let mut found = Vec::with_capacity(sh.workers.len() + 1);
     found.push(main.found);
-    let mut out = Walk { files: PathList::default(), diagnostics: main.diags, stats: main.stats };
+    let mut out = Walk { files: PathList::default(), projects: PathList::default(), diagnostics: main.diags, stats: main.stats };
+    let mut projects: Vec<Box<[u8]>> = Vec::new();
     for slot in sh.workers {
         let w = slot.into_inner().unwrap_or_else(PoisonError::into_inner);
         out.stats.add(&w.stats);
         out.diagnostics.extend(w.diags);
         found.push(w.found);
+        projects.extend(w.projects);
+    }
+    projects.sort_unstable_by(|a, b| path_cmp(a, b));
+    projects.dedup();
+    for p in &projects {
+        // Fewer bytes than the source paths: cannot overflow before them.
+        let _ = out.projects.push(p);
     }
     let mut prefixes: Vec<&[u8]> = sh.roots.iter().map(|r| &*r.out).collect();
     prefixes.push(b"");
@@ -824,6 +846,9 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
         match kind {
             Kind::File => {
                 if !is_python(name) {
+                    if opts.projects && name == PYPROJECT && !ignored(&mut w.key, &mut w.ex_key, name, false) {
+                        w.projects.push([&task.path[..], name].concat().into_boxed_slice());
+                    }
                     continue;
                 }
                 if ignored(&mut w.key, &mut w.ex_key, name, false) {

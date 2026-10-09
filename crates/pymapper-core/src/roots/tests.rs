@@ -1120,3 +1120,48 @@ fn distribution_metadata_edge_cases() {
     assert!(!d.is_claimed(0, b"elsewhere") && !d.is_claimed(0, b"up"));
     assert_eq!(d.record_hash(d.by_name(b"longmeta").expect("long")), crate::intern::hash_bytes(b""));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Project units
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn project_units_are_found_by_the_walk_and_files_map_to_the_nearest() {
+    let t = TempDir::new("units");
+    t.file("pyproject.toml", "[project]\nname = \"mono\"\n")
+        .file("a/pyproject.toml", "[project]\nname = \"a\"\n[project.scripts]\na = \"a.cli:main\"\n")
+        .file("a/x/pyproject.toml", "[project]\nname = \"ax\"\n")
+        .file("a-b/pyproject.toml", "not toml [")
+        .file("ignored/pyproject.toml", "[project]\nname = \"ignored\"\n")
+        .file(".gitignore", "ignored/\n")
+        .file("a/m.py", "");
+    let w = crate::walk::walk(&[t.path()], &crate::walk::WalkOptions { projects: true, ..Default::default() });
+    assert_eq!(w.files.len(), 1);
+    assert_eq!(w.projects.len(), 4, "{:?}", w.projects.iter().collect::<Vec<_>>());
+    let root_info = parse_pyproject("[project]\nname = \"mono\"\n[project.scripts]\nm = \"m:main\"\n");
+    let (units, diags) = ProjectUnits::discover(t.path(), root_info.as_ref(), &w.projects);
+    assert_eq!(units.len(), 4);
+    // The invalid one is reported but still a unit.
+    assert_eq!(diags.len(), 1);
+    assert!(diags[0].path.ends_with("a-b/pyproject.toml"));
+    let unit = |rel: &str| {
+        let d = t.p(rel);
+        units.dir(units.unit_of_dir(d.as_os_str().as_encoded_bytes())).strip_prefix(t.path()).expect("under root").to_owned()
+    };
+    assert_eq!(unit("a"), Path::new("a"));
+    assert_eq!(unit("a/pkg/sub"), Path::new("a"));
+    assert_eq!(unit("a/x/y"), Path::new("a/x"));
+    // `a-b` sorts between `a` and `a/...` bytewise: still its own unit, and `a-c` is the root's.
+    assert_eq!(unit("a-b/q"), Path::new("a-b"));
+    assert_eq!(unit("a-c"), Path::new(""));
+    assert_eq!(unit("ignored"), Path::new(""));
+    assert_eq!(units.unit_of_dir(b"/elsewhere/entirely"), 0);
+    // Scripts per unit; the root keeps its parsed ones.
+    assert_eq!(units.scripts(0), ["m:main"]);
+    let a = units.unit_of_dir(t.p("a").as_os_str().as_encoded_bytes());
+    assert_eq!(units.scripts(a), ["a.cli:main"]);
+    assert_eq!(units.all_scripts().len(), 2);
+    // Without the walk's list: one unit.
+    let single = ProjectUnits::single(t.path(), None);
+    assert_eq!((single.len(), single.unit_of_dir(t.p("a").as_os_str().as_encoded_bytes())), (1, 0));
+}

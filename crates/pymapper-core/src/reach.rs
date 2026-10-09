@@ -19,8 +19,9 @@
 //! `<module>` pseudo-scopes (module-level code runs on import), `__main__` guards and
 //! `__main__` modules, tests, declarative entrypoints ([`EntrypointMatcher`](crate::config::EntrypointMatcher): decorator, base
 //! class and name globs, presets included), `[project.scripts]` / `entry_points.txt` targets,
-//! and in library mode the public API ([`is_library`] resolves `mode = "auto"`). Only files of
-//! the selected origins contribute (first-party by default). See [`RootOptions`].
+//! and in library mode the public API ([`is_library`] resolves `mode = "auto"` for the whole
+//! index, [`FileModes`] per project unit). Only files of the selected origins contribute
+//! (first-party by default). See [`RootOptions`].
 //!
 //! # Forward reachability
 //!
@@ -100,5 +101,5 @@ mod tests;
 
 pub use bits::{BitSet, Ones};
 pub use forward::{Reached, forward};
-pub use roots::{RootOptions, RootSet, is_library, root_kind, roots};
+pub use roots::{FileModes, RootOptions, RootSet, is_library, root_kind, roots};
 pub use sizes::{DEFAULT_PRECISION, ReachSizes, SizeMode, SizeStats, Weights, reach_sizes};

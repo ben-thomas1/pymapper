@@ -1485,7 +1485,8 @@ mod tests {
                 Target::Deadcode => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "deadcode.roots",
-                    "deadcode.graph", "deadcode.propagate", "deadcode.evidence", "deadcode.findings",
+                    "deadcode.graph", "deadcode.propagate", "deadcode.evidence", "deadcode.referenced",
+                    "deadcode.findings",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]

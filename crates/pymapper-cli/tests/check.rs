@@ -530,3 +530,121 @@ fn project_scripts_are_entrypoints() {
     let r = p.check(&["--select", "PM401", "--confidence", "0"]);
     assert!(!r.stdout.contains("app.cli:main"), "{}", r.stdout);
 }
+
+/// A monorepo of two units: `apps/app` declares a script (application mode), `libs/lib` does
+/// not (library mode). The root unit has no Python files.
+fn monorepo(name: &str) -> Project {
+    let p = Project::new(name);
+    p.file("pyproject.toml", "[project]\nname = \"mono\"\n\n[tool.pymapper]\nsrc = [\"apps/app\", \"libs/lib\"]\n")
+        .file("apps/app/pyproject.toml", "[project]\nname = \"app\"\n\n[project.scripts]\napp = \"appkg.cli:main\"\n")
+        .file("apps/app/appkg/__init__.py", "")
+        .file("apps/app/appkg/cli.py", "from appkg.helpers import used\n\n\ndef main():\n    return used()\n")
+        .file("apps/app/appkg/helpers.py", "def used():\n    return 1\n\n\ndef orphan():\n    return 2\n")
+        .file("libs/lib/pyproject.toml", "[project]\nname = \"lib\"\n")
+        .file("libs/lib/libkg/__init__.py", "")
+        .file("libs/lib/libkg/api.py", "def public_tool():\n    return 1\n\n\ndef _private_unused():\n    return 2\n");
+    p
+}
+
+#[test]
+fn auto_mode_is_decided_per_project_unit() {
+    let p = monorepo("units");
+    let r = p.check(&["--no-cache", "--stats", "--select", "PM4"]);
+    r.expect_code(1);
+    let f = r.findings().join("\n");
+    // Application unit: what the script does not reach is dead.
+    assert!(f.contains("appkg.helpers:orphan"), "{f}");
+    // Library unit: public names are API; private unused ones are still dead.
+    assert!(!f.contains("public_tool"), "{f}");
+    assert!(f.contains("libkg.api:_private_unused"), "{f}");
+    assert_eq!(stat(&r.stderr, "deadcode.units"), 2, "{}", r.stderr);
+    assert_eq!(stat(&r.stderr, "deadcode.library"), 1);
+    assert_eq!(stat(&r.stderr, "deadcode.application"), 1);
+    assert!(!r.stderr.contains("no entry points"), "{}", r.stderr);
+    // Forcing application mode reports the library's public function too (PM404 off, so the
+    // module finding does not contain it), and warns about the unit that has no entry point
+    // (only that one).
+    let r = p.check(&["--no-cache", "--stats", "--select", "PM401", "--mode", "application"]);
+    let f = r.findings().join("\n");
+    assert!(f.contains("libkg.api:public_tool") && f.contains("appkg.helpers:orphan"), "{f}");
+    assert_eq!(stat(&r.stderr, "deadcode.application"), 2);
+    let warnings: Vec<&str> = r.stderr.lines().filter(|l| l.contains("no entry points found")).collect();
+    assert_eq!(warnings.len(), 1, "{}", r.stderr);
+    assert!(warnings[0].ends_with("every definition will look unused. Consider --mode library or [entrypoints]"), "{}", warnings[0]);
+    assert!(warnings[0].contains(&format!("in {} (", p.path("libs/lib").display())), "{}", warnings[0]);
+    // Forcing library mode keeps the app's public helper.
+    let r = p.check(&["--no-cache", "--select", "PM4", "--mode", "library"]);
+    assert!(!r.stdout.contains("orphan") && !r.stdout.contains("public_tool"), "{}", r.stdout);
+}
+
+#[test]
+fn single_package_mode_is_unchanged() {
+    // Application (a `__main__` guard): the unreachable public function is reported.
+    let p = simple_project("single-app");
+    p.file("app/extra.py", "def lonely():\n    return 1\n");
+    let r = p.check(&["--no-cache", "--stats", "--select", "PM401", "--confidence", "0"]);
+    assert!(r.stdout.contains("app.extra:lonely"), "{}", r.stdout);
+    assert_eq!((stat(&r.stderr, "deadcode.units"), stat(&r.stderr, "deadcode.application")), (1, 1));
+    let forced = p.check(&["--no-cache", "--select", "PM401", "--confidence", "0", "--mode", "application"]);
+    assert_eq!(forced.stdout, r.stdout);
+    // Library (no guard, no scripts): public functions are API, at any confidence.
+    let p = Project::new("single-lib");
+    p.file("pyproject.toml", "[project]\nname = \"lib\"\n")
+        .file("lib/__init__.py", "")
+        .file("lib/api.py", "def tool():\n    return 1\n");
+    let r = p.check(&["--no-cache", "--stats", "--select", "PM4"]);
+    r.expect_code(0);
+    assert_eq!((stat(&r.stderr, "deadcode.units"), stat(&r.stderr, "deadcode.library")), (1, 1));
+    let forced = p.check(&["--no-cache", "--select", "PM4", "--mode", "library"]);
+    assert_eq!(forced.stdout, r.stdout);
+}
+
+#[test]
+fn entrypoint_names_cover_a_whole_module() {
+    // Functions a framework loads by name from YAML: `module:*` keeps them all.
+    let p = monorepo("ep-names");
+    let args = ["--no-cache", "--select", "PM401", "--mode", "application"];
+    let r = p.check(&args);
+    assert!(r.stdout.contains("libkg.api:public_tool"), "{}", r.stdout);
+    let r = p.check(&[&args[..], &["--set", "entrypoints.names = [\"libkg.api:*\"]"]].concat());
+    assert!(!r.stdout.contains("libkg.api:"), "{}", r.stdout);
+    assert!(r.stdout.contains("appkg.helpers:orphan"), "{}", r.stdout);
+}
+
+#[test]
+fn application_mode_without_entry_points_warns_and_words_findings() {
+    let p = Project::new("no-entry");
+    p.file("pyproject.toml", "[project]\nname = \"pkg\"\n")
+        .file("pkg/__init__.py", "")
+        .file("pkg/a.py", "from pkg import b\n\n\ndef f():\n    return b.g()\n")
+        .file("pkg/b.py", "def g():\n    return 1\n")
+        .file("pkg/c.py", "def h():\n    return 2\n");
+    // `b` occurs in `a` (name evidence): confidence 50, shown with `--confidence 0`.
+    let r = p.check(&["--no-cache", "--select", "PM404", "--mode", "application", "--confidence", "0"]);
+    r.expect_code(1);
+    let f = r.findings().join("\n");
+    assert!(f.contains("module `pkg.a` is never imported"), "{f}");
+    assert!(f.contains("module `pkg.b` is only imported by unused modules"), "{f}");
+    assert!(f.contains("module `pkg.c` is never imported"), "{f}");
+    // One warning, for the project (the mode is forced and no unit has an entry point).
+    let warnings: Vec<&str> = r.stderr.lines().filter(|l| l.contains("no entry points found")).collect();
+    assert_eq!(warnings, [format!(
+        "pymapper: warning: no entry points found in {} (no __main__ guard, [project.scripts], entrypoint rules or tests); \
+         every definition will look unused. Consider --mode library or [entrypoints]",
+        p.path("").display().to_string().trim_end_matches('/')
+    )]);
+    let r = p.check(&["--no-cache", "--select", "PM401", "--mode", "application", "--confidence", "0"]);
+    let f = r.findings().join("\n");
+    assert!(f.contains("function `pkg.a:f` is never used"), "{f}");
+    assert!(f.contains("function `pkg.b:g` is only used by unused code"), "{f}");
+    assert!(f.contains("function `pkg.c:h` is never used"), "{f}");
+    // An entry point silences the warning; what it reaches is live, the rest keeps its wording.
+    p.file("pkg/a.py", "from pkg import b\n\n\ndef f():\n    return b.g()\n\n\nif __name__ == '__main__':\n    f()\n");
+    let r = p.check(&["--no-cache", "--select", "PM401,PM404", "--mode", "application"]);
+    assert!(!r.stderr.contains("no entry points"), "{}", r.stderr);
+    assert_eq!(r.findings().len(), 1, "{}", r.stdout);
+    assert!(r.stdout.contains("module `pkg.c` is never imported"), "{}", r.stdout);
+    // Library mode: no warning either.
+    let r = p.check(&["--no-cache", "--mode", "library"]);
+    assert!(!r.stderr.contains("no entry points"), "{}", r.stderr);
+}

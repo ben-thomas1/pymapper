@@ -75,7 +75,7 @@ fn sample() -> Findings {
     f.push(UNUSED_IMPORT, loc(1, 3, 1), s(1), 90, &[Arg::Name(2)]);
     f.push(IMPORT_CYCLE, NOFILE, SymbolId::NONE, 100, &[Arg::Symbol(s(1)), Arg::Symbol(s(4)), Arg::Symbol(s(1))]);
     f.push(LOW_MAINTAINABILITY, loc(1, 20, 5), s(2), 100, &[Arg::Symbol(s(2)), Arg::F32(12.25), Arg::F32(20.0)]);
-    f.push(UNUSED_FUNCTION, loc(2, 1, 1), s(5), 60, &[Arg::Symbol(s(5))]);
+    f.push(UNUSED_FUNCTION, loc(2, 1, 1), s(5), 60, &[Arg::Symbol(s(5)), Arg::Phrase(0)]);
     f.push(UNDECLARED_DEPENDENCY, loc(3, 2, 0), SymbolId::NONE, 100, &[Arg::Name(0), Arg::Name(1)]);
     f.push(LONG_MODULE, loc(4, 0, 0), s(3), 100, &[Arg::Symbol(s(3)), Arg::U32(900), Arg::U32(500)]);
     f.push(UNUSED_DEPENDENCY, NOFILE, SymbolId::NONE, 100, &[Arg::Name(4)]);
@@ -245,7 +245,7 @@ fn empty_report_in_every_format() {
 #[test]
 fn footer_can_be_disabled() {
     let mut f = Findings::new();
-    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0))]);
+    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
     let opts = Options { footer: false, ..Options::new(OutputFormat::Concise) };
     assert_eq!(
         render(&f, &ctx(), &opts, &summary()),
@@ -256,16 +256,16 @@ fn footer_can_be_disabled() {
 #[test]
 fn footer_counts() {
     let mut f = Findings::new();
-    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0))]);
-    f.push(UNUSED_FUNCTION, loc(0, 9, 1), SymbolId(0), 50, &[Arg::Symbol(SymbolId(0))]);
-    f.push(UNUSED_FUNCTION, loc(1, 9, 1), SymbolId(1), 100, &[Arg::Symbol(SymbolId(1))]);
+    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
+    f.push(UNUSED_FUNCTION, loc(0, 9, 1), SymbolId(0), 50, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
+    f.push(UNUSED_FUNCTION, loc(1, 9, 1), SymbolId(1), 100, &[Arg::Symbol(SymbolId(1)), Arg::Phrase(0)]);
     let c = ctx();
     let sum = Summary { files_checked: 0, filter: FilterStats { below_confidence: 1, ..FilterStats::default() } };
     let out = render(&f, &c, &Options::new(OutputFormat::Concise), &sum);
     // The one below-gate finding is shown, so none is hidden.
     assert!(out.ends_with("Found 3 findings in 2 files (1 below min-confidence 80).\n"), "{out}");
     let mut one = Findings::new();
-    one.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0))]);
+    one.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
     let sum = Summary { files_checked: 1, filter: FilterStats { below_confidence: 4, ..FilterStats::default() } };
     let out = render(&one, &c, &Options::new(OutputFormat::Concise), &sum);
     assert!(out.ends_with("Found 1 finding in 1 file (1 file checked).\nNot shown: 4 below min-confidence.\n"), "{out}");
@@ -276,7 +276,7 @@ fn exit_status_follows_the_gate() {
     let mut f = Findings::new();
     let c = ctx();
     assert_eq!(Report::new(&f, &c).exit_status(80), ExitStatus::Clean);
-    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 79, &[Arg::Symbol(SymbolId(0))]);
+    f.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 79, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
     let r = Report::new(&f, &c);
     assert_eq!(r.exit_status(80), ExitStatus::Clean);
     assert_eq!(r.exit_status(79), ExitStatus::Findings);
@@ -648,7 +648,7 @@ fn index_context_renders_paths_ids_and_names() {
     }];
 
     let mut f = Findings::new();
-    f.push(UNUSED_METHOD, Location::new(FileId(file), 4, 5), SymbolId(run), 90, &[Arg::Symbol(SymbolId(run))]);
+    f.push(UNUSED_METHOD, Location::new(FileId(file), 4, 5), SymbolId(run), 90, &[Arg::Symbol(SymbolId(run)), Arg::Phrase(0)]);
     f.push(FORBIDDEN_IMPORT, Location::new(FileId(file), 1, 1), SymbolId(run), 100, &[
         Arg::Symbol(SymbolId(run)),
         Arg::Name(os),

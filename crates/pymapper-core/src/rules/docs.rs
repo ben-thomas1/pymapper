@@ -100,7 +100,13 @@ fn message_shape(def: &RuleDef) -> String {
     for piece in pieces(def.message) {
         match piece {
             Ok(Piece::Lit(s)) => out.push_str(&s.replace('`', "")),
-            Ok(Piece::Arg(i)) => out.push_str(kind_name(def.args.get(i))),
+            Ok(Piece::Arg(i)) => match def.args.get(i) {
+                // The wordings, `[a | b]`.
+                Some(ArgKind::Phrase(words)) => {
+                    let _ = write!(out, "[{}]", words.join(" | "));
+                }
+                kind => out.push_str(kind_name(kind)),
+            },
             Ok(Piece::Rest(i, sep)) => {
                 let k = kind_name(def.args.get(i));
                 let _ = write!(out, "{k}{sep}{k}{sep}...");
@@ -119,6 +125,7 @@ fn kind_name(kind: Option<&ArgKind>) -> &'static str {
         Some(ArgKind::Name) => "<name>",
         Some(ArgKind::File) => "<file>",
         Some(ArgKind::Contract) => "<contract>",
+        Some(ArgKind::Phrase(_)) => "<phrase>",
         None => "?",
     }
 }
@@ -173,6 +180,10 @@ the import line, or line 1 for module-level findings). Codes are comma-separated
 `# pymapper: ignore[PM101, PM4]` suppresses PM101 and every dead-code rule on that line; a bare
 `# pymapper: ignore` suppresses every rule. Malformed codes (`E501`, `pm101`) are reported as
 diagnostics and ignored.
+
+Ruff's `# noqa` is honoured for unused imports only: a bare `# noqa` or a `# noqa` listing F401
+(`# noqa: F401`, `# noqa:F401,E501`, any case) suppresses PM405 on its line, or on every name of
+a multi-line import when it is on the statement's first line. Other codes suppress nothing.
 
 ## Categories
 
