@@ -20,14 +20,24 @@ pub mod codes {
     pub const UNUSED_IMPORT: Rule = Rule(405);
 }
 
-/// Shared confidence documentation for the reachability-based rules.
-const REACH_CONFIDENCE: &str = "Starts at 100 for a definition with no incoming reference at all and \
-is lowered by weaker evidence of use: a call resolved only with `possible` confidence (e.g. the \
-unique-method-name fallback), the name appearing as an attribute or identifier-like string \
-elsewhere (`analysis.name-fallback`), dynamic access in the defining module (`getattr`, \
-`globals()`, `__getattr__`), or a public name in library mode. Coverage evidence (when \
-configured) raises it for never-executed code and suppresses executed code. `check` reports \
-findings at or above `min-confidence` (default 80).";
+/// Shared confidence documentation for the reachability-based rules (scoring table:
+/// `analysis::deadcode`).
+const REACH_CONFIDENCE: &str = "100 minus how live the definition looks. 100 when nothing \
+reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 \
+when it carries an unknown decorator that may register it; 50 for a method of a class with a base \
+that is not loaded (it may override a framework method); 70 when the defining module uses \
+dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`); in application mode 30 when \
+listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API. \
+With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports \
+it or its module, 50 when it occurs anywhere else (attribute, identifier, string). Callees inherit \
+the confidence of such callers. `check` reports findings at or above `min-confidence` (default \
+80).";
+
+/// Confidence documentation of PM404.
+const MODULE_CONFIDENCE: &str = "100 when no live module imports it or calls into it; 50 when \
+reached only through `possible` calls or when its name occurs in another file (for instance \
+`importlib.import_module(\"pkg.plugins.x\")`); 40 for a module outside any regular package (it \
+may be run as a script) and for modules imported only from such modules.";
 
 const SYMBOL: &[ArgKind] = &[ArgKind::Symbol];
 
@@ -101,7 +111,7 @@ Fix: delete the module, or declare it as an entry point.",
         gate: Gate::None,
         pass: Pass::DeadCode,
         thresholds: &[],
-        confidence: ConfidenceModel::Scored(REACH_CONFIDENCE),
+        confidence: ConfidenceModel::Scored(MODULE_CONFIDENCE),
     },
     RuleDef {
         code: codes::UNUSED_IMPORT.0,
@@ -110,9 +120,9 @@ Fix: delete the module, or declare it as an entry point.",
         message: "`{0}` is imported but never used",
         args: &[ArgKind::Name],
         explanation: "Unlike per-file linters, this also follows re-exports: an import counts as used \
-when another module imports the name from here. Imports listed in `__all__`, `__init__.py` \
-re-exports in library mode, `try`/`except ImportError` fallbacks and side-effect imports of \
-known packages are kept.\n\n\
+when another module imports the name from here or accesses it as `module.name`. Imports listed \
+in `__all__`, the `import x as x` idiom, `__init__.py` re-exports in library mode, star \
+imports, `__future__` imports and `try`/`except ImportError` fallbacks are kept.\n\n\
 Fix: delete the import, or add the name to `__all__` if it is part of the module's API.",
         severity: Severity::Warning,
         default_enabled: true,
@@ -121,8 +131,11 @@ Fix: delete the import, or add the name to `__all__` if it is part of the module
         pass: Pass::DeadCode,
         thresholds: &[],
         confidence: ConfidenceModel::Scored(
-            "100 when no module uses the name; lowered when the importing module uses dynamic access \
-(`globals()`, `__getattr__`, star re-exports) or the name is referenced as a string.",
-        ),
+            "100 when no module uses the name, minus: 30 when the importing module uses dynamic \
+access (`globals()`, `vars()`, `getattr`, `__getattr__`), 40 when another module star-imports it \
+(public names), 40 when another file mentions both the name and the module without importing it \
+(string references such as `mock.patch(\"pkg.mod.name\")`), 30 for an application-mode \
+`__init__.py` re-export, 20 in an `__init__.py` (20 more for a submodule import, often made for \
+its side effects), 10 for a conditional import."),
     },
 ];

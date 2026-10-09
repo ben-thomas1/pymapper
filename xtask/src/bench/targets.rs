@@ -114,6 +114,14 @@ pub enum Target {
     /// thresholds. Peak RSS includes the index, the import resolution, the resolved calls and
     /// the call graph.
     Coupling,
+    /// `calls`, then the dead-code analysis (`pymapper_core::analysis::deadcode`) with every
+    /// PM4xx rule and the name fallback: roots (`deadcode.roots`), the call/override graphs and
+    /// seeds (`deadcode.graph`), the level propagation of defs and modules
+    /// (`deadcode.propagate`), the evidence scan plus the second propagation
+    /// (`deadcode.evidence`) and the findings (`deadcode.findings`). Application mode with no
+    /// entrypoints (the fewest roots: the most candidates); `XTASK_DEADCODE_MODE=library` for
+    /// library mode. Peak RSS includes the index, the import resolution and the resolved calls.
+    Deadcode,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -151,6 +159,7 @@ impl Target {
             Target::Rollup => "rollup",
             Target::Hotspot => "hotspot",
             Target::Coupling => "coupling",
+            Target::Deadcode => "deadcode",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -485,6 +494,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Rollup => rollup_target(root)?,
         Target::Hotspot => hotspot_target(root)?,
         Target::Coupling => coupling_target(root)?,
+        Target::Deadcode => deadcode_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -1090,6 +1100,59 @@ fn coupling_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     Ok((stats, counters))
 }
 
+/// `deadcode`: [`calls_target`]'s pipeline, then `pymapper_core::analysis::deadcode`.
+fn deadcode_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
+    use pymapper_core::analysis::deadcode::{self, DeadCodeOptions};
+    use pymapper_core::config::{Config, Mode};
+    use pymapper_core::index::{Inputs, load};
+    use pymapper_core::resolve::{Attribution, resolve_calls, resolve_imports};
+    use pymapper_core::roots::Origin;
+    use pymapper_core::rules::{Findings, RuleEngine};
+    let mode = match std::env::var("XTASK_DEADCODE_MODE").as_deref() {
+        Ok("library") => Mode::Library,
+        Ok("auto") => Mode::Auto,
+        _ => Mode::Application,
+    };
+    let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
+    let inputs = Inputs::from_root_dir(root, &files, Origin::FirstParty, b"corpus");
+    drop(files);
+    let ix = load(inputs);
+    let imp = resolve_imports(&ix, &Attribution::new());
+    let calls = resolve_calls(&ix, &imp);
+    let config = Config::new(root);
+    let engine = RuleEngine::new(&config);
+    let opts = DeadCodeOptions { mode, ..DeadCodeOptions::default() };
+    let mut out = Findings::new();
+    let dc = deadcode::analyse(&ix, &imp, &calls, &opts, &engine, &mut out);
+    let s = ix.stats();
+    let stats = ReadStats { files: s.files, bytes: s.bytes, errors: walk_errors + ix.read_errors().len() as u64 };
+    let st = dc.stats();
+    let gate = engine.min_confidence();
+    let reported = out.iter().filter(|(f, _)| f.confidence >= gate).count() as u64;
+    let mut counters = vec![
+        ("loc".to_owned(), s.lines),
+        ("nodes".to_owned(), u64::from(ix.node_count())),
+        ("library".to_owned(), u64::from(st.library)),
+        ("roots".to_owned(), st.roots),
+        ("live".to_owned(), st.live),
+        ("candidates".to_owned(), st.candidates),
+        ("probes".to_owned(), st.probes),
+        ("expansions".to_owned(), st.expansions),
+    ];
+    for (i, n) in st.findings.iter().enumerate() {
+        counters.push((format!("pm40{}", i + 1), *n));
+    }
+    counters.extend([
+        ("findings".to_owned(), out.len() as u64),
+        ("reported".to_owned(), reported),
+        ("graph_kb".to_owned(), st.graph_bytes / 1000),
+        ("deadcode_kb".to_owned(), dc.heap_bytes() as u64 / 1000),
+        ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
+        ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
+    ]);
+    Ok((stats, counters))
+}
+
 /// Cache directory of the `load-cold` / `load-warm` targets for `root`.
 fn bench_cache_dir(root: &Path) -> std::path::PathBuf {
     let h = pymapper_core::intern::hash_bytes(root.as_os_str().as_encoded_bytes());
@@ -1343,6 +1406,7 @@ mod tests {
             Target::Rollup,
             Target::Hotspot,
             Target::Coupling,
+            Target::Deadcode,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -1417,6 +1481,11 @@ mod tests {
                 Target::Coupling => &[
                     "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "graph.build", "coupling.analyse",
+                ],
+                Target::Deadcode => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "deadcode.roots",
+                    "deadcode.graph", "deadcode.propagate", "deadcode.evidence", "deadcode.findings",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
@@ -1524,6 +1593,12 @@ mod tests {
             } else if target == Target::Coupling {
                 assert_eq!(counter("modules"), Some(rec.files));
                 assert!(counter("import_edges").is_some() && counter("findings").is_some());
+            } else if target == Target::Deadcode {
+                assert!(counter("roots").unwrap() > 0);
+                assert!(counter("live").unwrap() >= counter("roots").unwrap());
+                let rules: u64 = (1..=5).map(|i| counter(&format!("pm40{i}")).unwrap()).sum();
+                assert_eq!(counter("findings"), Some(rules));
+                assert!(counter("reported") <= counter("findings"));
             } else if matches!(target, Target::LoadCold | Target::LoadWarm) {
                 assert_eq!(counter("segments"), Some(1));
                 if target == Target::LoadCold {

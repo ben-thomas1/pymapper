@@ -527,3 +527,29 @@ fn engine_selection_and_suppressions() {
     analyse(&f.ix, &f.imp, &f.calls, &opts, &engine, &mut out);
     assert!(out.iter().all(|(x, _)| x.rule == UNUSED_IMPORT) && out.len() == 2);
 }
+
+#[test]
+fn name_groups_link_through_module_imports() {
+    let handler = "def handler():\n    pass\n";
+    let f = fx(&[
+        ("m1.py", handler),
+        ("m2.py", handler),
+        ("m3.py", handler),
+        ("m4.py", handler),
+        // One module edge against a group of four: the module-edge side is iterated.
+        ("user.py", "import m2\n\nif __name__ == '__main__':\n    print(m2.handler)\n"),
+        // Four module edges: the member side is iterated.
+        ("user2.py", "import m3, x1, x2, x3\n\nif __name__ == '__main__':\n    print(m3.handler, x1, x2, x3)\n"),
+        ("x1.py", ""),
+        ("x2.py", ""),
+        ("x3.py", ""),
+    ]);
+    let (dc, lines) = f.app();
+    let lvl = |q: &str| (dc.level(f.node(q)), dc.why(f.node(q)));
+    assert_eq!(lvl("m2:handler"), (level::LINKED, Why::Linked));
+    assert_eq!(lvl("m3:handler"), (level::LINKED, Why::Linked));
+    // Mentioned only by files that do not import them.
+    assert_eq!(lvl("m1:handler"), (level::EVIDENCE, Why::Evidence));
+    assert_eq!(lvl("m4:handler"), (level::EVIDENCE, Why::Evidence));
+    assert_eq!(lines.iter().filter(|l| l.starts_with("PM404")).count(), 2, "{lines:?}");
+}

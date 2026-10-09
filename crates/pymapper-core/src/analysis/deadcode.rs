@@ -78,11 +78,11 @@
 //! (`mod.name`). Kept without a finding: star imports, `__future__`, `try`/`except ImportError`
 //! fallbacks, names in `__all__`, the `import x as x` idiom and, in library mode, every
 //! re-export of a package `__init__`. Confidence starts at 100 and loses: 30 when the file uses
-//! dynamic access, 40 when another module star-imports the file (public names), 40 when the
-//! name occurs in another file that does not import the module (string references such as
-//! `mock.patch("pkg.mod.name")`), 30 for an application-mode `__init__` re-export, 20 in an
-//! `__init__` file plus 20 more for a submodule import there (often for side effects), 10 for a
-//! conditional import.
+//! dynamic access, 40 when another module star-imports the file (public names), 40 when both
+//! the name and the module's name occur in another file that does not import the module
+//! (string references such as `mock.patch("pkg.mod.name")`), 30 for an application-mode
+//! `__init__` re-export, 20 in an `__init__` file plus 20 more for a submodule import there
+//! (often for side effects), 10 for a conditional import outside `if TYPE_CHECKING:`.
 //!
 //! # What is reported
 //!
