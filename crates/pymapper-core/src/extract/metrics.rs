@@ -467,7 +467,7 @@ impl DocTrack {
     fn confirm(&mut self, src: &[u8]) {
         if self.state == DOC_CAND {
             let text = src.get(self.from as usize..self.last_end as usize).unwrap_or(&[]);
-            let breaks = text.iter().enumerate().filter(|&(i, &b)| b == b'\n' || (b == b'\r' && text.get(i + 1) != Some(&b'\n'))).count();
+            let breaks = super::lines::count_line_ends(text);
             self.lines = breaks as u32 + 1;
         }
         self.state = DOC_DONE;

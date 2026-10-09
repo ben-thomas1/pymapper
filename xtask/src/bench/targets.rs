@@ -1512,10 +1512,15 @@ mod tests {
                 assert_eq!(counter("metric_rows"), if target == Target::MetricsMem { counter("defs") } else { None });
             } else if matches!(target, Target::ParseOnly | Target::ExtractMem) {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
-                assert_eq!(names, [
+                let mut want = vec![
                     "loc", "defs", "calls", "diagnostics", "parse_cpu_ms", "parse_MBps_core", "facts_B_per_kLOC",
-                    "metrics_B_per_kLOC", "facts_kb", "metrics_kb", "intern_kb"
-                ]);
+                    "metrics_B_per_kLOC", "facts_kb", "metrics_kb", "intern_kb",
+                ];
+                // `extract-mem` adds the in-process CPU counters where the OS has them (macOS).
+                if target == Target::ExtractMem && super::super::rusage::cpu_counters().is_some() {
+                    want.extend(["parse_kinstr", "parse_kcycles"]);
+                }
+                assert_eq!(names, want);
                 assert!(counter("loc").unwrap() > rec.files);
                 assert!(counter("defs").unwrap() > 0 && counter("calls").unwrap() > 0);
                 assert!(counter("facts_B_per_kLOC").unwrap() > 1000);

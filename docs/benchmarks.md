@@ -53,7 +53,7 @@ entered, and symlinks are not followed.
 | `lex-mem`    | `walk`, `load`, `lex`  | lexer micro benchmark: load the corpus into memory, then lex it from memory (no I/O in `lex`) |
 | `parse-mem`  | `walk`, `load`, `parse` | parser micro benchmark: like `lex-mem`, but runs `pymapper_core::extract::parse` with a counting visitor (counters `defs`, `calls`, `diagnostics`, `parse_cpu_ms`, `parse_MBps_core`) |
 | `metrics-mem` | `walk`, `load`, `parse` | like `parse-mem`, with `pymapper_core::extract::metrics` teed into the same pass; every metrics row is kept to the end (extra counters `metric_rows`, `metrics_kb` = heap of the kept tables) |
-| `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage |
+| `extract-mem` | `walk`, `load`, `parse` | the extractor micro benchmark: `parse-only`'s front end from memory (no I/O in `parse`). `XTASK_EXTRACT_STAGES=parse\|metrics\|facts-spans\|facts\|all` runs only part of it, to cost each stage; `XTASK_EXTRACT_REPS=N` repeats the in-memory pass N times and reports the fastest (peak RSS then holds two passes). On macOS it adds `parse_kinstr` / `parse_kcycles`: instructions and CPU cycles (thousands) of the fastest-cycles pass, from `proc_pid_rusage` |
 | `roots`      | `discover`, `module-map` | `pymapper_core::roots::discover` (deps + stdlib on) for the venv enclosing the corpus, then the module map over every `RECORD` file |
 | `load`       | `walk`, `load.extract`, `load.merge`, `load.build` | end-to-end `pymapper_core::index::load` with the corpus root as the import root of one group: parallel read -> extract -> intern -> drop source, in-order merge into the global tables, interner merge + remap, hierarchy. The whole index is alive at the end (counters `loc`, `defs`, `nodes`, `strings`, `index_kb` = `Index::heap_bytes`, `facts_kb`, `metrics_kb`, `intern_kb`, `index_B_per_kLOC`) |
 | `dupes`      | `walk`, `load.*`, `dupes.seeds`, `dupes.relex`, `dupes.extend`, `dupes.locate`, `dupes.group` | `load` with duplication fingerprints taken in the extraction pass (`index::load_with`, every file first-party), then `analysis::dupes::analyse` with the default thresholds. Counters: `load_peak_rss_mb` (peak RSS before matching: matching's own cost is the run's peak minus this), `fingerprints`, `fingerprints_kb`, `seeds` (= `extended` + `covered` + `unverified`: seeds that failed verification, e.g. after a parse error shifted the token stream), `tokens_cached` (tokens held while extending, 2 B each), `files_reread`, `bytes_reread_kb`, `pairs`, `copies`, `groups`, `duplicated_lines`, `findings` |
@@ -413,6 +413,109 @@ rows (-0.34). Interner bytes are per thread here (each worker interns its own fi
 global merge (S2.3) deduplicates them. Peak RSS of `parse-only` above the retained rows is the
 per-thread tables' doubling slack and the interners; `extract-mem` also holds the whole
 corpus in memory.
+
+### Front-end speed (S1.6)
+
+Goal: move the front end towards 400 MB/s/core without changing any result. 14-core M4 Pro,
+release build. The machine was shared with other worktrees the whole time (load average 5 to
+40), so single-process best-of-N wall times moved by up to 10% between runs. Every increment
+was therefore judged by an **interleaved A/B**: the old and new binaries alternate, each run
+does `XTASK_EXTRACT_REPS=10` in-memory passes of `extract-mem -j 1` on the stdlib, and the
+fewest CPU cycles of one pass (`parse_kcycles`, from `proc_pid_rusage`) is compared. Cycles
+only count time on a core and repeat within about 0.3%. A change was kept only if it saved
+more than about 1.5% of cycles.
+
+Equivalence: `xtask facts-digest DIR` hashes, for every file, each fact column (evidence
+hashes too), the rendered facts with resolved names, the interned strings, every metrics row,
+and the lexer's token streams (parser mode and trivia mode) plus suppressions. The digests
+were taken before this step and still match after every kept change:
+
+| corpus | files  | digest             |
+|--------|--------|--------------------|
+| tests/corpus | 29 | `db9257ab008f0205` |
+| stdlib | 1,043  | `e9853f071b4e8acf` |
+| venv   | 60,529 | `cdbc7e7ace54d802` |
+
+`diff-ruff` still finds 0 mismatches on tests/corpus, the stdlib and the venv (927,531 defs,
+901,139 imports, 3,496,134 calls). `xtask fuzz` ran 300 s per target with 0 crashes and 0
+hangs: `extract` 291M inputs, `lex` 1,096M inputs.
+
+Increments (stdlib, `extract-mem -j 1`; cycles and instructions of one pass, change against
+the build before the step; "kept" means the change is in the tree):
+
+| increment | cycles | instructions | verdict |
+|-----------|--------|--------------|---------|
+| line index: the parser's forward line cursor (a SWAR newline count per query) replaced by a line-start index built in one NEON pass (SSE2 on x86_64, SWAR elsewhere) in a per-thread reused buffer; lookups walk from the last line, binary search for long jumps | -2.1% | -3.9% | kept |
+| docstring line count by a vectorised `\n` count instead of a byte loop with lookahead; suppression lines from the parser's line index instead of a second byte-wise scan in the fact builder | -1.7% | -2.5% | kept |
+| string evidence: one table-driven pass classifies a literal as path / type expression / other, instead of up to four (`:` count, split + validate, `[`/`\|` search, charset check) | -1.7% | -2.1% | kept |
+| hash each identifier once: the lexer hashes every `Name`, the parser passes the hash with `token`/`name`/`attribute` events, the fact builder reuses it for evidence and (through a 64-slot cache by token start) for interning, metrics for Halstead operands | +1.1% | +6.6% | dropped |
+| same, hashed lazily by the parser on first use instead of in the lexer | +2.5% | +7.3% | dropped |
+| line index filled branch-free (count first, two unconditional stores per 16-byte block) | -0.2% | +5.3% | dropped |
+| parser ring refill (`fill`) out of line | +1.4% | +5.3% | dropped |
+| metrics: operator kinds gathered in one register-like field and folded into the frame on scope changes; docstring tracking skipped by a flag | -0.4% | -1.1% | dropped |
+| interner: 512-entry direct-mapped cache of recent strings in front of the index | +0.6% (venv +0.6%) | -0.2% | dropped |
+| lexer: one "special work" flag instead of testing four state fields per token | -1.3% (parse stage +2.0%) | -3.7% | dropped (not consistent) |
+
+Hashing once did not pay. Most likely it was never three hashes in practice: both visitors
+are inlined into the parser through `Tee`, so the evidence and Halstead hashes of the same
+token can be one computation already (not verified in the assembly), and hashing every `Name`
+up front (lookahead rescans included) plus carrying the hash through the ring buffer and the
+events costs more than the interner hashes it saves. SIMD went only where the profile showed a hot scalar
+loop: the newline scan. The identifier scan (`skip_ident`, about 1.2% of samples), the
+indentation scan (`line_start`, 1.5%) and comment/string body searches (`find2`/`find4`,
+under 1%) are already word-at-a-time and too short per call (identifiers average under 8
+bytes) for 16-byte vectors to help.
+
+Before / after (interleaved A/B of the binaries before and after this step, `extract-mem -j 1`,
+in-memory passes; best of 6 alternations for the stdlib `all` row, 2 for the stage rows and
+the venv):
+
+| corpus | stages (`XTASK_EXTRACT_STAGES`) | cycles before | cycles after | change | cycles/byte after | MB/s/core before -> after |
+|--------|-----------------|---------|---------|-------|-------|-----------|
+| stdlib | `parse` (lexer + parser) | 167.1M | 158.8M | -4.9% | 10.07 | 369 -> 384 |
+| stdlib | `metrics`        | 231.9M  | 219.0M  | -5.6% | 13.89 | 272 -> 291 |
+| stdlib | `facts-spans`    | 220.5M  | 209.4M  | -5.0% | 13.28 | 285 -> 300 |
+| stdlib | `facts`          | 245.2M  | 230.5M  | -6.0% | 14.62 | 256 -> 271 |
+| stdlib | `all` (the real front end) | 305.4M | 286.5M | -6.2% | 18.17 | 206 -> 222 |
+| venv   | `all`            | 12,098M | 11,307M | -6.5% | 17.39 | 200 -> 225 |
+
+Instructions dropped 8.3% (stdlib) and 10.1% (venv). The clock ran at about 3.9-4.0 GHz, so
+400 MB/s/core needs about 9.8 cycles per byte; the lexer + parser with a no-op visitor alone
+take 10.1.
+
+Final numbers, standard `cargo xtask bench` (single-process best of N; load average 14 to 33
+during these runs, so they are lower than the A/B passes above):
+
+| corpus | target        | threads | walk    | load / read+parse | parse phase | total   | MB/s/core | peak RSS MB |
+|--------|---------------|---------|---------|-------------------|-------------|---------|-----------|-------------|
+| stdlib | `extract-mem` | 1       | 16.3ms  | 99.1ms            | 78.6ms      | 195.8ms | 197       | 36.2        |
+| stdlib | `extract-mem` | 14      | 5.92ms  | 33.8ms            | 9.54ms      | 50.2ms  | 134       | 40.3        |
+| stdlib | `parse-only`  | 1       | 12.7ms  | 166.4ms           | -           | 179.1ms | 186       | 20.1        |
+| stdlib | `parse-only`  | 14      | 6.12ms  | 45.3ms            | -           | 51.7ms  | 166       | 23.6        |
+| venv   | `extract-mem` | 1       | 2.67s   | 5.47s             | 2.76s       | 11.21s  | 229       | 991.8       |
+| venv   | `extract-mem` | 14      | 993ms   | 2.21s             | 292ms       | 3.62s   | 130       | 1240.0      |
+| venv   | `parse-only`  | 1       | 2.71s   | 9.12s             | -           | 12.03s  | 200       | 351.1       |
+| venv   | `parse-only`  | 14      | 891ms   | 2.81s             | -           | 3.70s   | 167       | 452.1       |
+
+On 14 threads the venv front end extracts 650 MB in 292ms from memory (2.2 GB/s); MB/s/core
+there averages performance and efficiency cores competing with the other worktrees' load.
+
+Memory is unchanged: facts are identical, so retained bytes per LOC stay at 13.75 (facts) +
+1.47 (metrics) = 15.22 on the venv and 12.96 + 1.51 = 14.46 on the stdlib. (The 14.95 B/LOC
+of S1.5 above predates the `doc_lines` metrics column, 4 B per def, added after S1.5.) The
+line index adds one per-thread buffer of 4 bytes per line of the largest file seen (buffers
+above 4 MiB are not kept).
+
+Verdict: **400 MB/s/core is not reached.** The full front end went from about 206 to 222
+MB/s/core on the stdlib and from 200 to 225 on the venv (6-6.5% fewer cycles, 8-10% fewer
+instructions). The profile stays flat: lexer about a quarter, parser and expression scanner
+about a fifth, metrics about 12%, interning about 7% (mostly probing a large per-thread
+table), fact building about 10%; no function is above 6% self time. Reaching 400 would need
+the whole extractor to cost what the lexer + parser alone cost today (about 10 cycles per
+byte, 77 per token), i.e. halving the per-token work of every stage, not removing a hot
+spot. Candidates for a redesign rather than tuning: a lexer emitting tokens into a small
+batch buffer that the parser consumes without per-token state reloads, and folding the
+metrics token pass into the parser's own dispatch.
 
 ### Load / index (S2.3)
 
