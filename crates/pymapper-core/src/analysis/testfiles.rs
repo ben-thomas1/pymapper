@@ -8,7 +8,10 @@
 //! A file is test code when
 //!
 //! - a component of its dotted module name is `tests`, `test` or `testing` (a directory named
-//!   so anywhere below its import root: `pkg/tests/util.py` is `pkg.tests.util`), or
+//!   so anywhere below its import root: `pkg/tests/util.py` is `pkg.tests.util`), or one of the
+//!   private spellings `_tests` / `_testing` (test-support packages shipped inside a library,
+//!   such as `pandas/_testing`: assertion helpers and fixtures, long and repetitive by nature),
+//!   or
 //! - its module's last component starts with `test_`, ends with `_test` or is `conftest`, or
 //! - its file name is `test_*.py`, `*_test.py` or `conftest.py` (also `.pyi`; this catches
 //!   files whose module name is unknown, e.g. not importable).
@@ -28,7 +31,7 @@ pub fn is_test_module(module: &[u8]) -> bool {
     }
     let mut last: &[u8] = &[];
     for part in module.split(|&b| b == b'.') {
-        if matches!(part, b"tests" | b"test" | b"testing") {
+        if matches!(part, b"tests" | b"test" | b"testing" | b"_tests" | b"_testing") {
             return true;
         }
         last = part;
@@ -85,6 +88,10 @@ mod tests {
             "pkg.sub.test.deep.helpers",
             "pkg.testing",
             "pkg.testing.fixtures",
+            "pandas._testing",
+            "pandas._testing.asserters",
+            "pkg._tests",
+            "pkg._tests.helpers",
             "test_x",
             "pkg.test_x",
             "pkg.x_test",
@@ -93,7 +100,7 @@ mod tests {
         ] {
             assert!(is_test_module(m.as_bytes()), "{m}");
         }
-        for m in ["", "pkg", "pkg.latest", "pkg.contest", "pkg.testx", "pkg.attest", "pkg.tests_helpers", "pkg._testing", "testament.x"] {
+        for m in ["", "pkg", "pkg.latest", "pkg.contest", "pkg.testx", "pkg.attest", "pkg.tests_helpers", "pkg.__testing", "pkg.testing_", "pkg._testing_utils", "testament.x"] {
             assert!(!is_test_module(m.as_bytes()), "{m}");
         }
     }

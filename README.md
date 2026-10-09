@@ -170,7 +170,7 @@ Each rule's explanation, thresholds, cost class and confidence model:
 [`docs/rules.md`](docs/rules.md).
 
 Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`tests/`, `test/`,
-`testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
+`testing/`, `_tests/`, `_testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
 `analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
 tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
 structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a
@@ -181,7 +181,9 @@ route pymapper knows; lower values mean only weak evidence (a matching attribute
 string elsewhere, dynamic dispatch) keeps it possibly alive. `check` reports findings at or
 above `min-confidence`. Each finding names its evidence: the message says "is never used"
 only when nothing refers to the symbol, and the reasons are listed, e.g.
-`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON.
+`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON. Every
+first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
+is test-only API, reported below the gate as `used-only-in-tests`.
 
 ## Performance
 
