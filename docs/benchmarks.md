@@ -929,3 +929,75 @@ github 143 B per finding; the baseline file is 80 B per key.
 - **Memory**: 4 B per finding for the order plus the distinct paths. A loaded baseline holds
   one byte pool with every key (rule + length-prefixed id and detail parts) plus about 32 B
   per key for the entry, the hash index and the collision chain.
+
+### Check (S4.5)
+
+The whole `pymapper check` (config, roots, walk, cached load, import resolution, every analysis
+with a default rule, filter, sort, output to a file), measured with `pymapper check --stats`
+(phases on stderr) under `/usr/bin/time -l`. 14-core Apple M4 Pro, release build (fat LTO),
+warm OS file cache, nothing else running. "Cold" = cache directory removed before the run
+(every file read, parsed and written to the cache); "warm" = every file a cache hit, best of 3.
+Default rules (PM1xx-PM4xx; `analysis.dupes` off unless noted), default confidence gate.
+
+Corpora:
+
+- `stdlib`: CPython 3.13.5 `lib/python3.13` checked as a first-party project (630 files,
+  305k LOC, 11 MB; this install has no `test` package and its `site-packages` is excluded).
+- `venv`: the `aiml-lectio` venv's site-packages (60,529 files, 17.0M LOC, 650 MB) checked as
+  first-party code through a config with `src` = `paths` = the site-packages directory,
+  `exclude = ["__pycache__"]`, `respect-gitignore = false`: every analysis runs over 17M LOC.
+- `lectio`: the `aiml-lectio` project itself (1,803 first-party files, 478k LOC), alone and with
+  `--deps --stdlib` (63,017 files, 17.8M LOC: third-party code from `RECORD` lists, the stdlib
+  walked; analyses report first-party code only).
+
+| corpus | flags | run | total | walk | load.extract | resolve.calls | deadcode | findings | peak RSS |
+|--------|-------|-----|-------|------|--------------|---------------|----------|----------|----------|
+| stdlib | | cold | 54-66 ms | 12 ms | 31 ms | 1.3 ms | 5.8 ms | 2,035 | 22-23 MB |
+| stdlib | | warm | 19.1 ms | 1.5 ms | 3.1 ms | 1.1 ms | 6.2 ms | 2,035 | 25-28 MB |
+| stdlib | `-j 1` | cold | 208 ms | | 166 ms | | 5.6 ms | 2,035 | 18.6 MB |
+| stdlib | `-j 1` | warm | 23.3 ms | | 4.5 ms | | 5.8 ms | 2,035 | 18.1 MB |
+| stdlib | dupes | cold | 77.6 ms | | 28.9 ms | | | 3,332 | 29.9 MB |
+| stdlib | dupes | warm | 48.4 ms | | 4.0 ms | | | 3,332 | 31-32 MB |
+| venv | | cold | 3.42 s | 764 ms | 1.95 s | 51 ms | 243 ms | 141,138 | 696 MB |
+| venv | | warm | 1.50 s | 863 ms | 116 ms | 46 ms | 244 ms | 141,138 | 742-752 MB |
+| venv | dupes | cold | 6.84 s | | 2.15 s | | | 353,298 | 975 MB |
+| venv | dupes | warm | 4.65 s | | 123 ms | | | 353,298 | 0.99-1.04 GB |
+| lectio | | cold | 161 ms | | | | | 1,489 | 42.5 MB |
+| lectio | | warm | 102 ms | 40 ms | 4.6 ms | 1.3 ms | 3.6 ms | 1,489 | 45-49 MB |
+| lectio | `--deps --stdlib` | cold | 2.75 s | 39 ms | 2.16 s | 48 ms | 91 ms | 1,510 | 685 MB |
+| lectio | `--deps --stdlib` | warm | 516 ms | 44 ms | 91 ms | 50 ms | 89 ms | 1,510 | 679-700 MB |
+| lectio | `--deps --stdlib -j 4` | cold | 3.55 s | | 2.89 s | | | 1,510 | 659 MB |
+| lectio | `--deps --stdlib -j 4` | warm | 656 ms | | 113 ms | | | 1,510 | 640-643 MB |
+| lectio | `--deps --stdlib -j 1` | cold | 10.4 s | | 8.97 s | | | 1,510 | 632 MB |
+| lectio | `--deps --stdlib -j 1` | warm | 1.36 s | | 260 ms | | | 1,510 | 602-605 MB |
+
+Wall clock (`real`) is within 10-40 ms of `total`, except on the first run of a freshly built
+binary, which pays about 0.4-0.6 s of macOS executable verification before `main` (seen as
+`real` 0.47-0.68 s against a 61-66 ms `total` on the stdlib); the table excludes it.
+dupes phases: `dupes` = matching (seeds, re-lex, extend, locate, group); fingerprinting is
+inside `load.extract`. Cache sizes after a cold run: stdlib 4.6 MB (5.3 MB with fingerprints),
+venv 269 MB (305 MB with fingerprints), lectio `--deps --stdlib` 284 MB in 493 segments.
+
+Observations:
+
+- **Where warm time goes.** On the 17M-LOC venv as first-party code, the walk is 58% of a warm
+  run (0.86 s; the walker alone measures 0.78 s on this tree, see "Walker (S2.2)") and dead code
+  16%; the cached load is 0.19 s (60k `stat`s plus copying facts out of one 280 MB segment).
+  Real projects walk only first-party code: with `--deps --stdlib` the same 17.8M LOC load
+  warm in 0.52 s, of which the walk is 44 ms.
+- **Roots discovery** costs 42-68 ms on lectio whether or not `--deps` is on (every
+  `*.dist-info` of the venv is parsed for attribution): 40% of the 102 ms warm first-party-only
+  run. Follow-up for the roots step: cache the distribution table per site-packages, or parse
+  `RECORD` lazily when third-party analysis is off.
+- **Analyses** are small next to loading: on 17M LOC hotspot 14 ms, cycles 13 ms, coupling
+  7 ms, call resolution 45 ms, dead code 244 ms (of which name evidence 130 ms), output of
+  141k findings 33 ms.
+- **Memory.** Peak RSS is the index (facts, metrics, interner) plus the analysis tables; warm
+  runs peak 40-60 MB higher than cold ones on the venv because the touched pages of the mapped
+  cache segment count as resident while facts are copied out. One thread saves only 10-15%
+  of peak memory against 14 threads.
+- **Thread scaling** (lectio `--deps --stdlib`): cold 10.4 s / 3.55 s / 2.75 s at 1 / 4 / 14
+  threads (extraction-bound: 2.9x at 4 threads, 3.8x at 14, flattening like the walker and the
+  cache benchmarks); warm 1.36 s / 0.66 s / 0.52 s.
+- **dupes** is the only gated analysis: +20-30 ms on 305k LOC, +3.1 s matching and +0.2 s of
+  fingerprinting on 17M LOC (peak 0.70 -> 1.0 GB), which is why it is off by default.
