@@ -17,6 +17,7 @@ mod glob;
 mod parse;
 mod presets;
 mod suggest;
+pub(crate) use suggest::closest;
 mod write;
 
 #[cfg(test)]
@@ -26,6 +27,7 @@ use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 pub use glob::{Glob, GlobError, GlobSet};
 pub use presets::Preset;
@@ -450,6 +452,9 @@ pub struct EntrypointConfig {
     /// Globs over symbol names: patterns without `.`/`:` match the simple name, others match the
     /// qualified id (`pkg.mod:Class.method`).
     pub names: Vec<Glob>,
+    /// Globs over a method's decorators (dotted name as written) or its name: matching methods
+    /// are live with their class, without being roots themselves (pydantic validators).
+    pub members: Vec<Glob>,
     /// Treat `[project.scripts]`, `[project.gui-scripts]`, `[project.entry-points]` and
     /// `entry_points.txt` targets as roots.
     pub project_scripts: bool,
@@ -457,9 +462,12 @@ pub struct EntrypointConfig {
 
 impl Default for EntrypointConfig {
     fn default() -> Self {
-        EntrypointConfig { decorators: Vec::new(), bases: Vec::new(), names: Vec::new(), project_scripts: true }
+        EntrypointConfig { decorators: Vec::new(), bases: Vec::new(), names: Vec::new(), members: Vec::new(), project_scripts: true }
     }
 }
+
+/// Default `analysis.config-evidence-globs`.
+pub const DEFAULT_CONFIG_EVIDENCE_GLOBS: &[&str] = &["*.yaml", "*.yml", "*.toml", "*.json", "*.cfg", "*.ini"];
 
 /// Analysis toggles; the expensive ones are off by default (design: Performance rules).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,11 +479,19 @@ pub struct AnalysisConfig {
     /// Dead code: treat a name referenced anywhere (attribute names, identifier-like string
     /// literals) as possibly live, lowering confidence instead of reporting it (O(n)).
     pub name_fallback: bool,
+    /// Dead code: identifiers and dotted / `module:attr` paths in non-Python config files
+    /// (YAML, TOML, JSON, ...) of the first-party walk are evidence (O(config bytes), cached).
+    pub config_evidence: bool,
+    /// File-name globs of the config files read for `config_evidence`.
+    pub config_evidence_globs: Vec<String>,
     /// Call resolution: link a call on an unknown receiver to the only method with that name
     /// (confidence `possible`) (O(calls)).
     pub unique_method_fallback: bool,
     /// Count `if TYPE_CHECKING:` imports when finding import cycles.
     pub type_checking_cycles: bool,
+    /// Report complexity (PM1xx), coupling (PM2xx) and duplication (PM5xx) findings in test
+    /// code too (see [`crate::analysis::testfiles`]); off by default.
+    pub include_tests_in_metrics: bool,
     /// coverage.py JSON report used as dead-code evidence (P6).
     pub coverage: Option<PathBuf>,
 }
@@ -486,8 +502,11 @@ impl Default for AnalysisConfig {
             dupes: false,
             exact_reachability: false,
             name_fallback: true,
+            config_evidence: true,
+            config_evidence_globs: DEFAULT_CONFIG_EVIDENCE_GLOBS.iter().map(|g| (*g).to_owned()).collect(),
             unique_method_fallback: true,
             type_checking_cycles: false,
+            include_tests_in_metrics: false,
             coverage: None,
         }
     }
@@ -644,31 +663,63 @@ impl Config {
 
     /// User entrypoint rules merged with the enabled presets, compiled for matching. Infallible:
     /// user patterns are [`Glob`]s and preset patterns are static and tested.
+    ///
+    /// A user `names` pattern with a `.` but no `:` names a module (`pkg.cli`, `*.views`): it
+    /// matches the module and every symbol in it, as if `pkg.cli:*` were also given.
     pub fn entrypoint_matcher(&self) -> EntrypointMatcher {
         let ep = &self.entrypoints;
         let mut decorators: Vec<Glob> = Vec::new();
         let mut bases: Vec<Glob> = Vec::new();
         let mut names: Vec<Glob> = Vec::new();
+        let mut members: Vec<Glob> = Vec::new();
         for preset in &self.presets {
             let rules = preset.rules();
             decorators.extend(rules.decorators.iter().map(|p| presets::glob(p)));
             bases.extend(rules.bases.iter().map(|p| presets::glob(p)));
             names.extend(rules.names.iter().map(|p| presets::glob(p)));
+            members.extend(rules.members.iter().map(|p| presets::glob(p)));
+        }
+        let mut user: Vec<UserPattern> = Vec::new();
+        for g in &ep.decorators {
+            user.push(UserPattern { key: "decorators", kind: PatternKind::Decorator, text: g.clone(), globs: vec![g.clone()] });
+        }
+        for g in &ep.bases {
+            user.push(UserPattern { key: "bases", kind: PatternKind::Base, text: g.clone(), globs: vec![g.clone()] });
+        }
+        for g in &ep.members {
+            user.push(UserPattern { key: "members", kind: PatternKind::Member, text: g.clone(), globs: vec![g.clone()] });
+        }
+        let mut user_names: Vec<Glob> = Vec::new();
+        for g in &ep.names {
+            let mut globs = vec![g.clone()];
+            if is_module_pattern(g)
+                && let Ok(all) = Glob::new(&format!("{g}:*"))
+            {
+                globs.push(all);
+            }
+            user_names.extend(globs.iter().cloned());
+            let kind = if is_qualified_pattern(g) { PatternKind::Qualified } else { PatternKind::Simple };
+            user.push(UserPattern { key: "names", kind, text: g.clone(), globs });
         }
         let mut simple: Vec<&Glob> = Vec::new();
         let mut qualified: Vec<&Glob> = Vec::new();
-        for g in names.iter().chain(&ep.names) {
+        for g in names.iter().chain(&user_names) {
             if is_qualified_pattern(g) {
                 qualified.push(g);
             } else {
                 simple.push(g);
             }
         }
+        let used = user.iter().map(|_| AtomicBool::new(false)).collect();
         EntrypointMatcher {
             decorators: GlobSet::from_globs(decorators.iter().chain(&ep.decorators)),
             bases: GlobSet::from_globs(bases.iter().chain(&ep.bases)),
             names: GlobSet::from_globs(simple),
             qualnames: GlobSet::from_globs(qualified),
+            members: GlobSet::from_globs(members.iter().chain(&ep.members)),
+            unused: AtomicUsize::new(user.len()),
+            user,
+            used,
         }
     }
 
@@ -683,26 +734,111 @@ fn is_qualified_pattern(g: &Glob) -> bool {
     g.as_str().contains(['.', ':'])
 }
 
-/// Compiled entrypoint rules: user rules plus presets. All lookups are allocation-free.
+/// A dotted name pattern without `:` names a module (see [`Config::entrypoint_matcher`]).
+fn is_module_pattern(g: &Glob) -> bool {
+    g.as_str().contains('.') && !g.as_str().contains(':')
+}
+
+/// What an entrypoint pattern is matched against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatternKind {
+    Decorator,
+    Base,
+    Simple,
+    Qualified,
+    Member,
+}
+
+/// A user entrypoint pattern (presets excluded), tracked for "matches nothing" warnings.
 #[derive(Clone, Debug)]
+struct UserPattern {
+    /// `[entrypoints]` key: `decorators`, `bases`, `members` or `names`.
+    key: &'static str,
+    kind: PatternKind,
+    /// As written.
+    text: Glob,
+    /// What it matches: the pattern, plus `pattern:*` for a module name.
+    globs: Vec<Glob>,
+}
+
+/// Compiled entrypoint rules: user rules plus presets. All lookups are allocation-free. The
+/// matcher also records which user patterns matched something
+/// ([`unmatched`](Self::unmatched)); that costs nothing on misses and stops entirely once every
+/// user pattern has matched. Safe to share across threads.
+#[derive(Debug)]
 pub struct EntrypointMatcher {
     decorators: GlobSet,
     bases: GlobSet,
     names: GlobSet,
     qualnames: GlobSet,
+    members: GlobSet,
+    user: Vec<UserPattern>,
+    /// Parallel to `user`: matched at least once.
+    used: Box<[AtomicBool]>,
+    /// Number of `used` flags still false.
+    unused: AtomicUsize,
+}
+
+impl Clone for EntrypointMatcher {
+    fn clone(&self) -> Self {
+        EntrypointMatcher {
+            decorators: self.decorators.clone(),
+            bases: self.bases.clone(),
+            names: self.names.clone(),
+            qualnames: self.qualnames.clone(),
+            members: self.members.clone(),
+            user: self.user.clone(),
+            used: self.used.iter().map(|u| AtomicBool::new(u.load(AtomicOrdering::Relaxed))).collect(),
+            unused: AtomicUsize::new(self.unused.load(AtomicOrdering::Relaxed)),
+        }
+    }
 }
 
 impl EntrypointMatcher {
+    /// Records that `text` matched a set of `kind` (called on hits only).
+    #[inline]
+    fn hit(&self, kind: PatternKind, text: &[u8]) -> bool {
+        if self.unused.load(AtomicOrdering::Relaxed) != 0 {
+            self.mark(kind, text);
+        }
+        true
+    }
+
+    #[cold]
+    fn mark(&self, kind: PatternKind, text: &[u8]) {
+        for (p, used) in self.user.iter().zip(&self.used) {
+            if p.kind == kind
+                && !used.load(AtomicOrdering::Relaxed)
+                && p.globs.iter().any(|g| g.is_match(text))
+                && !used.swap(true, AtomicOrdering::Relaxed)
+            {
+                self.unused.fetch_sub(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// User patterns (presets excluded) that have not matched anything so far, as
+    /// `(entrypoints key, pattern)`, in config order. Ask after the analysis that used the
+    /// matcher.
+    pub fn unmatched(&self) -> impl Iterator<Item = (&'static str, &Glob)> + '_ {
+        let all_used = self.unused.load(AtomicOrdering::Relaxed) == 0;
+        self.user
+            .iter()
+            .zip(&self.used)
+            .filter(move |(_, u)| !all_used && !u.load(AtomicOrdering::Relaxed))
+            .map(|(p, _)| (p.key, &p.text))
+    }
+
     /// Whether a decorator (dotted name as written, no call arguments) marks a root.
     #[inline]
     pub fn decorator(&self, dotted: &[u8]) -> bool {
-        self.decorators.is_match(dotted)
+        self.decorators.is_match(dotted) && self.hit(PatternKind::Decorator, dotted)
     }
 
     /// Whether subclasses of this fully qualified base class are roots.
     #[inline]
     pub fn base(&self, qualified: &[u8]) -> bool {
-        self.bases.is_match(qualified)
+        self.bases.is_match(qualified) && self.hit(PatternKind::Base, qualified)
     }
 
     /// Whether a symbol is a root by name: `simple` is its bare name, `qualified` its stable id
@@ -710,19 +846,20 @@ impl EntrypointMatcher {
     /// false, prefer [`simple_name`](Self::simple_name) and skip building the qualified id.
     #[inline]
     pub fn name(&self, simple: &[u8], qualified: &[u8]) -> bool {
-        self.simple_name(simple) || self.qualified_name(qualified)
+        // Both sides run, so every matching pattern is recorded as used.
+        self.simple_name(simple) | self.qualified_name(qualified)
     }
 
     /// Whether a bare symbol name matches a name pattern without `.`/`:`.
     #[inline]
     pub fn simple_name(&self, simple: &[u8]) -> bool {
-        self.names.is_match(simple)
+        self.names.is_match(simple) && self.hit(PatternKind::Simple, simple)
     }
 
     /// Whether a qualified id (`pkg.mod:Class.method`) matches a name pattern with `.`/`:`.
     #[inline]
     pub fn qualified_name(&self, qualified: &[u8]) -> bool {
-        self.qualnames.is_match(qualified)
+        self.qualnames.is_match(qualified) && self.hit(PatternKind::Qualified, qualified)
     }
 
     /// Whether any name pattern matches qualified ids. When false, callers need not build
@@ -736,6 +873,19 @@ impl EntrypointMatcher {
     #[inline]
     pub fn has_bases(&self) -> bool {
         !self.bases.is_empty()
+    }
+
+    /// Whether a method's decorator (dotted name) or name matches a member pattern: live with
+    /// its class.
+    #[inline]
+    pub fn member(&self, text: &[u8]) -> bool {
+        self.members.is_match(text) && self.hit(PatternKind::Member, text)
+    }
+
+    /// Whether any member pattern is configured.
+    #[inline]
+    pub fn has_members(&self) -> bool {
+        !self.members.is_empty()
     }
 
     /// Whether no rule is configured at all (callers can skip matching).
@@ -756,8 +906,10 @@ pub enum ConfigFileKind {
 /// Where the project is and which files configured it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
-    /// Project root: the config file's directory, else the nearest directory with a
-    /// `pyproject.toml`, else the start directory. Globs are relative to it.
+    /// Project root: the config file's directory, else
+    /// [`find_project_root`](crate::roots::find_project_root) from the start directory (uv
+    /// workspace root, else top of the git repository, else the outermost directory with a
+    /// `pyproject.toml` / `pymapper.toml`, else the start directory). Globs are relative to it.
     pub root: PathBuf,
     /// The config file applied, if any.
     pub config_file: Option<(PathBuf, ConfigFileKind)>,
@@ -775,6 +927,12 @@ pub struct Loaded {
     pub config: Config,
     /// Non-fatal notes (e.g. a shadowed `[tool.pymapper]`), for the CLI to print.
     pub warnings: Vec<String>,
+    /// The positional paths ([`Overrides::paths`]), absolute and normalised: the files and
+    /// directories whose findings are reported. Empty = report everything. The whole project
+    /// is analysed either way; a positional path inside the project root that the configured
+    /// `paths` do not cover is appended to [`Config::paths`] so that it is loaded. Paths outside
+    /// the project root are not loaded (their files would have no module names).
+    pub scope: Vec<PathBuf>,
 }
 
 /// Command-line overrides, applied on top of the config file. Relative paths are resolved
@@ -785,8 +943,9 @@ pub struct Overrides {
     pub config_file: Option<PathBuf>,
     /// Ignore all config files (defaults + overrides only).
     pub isolated: bool,
-    /// Paths to analyse; when non-empty they replace `paths`, and the first one is where config
-    /// discovery starts (else the working directory).
+    /// Paths to report on (see [`Loaded::scope`]); the first one is where config and project
+    /// root discovery start (else the working directory). They never change the project root
+    /// or module names: the whole project is analysed and findings are filtered to them.
     pub paths: Vec<PathBuf>,
     /// TOML fragments in `pymapper.toml` syntax, e.g. `thresholds.max-mccabe = 12`; applied in
     /// order, before the typed flags below.
@@ -921,7 +1080,10 @@ pub fn load(cwd: &Path, overrides: &Overrides) -> Result<Loaded, ConfigError> {
 
     let root = match &found {
         Some((file, _, _)) => file.parent().map_or_else(|| start_dir.clone(), Path::to_path_buf),
-        None => nearest_pyproject_dir(&start_dir).unwrap_or_else(|| start_dir.clone()),
+        None => {
+            let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| normalize(Path::new(&h)));
+            crate::roots::find_project_root(&start_dir, home.as_deref())
+        }
     };
     let mut config = Config::new(&root);
     let mut diagnostics = Vec::new();
@@ -950,10 +1112,10 @@ pub fn load(cwd: &Path, overrides: &Overrides) -> Result<Loaded, ConfigError> {
         return Err(ConfigError::Invalid { diagnostics });
     }
 
-    apply_typed(&mut config, cwd, overrides);
+    apply_typed(&mut config, &root, cwd, overrides);
     let pyproject = Some(root.join(PYPROJECT_FILE)).filter(|p| p.is_file());
     let project = Project { root, config_file: found.map(|(file, kind, _)| (file, kind)), pyproject };
-    Ok(Loaded { project, config, warnings })
+    Ok(Loaded { project, config, warnings, scope: scope(cwd, overrides) })
 }
 
 /// Parses and validates `text` as a standalone `pymapper.toml` on top of `Config::new(base)`.
@@ -980,9 +1142,13 @@ fn check_overrides(o: &Overrides) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn apply_typed(config: &mut Config, cwd: &Path, o: &Overrides) {
-    if !o.paths.is_empty() {
-        config.paths = o.paths.iter().map(|p| normalize(&cwd.join(p))).collect();
+fn apply_typed(config: &mut Config, root: &Path, cwd: &Path, o: &Overrides) {
+    // Positional paths filter the report; those inside the project are loaded too when the
+    // configured `paths` do not cover them (see `Loaded::scope`).
+    for p in scope(cwd, o) {
+        if p.starts_with(root) && !config.paths.iter().any(|c| p.starts_with(c)) {
+            config.paths.push(p);
+        }
     }
     if let Some(select) = &o.select {
         config.rules.select = Some(select.clone());
@@ -1022,6 +1188,18 @@ fn apply_typed(config: &mut Config, cwd: &Path, o: &Overrides) {
     if let Some(v) = o.threads {
         config.threads = v;
     }
+}
+
+/// The positional paths of `o`, absolute and normalised, deduplicated in order.
+fn scope(cwd: &Path, o: &Overrides) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(o.paths.len());
+    for p in &o.paths {
+        let p = normalize(&cwd.join(p));
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn read(path: &Path) -> Result<String, ConfigError> {
@@ -1064,10 +1242,6 @@ fn pyproject_has_section(text: &str) -> bool {
         return false;
     }
     parse::pyproject_has_section(text).unwrap_or(true)
-}
-
-fn nearest_pyproject_dir(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find(|d| d.join(PYPROJECT_FILE).is_file()).map(Path::to_path_buf)
 }
 
 /// Lexically normalises a path: drops `.` components and folds `..` into the preceding normal

@@ -489,15 +489,7 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
         }
     }
 
-    // Longest prefix first, except that an editable hook root that names its files exactly as
-    // an enclosing first-party root does (setuptools' `proj -> <root>/src/proj` mapping) yields
-    // to it: the project's own files keep first-party priority whichever way it is installed.
-    let yields = |r: &ImportRoot| r.kind == RootKind::EditableHook && roots.iter().any(|o| hook_redundant(r, o));
-    let mut match_order: Vec<RootId> = (0..roots.len() as RootId).collect();
-    match_order.sort_by_cached_key(|&i| {
-        let r = &roots[i as usize];
-        (yields(r), std::cmp::Reverse(path_bytes(&r.path).len()), i)
-    });
+    let match_order = match_order(&roots);
     Roots {
         project_root,
         roots,
@@ -514,7 +506,48 @@ pub fn discover(project_root: &Path, opts: &RootOptions) -> Roots {
     }
 }
 
+/// Root ids in [`Roots::classify`] order: longest prefix first, except that an editable hook
+/// root that names its files exactly as an enclosing first-party root does (setuptools' `proj ->
+/// <root>/src/proj` mapping) yields to it: the project's own files keep first-party priority
+/// whichever way it is installed.
+fn match_order(roots: &[ImportRoot]) -> Vec<RootId> {
+    let yields = |r: &ImportRoot| r.kind == RootKind::EditableHook && roots.iter().any(|o| hook_redundant(r, o));
+    let mut order: Vec<RootId> = (0..roots.len() as RootId).collect();
+    order.sort_by_cached_key(|&i| {
+        let r = &roots[i as usize];
+        (yields(r), std::cmp::Reverse(path_bytes(&r.path).len()), i)
+    });
+    order
+}
+
 impl Roots {
+    /// Adds the first-party import roots of the project units found by the walk
+    /// ([`ProjectUnits::import_dirs`]), after the existing first-party roots and before the
+    /// project root. A unit that an editable install in the venv already maps (a first-party
+    /// `.pth` / hook root at or below the unit directory) is left to it: the install is what
+    /// Python really imports. Directories that already are roots or lie outside the project
+    /// root are skipped. Call before classifying files. O(roots * dirs).
+    pub fn add_unit_roots(&mut self, units: &ProjectUnits) {
+        let mut added = false;
+        let dirs = units.import_dirs();
+        for (i, d) in dirs.iter().enumerate() {
+            let unit_dir = units.dir(units.import_dir_units()[i]);
+            let installed = self.roots.iter().any(|r| {
+                r.origin == Origin::FirstParty && matches!(r.kind, RootKind::Pth | RootKind::EditableHook) && is_under(&r.path, unit_dir)
+            });
+            if installed || !is_under(d, &self.project_root) || self.roots.iter().any(|r| r.path == *d) {
+                continue;
+            }
+            let at = self.roots.iter().position(|r| r.origin != Origin::FirstParty || r.kind == RootKind::Project);
+            let at = at.unwrap_or(self.roots.len());
+            self.roots.insert(at, root(d.clone(), RootKind::Src, Origin::FirstParty, true));
+            added = true;
+        }
+        if added {
+            self.match_order = match_order(&self.roots);
+        }
+    }
+
     /// The root with id `id`.
     pub fn root(&self, id: RootId) -> &ImportRoot {
         &self.roots[id as usize]

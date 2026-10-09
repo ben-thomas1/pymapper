@@ -18,7 +18,7 @@ name_enum!(
         Click = "click",
         /// pytest tests, fixtures, hooks and unittest-style classes.
         Pytest = "pytest",
-        /// Pydantic models, validators and serialisers.
+        /// Pydantic validators, serialisers and hooks (live with their model).
         Pydantic = "pydantic",
     }
 );
@@ -32,6 +32,9 @@ pub struct PresetRules {
     pub bases: &'static [&'static str],
     /// Name globs.
     pub names: &'static [&'static str],
+    /// Member globs: a method whose decorator (dotted name as written) or name matches is live
+    /// with its class (not a root on its own).
+    pub members: &'static [&'static str],
 }
 
 const HTTP_VERBS: [&str; 7] = ["*.get", "*.post", "*.put", "*.patch", "*.delete", "*.head", "*.options"];
@@ -69,6 +72,7 @@ const FLASK: PresetRules = PresetRules {
     ],
     bases: &["flask.views.View", "flask.views.MethodView"],
     names: &["create_app", "make_app"],
+    members: &[],
 };
 
 const FASTAPI: PresetRules = PresetRules {
@@ -95,6 +99,7 @@ const FASTAPI: PresetRules = PresetRules {
         "starlette.endpoints.WebSocketEndpoint",
     ],
     names: &["lifespan"],
+    members: &[],
 };
 
 const DJANGO: PresetRules = PresetRules {
@@ -140,6 +145,7 @@ const DJANGO: PresetRules = PresetRules {
         "clean_*",
         "default_app_config",
     ],
+    members: &[],
 };
 
 const CLICK: PresetRules = PresetRules {
@@ -153,6 +159,7 @@ const CLICK: PresetRules = PresetRules {
     ],
     bases: &["click.Command", "click.Group", "click.ParamType", "click.MultiCommand"],
     names: &[],
+    members: &[],
 };
 
 const PYTEST: PresetRules = PresetRules {
@@ -187,10 +194,17 @@ const PYTEST: PresetRules = PresetRules {
         "asyncSetUp",
         "asyncTearDown",
     ],
+    members: &[],
 };
 
+/// Pydantic: models are ordinary classes (live only when used: a dead model is reported);
+/// validators, serialisers, computed fields and hooks run whenever their model is used, so they
+/// are live with their class.
 const PYDANTIC: PresetRules = PresetRules {
-    decorators: &[
+    decorators: &[],
+    bases: &[],
+    names: &[],
+    members: &[
         "validator",
         "*.validator",
         "root_validator",
@@ -205,15 +219,10 @@ const PYDANTIC: PresetRules = PresetRules {
         "*.model_serializer",
         "computed_field",
         "*.computed_field",
+        "model_post_init",
+        "model_config",
+        "Config",
     ],
-    bases: &[
-        "pydantic.BaseModel",
-        "pydantic.main.BaseModel",
-        "pydantic.RootModel",
-        "pydantic_settings.BaseSettings",
-        "pydantic.BaseSettings",
-    ],
-    names: &["model_config", "model_post_init", "Config"],
 };
 
 impl Preset {
@@ -245,7 +254,7 @@ mod tests {
     fn every_preset_pattern_is_a_valid_glob() {
         for &p in Preset::ALL {
             let r = p.rules();
-            for list in [r.decorators, r.bases, r.names] {
+            for list in [r.decorators, r.bases, r.names, r.members] {
                 GlobSet::new(list).unwrap_or_else(|(i, e)| panic!("{p}: {:?}: {e}", list[i]));
             }
         }

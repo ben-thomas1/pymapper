@@ -273,9 +273,12 @@ pub fn import_location(ix: &Index, imp: &Imports, f: FileId, dst: NodeId, exclud
 }
 
 /// Appends one PM301 finding per cycle of `cycles` to `out`: at the import closing its
-/// witness, `import cycle: a -> b -> ... -> a`, symbol the first module of the witness.
+/// witness, `import cycle (N modules): a -> b -> ... -> a`, symbol the first module of the
+/// witness. The component's members (ascending node order) are the finding's extra arguments
+/// (JSON `cycle.members`).
 pub fn findings(ix: &Index, imp: &Imports, cycles: &Cycles, opts: &CycleOptions, out: &mut Findings) {
     let mut args: Vec<Arg> = Vec::new();
+    let mut extra: Vec<Arg> = Vec::new();
     for i in 0..cycles.len() {
         let w = cycles.witness(i);
         let (a, b) = (w[0], w[1 % w.len()]);
@@ -283,10 +286,15 @@ pub fn findings(ix: &Index, imp: &Imports, cycles: &Cycles, opts: &CycleOptions,
             .file(a)
             .and_then(|f| import_location(ix, imp, f, b, opts.exclude))
             .unwrap_or(Location::new(ix.file(a).map_or(rules::FileId::NONE, rules::FileId), 0, 0));
+        let members = cycles.members(i);
+        let size = members.len() as u32;
         args.clear();
+        args.extend([Arg::U32(size), Arg::Phrase(u32::from(size != 1))]);
         args.extend(w.iter().map(|&v| Arg::Symbol(SymbolId(v))));
         args.push(Arg::Symbol(SymbolId(a)));
-        out.push(IMPORT_CYCLE, loc, SymbolId(a), 100, &args);
+        extra.clear();
+        extra.extend(members.iter().map(|&v| Arg::Symbol(SymbolId(v))));
+        out.push_ext(IMPORT_CYCLE, loc, loc.line, SymbolId(a), 100, &args, &extra);
     }
 }
 

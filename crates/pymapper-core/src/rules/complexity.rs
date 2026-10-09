@@ -89,11 +89,14 @@ Fix: return or `continue` early, and move inner blocks into helper functions.",
     RuleDef {
         code: codes::LONG_FUNCTION.0,
         name: "long-function",
-        summary: "Function longer than `max-function-loc` lines",
-        message: "`{0}` is {1} lines long (> {2})",
+        summary: "Function longer than `max-function-loc` lines, docstrings excluded",
+        message: "`{0}` is {1} lines long without docstrings (> {2})",
         args: FN_METRIC,
         explanation: "Lines of the function's inclusive span, from its first decorator or `def` to \
-its last line, including blank lines and comments. Long functions tend to do several things.\n\n\
+its last line, minus the lines of its docstring and of the docstrings of functions and classes \
+nested in it (a long numpydoc docstring is documentation, not code). Blank lines and comments \
+count. A docstring is the first statement of a body when it is a plain string literal (not an \
+f-string or bytes) on its own line(s). Long functions tend to do several things.\n\n\
 Fix: split the function along its steps.",
         severity: Severity::Warning,
         default_enabled: true,
@@ -143,10 +146,12 @@ Fix: reduce the function's size and complexity (see PM101 and PM104).",
     RuleDef {
         code: codes::LONG_MODULE.0,
         name: "long-module",
-        summary: "Module longer than `max-module-loc` lines",
-        message: "module `{0}` is {1} lines long (> {2})",
+        summary: "Module longer than `max-module-loc` lines, docstrings excluded",
+        message: "module `{0}` is {1} lines long without docstrings (> {2})",
         args: FN_METRIC,
-        explanation: "Total lines of the module file. Very long modules are hard to navigate and \
+        explanation: "Lines of the module file minus the lines of every docstring in it (the \
+module's, and those of its classes and functions, as for PM104). Blank lines and comments \
+count. Very long modules are hard to navigate and \
 usually hold several unrelated concerns.\n\n\
 Fix: split the module into a package of focused modules.",
         severity: Severity::Info,

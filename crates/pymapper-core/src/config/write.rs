@@ -73,6 +73,7 @@ pub(super) fn to_toml(c: &Config) -> String {
     w.strs("decorators", &e.decorators);
     w.strs("bases", &e.bases);
     w.strs("names", &e.names);
+    w.strs("members", &e.members);
     w.raw("project-scripts", e.project_scripts);
 
     let a = &c.analysis;
@@ -80,8 +81,11 @@ pub(super) fn to_toml(c: &Config) -> String {
     w.raw("dupes", a.dupes);
     w.raw("exact-reachability", a.exact_reachability);
     w.raw("name-fallback", a.name_fallback);
+    w.raw("config-evidence", a.config_evidence);
+    w.strs("config-evidence-globs", &a.config_evidence_globs);
     w.raw("unique-method-fallback", a.unique_method_fallback);
     w.raw("type-checking-cycles", a.type_checking_cycles);
+    w.raw("include-tests-in-metrics", a.include_tests_in_metrics);
     if let Some(v) = &a.coverage {
         w.path("coverage", v);
     }

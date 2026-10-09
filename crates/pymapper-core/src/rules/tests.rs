@@ -287,8 +287,12 @@ fn messages_render() {
         message(LOW_MAINTAINABILITY, &[s(1), Arg::F32(7.25), Arg::F32(10.0)]),
         "`mod.sym1` has a low maintainability index (7.2 < 10.0)"
     );
-    assert_eq!(message(IMPORT_CYCLE, &[s(1), s(2), s(1)]), "import cycle: mod.sym1 -> mod.sym2 -> mod.sym1");
-    assert_eq!(message(IMPORT_CYCLE, &[s(4)]), "import cycle: mod.sym4");
+    let (two, plural, one, single) = (Arg::U32(2), Arg::Phrase(1), Arg::U32(1), Arg::Phrase(0));
+    assert_eq!(
+        message(IMPORT_CYCLE, &[two, plural, s(1), s(2), s(1)]),
+        "import cycle (2 modules): mod.sym1 -> mod.sym2 -> mod.sym1"
+    );
+    assert_eq!(message(IMPORT_CYCLE, &[one, single, s(4)]), "import cycle (1 module): mod.sym4");
     assert_eq!(
         message(LAYER_VIOLATION, &[s(1), s(2), Arg::Contract(0)]),
         "`mod.sym1` imports higher layer `mod.sym2` (contract `contract0`)"
@@ -338,11 +342,14 @@ fn accepts_checks_kinds_and_arity() {
     assert!(!d.accepts(&[s, Arg::F32(1.0), Arg::U32(2)]));
     assert!(!d.is_variadic());
     let c = codes::IMPORT_CYCLE.def();
+    let (n, p) = (Arg::U32(2), Arg::Phrase(1));
     assert!(c.is_variadic());
-    assert!(c.accepts(&[s]));
-    assert!(c.accepts(&[s, s, s, s]));
-    assert!(!c.accepts(&[]));
-    assert!(!c.accepts(&[s, Arg::U32(1)]));
+    assert!(c.accepts(&[n, p, s]));
+    assert!(c.accepts(&[n, p, s, s, s, s]));
+    assert!(!c.accepts(&[n, p]));
+    assert!(!c.accepts(&[s]));
+    assert!(!c.accepts(&[n, p, s, Arg::U32(1)]));
+    assert!(!c.accepts(&[n, Arg::Phrase(2), s]));
 }
 
 // ----- findings -----
@@ -350,7 +357,7 @@ fn accepts_checks_kinds_and_arity() {
 #[test]
 fn record_sizes() {
     assert_eq!(size_of::<Arg>(), 8);
-    assert_eq!(size_of::<Finding>(), 28);
+    assert_eq!(size_of::<Finding>(), 40);
     assert_eq!(size_of::<RuleSet>(), 128);
     assert_eq!(size_of::<SuppressionEntry>(), 8);
 }
@@ -369,7 +376,7 @@ fn tags(f: &Findings) -> Vec<u32> {
     f.iter()
         .map(|(_, args)| match args {
             [Arg::Name(t)] => *t,
-            [Arg::Symbol(s), ..] => 1000 + s.0,
+            [Arg::Symbol(s), ..] | [Arg::U32(_), Arg::Phrase(_), Arg::Symbol(s), ..] => 1000 + s.0,
             other => panic!("unexpected args {other:?}"),
         })
         .collect()
@@ -404,7 +411,7 @@ fn findings_append_rebases_args() {
     push_dead(&mut a, 1, 1, 90, 1);
     push_dead(&mut a, 1, 2, 90, 2);
     let mut b = Findings::new();
-    b.push(codes::IMPORT_CYCLE, at(3, 1), SymbolId::NONE, 100, &[Arg::Symbol(SymbolId(1)); 3]);
+    b.push(codes::LONG_FUNCTION, at(3, 1), SymbolId::NONE, 100, &[Arg::Symbol(SymbolId(1)), Arg::U32(1), Arg::U32(1)]);
     push_dead(&mut b, 4, 1, 90, 4);
     a.append(&mut b);
     assert!(b.is_empty());
@@ -422,7 +429,8 @@ fn findings_retain_compacts() {
     for i in 0..10 {
         push_dead(&mut f, i, 1, 90, i);
     }
-    f.push(codes::IMPORT_CYCLE, at(10, 1), SymbolId::NONE, 100, &[Arg::Symbol(SymbolId(7)); 4]);
+    let cycle = [Arg::U32(4), Arg::Phrase(1), Arg::Symbol(SymbolId(7)), Arg::Symbol(SymbolId(7))];
+    f.push(codes::IMPORT_CYCLE, at(10, 1), SymbolId::NONE, 100, &cycle);
     f.retain(|x, _| x.loc.file.0 % 3 == 1);
     assert_eq!(tags(&f), [1, 4, 7, 1007]);
     assert_eq!(f.args(&f.as_slice()[3]).len(), 4);
@@ -433,11 +441,42 @@ fn findings_retain_compacts() {
 }
 
 #[test]
+fn extra_args_and_end_line_survive_append_retain_and_sort() {
+    let mut f = Findings::new();
+    let mut b = Findings::new();
+    for i in 0..6u32 {
+        let extra = [Arg::Symbol(SymbolId(100 + i)), Arg::U32(i)];
+        let args = [Arg::U32(1), Arg::Phrase(0), Arg::Symbol(SymbolId(i))];
+        let buf = if i % 2 == 0 { &mut f } else { &mut b };
+        buf.push_ext(codes::IMPORT_CYCLE, at(i, 10 - i), 20 - i, SymbolId(i), 100, &args, &extra);
+        push_dead(buf, i, 1, 90, i);
+    }
+    f.append(&mut b);
+    f.sort_by_location();
+    f.retain(|x, _| x.loc.file.0 != 3);
+    let mut seen = 0;
+    for x in f.as_slice() {
+        if x.rule == codes::IMPORT_CYCLE {
+            let i = x.loc.file.0;
+            assert_eq!(x.end_line, 20 - i);
+            assert_eq!(f.args(x), [Arg::U32(1), Arg::Phrase(0), Arg::Symbol(SymbolId(i))]);
+            assert_eq!(f.extra(x), [Arg::Symbol(SymbolId(100 + i)), Arg::U32(i)]);
+            seen += 1;
+        } else {
+            assert!(f.extra(x).is_empty());
+            assert_eq!(x.end_line, 0);
+        }
+    }
+    assert_eq!(seen, 5);
+}
+
+#[test]
 fn findings_retain_after_sort() {
     let mut f = Findings::new();
     for (i, line) in [5u32, 3, 9, 1, 7].into_iter().enumerate() {
         if i == 2 {
-            f.push(codes::IMPORT_CYCLE, at(0, line), SymbolId::NONE, 100, &[Arg::Symbol(SymbolId(3)); 2]);
+            let cycle = [Arg::U32(1), Arg::Phrase(0), Arg::Symbol(SymbolId(3))];
+            f.push(codes::IMPORT_CYCLE, at(0, line), SymbolId::NONE, 100, &cycle);
         } else {
             push_dead(&mut f, 0, line, 90, line);
         }
@@ -822,4 +861,16 @@ fn docs_cover_every_rule() {
         assert!(md.contains(&format!("\n## {}\n", cat.title())));
     }
     assert!(md.contains("needs `analysis.dupes`"));
+}
+
+#[test]
+fn selector_suggestions() {
+    let sel = |s: &str| s.parse::<RuleSelector>().unwrap();
+    assert!(selector_is_known(sel("ALL")) && selector_is_known(sel("PM4")) && selector_is_known(sel("PM405")));
+    assert!(!selector_is_known(sel("PM999")) && !selector_is_known(sel("PM7")) && !selector_is_known(sel("PM409")));
+    assert_eq!(suggest_selector(sel("PM409")).as_deref(), Some("PM401"));
+    assert_eq!(suggest_selector(sel("PM108")).as_deref(), Some("PM101"));
+    assert_eq!(suggest_selector(sel("PM49")).as_deref(), Some("PM4"));
+    assert_eq!(suggest_selector(sel("PM999")), None);
+    assert_eq!(suggest_selector(sel("PM7")), None);
 }

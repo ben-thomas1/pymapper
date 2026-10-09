@@ -64,6 +64,17 @@
 //! share of differing tokens. Statement-level `import`/`from` statements are dropped (import
 //! blocks would dominate the results).
 //!
+//! # Skipped code and trimming ([`analyse`])
+//!
+//! Stub files (`.pyi`) and, unless `analysis.include-tests-in-metrics`, test code (see
+//! [`crate::analysis::testfiles`]) are left out by dropping their fingerprints before
+//! matching (this also makes matching cheaper). When copies are located, each is trimmed: the
+//! rest of a statement it starts in the middle of (first line only), leading / trailing tokens
+//! on `@overload` signature lines ([`LineMask::overloads`]) and leading / trailing string
+//! statements (docstrings). A pair whose trimmed copies fall below `min_tokens` or
+//! `min_lines` is dropped, so runs of overload signatures are not reported. A finding's
+//! symbol is the innermost class or function containing its whole copy ([`enclosing_def`]).
+//!
 //! Boilerplate is only reported when the two copies are identical: highly repetitive runs (a
 //! period of at most 24 tokens covering 90% of the run, e.g. long `self.a = a` assignment
 //! lists) and data (fewer than one token in 8 is a name or keyword, e.g. tables of tuples or
@@ -79,13 +90,15 @@ mod norm;
 mod tests;
 mod winnow;
 
-pub use matcher::{Best, DupesReport, DupesStats, find_clones};
+pub use matcher::{Best, DupesReport, DupesStats, find_clones, find_clones_masked};
 pub use winnow::{Fingerprint, FingerprintScratch, FingerprintVisitor, Fingerprints, fingerprint_source};
 
 use std::fs::File;
 use std::io::Read;
 
+use crate::analysis::testfiles;
 use crate::config::Config;
+use crate::extract::facts::def_flags;
 use crate::index::Index;
 use crate::rules::codes::DUPLICATE_CODE;
 use crate::rules::{Arg, FileId, Findings, Location, Pass, RuleEngine, SymbolId};
@@ -108,11 +121,14 @@ pub struct DupesParams {
     pub min_tokens: u32,
     /// Smallest reported clone, in lines (in both copies).
     pub min_lines: u32,
+    /// Also match test code (`analysis.include-tests-in-metrics`; see
+    /// [`crate::analysis::testfiles`]). Fingerprints do not depend on it.
+    pub include_tests: bool,
 }
 
 impl Default for DupesParams {
     fn default() -> Self {
-        DupesParams { min_tokens: 50, min_lines: 6 }
+        DupesParams { min_tokens: 50, min_lines: 6, include_tests: false }
     }
 }
 
@@ -121,21 +137,28 @@ impl DupesParams {
     /// k-gram and a window) is raised to 2. The config accepts `dupes-min-tokens >= 10`, below
     /// which nearly every statement would be reported; smaller values are for tests.
     pub fn new(min_tokens: u32, min_lines: u32) -> DupesParams {
-        DupesParams { min_tokens: min_tokens.max(2), min_lines }
+        DupesParams { min_tokens: min_tokens.max(2), min_lines, include_tests: false }
+    }
+
+    /// With `include_tests` set.
+    pub fn with_tests(self, include_tests: bool) -> DupesParams {
+        DupesParams { include_tests, ..self }
     }
 
     /// The parameters of `config` when `analysis.dupes` is on, else `None` (the analysis does
     /// not run and fingerprints should not be taken).
     pub fn from_config(config: &Config) -> Option<DupesParams> {
         let t = &config.thresholds;
-        config.analysis.dupes.then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines))
+        let tests = config.analysis.include_tests_in_metrics;
+        config.analysis.dupes.then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines).with_tests(tests))
     }
 
     /// The parameters for a run of `engine`: `None` when no rule of the duplication pass is
     /// enabled (PM501 ignored, or `analysis.dupes` off).
     pub fn from_engine(engine: &RuleEngine) -> Option<DupesParams> {
         let t = engine.thresholds();
-        engine.should_run(Pass::Dupes).then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines))
+        let tests = engine.include_tests_in_metrics();
+        engine.should_run(Pass::Dupes).then(|| DupesParams::new(t.dupes_min_tokens, t.dupes_min_lines).with_tests(tests))
     }
 
     /// k-gram length (noise threshold).
@@ -195,6 +218,58 @@ pub struct ClonePair {
     pub similarity: u8,
 }
 
+/// Line ranges per file that reported copies must not start or end on (`@overload`
+/// signatures): sorted `(file, first line, last line)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineMask {
+    ranges: Vec<(u32, u32, u32)>,
+}
+
+impl LineMask {
+    /// A mask of the given `(file, first line, last line)` ranges (any order).
+    pub fn new(mut ranges: Vec<(u32, u32, u32)>) -> LineMask {
+        ranges.sort_unstable();
+        // Merge overlapping ranges of a file (nested overloads), so they are disjoint.
+        let mut merged: Vec<(u32, u32, u32)> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match merged.last_mut() {
+                Some(m) if m.0 == r.0 && r.1 <= m.2.saturating_add(1) => m.2 = m.2.max(r.2),
+                _ => merged.push(r),
+            }
+        }
+        LineMask { ranges: merged }
+    }
+
+    /// The lines of every `@overload` definition (decorators included) of the files of
+    /// `index`. O(defs).
+    pub fn overloads(index: &Index) -> LineMask {
+        let defs = &index.facts().defs;
+        let mut ranges = Vec::new();
+        for f in 0..index.file_count() {
+            for g in index.file_facts(f).defs.range() {
+                if defs.flags[g] & def_flags::OVERLOAD != 0 {
+                    ranges.push((f, defs.start_line[g], defs.end_line[g]));
+                }
+            }
+        }
+        LineMask::new(ranges)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Whether `line` of `file` is masked. O(log ranges): ranges are disjoint.
+    pub fn contains(&self, file: u32, line: u32) -> bool {
+        let i = self.ranges.partition_point(|&(f, s, _)| (f, s) <= (file, line));
+        i > 0 && {
+            let (f, s, e) = self.ranges[i - 1];
+            f == file && s <= line && line <= e
+        }
+    }
+}
+
 /// A source reader for [`find_clones`] that re-reads the files of `index` from disk.
 pub fn index_reader(index: &Index) -> impl Fn(u32, &mut Vec<u8>) -> bool + Sync + '_ {
     move |f, buf| File::open(index.file_path(f)).and_then(|mut h| h.read_to_end(buf)).is_ok()
@@ -202,25 +277,71 @@ pub fn index_reader(index: &Index) -> impl Fn(u32, &mut Vec<u8>) -> bool + Sync 
 
 /// Runs the analysis over the fingerprints taken by
 /// [`load_with`](crate::index::load_with) and appends its findings to `out`.
-pub fn analyse(index: &Index, fps: Fingerprints, params: &DupesParams, out: &mut Findings) -> DupesReport {
-    let report = find_clones(fps, params, index_reader(index));
-    findings(&report, out);
+///
+/// Stub files (`.pyi`: signatures only) and, unless `params.include_tests`, test code are left
+/// out: their fingerprints are dropped before matching. Copies are trimmed off `@overload`
+/// signatures and docstrings at their ends (see [`find_clones_masked`]).
+pub fn analyse(index: &Index, mut fps: Fingerprints, params: &DupesParams, out: &mut Findings) -> DupesReport {
+    let skip: Vec<bool> = (0..index.file_count())
+        .map(|f| {
+            index.file_path(f).as_os_str().as_encoded_bytes().ends_with(b".pyi")
+                || (!params.include_tests && testfiles::is_test_file(index, f))
+        })
+        .collect();
+    fps.rows.retain(|fp| !skip.get(fp.file as usize).copied().unwrap_or(false));
+    drop(skip);
+    let mask = LineMask::overloads(index);
+    let report = find_clones_masked(fps, params, index_reader(index), &mask);
+    findings_in(index, &report, out);
     report
 }
 
 /// Appends one PM501 finding per copy (member) of `report` to `out`, for its most similar
 /// pair: at the first token of the member's own copy in that pair, `<lines> lines duplicated
 /// in <file>:<line>` with that copy's lines and the other copy's start, and the pair's
-/// similarity as confidence.
+/// similarity as confidence. `end_line` is the copy's last line; the other copy is in the
+/// extra arguments `[File, U32 start line, U32 end line, Symbol]`. Without an index, symbols
+/// are [`SymbolId::NONE`].
 pub fn findings(report: &DupesReport, out: &mut Findings) {
+    push_findings(None, report, out);
+}
+
+/// [`findings`] with symbols: a copy within one class or function gets the innermost one.
+pub fn findings_in(index: &Index, report: &DupesReport, out: &mut Findings) {
+    push_findings(Some(index), report, out);
+}
+
+fn push_findings(index: Option<&Index>, report: &DupesReport, out: &mut Findings) {
+    let sym = |r: &Region| index.map_or(SymbolId::NONE, |ix| enclosing_def(ix, r));
     for best in &report.best {
         let (this, other) = (&best.this, &best.other);
-        out.push(
+        out.push_ext(
             DUPLICATE_CODE,
             Location::new(FileId(this.file), this.start_line, this.col),
-            SymbolId::NONE,
+            this.end_line,
+            sym(this),
             best.similarity,
             &[Arg::U32(this.lines()), Arg::File(FileId(other.file)), Arg::U32(other.start_line)],
+            &[Arg::File(FileId(other.file)), Arg::U32(other.start_line), Arg::U32(other.end_line), Arg::Symbol(sym(other))],
         );
     }
+}
+
+/// The innermost class or function of `r`'s file whose lines contain all of `r`'s, or
+/// [`SymbolId::NONE`]. O(defs of the file).
+pub fn enclosing_def(index: &Index, r: &Region) -> SymbolId {
+    if r.file >= index.file_count() || index.file_node(r.file) == crate::index::NONE {
+        return SymbolId::NONE;
+    }
+    let defs = &index.facts().defs;
+    let range = index.file_facts(r.file).defs.range();
+    let base = range.start;
+    let mut best = SymbolId::NONE;
+    // Pre-order: a containing def found later is nested in an earlier one.
+    for g in base + 1..range.end {
+        if defs.start_line[g] <= r.start_line && r.end_line <= defs.end_line[g] {
+            best = SymbolId(index.file_node(r.file) + (g - base) as u32);
+        }
+    }
+    best
 }

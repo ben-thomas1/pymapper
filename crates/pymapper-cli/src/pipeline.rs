@@ -4,6 +4,7 @@
 //!   Config ──> import roots (discover)      phase `roots`
 //!          ──> walk: first-party walk,      phase `walk`
 //!              stdlib walk, third-party RECORDs (+ walk of unclaimed site-packages entries)
+//!          ──> project units (+ their import roots)
 //!          ──> Inputs (module names, groups)
 //!          ──> Index, through the cache     phases `load.*`, `cache.write`
 //!          ──> import resolution            phases `resolve.*`
@@ -18,11 +19,12 @@ use std::path::{Path, PathBuf};
 use pymapper_core::analysis::dupes::{DupesParams, Fingerprints};
 use pymapper_core::cache::{self, Cache, CacheStats};
 use pymapper_core::config::Config;
+use pymapper_core::extract::config::ConfigEvidence;
 use pymapper_core::extract::facts::sup_kind;
 use pymapper_core::index::{self, Index, Inputs, LoadOptions};
 use pymapper_core::resolve::{Attribution, Imports, resolve_imports};
 use pymapper_core::roots::{self, ProjectUnits, RootOptions, Roots, Source};
-use pymapper_core::rules::{self, Suppressions, SuppressionsBuilder};
+use pymapper_core::rules::{self, BadCodeKind, Suppressions, SuppressionsBuilder};
 use pymapper_core::timing;
 use pymapper_core::walk::{self, PathList, WalkOptions};
 
@@ -80,6 +82,8 @@ pub struct Project {
     pub cache: Option<CacheStats>,
     /// Non-fatal walk problems (unreadable directories, invalid excludes).
     pub walk_errors: usize,
+    /// Dead-code evidence from config files (`analysis.config-evidence`).
+    pub config_evidence: Option<ConfigEvidence>,
 }
 
 /// Loads the project described by `config` (rooted at `project_root`).
@@ -87,16 +91,18 @@ pub struct Project {
 /// `dupes`: take duplication fingerprints during extraction (see
 /// [`DupesParams::from_engine`]).
 pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) -> Project {
-    let roots = timing::time("roots", || roots::discover(project_root, &RootOptions::from_config(config)));
+    let mut roots = timing::time("roots", || roots::discover(project_root, &RootOptions::from_config(config)));
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, pyprojects, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (files, pyprojects, configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
     let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
     drop(pyprojects);
     for d in &diags {
         warn(format_args!("{d}"));
     }
+    // Nested units (uv workspace members, monorepo packages) are import roots of their own.
+    roots.add_unit_roots(&units);
     let inputs = Inputs::from_roots(&roots, &files);
     drop(files);
     let opts = LoadOptions { dupes };
@@ -123,7 +129,9 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
         ));
     }
     let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
-    Project { units, index, imports, fingerprints, cache, walk_errors }
+    let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
+        .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
+    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence }
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).
@@ -135,16 +143,18 @@ fn same_opts(a: &WalkOptions, b: &WalkOptions) -> bool {
         && a.excludes == b.excludes
         && a.exclude_base == b.exclude_base
         && a.projects == b.projects
+        && a.configs == b.configs
 }
 
 /// Every file to load, in a deterministic order: walks of the sources (consecutive walks with
 /// the same options merged into one walk), and the `RECORD` files of third-party
-/// distributions. Returns the files, the `pyproject.toml` files of the first-party walks and
-/// the number of walk diagnostics (each printed).
-pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (PathList, PathList, usize) {
+/// distributions. Returns the files, the `pyproject.toml` files and config files of the
+/// first-party walks and the number of walk diagnostics (each printed).
+pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (PathList, PathList, PathList, usize) {
     let first_party = WalkOptions::first_party(config, project_root);
     let mut files = PathList::default();
     let mut projects = PathList::default();
+    let mut configs = PathList::default();
     let mut errors = 0;
     let mut full = false;
     // Pending walk: roots sharing one set of options.
@@ -155,13 +165,13 @@ pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (Pa
         match src {
             Source::Walk { path, opts, .. } => {
                 if !pending_opts.as_ref().is_some_and(|p| same_opts(p, &opts)) {
-                    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
+                    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, &mut errors, &mut full);
                     pending_opts = Some(opts);
                 }
                 pending.push(path);
             }
             Source::Record { dist } => {
-                flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
+                flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, &mut errors, &mut full);
                 let site = roots.dists.site_path(dist).as_os_str().as_encoded_bytes();
                 for rel in roots.dists.owned_files(dist) {
                     buf.clear();
@@ -176,12 +186,12 @@ pub fn collect_files(roots: &Roots, config: &Config, project_root: &Path) -> (Pa
             }
         }
     }
-    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut errors, &mut full);
+    flush_walk(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, &mut errors, &mut full);
     if full {
         warn(format_args!("more than 4 GiB of file paths: the remaining files were dropped"));
         errors += 1;
     }
-    (files, projects, errors)
+    (files, projects, configs, errors)
 }
 
 /// Walks the pending roots (if any) with `opts`, appends the files to `files` (setting `full`
@@ -192,6 +202,7 @@ fn flush_walk(
     opts: Option<&WalkOptions>,
     files: &mut PathList,
     projects: &mut PathList,
+    configs: &mut PathList,
     errors: &mut usize,
     full: &mut bool,
 ) {
@@ -215,12 +226,18 @@ fn flush_walk(
             break;
         }
     }
+    for i in 0..w.configs.len() {
+        if configs.push(w.configs.get_bytes(i)).is_err() {
+            break;
+        }
+    }
     pending.clear();
 }
 
 /// Inline `# pymapper: ignore[...]` and F401 `# noqa` suppressions of every file, from the facts.
-/// Malformed codes are skipped (they suppress nothing).
-pub fn suppressions(ix: &Index) -> Suppressions {
+/// Malformed codes suppress nothing; they, unknown codes and empty lists (`ignore[]`) are passed
+/// to `bad(file, line, code, kind)` (`code` is empty for an empty list), in file and line order.
+pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
     let mut b = SuppressionsBuilder::new();
     let st = &ix.facts().suppressions;
     let mut entries = Vec::new();
@@ -232,15 +249,21 @@ pub fn suppressions(ix: &Index) -> Suppressions {
         entries.clear();
         let view = ix.file_view(f);
         for r in range {
+            let line = st.line[r];
             if st.kind[r] == sup_kind::NOQA_F401 {
-                entries.push(rules::noqa_f401(st.line[r]));
+                entries.push(rules::noqa_f401(line));
                 continue;
             }
             if st.kind[r] == sup_kind::ALL {
-                rules::parse_codes(st.line[r], None, &mut entries, |_| {});
+                rules::parse_codes(line, None, &mut entries, |_| {});
             }
-            for &s in view.chain(st.codes[r]) {
-                rules::parse_codes(st.line[r], Some(ix.str(s)), &mut entries, |_| {});
+            let codes = view.chain(st.codes[r]);
+            if st.kind[r] == sup_kind::CODES && codes.is_empty() {
+                bad(f, line, b"", BadCodeKind::Malformed);
+            }
+            for &s in codes {
+                let code = ix.str(s);
+                rules::parse_codes(line, Some(code), &mut entries, |e| bad(f, line, code, e.kind));
             }
         }
         b.push_file(rules::FileId(f), &entries);

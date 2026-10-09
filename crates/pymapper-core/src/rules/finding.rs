@@ -121,8 +121,9 @@ pub trait ArgResolver {
     fn write_contract(&self, index: u32, out: &mut dyn fmt::Write) -> fmt::Result;
 }
 
-/// One finding (28 bytes). The message is the rule's template applied to the arguments stored
-/// in the owning [`Findings`].
+/// One finding (40 bytes). The message is the rule's template applied to the arguments stored
+/// in the owning [`Findings`]; structured data that is not part of the message (a cycle's
+/// members, the other copy of a duplicate) follows them as *extra* arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Finding {
     /// The rule.
@@ -131,10 +132,18 @@ pub struct Finding {
     pub confidence: u8,
     /// Where it is.
     pub loc: Location,
+    /// Last line (inclusive) of the reported span; 0 when the analysis did not set one (output
+    /// then derives it from the symbol's definition, else uses `loc.line`).
+    pub end_line: u32,
     /// The symbol it is about (or [`SymbolId::NONE`]).
     pub symbol: SymbolId,
+    /// Machine-readable reasons for the confidence: a bit set over the rule family's reason
+    /// names (dead code: [`super::dead_code::reason`]; 0 = none). Rendered by output only.
+    pub reasons: u32,
     args_start: u32,
     args_len: u32,
+    /// Extra (data-only) arguments, stored right after the message arguments.
+    extra_len: u32,
 }
 
 /// A buffer of findings and their arguments. Build one per thread and merge with
@@ -166,6 +175,47 @@ impl Findings {
     /// [`ConfidenceModel::Certain`](super::ConfidenceModel::Certain) gets less than 100.
     #[inline]
     pub fn push(&mut self, rule: Rule, loc: Location, symbol: SymbolId, confidence: u8, args: &[Arg]) {
+        self.push_full(rule, loc, 0, symbol, confidence, 0, args, &[]);
+    }
+
+    /// [`push`](Self::push) with confidence reasons ([`Finding::reasons`]).
+    #[inline]
+    pub fn push_with_reasons(&mut self, rule: Rule, loc: Location, symbol: SymbolId, confidence: u8, args: &[Arg], reasons: u32) {
+        self.push_full(rule, loc, 0, symbol, confidence, reasons, args, &[]);
+    }
+
+    /// [`push`](Self::push) with the last line of the reported span (`0` = unknown) and extra
+    /// data-only arguments (`extra`, not rendered in the message nor part of baseline keys;
+    /// see [`extra`](Self::extra)).
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn push_ext(
+        &mut self,
+        rule: Rule,
+        loc: Location,
+        end_line: u32,
+        symbol: SymbolId,
+        confidence: u8,
+        args: &[Arg],
+        extra: &[Arg],
+    ) {
+        self.push_full(rule, loc, end_line, symbol, confidence, 0, args, extra);
+    }
+
+    /// Every field of a finding: [`push_ext`](Self::push_ext) with confidence reasons.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn push_full(
+        &mut self,
+        rule: Rule,
+        loc: Location,
+        end_line: u32,
+        symbol: SymbolId,
+        confidence: u8,
+        reasons: u32,
+        args: &[Arg],
+        extra: &[Arg],
+    ) {
         #[cfg(debug_assertions)]
         {
             let def = rule.def();
@@ -176,13 +226,17 @@ impl Findings {
         }
         let args_start = to_u32(self.args.len());
         self.args.extend_from_slice(args);
+        self.args.extend_from_slice(extra);
         self.items.push(Finding {
             rule,
             confidence: confidence.min(100),
             loc,
+            end_line,
             symbol,
+            reasons,
             args_start,
             args_len: to_u32(args.len()),
+            extra_len: to_u32(extra.len()),
         });
     }
 
@@ -230,6 +284,13 @@ impl Findings {
         &self.args[f.args_start as usize..(f.args_start + f.args_len) as usize]
     }
 
+    /// The extra (data-only) arguments of a finding of this buffer (empty for most rules).
+    #[inline]
+    pub fn extra(&self, f: &Finding) -> &[Arg] {
+        let s = (f.args_start + f.args_len) as usize;
+        &self.args[s..s + f.extra_len as usize]
+    }
+
     /// Findings with their arguments.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Finding, &[Arg])> {
         self.items.iter().map(|f| (f, self.args(f)))
@@ -258,15 +319,16 @@ impl Findings {
         for read in 0..self.items.len() {
             let f = self.items[read];
             let (s, n) = (f.args_start as usize, f.args_len as usize);
+            let total = n + f.extra_len as usize;
             if !keep(&f, &self.args[s..s + n]) {
                 continue;
             }
             // Arguments are in finding order, so `s >= args_write`: copying never clobbers
             // arguments of a later finding.
-            self.args.copy_within(s..s + n, args_write);
+            self.args.copy_within(s..s + total, args_write);
             self.items[write] = Finding { args_start: to_u32(args_write), ..f };
             write += 1;
-            args_write += n;
+            args_write += total;
         }
         self.items.truncate(write);
         self.args.truncate(args_write);
@@ -279,7 +341,7 @@ impl Findings {
             if f.args_start != next {
                 return false;
             }
-            next += f.args_len;
+            next += f.args_len + f.extra_len;
         }
         true
     }
@@ -290,7 +352,7 @@ impl Findings {
         for f in &mut self.items {
             let s = f.args_start as usize;
             let start = to_u32(args.len());
-            args.extend_from_slice(&self.args[s..s + f.args_len as usize]);
+            args.extend_from_slice(&self.args[s..s + (f.args_len + f.extra_len) as usize]);
             f.args_start = start;
         }
         self.args = args;
@@ -472,4 +534,11 @@ fn write_arg(a: Arg, r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Resu
         // Rendered from the rule's wordings by `write_message`; not variadic.
         Arg::Phrase(_) => out.write_str("?"),
     }
+}
+
+/// Names of the reason bits of `f` ([`Finding::reasons`]), lowest bit first.
+pub fn reason_names(f: &Finding) -> impl Iterator<Item = &'static str> {
+    let bits = f.reasons;
+    let names = super::dead_code::reason::NAMES;
+    (0..names.len()).filter(move |&i| bits & (1 << i) != 0).map(move |i| names[i])
 }

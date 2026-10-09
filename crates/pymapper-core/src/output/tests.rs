@@ -29,6 +29,14 @@ impl Context for TestCtx {
     fn write_symbol_id(&self, sym: SymbolId, out: &mut Vec<u8>) {
         out.extend_from_slice(self.symbols[sym.0 as usize].as_bytes());
     }
+    fn def_end_line(&self, sym: SymbolId) -> u32 {
+        // `pkg.zeta:handle` and `pkg.alpha:Big.run` are definitions.
+        match sym.0 {
+            0 => 30,
+            2 => 25,
+            _ => 0,
+        }
+    }
 }
 
 impl ArgResolver for TestCtx {
@@ -73,7 +81,10 @@ fn sample() -> Findings {
     let s = SymbolId;
     f.push(COMPLEX_FUNCTION, loc(0, 12, 5), s(0), 100, &[Arg::Symbol(s(0)), Arg::U32(14), Arg::U32(10)]);
     f.push(UNUSED_IMPORT, loc(1, 3, 1), s(1), 90, &[Arg::Name(2)]);
-    f.push(IMPORT_CYCLE, NOFILE, SymbolId::NONE, 100, &[Arg::Symbol(s(1)), Arg::Symbol(s(4)), Arg::Symbol(s(1))]);
+    let cycle = [Arg::U32(2), Arg::Phrase(1), Arg::Symbol(s(1)), Arg::Symbol(s(4)), Arg::Symbol(s(1))];
+    f.push_ext(IMPORT_CYCLE, NOFILE, 0, SymbolId::NONE, 100, &cycle, &[Arg::Symbol(s(1)), Arg::Symbol(s(4))]);
+    let other = [Arg::File(FileId(1)), Arg::U32(40), Arg::U32(47), Arg::Symbol(s(2))];
+    f.push_ext(DUPLICATE_CODE, loc(0, 14, 9), 21, s(0), 96, &[Arg::U32(8), Arg::File(FileId(1)), Arg::U32(40)], &other);
     f.push(LOW_MAINTAINABILITY, loc(1, 20, 5), s(2), 100, &[Arg::Symbol(s(2)), Arg::F32(12.25), Arg::F32(20.0)]);
     f.push(UNUSED_FUNCTION, loc(2, 1, 1), s(5), 60, &[Arg::Symbol(s(5)), Arg::Phrase(0)]);
     f.push(UNDECLARED_DEPENDENCY, loc(3, 2, 0), SymbolId::NONE, 100, &[Arg::Name(0), Arg::Name(1)]);
@@ -149,6 +160,7 @@ fn order_is_by_path_then_position_then_rule_then_message() {
         ("pkg/alpha.py", 20, 5, 106),
         ("pkg/caf\u{e9}/\u{fffd}.py", 2, 0, 601),
         ("pkg/zeta.py", 12, 5, 101),
+        ("pkg/zeta.py", 14, 9, 501),
     ];
     let want: Vec<(String, u32, u32, u16)> = want.iter().map(|&(p, l, c, r)| (p.to_owned(), l, c, r)).collect();
     assert_eq!(got, want);
@@ -177,7 +189,7 @@ fn order_does_not_depend_on_push_order() {
         let mut g = Findings::new();
         for k in 0..items.len() {
             let (x, args) = items[(items.len() - 1 - k + rot) % items.len()];
-            g.push(x.rule, x.loc, x.symbol, x.confidence, args);
+            g.push_full(x.rule, x.loc, x.end_line, x.symbol, x.confidence, x.reasons, args, f.extra(x));
         }
         assert_eq!(render(&g, &c, &opts, &summary()), want, "rotation {rot}");
     }
@@ -435,7 +447,7 @@ fn baseline_round_trips_and_hides_everything_it_recorded() {
     assert_eq!(r.exit_status(0), ExitStatus::Clean);
     let mut out = Vec::new();
     r.write(&Options::new(OutputFormat::Concise), &Summary::default(), &mut out).expect("write");
-    assert_eq!(String::from_utf8(out).expect("UTF-8"), "All checks passed!\nNot shown: 10 baselined.\n");
+    assert_eq!(String::from_utf8(out).expect("UTF-8"), "All checks passed!\nNot shown: 11 baselined.\n");
 }
 
 #[test]
@@ -692,4 +704,60 @@ fn json_escaping() {
     let mut out = Vec::new();
     json::push_str(&mut out, b"a\"b\\c\n\r\t\x01\x1f\x7f \xc3\xa9 \xff end");
     assert_eq!(String::from_utf8(out).expect("UTF-8"), r#""a\"b\\c\n\r\t\u0001\u001f\u007f é \ufffd end""#);
+}
+
+#[test]
+fn baselines_with_superseded_ids_still_load() {
+    // A baseline saved before overload implementations lost their `#N` suffix (and before
+    // PM301 messages carried the cycle size): the old PM101 id no longer matches, so that
+    // finding is new again; everything else stays baselined.
+    let text = r#"{"version": 1, "tool": "pymapper", "entries": [
+        {"code": "PM101", "id": "pkg.zeta:handle#4", "count": 1},
+        {"code": "PM301", "id": "", "detail": ["pkg.alpha", "pkg.zeta", "pkg.alpha"], "count": 1},
+        {"code": "PM405", "id": "pkg.alpha", "detail": ["yaml"], "count": 1}
+    ]}"#;
+    let b = parse(text);
+    let f = sample();
+    let c = ctx();
+    let mut r = Report::new(&f, &c);
+    assert_eq!(r.apply_baseline(&b), 2);
+    let left: Vec<u16> = r.iter().map(|x| x.rule.code()).collect();
+    assert!(left.contains(&101) && !left.contains(&301), "{left:?}");
+    assert_eq!(left.iter().filter(|&&c| c == 405).count(), 1, "only `yaml` was baselined");
+}
+
+#[test]
+fn json_end_line_and_unused_import_symbol() {
+    let f = sample();
+    let c = ctx();
+    let got = render(&f, &c, &Options::new(OutputFormat::Json), &summary());
+    assert_json(&got);
+    // Derived from the definition when the analysis gave none; the analysis' value wins.
+    assert!(got.contains("\"line\":12,\"col\":5,\"end_line\":30,\"symbol\":\"pkg.zeta:handle\""), "{got}");
+    assert!(got.contains("\"line\":14,\"col\":9,\"end_line\":21,"), "{got}");
+    assert!(got.contains("\"symbol\":\"pkg.alpha:yaml\""), "{got}");
+    // Reals are numbers with at most two decimals.
+    assert!(got.contains("\"value\":12.25,\"threshold\":20}"), "{got}");
+}
+
+#[test]
+fn dead_code_reasons_are_rendered() {
+    use crate::rules::dead_code::reason;
+    let mut f = Findings::new();
+    let args = [Arg::Symbol(SymbolId(0)), Arg::Phrase(3)];
+    f.push_with_reasons(UNUSED_FUNCTION, loc(0, 4, 5), SymbolId(0), 50, &args, reason::NAME_ELSEWHERE | reason::ONLY_USED_BY_UNUSED_CODE);
+    f.push_with_reasons(UNUSED_FUNCTION, loc(0, 9, 5), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)], reason::NO_REFERENCES);
+    f.push(COMPLEX_FUNCTION, loc(0, 12, 5), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::U32(14), Arg::U32(10)]);
+    let sum = Summary::default();
+    let text = render(&f, &ctx(), &Options { footer: false, ..Options::new(OutputFormat::Concise) }, &sum);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "pkg/zeta.py:4:5: PM401 function `pkg.zeta:handle` has no resolved callers (name appears elsewhere) (confidence 50: only-used-by-unused-code, name-elsewhere)");
+    // Full confidence: no parenthesis, as before.
+    assert_eq!(lines[1], "pkg/zeta.py:9:5: PM401 function `pkg.zeta:handle` is never used");
+    let json = render(&f, &ctx(), &Options::new(OutputFormat::Json), &sum);
+    assert_json(&json);
+    assert!(json.contains(r#""reasons":["only-used-by-unused-code","name-elsewhere"]}"#), "{json}");
+    assert!(json.contains(r#""reasons":["no-references"]}"#), "{json}");
+    // Findings without reasons have no `reasons` key.
+    assert_eq!(json.matches("\"reasons\"").count(), 2, "{json}");
 }

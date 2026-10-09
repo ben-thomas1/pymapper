@@ -1113,3 +1113,31 @@ fn walk_options_from_config() {
     let e = WalkOptions::everything();
     assert!(!e.gitignore && !e.parents && e.hidden && e.excludes.is_empty());
 }
+
+#[test]
+fn walk_lists_config_files_when_asked() {
+    let t = TempDir::new("configs");
+    t.file("a.py", "")
+        .file("servers/elnb.yaml", "module_name: x\n")
+        .file("cfg/app.toml", "")
+        .file("data.json", "{}")
+        .file("setup.cfg", "")
+        .file("tox.ini", "")
+        .file("notes.txt", "")
+        .file("uv.lock", "")
+        .file("web/package-lock.json", "{}")
+        .file("ignored/secret.yaml", "")
+        .file("excluded/x.yml", "")
+        .file(".hidden/h.yaml", "")
+        .file(".gitignore", "ignored/\n");
+    let globs: Vec<String> = crate::config::DEFAULT_CONFIG_EVIDENCE_GLOBS.iter().map(|g| (*g).to_owned()).collect();
+    let o = WalkOptions { configs: globs, excludes: vec!["excluded/".to_owned()], ..opts() };
+    let w = walk(&[t.path()], &o);
+    assert!(w.diagnostics.is_empty(), "{:?}", w.diagnostics);
+    // Lockfiles, gitignored, excluded and hidden files are skipped; sorted component-wise.
+    assert_eq!(rel_list(t.path(), &w.configs), ["cfg/app.toml", "data.json", "servers/elnb.yaml", "setup.cfg", "tox.ini"]);
+    assert_eq!(rel_list(t.path(), &w.files), ["a.py"]);
+    // Off by default.
+    assert!(walk(&[t.path()], &opts()).configs.is_empty());
+    assert!(is_lockfile(b"poetry.lock") && !is_lockfile(b"pyproject.toml"));
+}

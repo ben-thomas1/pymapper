@@ -6,8 +6,9 @@ codes, config, suppressions, baselines and exit codes. ruff and ty check one fil
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. `pymapper check` works end to end; the query subcommands
-(`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are not implemented yet.
+**Status:** under rewrite. `pymapper check` and `pymapper config` work end to end; the query
+subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are not
+implemented yet (hidden from `--help`; running one exits 2).
 See [`docs/design.md`](docs/design.md) for the design.
 
 ## Install
@@ -24,8 +25,8 @@ cargo build --release                         # target/release/pymapper
 ## Usage
 
 ```
-pymapper check                       # the project around the working directory
-pymapper check src tests             # explicit paths (config discovery starts at the first)
+pymapper check                       # the whole project around the working directory
+pymapper check src/pkg tests/x.py    # analyse the whole project, report only these paths
 pymapper check --select PM3,PM4      # only cycles/contracts and dead code
 pymapper check --ignore PM1          # everything but complexity
 pymapper check --format json         # concise | json | sarif | github
@@ -40,15 +41,22 @@ pymapper config --template           # every option, commented, with its default
 
 ```
 $ pymapper check
-app/billing.py:1:1: PM301 import cycle: app.billing -> app.accounts -> app.billing
+app/billing.py:1:1: PM301 import cycle (2 modules): app.billing -> app.accounts -> app.billing
 app/report.py:42:5: PM101 `app.report:render` is too complex (McCabe 14 > 10)
 app/legacy.py:10:5: PM401 function `app.legacy:old_export` is never used
 Found 3 findings in 3 files (128 files checked).
 ```
 
+The analysis is always whole-program: positional paths only filter which findings are
+reported (`pymapper check src/pkg` gives exactly the findings of the whole-project run that lie
+under `src/pkg`, with the same module names), and the footer says so (`Filtered to src/pkg (12 of
+340 first-party files); the whole project was analysed.`).
+
 Exit codes: **0** clean, **1** findings at or above the confidence gate, **2** usage error
-(including a path to check that does not exist), invalid configuration or baseline, or a fatal
-I/O error. Files and directories that exist but cannot be read are warnings.
+(including a path to check that does not exist, an unknown rule selector such as `PM999`, or a
+selection of which no rule can run, e.g. `--select PM6` or `--select PM501` without
+`analysis.dupes = true`), invalid configuration or baseline, or a fatal I/O error. Files and
+directories that exist but cannot be read are warnings.
 Output to a closed pipe (`| head`) stops quietly.
 
 Full reference (pipeline, every flag, output formats, baselines, `--stats`):
@@ -57,9 +65,22 @@ Full reference (pipeline, every flag, output formats, baselines, `--stats`):
 ## Configuration
 
 `[tool.pymapper]` in `pyproject.toml`, or a standalone `pymapper.toml` (top-level keys, no
-`[tool.pymapper]` header). Discovery walks up from the first path; the directory holding the
-config file is the project root. Precedence: defaults < config file < `--set 'KEY = VALUE'` <
+`[tool.pymapper]` header). Discovery walks up from the first path (else the working directory);
+the nearest config file applies. Precedence: defaults < config file < `--set 'KEY = VALUE'` <
 typed flags. Validation is strict (unknown keys are errors with file:line:col).
+
+The project root does not depend on how deep the first path is. It is, in order: the directory
+of the config file found (`--config` included; not with `--isolated`); else, walking up from the
+first path, the outermost directory whose `pyproject.toml` has `[tool.uv.workspace]`; else the
+top of the git repository (the nearest `.git` directory or file; the walk never crosses it);
+else the outermost directory with a `pyproject.toml` or `pymapper.toml`; else the first path
+itself (its directory, for a file). `$HOME` and its parents are never chosen for a path below
+`$HOME`. Every directory below the root with a `pyproject.toml` is a project unit (dead-code
+mode per unit) and an import root (its build-backend source dirs, its `src/` layout, then the
+directory itself), so uv workspace members and monorepo packages get the right module names
+without a venv; a `pyproject.toml` inside a package directory (one with `__init__.py`) is
+neither. The venv is looked up in the project root (`.venv` / `venv`) unless `venv` or
+`$VIRTUAL_ENV` says otherwise.
 
 ```toml
 [tool.pymapper]
@@ -79,6 +100,7 @@ max-mccabe = 12
 
 [tool.pymapper.analysis]
 dupes = true                         # expensive: duplicate-code detection (PM501)
+include-tests-in-metrics = false     # PM1xx / PM2xx / PM5xx skip test code by default
 
 [[tool.pymapper.contracts]]
 name = "architecture"
@@ -97,23 +119,40 @@ Every option, its default and its cost: `pymapper config --template`
   `[project.scripts]` / entry points, tests, `[entrypoints]` rules and presets.
 - `auto` (default): decided per package. Every directory with a `pyproject.toml` (the root and
   nested monorepo packages) is a unit, and each file belongs to its nearest unit. A unit with
-  entry points of its own (scripts in its `pyproject.toml`, a `__main__` module or guard) is an
-  application, any other a library. `check --stats` prints `deadcode.units`,
-  `deadcode.library` and `deadcode.application`.
+  entry points of its own (`[project.scripts]` in its `pyproject.toml`, a plausible
+  `__main__` module or guard) is an application, any other a library. `__main__` guards in
+  tests, private modules (`_doctools.py`) and `scripts/`, `tools/`, `examples/`, `docs/`,
+  `benchmarks/` do not count (they are still roots). `check --stats` prints
+  `deadcode.units`, `deadcode.library`, `deadcode.application` and one `deadcode.mode` line
+  per unit with the deciding evidence, e.g.
+  `deadcode.mode apps/x: application ([project.scripts] in apps/x/pyproject.toml)`.
 
 Force one mode for every unit with `--mode application|library` or `mode = "..."`. An
 application-mode unit with no entry point at all gets a warning, since everything in it would
 look unused. Functions a framework loads by name from non-Python configuration (YAML tool
-lists, plugin registries) are invisible to the analysis; declare them:
+lists, plugin registries) are found through config-file evidence (`analysis.config-evidence`,
+on by default): `*.yaml`, `*.yml`, `*.toml`, `*.json`, `*.cfg` and `*.ini` files of the
+first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles and pymapper /
+coverage.py reports are skipped) are tokenized once and cached. A full dotted path
+(`pkg.mod.func`, `pkg.mod:Class`) keeps a definition or module; a bare name lowers the
+confidence to 50 (10 when the file also names the module). Cost: one read per config file on a
+cold cache (a few ms for hundreds of files), a stat per file when warm. Rules you know better
+can still be declared:
 
 ```toml
 [tool.pymapper.entrypoints]
 names = ["aiml_ais_mcp.elnb.tools:*"]   # every definition of that module is an entry point
+# names = ["aiml_ais_mcp.elnb.tools"]   # the same: a dotted name without `:` means `module:*`
 ```
+
+A user entrypoint pattern (`decorators`, `bases`, `members`, `names`) that matches nothing in the project
+gets one warning after the dead-code pass, so a typo does not silently keep code "dead".
 
 Inline suppression: `# pymapper: ignore[PM401]` (or `ignore[PM4]`, or a bare
 `# pymapper: ignore`) on the reported line. Ruff's `# noqa` / `# noqa: F401` on an import line
-also suppresses PM405 (unused import); other `noqa` codes are ignored.
+also suppresses PM405 (unused import); other `noqa` codes are ignored. Malformed codes
+(`ignore[E501]`, `ignore[pm405]`), unknown codes (`PM999`) and empty lists (`ignore[]`) get a
+`path:line` warning and suppress nothing.
 
 ## Rules
 
@@ -129,10 +168,19 @@ also suppresses PM405 (unused import); other `noqa` codes are ignored.
 Each rule's explanation, thresholds, cost class and confidence model:
 [`docs/rules.md`](docs/rules.md).
 
+Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`tests/`, `test/`,
+`testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
+`analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
+tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
+structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a
+duplicate): see [`docs/cli.md`](docs/cli.md#output-formats).
+
 Dead-code findings carry a confidence (0-100): 100 means nothing references the symbol by any
 route pymapper knows; lower values mean only weak evidence (a matching attribute name or
 string elsewhere, dynamic dispatch) keeps it possibly alive. `check` reports findings at or
-above `min-confidence`.
+above `min-confidence`. Each finding names its evidence: the message says "is never used"
+only when nothing refers to the symbol, and the reasons are listed, e.g.
+`(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON.
 
 ## Performance
 

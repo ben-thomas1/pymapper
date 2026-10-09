@@ -32,7 +32,7 @@
 
 mod complexity;
 mod coupling;
-mod dead_code;
+pub mod dead_code;
 mod dependencies;
 mod docs;
 mod duplication;
@@ -47,12 +47,12 @@ mod tests;
 
 use std::fmt;
 
-use crate::config::{AnalysisConfig, Thresholds};
+use crate::config::{AnalysisConfig, RuleSelector, Thresholds};
 
 pub use docs::render_markdown;
 pub use engine::{FilterStats, RuleEngine, Verdict};
 pub use dead_code::{USE_NEVER, USE_ONLY_UNUSED};
-pub use finding::{Arg, ArgKind, ArgResolver, FileId, Finding, Findings, Location, MessageError, SymbolId};
+pub use finding::{Arg, ArgKind, ArgResolver, FileId, Finding, Findings, Location, MessageError, SymbolId, reason_names};
 pub use ruleset::RuleSet;
 pub use suppress::{BadCode, BadCodeKind, SuppressionEntry, Suppressions, SuppressionsBuilder, noqa_f401, parse_codes};
 
@@ -491,6 +491,29 @@ pub fn lookup_name(name: &str) -> Option<&'static RuleDef> {
 /// Every registered rule, in code order.
 pub fn all() -> impl Iterator<Item = &'static RuleDef> {
     GROUPS.iter().flat_map(|g| g.iter())
+}
+
+/// Whether `sel` selects at least one registered rule.
+pub fn selector_is_known(sel: RuleSelector) -> bool {
+    all().any(|d| sel.matches(d.code))
+}
+
+/// "Did you mean" help for a selector that matches no rule ([`selector_is_known`] is false):
+/// the closest registered code by edit distance (`PM409` -> `PM401`), else the category of
+/// a code in a reserved range (`PM499` -> `PM4`). For error messages only.
+pub fn suggest_selector(sel: RuleSelector) -> Option<String> {
+    let text = sel.to_string();
+    let codes: Vec<String> = all().map(|d| d.rule().to_string()).collect();
+    if let Some(c) = crate::config::closest(&text, codes.iter().map(String::as_str)) {
+        return Some(c.to_owned());
+    }
+    match sel {
+        RuleSelector::Prefix { value, digits } if digits > 1 => {
+            let digit = value / [1, 1, 10, 100][digits as usize];
+            Category::of(digit * 100).map(|c| format!("PM{}", c.digit()))
+        }
+        _ => None,
+    }
 }
 
 /// Rules of one category, in code order.

@@ -40,6 +40,9 @@
 //!   definition, including nested definitions at the depth they sit at.
 //! - `loc`: inclusive line span, from the definition's first line (first
 //!   decorator) to its last token.
+//! - `doc_lines`: lines of docstrings inside the definition: its own
+//!   docstring plus those of the definitions nested in it (see "Docstrings"
+//!   below). `loc - doc_lines` is the length PM104 checks.
 //! - Halstead counts from the tokens of the definition, from its `def` /
 //!   `class` keyword to its end (decorators, and the `async` of an
 //!   `async def`, belong to the enclosing scope).
@@ -53,6 +56,24 @@
 //!   `clamp((171 - 5.2 ln V - 0.23 CC - 16.2 ln LOC) * 100 / 171, 0, 100)`
 //!   with `ln V` taken as 0 when `V < 1`.
 //! - `params`: number of parameters (functions; 0 for classes).
+//!
+//! # Docstrings
+//!
+//! A docstring is the first statement of a function, class or module body
+//! when it is a string literal on its own: one or more adjacent `str`
+//! literals (any `r`/`u` prefix, single or triple quoted; not bytes, not
+//! f-/t-strings, not parenthesised) followed by the end of the statement
+//! (a line break or `;`). `"x".join(y)` or `"a" % b` as the first statement
+//! is an expression, not a docstring. A docstring on the header's line
+//! (`def f(): "doc"`) is not counted (that line holds code too). Its lines
+//! are those it spans, from the line of its first literal to the line of its
+//! last. A later string statement is never a docstring. The visitor sees no
+//! NEWLINE tokens, so statement boundaries between literals are line breaks
+//! in the source between two tokens (adjacent literals on separate lines
+//! without brackets are separate statements anyway; with a backslash
+//! continuation they are taken as separate too, a rare approximation).
+//! Module docstring lines plus the `doc_lines` of the top-level definitions
+//! are [`MetricsVisitor::file_doc_lines`] (PM107 subtracts them).
 //!
 //! Cost: O(tokens) time plus one hash-map probe per operand token inside a
 //! definition. Distinct counts are inclusive of nested definitions without
@@ -91,6 +112,8 @@ pub struct MetricsTable {
     pub operands: Vec<u32>,
     /// Saturates at `u8::MAX` (the facts' params run is exact).
     pub params: Vec<u8>,
+    /// Docstring lines inside the definition (own and nested; see the module docs).
+    pub doc_lines: Vec<u32>,
 }
 
 #[inline]
@@ -113,11 +136,12 @@ pub struct DefMetrics {
     pub volume: f32,
     pub mi: f32,
     pub params: u16,
+    pub doc_lines: u32,
 }
 
 impl MetricsTable {
     /// Bytes of one row (all columns).
-    pub const ROW_BYTES: usize = 2 + 2 + 1 + 4 + 1 + 4 + 4 + 4 + 1;
+    pub const ROW_BYTES: usize = 2 + 2 + 1 + 4 + 1 + 4 + 4 + 4 + 1 + 4;
 
     pub fn new() -> Self {
         Self::default()
@@ -141,6 +165,7 @@ impl MetricsTable {
         self.operators.clear();
         self.operands.clear();
         self.params.clear();
+        self.doc_lines.clear();
     }
 
     /// Row `i` as a struct (volume and MI computed). Panics if out of range.
@@ -157,7 +182,15 @@ impl MetricsTable {
             volume: self.volume(i) as f32,
             mi: self.mi(i) as f32,
             params: u16::from(self.params[i]),
+            doc_lines: self.doc_lines[i],
         }
+    }
+
+    /// Lines of row `i` without docstrings (`loc - doc_lines`, at least 1): the length PM104
+    /// checks.
+    #[inline]
+    pub fn code_lines(&self, i: usize) -> u32 {
+        self.loc[i].saturating_sub(self.doc_lines[i]).max(1)
     }
 
     /// Halstead volume of row `i`.
@@ -188,6 +221,7 @@ impl MetricsTable {
         self.operators.extend_from_slice(&other.operators);
         self.operands.extend_from_slice(&other.operands);
         self.params.extend_from_slice(&other.params);
+        self.doc_lines.extend_from_slice(&other.doc_lines);
     }
 
     /// Heap bytes held (capacity).
@@ -197,6 +231,7 @@ impl MetricsTable {
             + self.params.capacity()
             + 2 * (self.cyclomatic.capacity() + self.cognitive.capacity())
             + 4 * (self.loc.capacity()
+                + self.doc_lines.capacity()
                 + self.distinct_operands.capacity()
                 + self.operators.capacity()
                 + self.operands.capacity())
@@ -213,6 +248,7 @@ impl MetricsTable {
         self.operators.push(0);
         self.operands.push(0);
         self.params.push(0);
+        self.doc_lines.push(0);
     }
 
     /// Stores row `i`, narrowing with saturation (volume and MI are derived, not stored).
@@ -226,6 +262,7 @@ impl MetricsTable {
         self.operators[i] = m.operators;
         self.operands[i] = m.operands;
         self.params[i] = m.params.min(u16::from(u8::MAX)) as u8;
+        self.doc_lines[i] = m.doc_lines;
     }
 }
 
@@ -355,10 +392,101 @@ struct Hal {
     n2: u32,
 }
 
+/// Docstring detection for one body (see "Docstrings" in the module docs).
+#[derive(Clone, Copy, Debug, Default)]
+struct DocTrack {
+    state: u8,
+    /// `AWAIT`: end of the header (the body's first token must start on a later line);
+    /// `CAND`: start of the first literal.
+    from: u32,
+    /// `CAND`: end of the last literal.
+    last_end: u32,
+    /// Lines of the confirmed docstring.
+    lines: u32,
+}
+
+/// The body's first token is still to come.
+const DOC_AWAIT: u8 = 0;
+/// One or more literals seen as the first statement; waiting for the statement's end.
+const DOC_CAND: u8 = 1;
+/// Decided (`lines` holds the docstring's lines, 0 without one).
+const DOC_DONE: u8 = 2;
+
+/// Whether `src[from..to]` holds a line break.
+#[inline]
+fn line_break(src: &[u8], from: u32, to: u32) -> bool {
+    src.get(from as usize..to as usize).is_some_and(|s| s.iter().any(|&b| b == b'\n' || b == b'\r'))
+}
+
+/// Whether a `String` token is a bytes literal (`b"..."`, `rb'...'`, ...).
+#[inline]
+fn is_bytes(text: &[u8]) -> bool {
+    for &c in text {
+        match c {
+            b'b' | b'B' => return true,
+            b'\'' | b'"' => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+impl DocTrack {
+    /// A body whose header ends at `header_end` (`inline_ok`: the first token may be on the
+    /// same line, as for a module).
+    fn new(header_end: u32, inline_ok: bool) -> DocTrack {
+        DocTrack { state: DOC_AWAIT, from: if inline_ok { u32::MAX } else { header_end }, last_end: 0, lines: 0 }
+    }
+
+    /// Feeds the next token of the body (only called while not `DOC_DONE`).
+    #[cold]
+    fn token(&mut self, src: &[u8], tok: Token) {
+        let (start, end) = (tok.start, tok.start + tok.len);
+        if self.state == DOC_AWAIT {
+            let own_line = self.from == u32::MAX || line_break(src, self.from, start);
+            if tok.kind == K::String && own_line && !is_bytes(tok.text(src)) {
+                *self = DocTrack { state: DOC_CAND, from: start, last_end: end, lines: 0 };
+            } else {
+                self.state = DOC_DONE;
+            }
+            return;
+        }
+        let new_line = line_break(src, self.last_end, start);
+        if tok.kind == K::String && !new_line {
+            // Implicit concatenation on the same line.
+            self.last_end = end;
+        } else if new_line || tok.kind == K::Semi {
+            self.confirm(src);
+        } else {
+            // `"..." .join(...)`, `"a" % b`: an expression statement.
+            self.state = DOC_DONE;
+        }
+    }
+
+    /// Ends a candidate as a docstring (at a statement end or the end of the body).
+    fn confirm(&mut self, src: &[u8]) {
+        if self.state == DOC_CAND {
+            let text = src.get(self.from as usize..self.last_end as usize).unwrap_or(&[]);
+            let breaks = text.iter().enumerate().filter(|&(i, &b)| b == b'\n' || (b == b'\r' && text.get(i + 1) != Some(&b'\n'))).count();
+            self.lines = breaks as u32 + 1;
+        }
+        self.state = DOC_DONE;
+    }
+
+    /// Lines of the docstring, deciding a pending candidate (the body ended after it).
+    fn finish(&mut self, src: &[u8]) -> u32 {
+        self.confirm(src);
+        self.lines
+    }
+}
+
 /// An open definition.
 #[derive(Clone, Copy, Debug)]
 struct Frame {
     row: u32,
+    /// Docstring of this body, and docstring lines of the closed definitions nested in it.
+    doc: DocTrack,
+    doc_nested: u32,
     is_class: bool,
     name: Token,
     start_line: u32,
@@ -489,6 +617,11 @@ pub struct MetricsScratch {
     tok: u32,
     ops: u32,
     opds: u32,
+    /// End offset of the last token seen.
+    last_end: u32,
+    /// The module's docstring, and docstring lines of the closed top-level definitions.
+    module_doc: DocTrack,
+    module_doc_nested: u32,
 }
 
 impl MetricsScratch {
@@ -504,6 +637,9 @@ impl MetricsScratch {
         self.tok = 0;
         self.ops = 0;
         self.opds = 0;
+        self.last_end = 0;
+        self.module_doc = DocTrack::new(0, true);
+        self.module_doc_nested = 0;
     }
 
     /// Heap bytes held (capacity).
@@ -541,6 +677,13 @@ pub fn compute(src: &[u8]) -> MetricsTable {
 }
 
 impl MetricsVisitor<'_> {
+    /// Docstring lines of the whole file: the module docstring plus every definition's (for
+    /// PM107). Call after the parse.
+    pub fn file_doc_lines(&mut self) -> u32 {
+        let s = &mut *self.s;
+        s.module_doc.finish(self.src).saturating_add(s.module_doc_nested)
+    }
+
     /// Innermost open definition (a pending header excluded).
     #[inline]
     fn top(&mut self) -> Option<&mut Frame> {
@@ -597,7 +740,8 @@ impl MetricsVisitor<'_> {
 
     /// Closes the innermost frame and folds it into its parent.
     fn close(&mut self, end: End) {
-        let Some(f) = self.s.frames.pop() else { return };
+        let Some(mut f) = self.s.frames.pop() else { return };
+        let doc_lines = f.doc.finish(self.src).saturating_add(f.doc_nested);
         let big_n1 = self.s.ops - f.hal.ops0;
         let big_n2 = self.s.opds - f.hal.opds0;
         let loc = end.line.saturating_sub(f.start_line) + 1;
@@ -616,9 +760,14 @@ impl MetricsVisitor<'_> {
             volume: 0.0,
             mi: 0.0,
             params: f.params,
+            doc_lines,
         };
         self.out.set(f.row as usize, &m);
+        if self.s.frames.is_empty() {
+            self.s.module_doc_nested = self.s.module_doc_nested.saturating_add(doc_lines);
+        }
         if let Some(p) = self.s.frames.last_mut() {
+            p.doc_nested = p.doc_nested.saturating_add(doc_lines);
             p.hal.ops_seen |= f.hal.ops_seen;
             // A nested function's full score (its base 1 is the +1 for the
             // nested def); a class is transparent.
@@ -648,6 +797,17 @@ impl Visitor for MetricsVisitor<'_> {
     #[inline]
     fn token(&mut self, tok: Token) {
         let k = tok.kind;
+        {
+            let s = &mut *self.s;
+            let doc = match s.frames.last_mut() {
+                Some(f) => &mut f.doc,
+                None => &mut s.module_doc,
+            };
+            if doc.state != DOC_DONE {
+                doc.token(self.src, tok);
+            }
+            s.last_end = tok.start + tok.len;
+        }
         let role = token_role(k);
         if role == TokenRole::Ignored {
             return;
@@ -690,8 +850,11 @@ impl Visitor for MetricsVisitor<'_> {
         let is_class = def.kind == DefKind::Class;
         let row = self.out.len() as u32;
         self.out.push_zero();
+        let doc = DocTrack::new(s.last_end, false);
         s.frames.push(Frame {
             row,
+            doc,
+            doc_nested: 0,
             is_class,
             name: def.name,
             start_line: def.start_line,

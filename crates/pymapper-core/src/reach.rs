@@ -101,5 +101,5 @@ mod tests;
 
 pub use bits::{BitSet, Ones};
 pub use forward::{Reached, forward};
-pub use roots::{FileModes, RootOptions, RootSet, is_library, root_kind, roots};
+pub use roots::{FileModes, ModeReason, RootOptions, RootSet, is_library, plausible_entry, root_kind, roots};
 pub use sizes::{DEFAULT_PRECISION, ReachSizes, SizeMode, SizeStats, Weights, reach_sizes};

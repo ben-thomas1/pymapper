@@ -20,6 +20,8 @@ pub(super) struct ModuleLevels {
     nodes: Vec<NodeId>,
     level: Vec<u8>,
     why: Vec<u8>,
+    /// See [`Levels::origin`].
+    origin: Vec<u8>,
     /// Some other module imports it (live or not).
     imported: Vec<bool>,
 }
@@ -38,13 +40,17 @@ impl ModuleLevels {
         self.local(v).map(|i| Why::from_u8(self.why[i]))
     }
 
+    pub fn origin(&self, v: NodeId) -> Option<Why> {
+        self.local(v).map(|i| Why::from_u8(self.origin[i]))
+    }
+
     /// Whether another module has an import edge to `v` (from live or unused code).
     pub fn imported(&self, v: NodeId) -> bool {
         self.local(v).is_some_and(|i| self.imported[i])
     }
 
     pub fn heap_bytes(&self) -> usize {
-        self.nodes.capacity() * 4 + self.level.capacity() + self.why.capacity() + self.imported.capacity()
+        self.nodes.capacity() * 4 + self.level.capacity() + self.why.capacity() + self.origin.capacity() + self.imported.capacity()
     }
 }
 
@@ -57,22 +63,23 @@ pub(super) struct ModGraph<'a> {
 
 impl Expand for ModGraph<'_> {
     fn expand(&self, lv: &mut Levels, m: u32, l: u8) {
+        let o = lv.origin[m as usize];
         for &w in self.imports.graph().succ(m) {
-            lv.raise(w, l, Why::Import);
+            lv.step(w, l, level::LIVE, Why::Import, o);
         }
         let fwd = self.calls.graph().forward();
         let labels = fwd.neighbour_labels(m);
         for (i, &w) in fwd.neighbours(m).iter().enumerate() {
             if labels[i] <= Confidence::Likely as u8 {
-                lv.raise(w, l, Why::Call);
+                lv.step(w, l, level::LIVE, Why::Call, o);
             } else {
-                lv.raise(w, l.min(level::POSSIBLE), Why::PossibleCall);
+                lv.step(w, l, level::POSSIBLE, Why::PossibleCall, o);
             }
         }
         if let Some(p) = self.ix.parent(self.imports.node(m))
             && let Some(lp) = self.imports.local(p)
         {
-            lv.raise(lp, l, Why::Submodule);
+            lv.step(lp, l, level::LIVE, Why::Submodule, o);
         }
     }
 }
@@ -140,6 +147,6 @@ impl<'a> ModuleProp<'a> {
         let nodes = imports.nodes().to_vec();
         let g = imports.graph();
         let imported = (0..nodes.len() as u32).map(|m| g.pred(m).iter().any(|&w| w != m)).collect();
-        (ModuleLevels { nodes, level: self.lv.level, why: self.lv.why, imported }, self.lv.expansions)
+        (ModuleLevels { nodes, level: self.lv.level, why: self.lv.why, origin: self.lv.origin, imported }, self.lv.expansions)
     }
 }

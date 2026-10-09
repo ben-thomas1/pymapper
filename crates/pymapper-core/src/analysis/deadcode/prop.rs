@@ -10,6 +10,9 @@ use crate::resolve::{Classes, Confidence, Reason, ResolvedCalls};
 pub(super) struct Levels {
     pub level: Vec<u8>,
     pub why: Vec<u8>,
+    /// The [`Why`] of the step that capped the node's best path (the seed or the evidence it
+    /// started from, or the weakest step on it): what its confidence is due to.
+    pub origin: Vec<u8>,
     /// One stack per level; a node is pushed each time its level rises.
     queue: Vec<Vec<u32>>,
     pub expansions: u64,
@@ -25,19 +28,39 @@ impl Levels {
         Levels {
             level: vec![0; n as usize],
             why: vec![Why::Dead as u8; n as usize],
+            origin: vec![Why::Dead as u8; n as usize],
             queue: (0..=level::LIVE).map(|_| Vec::new()).collect(),
             expansions: 0,
         }
     }
 
-    /// Raises `v` to level `l` (no-op unless higher), queueing it for expansion.
+    /// Raises `v` to level `l` (no-op unless higher), queueing it for expansion; `why` is
+    /// also its origin (a seed).
     #[inline]
     pub fn raise(&mut self, v: u32, l: u8, why: Why) {
+        self.raise_with(v, l, why, why as u8);
+    }
+
+    /// Raises `v` to `l` with an explicit origin.
+    #[inline]
+    pub fn raise_with(&mut self, v: u32, l: u8, why: Why, origin: u8) {
         let cur = &mut self.level[v as usize];
         if l > *cur {
             *cur = l;
             self.why[v as usize] = why as u8;
+            self.origin[v as usize] = origin;
             self.queue[l as usize].push(v);
+        }
+    }
+
+    /// A step from a source at level `l` with origin `origin`, capped at `cap`: the target
+    /// gets `min(l, cap)`, and the cap becomes its origin when it is the binding constraint.
+    #[inline]
+    pub fn step(&mut self, v: u32, l: u8, cap: u8, why: Why, origin: u8) {
+        if cap < l {
+            self.raise_with(v, cap, why, why as u8);
+        } else {
+            self.raise_with(v, l, why, origin);
         }
     }
 
@@ -104,13 +127,14 @@ impl<'a> DefGraph<'a> {
 impl Expand for DefGraph<'_> {
     fn expand(&self, lv: &mut Levels, v: u32, l: u8) {
         let ix = self.ix;
+        let o = lv.origin[v as usize];
         let fwd = self.calls.forward();
         let labels = fwd.neighbour_labels(v);
         for (i, &w) in fwd.neighbours(v).iter().enumerate() {
             if labels[i] <= Confidence::Likely as u8 {
-                lv.raise(w, l, Why::Call);
+                lv.step(w, l, level::LIVE, Why::Call, o);
             } else {
-                lv.raise(w, l.min(level::POSSIBLE), Why::PossibleCall);
+                lv.step(w, l, level::POSSIBLE, Why::PossibleCall, o);
             }
         }
         let kind = ix.kind(v);
@@ -119,7 +143,7 @@ impl Expand for DefGraph<'_> {
                 let s = self.seed[c as usize];
                 if s != 0 {
                     let why = Why::from_u8(s);
-                    lv.raise(c, l.min(why.seed_strength()), why);
+                    lv.step(c, l, why.seed_strength(), why, o);
                 }
             }
         }
@@ -127,17 +151,21 @@ impl Expand for DefGraph<'_> {
             NodeKind::Class => {
                 if let Some(c) = self.classes.id(ix, v) {
                     for &b in self.classes.bases(c) {
-                        lv.raise(self.classes.node(b), l, Why::Subclass);
+                        lv.step(self.classes.node(b), l, level::LIVE, Why::Subclass, o);
                     }
                 }
                 // Methods overriding a live base method are live as far as the class is.
                 for m in ix.children(v) {
-                    let mut best = 0;
+                    let (mut best, mut best_o) = (0, o);
                     for &b in self.over.pred(m) {
-                        best = best.max(lv.level[b as usize]);
+                        if lv.level[b as usize] > best {
+                            best = lv.level[b as usize];
+                            best_o = lv.origin[b as usize];
+                        }
                     }
                     if best > 0 {
-                        lv.raise(m, l.min(best), Why::Override);
+                        let origin = if best < l { best_o } else { o };
+                        lv.raise_with(m, l.min(best), Why::Override, origin);
                     }
                 }
             }
@@ -145,11 +173,12 @@ impl Expand for DefGraph<'_> {
                 for &m in self.over.succ(v) {
                     if let Some(c) = ix.parent(m) {
                         let lc = lv.level[c as usize];
-                        lv.raise(m, l.min(lc), Why::Override);
+                        let origin = if lc < l { lv.origin[c as usize] } else { o };
+                        lv.raise_with(m, l.min(lc), Why::Override, origin);
                     }
                 }
                 for &b in self.over.pred(v) {
-                    lv.raise(b, l, Why::Override);
+                    lv.step(b, l, level::LIVE, Why::Override, o);
                 }
             }
             _ => {}
@@ -158,10 +187,10 @@ impl Expand for DefGraph<'_> {
             && let Some(p) = ix.parent(v)
             && ix.kind(p) == NodeKind::Class
         {
-            lv.raise(p, l, Why::Method);
+            lv.step(p, l, level::LIVE, Why::Method, o);
         }
         if let Some(&t) = self.siblings.get(&v) {
-            lv.raise(t, l, Why::Sibling);
+            lv.step(t, l, level::LIVE, Why::Sibling, o);
         }
     }
 }

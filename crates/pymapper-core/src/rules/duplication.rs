@@ -18,8 +18,13 @@ pub(super) const RULES: &[RuleDef] = &[RuleDef {
     args: &[ArgKind::U32, ArgKind::File, ArgKind::U32],
     explanation: "Token sequences of at least `dupes-min-tokens` tokens spanning at least \
 `dupes-min-lines` lines that occur more than once, after normalising identifiers and literals \
-(so renamed copies match). Reported at each copy, pointing at another copy. Duplicates must be \
-kept in sync by hand and drift apart.\n\n\
+(so renamed copies match). Reported at each copy, pointing at another copy; JSON output adds the \
+copy's `end_line`, its `symbol` (the innermost class or function containing the whole copy, if \
+any) and an `other` object with the other copy's `path`, `line`, `end_line` and `symbol`. Import \
+statements are ignored, stub files (`.pyi`) are skipped, and a copy never starts or ends on an \
+`@overload` signature or a docstring (it is trimmed to the code in between, and dropped if too \
+little is left), so runs of overloads are not reported. Duplicates must be kept in sync by hand \
+and drift apart.\n\n\
 Fix: extract the shared code into a function or base class.\n\n\
 Off unless `analysis.dupes = true` (token-window hashing across all first-party files).",
     severity: Severity::Info,

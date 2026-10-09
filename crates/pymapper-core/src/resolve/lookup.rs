@@ -92,6 +92,9 @@ impl Locals {
             }
         }
         for row in ff.decls.range() {
+            if st.decls.kind[row] == crate::extract::facts::DECL_GETATTR_PREFIX {
+                continue;
+            }
             let kind = match decl_kind(st.decls.kind[row]) {
                 crate::extract::events::DeclKind::Global => lkind::GLOBAL,
                 crate::extract::events::DeclKind::Nonlocal => lkind::NONLOCAL,

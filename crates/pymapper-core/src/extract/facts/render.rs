@@ -28,6 +28,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
         (file_flags::ALL_DEFINED as u16, "all_defined"),
         (file_flags::ALL_DYNAMIC as u16, "all_dynamic"),
         (file_flags::TRUNCATED as u16, "truncated"),
+        (file_flags::DYNAMIC_GETATTR as u16, "dynamic_getattr"),
     ]);
     out.push('\n');
 
@@ -184,6 +185,7 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
     for i in ff.decls.range() {
         let d = &st.decls;
         let k = match decl_kind(d.kind[i]) {
+            _ if d.kind[i] == super::DECL_GETATTR_PREFIX => "getattr_prefix",
             DeclKind::Global => "global",
             DeclKind::Nonlocal => "nonlocal",
         };

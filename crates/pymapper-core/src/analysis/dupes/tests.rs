@@ -777,3 +777,121 @@ fn overlapping_copies_do_not_merge_transitively() {
     assert_eq!(out.len(), r.members.len());
     assert_eq!(r.groups.len(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Trimming, skipped files, structured findings
+// ---------------------------------------------------------------------------------------------
+
+/// [`run`] with a line mask.
+fn run_masked(srcs: &[&str], params: DupesParams, mask: &LineMask) -> DupesReport {
+    let mut fps = Fingerprints::new();
+    let mut sc = FingerprintScratch::new();
+    for (i, s) in srcs.iter().enumerate() {
+        fingerprint_source(s.as_bytes(), i as u32, &params, &mut sc, &mut fps);
+    }
+    find_clones_masked(fps, &params, |f, buf| {
+        buf.extend_from_slice(srcs[f as usize].as_bytes());
+        true
+    }, mask)
+}
+
+/// The body of [`func`] (indented), without its `def` line.
+fn body(n: &str) -> String {
+    func("x", n).split_once('\n').map(|(_, b)| b.to_owned()).unwrap_or_default()
+}
+
+const DOC: &str = "    \"\"\"Compute the total.\n\n    Parameters\n    ----------\n    items : list\n    \"\"\"\n";
+
+#[test]
+fn copies_do_not_start_at_a_docstring() {
+    // Different signatures, the same docstring and body: the copy starts at the body.
+    let f0 = format!("def alpha(items, limit=10) -> int:\n{DOC}{}", body("a"));
+    let f1 = format!("def beta(items, limit):\n{DOC}{}", body("b"));
+    let r = run(&[&f0, &f1], DupesParams::default());
+    assert_eq!(r.pairs.len(), 1, "{r:?}");
+    let p = r.pairs[0];
+    // Line 1 is the header, lines 2-7 the docstring.
+    assert_eq!((p.a.start_line, p.b.start_line), (8, 8), "{p:?}");
+    assert_eq!(p.a.col, 5);
+    // A trailing docstring (of the next function) is trimmed too.
+    let f2 = format!("{f0}\ndef gamma():\n    \"\"\"Next.\"\"\"\n    return 1\n");
+    let f3 = format!("{f1}\ndef delta():\n    \"\"\"Next.\"\"\"\n    raise ValueError(f, g)\n");
+    let r = run(&[&f2, &f3], DupesParams::default());
+    assert_eq!(r.pairs.len(), 1, "{r:?}");
+    let a = r.pairs[0].a;
+    assert!(a.end_line < line_of(&f2, "\"\"\"Next"), "{a:?}");
+}
+
+/// A run of `@overload` signatures (12 lines, about 90 tokens), then an implementation.
+fn overloads(name: &str, imp: &str) -> String {
+    let mut s = String::from("from typing import overload\n\n");
+    for t in ["int", "str", "bytes", "float"] {
+        s += &format!("@overload\ndef {name}(value: {t}, *, strict: bool = ..., limit: int = ...) -> {t}: ...\n");
+    }
+    s += &format!("def {name}(value, *, strict=False, limit=0):\n    return {imp}\n");
+    s
+}
+
+#[test]
+fn overload_runs_are_not_clones() {
+    let f0 = overloads("reset", "value");
+    let f1 = overloads("clear", "strict or limit");
+    let params = DupesParams::new(30, 4);
+    let r = run(&[&f0, &f1], params);
+    assert!(r.pairs.iter().any(|p| (p.a.file, p.b.file) == (0, 1)), "unmasked, the signatures match: {r:?}");
+    // Lines 3-10 are the overloads of both files.
+    let mask = LineMask::new(vec![(0, 3, 10), (1, 3, 10)]);
+    let r = run_masked(&[&f0, &f1], params, &mask);
+    assert!(r.pairs.is_empty(), "{r:?}");
+    assert!(mask.contains(1, 3) && mask.contains(1, 10) && !mask.contains(1, 11) && !mask.contains(2, 5));
+    // Overlapping ranges merge.
+    let m = LineMask::new(vec![(0, 5, 9), (0, 1, 6), (0, 20, 22)]);
+    assert!((1..=9).all(|l| m.contains(0, l)) && !m.contains(0, 10) && m.contains(0, 21));
+}
+
+#[test]
+fn stubs_tests_and_overloads_are_skipped_by_analyse() {
+    use crate::index::{LoadOptions, load_with};
+    let f = func("alpha", "a");
+    let files = [
+        ("pkg/a.py", format!("x = [1, 2]\n{f}")),
+        ("pkg/b.py", format!("if y:\n    pass\n\n{}", func("beta", "b"))),
+        ("pkg/s1.pyi", overloads("reset", "...")),
+        ("pkg/s2.pyi", overloads("reset", "...")),
+        ("pkg/o1.py", overloads("reset", "value")),
+        ("pkg/o2.py", overloads("clear", "strict or limit")),
+        ("tests/test_one.py", func("test_one", "t")),
+        ("tests/test_two.py", func("test_two", "u")),
+    ];
+    let params = DupesParams::new(30, 4);
+    let (dir, inputs) = temp_inputs("skip", &files);
+    let (ix, fps) = load_with(inputs, &LoadOptions { dupes: Some(params) });
+    let fps = fps.expect("fingerprints");
+    let mut out = Findings::new();
+    let report = analyse(&ix, fps.clone(), &params, &mut out);
+    let files_of = |r: &DupesReport| r.pairs.iter().map(|p| (p.a.file, p.b.file)).collect::<Vec<_>>();
+    assert_eq!(files_of(&report), [(0, 1)], "{report:?}");
+    // Structured findings: end line, enclosing def, the other copy.
+    assert_eq!(out.len(), 2);
+    for (x, _) in out.iter() {
+        let this = if x.loc.file.0 == 0 { 0 } else { 1 };
+        let def = ["pkg.a:alpha", "pkg.b:beta"][this];
+        assert_eq!(ix.qid_string(x.symbol.0), def);
+        assert_eq!(x.end_line, x.loc.line + 11);
+        let other = 1 - this;
+        match out.extra(x) {
+            [Arg::File(f), Arg::U32(start), Arg::U32(end), Arg::Symbol(s)] => {
+                assert_eq!(f.0, other as u32);
+                assert_eq!(end - start, 11);
+                assert_eq!(ix.qid_string(s.0), ["pkg.a:alpha", "pkg.b:beta"][other]);
+            }
+            e => panic!("unexpected extra {e:?}"),
+        }
+    }
+    // With test code included, the two tests are clones of the others.
+    let mut out = Findings::new();
+    let report = analyse(&ix, fps, &params.with_tests(true), &mut out);
+    let pairs = files_of(&report);
+    assert!(pairs.contains(&(6, 7)) && !pairs.iter().any(|&(a, b)| a == 2 || b == 3), "{pairs:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}

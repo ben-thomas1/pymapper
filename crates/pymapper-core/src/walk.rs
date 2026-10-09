@@ -72,6 +72,10 @@ pub struct WalkOptions {
     /// [`Walk::projects`] (project units, see [`crate::roots::ProjectUnits`]). Default `false`;
     /// on for first-party code. Ignore files and excludes apply to them as to sources.
     pub projects: bool,
+    /// File-name globs (wildmatch syntax, e.g. `*.yaml`) of non-Python config files to list in
+    /// [`Walk::configs`] (config-file evidence for dead code). Empty (default): none. Ignore
+    /// files and excludes apply; lockfiles ([`is_lockfile`]) are never listed.
+    pub configs: Vec<String>,
 }
 
 impl Default for WalkOptions {
@@ -84,6 +88,7 @@ impl Default for WalkOptions {
             exclude_base: None,
             sort: true,
             projects: false,
+            configs: Vec::new(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl WalkOptions {
             excludes: config.all_excludes().map(str::to_owned).collect(),
             exclude_base: Some(project_root.to_path_buf()),
             projects: true,
+            configs: if config.analysis.config_evidence { config.analysis.config_evidence_globs.clone() } else { Vec::new() },
             ..WalkOptions::default()
         }
     }
@@ -182,6 +188,9 @@ pub struct Walk {
     /// `pyproject.toml` files, sorted component-wise, without duplicates (only with
     /// [`WalkOptions::projects`]).
     pub projects: PathList,
+    /// Config files matching [`WalkOptions::configs`], sorted component-wise, without
+    /// duplicates.
+    pub configs: PathList,
     pub diagnostics: Vec<Diagnostic>,
     pub stats: WalkStats,
 }
@@ -390,6 +399,25 @@ fn joined_cmp(a0: &[u8], a1: &[u8], b0: &[u8], b1: &[u8]) -> Ordering {
 /// File name of a project unit's metadata ([`WalkOptions::projects`]).
 const PYPROJECT: &[u8] = crate::config::PYPROJECT_FILE.as_bytes();
 
+/// Lockfiles: generated, large, and full of package names that are not code references.
+pub const LOCKFILES: &[&[u8]] = &[
+    b"uv.lock",
+    b"poetry.lock",
+    b"pdm.lock",
+    b"Pipfile.lock",
+    b"package-lock.json",
+    b"npm-shrinkwrap.json",
+    b"yarn.lock",
+    b"pnpm-lock.yaml",
+    b"Cargo.lock",
+    b"composer.lock",
+];
+
+/// Whether file name `name` is a lockfile ([`LOCKFILES`]).
+pub fn is_lockfile(name: &[u8]) -> bool {
+    LOCKFILES.contains(&name)
+}
+
 /// Whether a file name is a Python source or stub.
 #[inline]
 pub fn is_python(name: &[u8]) -> bool {
@@ -450,6 +478,8 @@ struct Worker {
     found: Found,
     /// Full paths of the `pyproject.toml` files found ([`WalkOptions::projects`]; rare).
     projects: Vec<Box<[u8]>>,
+    /// Full paths of the config files found ([`WalkOptions::configs`]).
+    configs: Vec<Box<[u8]>>,
     diags: Vec<Diagnostic>,
     stats: WalkStats,
 }
@@ -536,20 +566,35 @@ pub fn walk<P: AsRef<Path>>(roots: &[P], opts: &WalkOptions) -> Walk {
     });
     let mut found = Vec::with_capacity(sh.workers.len() + 1);
     found.push(main.found);
-    let mut out = Walk { files: PathList::default(), projects: PathList::default(), diagnostics: main.diags, stats: main.stats };
+    let mut out = Walk {
+        files: PathList::default(),
+        projects: PathList::default(),
+        configs: PathList::default(),
+        diagnostics: main.diags,
+        stats: main.stats,
+    };
     let mut projects: Vec<Box<[u8]>> = Vec::new();
+    let mut configs: Vec<Box<[u8]>> = Vec::new();
     for slot in sh.workers {
         let w = slot.into_inner().unwrap_or_else(PoisonError::into_inner);
         out.stats.add(&w.stats);
         out.diagnostics.extend(w.diags);
         found.push(w.found);
         projects.extend(w.projects);
+        configs.extend(w.configs);
     }
     projects.sort_unstable_by(|a, b| path_cmp(a, b));
     projects.dedup();
     for p in &projects {
         // Fewer bytes than the source paths: cannot overflow before them.
         let _ = out.projects.push(p);
+    }
+    configs.sort_unstable_by(|a, b| path_cmp(a, b));
+    configs.dedup();
+    for p in &configs {
+        if out.configs.push(p).is_err() {
+            break;
+        }
     }
     let mut prefixes: Vec<&[u8]> = sh.roots.iter().map(|r| &*r.out).collect();
     prefixes.push(b"");
@@ -848,6 +893,13 @@ fn run_dir<'s>(s: &rayon::Scope<'s>, sh: &'s Shared<'s>, task: DirTask) {
                 if !is_python(name) {
                     if opts.projects && name == PYPROJECT && !ignored(&mut w.key, &mut w.ex_key, name, false) {
                         w.projects.push([&task.path[..], name].concat().into_boxed_slice());
+                    }
+                    if !opts.configs.is_empty()
+                        && !is_lockfile(name)
+                        && opts.configs.iter().any(|g| wildmatch::wildmatch(g.as_bytes(), name))
+                        && !ignored(&mut w.key, &mut w.ex_key, name, false)
+                    {
+                        w.configs.push([&task.path[..], name].concat().into_boxed_slice());
                     }
                     continue;
                 }

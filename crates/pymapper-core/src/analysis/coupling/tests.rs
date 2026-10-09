@@ -423,3 +423,27 @@ fn corpus_coupling_matches_import_graph() {
     assert!(found > 0 && total_edges > 0, "low thresholds find something");
 }
 
+
+#[test]
+fn test_code_is_skipped_unless_included() {
+    let fx = fx(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/a.py", "from pkg import b, c\n"),
+        ("pkg/b.py", ""),
+        ("pkg/c.py", ""),
+        ("tests/test_a.py", "from pkg import b, c\n"),
+        ("pkg/tests/helpers.py", "from pkg import b, c\n"),
+    ]);
+    let mut cfg = config();
+    cfg.thresholds.max_fan_out = 1;
+    let (_, got) = fx.run(&cfg, false);
+    assert_eq!(got, ["PM201 1:1 pkg.a 2 1"]);
+    cfg.analysis.include_tests_in_metrics = true;
+    let (_, got) = fx.run(&cfg, false);
+    assert_eq!(got, ["PM201 1:1 pkg.a 2 1", "PM201 1:1 pkg.tests.helpers 2 1", "PM201 1:1 tests.test_a 2 1"]);
+    // Module findings span the whole file.
+    let engine = RuleEngine::new(&cfg);
+    let mut out = Findings::new();
+    analyse(&fx.ix, &fx.imp, None, &engine, &mut out);
+    assert!(out.as_slice().iter().all(|f| f.end_line == 1), "one-line files");
+}

@@ -1064,11 +1064,100 @@ fn first_party_layouts() {
     assert_eq!(r.diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(), [DiagnosticKind::Pyproject]);
     assert!(r.pyproject.is_none());
 
-    // Project root detection.
-    t.file("h/pyproject.toml", "").dir("h/deep/er");
-    assert_eq!(find_project_root(&t.p("h/deep/er")), t.p("h"));
+}
+
+/// Project root discovery does not depend on how deep the start directory is.
+#[test]
+fn project_root_is_outermost() {
+    let t = TempDir::new("projroot");
+    // Outermost pyproject.toml wins over a nested one (a wheel's `pandas/pyproject.toml`).
+    t.file("h/pyproject.toml", "").file("h/pkg/pyproject.toml", "").file("h/pkg/__init__.py", "").dir("h/pkg/deep/er");
+    assert_eq!(find_project_root(&t.p("h/pkg/deep/er"), None), t.p("h"));
+    assert_eq!(find_project_root(&t.p("h/pkg"), None), t.p("h"));
+    assert_eq!(find_project_root(&t.p("h"), None), t.p("h"));
+    // `pymapper.toml` is a marker too.
+    t.file("s/pymapper.toml", "").file("s/a/pyproject.toml", "").dir("s/a/b");
+    assert_eq!(find_project_root(&t.p("s/a/b"), None), t.p("s"));
+    // Top of the git repository, even without a pyproject.toml there.
+    t.dir("r/.git").file("r/backend/pyproject.toml", "").dir("r/backend/pkg");
+    assert_eq!(find_project_root(&t.p("r/backend/pkg"), None), t.p("r"));
+    // A uv workspace root wins over the git top, and over nested members.
+    let ws = "[project]\nname = \"ws\"\n[tool.uv.workspace]\nmembers = [\"m\"]\n";
+    t.dir("g/.git").file("g/sub/pyproject.toml", ws).file("g/sub/m/pyproject.toml", "[project]\nname = \"m\"\n").dir("g/sub/m/x");
+    assert_eq!(find_project_root(&t.p("g/sub/m/x"), None), t.p("g/sub"));
+    // The walk stops at the first `.git` (a directory or a worktree / submodule file).
+    t.file("o/pyproject.toml", ws).file("o/inner/.git", "gitdir: ../x\n").dir("o/inner/x");
+    assert_eq!(find_project_root(&t.p("o/inner/x"), None), t.p("o/inner"));
+    // Nothing above `$HOME` (nor `$HOME` itself) for a start below it.
+    t.file("home/pyproject.toml", "").dir("home/proj/x");
+    assert_eq!(find_project_root(&t.p("home/proj/x"), Some(&t.p("home"))), t.p("home/proj/x"));
+    assert_eq!(find_project_root(&t.p("home"), Some(&t.p("home"))), t.p("home"));
+    assert_eq!(find_project_root(&t.p("home/proj/x"), Some(&t.p("elsewhere"))), t.p("home"));
+    // No marker at all: the start directory.
     let lone = TempDir::new("noproj");
-    assert_eq!(find_project_root(lone.path()), lone.path());
+    assert_eq!(find_project_root(lone.path(), None), lone.path());
+}
+
+/// Nested units (workspace members) contribute import roots; package directories do not.
+#[test]
+fn unit_import_dirs() {
+    let t = TempDir::new("unitroots");
+    t.file("p/pyproject.toml", "")
+        .file("p/libs/a/pyproject.toml", "")
+        .file("p/libs/a/ns/a/mod.py", "")
+        .file("p/libs/b/pyproject.toml", "[tool.setuptools.packages.find]\nwhere = [\"python\"]\n")
+        .file("p/libs/b/python/bpkg/__init__.py", "")
+        .file("p/libs/c/pyproject.toml", "")
+        .file("p/libs/c/src/cpkg/__init__.py", "")
+        .file("p/pkg/__init__.py", "")
+        .file("p/pkg/pyproject.toml", "");
+    let mut list = crate::walk::PathList::default();
+    for u in ["libs/a", "libs/b", "libs/c", "pkg"] {
+        list.push(t.p(&format!("p/{u}/pyproject.toml")).as_os_str().as_encoded_bytes()).unwrap();
+    }
+    let (units, diags) = ProjectUnits::discover(&t.p("p"), None, &list);
+    assert!(diags.is_empty());
+    assert_eq!(units.len(), 5);
+    let want = [t.p("p/libs/a"), t.p("p/libs/b/python"), t.p("p/libs/b"), t.p("p/libs/c/src"), t.p("p/libs/c")];
+    assert_eq!(units.import_dirs(), &want);
+
+    assert_eq!(units.import_dir_units(), &[1, 2, 2, 3, 3]);
+    let mut r = discover(&t.p("p"), &opts());
+    r.add_unit_roots(&units);
+    let rel = |path: &str| r.classify(&t.p(path)).map(|l| (r.root(l.root).path.clone(), l.rel.to_vec()));
+    assert_eq!(rel("p/libs/a/ns/a/mod.py"), Some((t.p("p/libs/a"), b"ns/a/mod.py".to_vec())));
+    assert_eq!(rel("p/libs/c/src/cpkg/__init__.py"), Some((t.p("p/libs/c/src"), b"cpkg/__init__.py".to_vec())));
+    assert_eq!(rel("p/pkg/__init__.py"), Some((t.p("p"), b"pkg/__init__.py".to_vec())));
+    // First-party unit roots come before the project root.
+    let kinds: Vec<RootKind> = r.roots.iter().map(|x| x.kind).collect();
+    assert_eq!(kinds, [RootKind::Src, RootKind::Src, RootKind::Src, RootKind::Src, RootKind::Src, RootKind::Project]);
+
+    // A unit mapped by an editable install (a first-party `.pth` root at or below it) is left
+    // to the install, and adding twice changes nothing.
+    let mut r = discover(&t.p("p"), &opts());
+    let mut pth = r.roots[0].clone();
+    pth.path = t.p("p/libs/b");
+    pth.kind = RootKind::Pth;
+    r.roots.push(pth);
+    r.add_unit_roots(&units);
+    r.add_unit_roots(&units);
+    let paths: Vec<PathBuf> = r.roots.iter().map(|x| x.path.clone()).collect();
+    assert_eq!(paths, [t.p("p/libs/a"), t.p("p/libs/c/src"), t.p("p/libs/c"), t.p("p"), t.p("p/libs/b")]);
+    assert_eq!(rel("p/libs/b/python/bpkg/__init__.py").map(|x| x.0), Some(t.p("p/libs/b/python")));
+    let rel2 = |path: &str| r.classify(&t.p(path)).map(|l| r.root(l.root).path.clone());
+    assert_eq!(rel2("p/libs/b/python/bpkg/__init__.py"), Some(t.p("p/libs/b")));
+}
+
+#[test]
+fn hatch_sources_override_package_parents() {
+    let info = |text: &str| parse_pyproject(text).unwrap().source_dirs;
+    let base = "[tool.hatch.build.targets.wheel]\npackages = [\"cogito/forge\"]\n";
+    assert_eq!(info(base), [PathBuf::from("cogito")]);
+    // `"" = ""` keeps paths as they are: the project directory is the import root.
+    assert_eq!(info(&format!("{base}[tool.hatch.build.targets.wheel.sources]\n\"\" = \"\"\n")), [PathBuf::from(".")]);
+    assert_eq!(info(&format!("{base}[tool.hatch.build.targets.wheel.sources]\n\"src/\" = \"\"\n\"x\" = \"y\"\n")), [PathBuf::from("src")]);
+    let arr = "[tool.hatch.build.targets.wheel]\npackages = [\"lib/a\"]\nsources = [\"lib\"]\n";
+    assert_eq!(info(arr), [PathBuf::from("lib")]);
 }
 
 #[test]

@@ -35,10 +35,15 @@ impl Project {
 
     /// Runs `pymapper check <args>` in the project directory.
     fn check(&self, args: &[&str]) -> Run {
+        self.check_in("", args)
+    }
+
+    /// Runs `pymapper check <args>` in the directory `rel` of the project.
+    fn check_in(&self, rel: &str, args: &[&str]) -> Run {
         let out = Command::new(env!("CARGO_BIN_EXE_pymapper"))
             .arg("check")
             .args(args)
-            .current_dir(&self.dir)
+            .current_dir(self.dir.join(rel))
             .env_remove("VIRTUAL_ENV")
             .output()
             .expect("run pymapper");
@@ -185,9 +190,12 @@ fn inline_suppressions_and_per_file_ignores() {
 
     add_tangled(&p, COMPLEX);
     p.file("tests/test_x.py", &COMPLEX.replace("tangled", "test_tangled"));
+    // Test code is out of the metric rules by default.
     let r = p.check(&["--select", "PM101"]);
+    assert_eq!(r.expect_code(1).codes(), ["PM101"]);
+    let r = p.check(&["--select", "PM101", "--set", "analysis.include-tests-in-metrics = true"]);
     assert_eq!(r.expect_code(1).codes(), ["PM101", "PM101"]);
-    p.file("pymapper.toml", "[rules.per-file-ignores]\n\"tests/\" = [\"PM1\"]\n");
+    p.file("pymapper.toml", "[analysis]\ninclude-tests-in-metrics = true\n[rules.per-file-ignores]\n\"tests/\" = [\"PM1\"]\n");
     let r = p.check(&["--select", "PM101"]);
     let lines = r.expect_code(1).findings();
     assert_eq!(lines.len(), 1, "{}", r.stdout);
@@ -210,13 +218,14 @@ fn import_cycle_in_every_format() {
     assert_eq!(r.expect_code(1).codes(), ["PM301"]);
     let first = r.findings()[0];
     assert!(first.starts_with("app/a.py:1:") || first.starts_with("app/b.py:1:"), "{}", r.stdout);
-    assert!(first.contains("import cycle: "), "{}", r.stdout);
+    assert!(first.contains("import cycle (2 modules): "), "{}", r.stdout);
 
     let r = p.check(&["--select", "PM301", "--format", "json"]);
     r.expect_code(1);
-    assert!(r.stdout.starts_with("{\"version\":1,"), "{}", r.stdout);
+    assert!(r.stdout.starts_with("{\"version\":2,"), "{}", r.stdout);
     assert!(r.stdout.contains("\"code\":\"PM301\""), "{}", r.stdout);
     assert!(r.stdout.contains("\"path\":\"app/"), "{}", r.stdout);
+    assert!(r.stdout.contains("\"cycle\":{\"size\":2,\"members\":[\"app.a\",\"app.b\"],\"witness\":["), "{}", r.stdout);
 
     let r = p.check(&["--select", "PM301", "--output-format", "sarif"]);
     r.expect_code(1);
@@ -308,20 +317,84 @@ fn missing_paths_exit_two() {
     r.expect_code(2);
     assert!(r.stderr.contains("(from `paths` in "), "{}", r.stderr);
     assert!(r.stderr.contains("pymapper.toml"), "{}", r.stderr);
-    // Explicit paths replace the configured ones.
+    // Positional paths only filter the report: the configured paths are still loaded, so a
+    // stale one fails even when the positional path is fine.
+    p.check(&["app"]).expect_code(2);
+    p.file("pymapper.toml", "paths = [\"app\"]\n");
     p.check(&["app"]).expect_code(0);
 }
 
 #[test]
-fn unknown_selectors_warn() {
+fn unknown_selectors_are_usage_errors() {
     let p = simple_project("unknown-sel");
-    let r = p.check(&["--select", "PM999,PM1", "--ignore", "PM9"]);
-    r.expect_code(0);
-    assert!(r.stderr.contains("selector `PM999` matches no known rule"), "{}", r.stderr);
-    assert!(r.stderr.contains("selector `PM9` matches no known rule"), "{}", r.stderr);
-    assert!(!r.stderr.contains("`PM1`"), "{}", r.stderr);
+    let r = p.check(&["--select", "PM999,PM1"]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("unknown rule selector `PM999`"), "{}", r.stderr);
+    assert!(!r.stdout.contains("All checks passed"), "{}", r.stdout);
+    let r = p.check(&["--select", "PM1", "--ignore", "PM9"]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("unknown rule selector `PM9`"), "{}", r.stderr);
+    // A near miss gets a suggestion, from the CLI and from the config file alike.
+    let r = p.check(&["--select", "PM409"]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("did you mean `PM401`?"), "{}", r.stderr);
+    p.file("pymapper.toml", "[rules]\nextend-select = [\"PM108\"]\n");
+    let r = p.check(&[]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("unknown rule selector `PM108`") && r.stderr.contains("did you mean `PM10"), "{}", r.stderr);
+    p.file("pymapper.toml", "[rules.per-file-ignores]\n\"tests/\" = [\"PM77\"]\n");
+    p.check(&[]).expect_code(2);
+    std::fs::remove_file(p.path("pymapper.toml")).expect("remove config");
     let r = p.check(&["--select", "PM1"]);
-    assert!(!r.stderr.contains("matches no known rule"), "{}", r.stderr);
+    r.expect_code(0);
+    assert!(!r.stderr.contains("unknown rule selector"), "{}", r.stderr);
+}
+
+/// Selections whose rules cannot run in `check` fail or say so; never a silent "All checks
+/// passed!".
+#[test]
+fn selections_that_cannot_run() {
+    let p = simple_project("cannot-run");
+    for (sel, needle) in [
+        ("PM6", "PM601-PM604: dependency rules are not run by `check`"),
+        ("PM601", "PM601: dependency rules"),
+        ("PM501", "PM501: expensive, needs `analysis.dupes = true`"),
+        ("PM302", "PM302: no [[contracts]] are configured"),
+        ("PM5,PM6", "PM501: expensive"),
+    ] {
+        let r = p.check(&["--select", sel]);
+        r.expect_code(2);
+        assert!(r.stderr.contains("none of the selected rules can run in `check`"), "{sel}: {}", r.stderr);
+        assert!(r.stderr.contains(needle), "{sel}: {}", r.stderr);
+        assert!(r.stdout.is_empty(), "{sel}: {}", r.stdout);
+    }
+    let r = p.check(&["--select", "PM1", "--ignore", "PM1"]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("no rule is selected"), "{}", r.stderr);
+
+    // Some rules run: a warning naming the skipped ones, and the footer counts them.
+    let r = p.check(&["--select", "PM1,PM501"]);
+    r.expect_code(0);
+    assert!(r.stderr.contains("PM501 is selected but does not run") && r.stderr.contains("analysis.dupes"), "{}", r.stderr);
+    assert!(r.stdout.contains("7 rules ran, 1 skipped (PM501: needs `analysis.dupes = true`)."), "{}", r.stdout);
+    // `ALL` stays quiet on stderr but the footer lists every skipped rule.
+    let r = p.check(&["--select", "ALL"]);
+    r.expect_code(0);
+    assert!(!r.stderr.contains("does not run"), "{}", r.stderr);
+    for needle in ["8 skipped", "PM302-PM304: no [[contracts]]", "PM501: needs `analysis.dupes = true`", "PM601-PM604: run by `pymapper deps`"] {
+        assert!(r.stdout.contains(needle), "{needle}: {}", r.stdout);
+    }
+    // `PM3` without contracts is a normal way to ask for cycles: no warning.
+    let r = p.check(&["--select", "PM3"]);
+    r.expect_code(0);
+    assert!(!r.stderr.contains("does not run"), "{}", r.stderr);
+    assert!(r.stdout.contains("1 rule ran, 3 skipped"), "{}", r.stdout);
+    // The default selection prints no rule counts (skipping gated rules is the default).
+    let r = p.check(&[]);
+    assert!(!r.stdout.contains("skipped"), "{}", r.stdout);
+    // `--stats` lists the counts and reasons.
+    let r = p.check(&["--select", "ALL", "--stats"]);
+    assert!(r.stderr.contains("rules_run") && r.stderr.contains("skipped PM501: expensive"), "{}", r.stderr);
 }
 
 #[test]
@@ -510,7 +583,7 @@ fn duplication_is_gated() {
         "from app.one import first\nfrom app.two import second\n\n\nif __name__ == '__main__':\n    first(1, 2)\n    second(1, 2)\n",
     );
     let r = p.check(&["--select", "PM501"]);
-    r.expect_code(0);
+    r.expect_code(2);
     assert!(r.stderr.contains("PM501") && r.stderr.contains("analysis.dupes"), "{}", r.stderr);
     let r = p.check(&["--select", "PM501", "--set", "analysis.dupes = true"]);
     r.expect_code(1);
@@ -647,4 +720,193 @@ fn application_mode_without_entry_points_warns_and_words_findings() {
     // Library mode: no warning either.
     let r = p.check(&["--no-cache", "--mode", "library"]);
     assert!(!r.stderr.contains("no entry points"), "{}", r.stderr);
+}
+
+// ----- positional paths filter a whole-program run -----
+
+/// A uv workspace whose members share the PEP 420 namespace package `ns`, plus a loose script
+/// (in `cli/`: a `__main__` guard under a helper directory such as `tools/` is no entry point).
+/// No venv: the members' import roots come from their `pyproject.toml` files.
+fn namespace_workspace(name: &str) -> Project {
+    let p = Project::new(name);
+    p.file("pyproject.toml", "[project]\nname = \"mono\"\n[tool.uv.workspace]\nmembers = [\"libs/*\"]\n")
+        .file("libs/core/pyproject.toml", "[project]\nname = \"ns-core\"\n")
+        .file("libs/core/ns/core/util.py", "def used():\n    return _helper()\n\n\ndef _helper():\n    return 1\n\n\ndef _unused_private():\n    return 2\n")
+        .file("libs/core/ns/core/_orphan.py", "def _orphan():\n    return 1\n")
+        .file("libs/app/pyproject.toml", "[project]\nname = \"ns-app\"\n[project.scripts]\napp = \"ns.app.main:main\"\n")
+        .file(
+            "libs/app/ns/app/main.py",
+            "import os\nfrom ns.core.util import used\n\n\ndef main():\n    return used()\n\n\ndef dead_app():\n    return 3\n",
+        )
+        .file("libs/app/ns/app/stale.py", "def stale():\n    return 1\n")
+        .file("cli/run.py", "def tool_dead():\n    pass\n\n\nif __name__ == '__main__':\n    print(1)\n");
+    p
+}
+
+/// Finding lines of `whole` whose path starts with one of `prefixes`.
+fn restricted<'a>(whole: &'a Run, prefixes: &[&str]) -> Vec<&'a str> {
+    whole.findings().into_iter().filter(|l| prefixes.iter().any(|p| l.starts_with(p))).collect()
+}
+
+#[test]
+fn positional_paths_filter_the_whole_program_findings() {
+    let p = namespace_workspace("scope-ns");
+    let args = ["--confidence", "0"];
+    let whole = p.check(&args);
+    whole.expect_code(1);
+    // Module names come from the members' import roots: `ns.app.main`, not `app.main`.
+    let all = whole.findings().join("\n");
+    for needle in ["ns.app.main:dead_app", "ns.core.util:_unused_private", "module `ns.app.stale`", "cli.run:tool_dead"] {
+        assert!(all.contains(needle), "{needle}:\n{all}");
+    }
+    assert!(!all.contains("`app.") && !all.contains("`core."), "{all}");
+    for scope in [
+        &["libs/app"][..],
+        &["libs/app/"],
+        &["libs/core/ns/core/util.py"],
+        &["libs/app/ns/app/main.py", "cli"],
+        &["libs/core", "libs/core/ns"],
+        &["libs/app/ns/app/__init__.py/.."],
+    ] {
+        let r = p.check(&[&args[..], scope].concat());
+        let prefixes: Vec<String> = scope.iter().map(|s| s.replace("/__init__.py/..", "").trim_end_matches('/').to_owned()).collect();
+        let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        assert_eq!(r.findings(), restricted(&whole, &prefixes), "{scope:?}\n{}{}", r.stdout, r.stderr);
+        assert!(!r.findings().is_empty(), "{scope:?}");
+        assert!(r.stdout.contains("Filtered to "), "{scope:?}: {}", r.stdout);
+        assert!(r.stdout.contains("the whole project was analysed"), "{scope:?}: {}", r.stdout);
+    }
+    // The footer counts the files in scope.
+    let r = p.check(&[&args[..], &["libs/core/ns/core/util.py"]].concat());
+    assert!(r.stdout.contains("Found 1 finding in 1 file (1 file checked)."), "{}", r.stdout);
+    assert!(r.stdout.contains("Filtered to libs/core/ns/core/util.py (1 of 5 first-party files)"), "{}", r.stdout);
+    // A file with no findings passes, but only because it is clean.
+    p.file("libs/core/ns/core/clean.py", "from ns.core.util import used\n\nVALUE = used()\n");
+    let r = p.check(&[&args[..], &["libs/core/ns/core/clean.py"]].concat());
+    r.expect_code(0);
+    assert!(r.stdout.contains("All checks passed! (1 file checked)"), "{}", r.stdout);
+    // From inside a member, with relative paths, warm cache: the same answers.
+    let r = p.check_in("libs/app", &[&args[..], &["."]].concat());
+    assert_eq!(r.findings(), restricted(&whole, &["libs/app"]), "{}{}", r.stdout, r.stderr);
+    let r = p.check_in("libs/app/ns/app", &[&args[..], &["main.py"]].concat());
+    assert_eq!(r.findings(), restricted(&whole, &["libs/app/ns/app/main.py"]), "{}{}", r.stdout, r.stderr);
+    // No positional path: the whole project, wherever it runs from.
+    let r = p.check_in("libs/app", &args);
+    assert_eq!(r.findings(), whole.findings());
+    assert!(!r.stdout.contains("Filtered to"), "{}", r.stdout);
+    // A path covering the project root filters nothing.
+    let r = p.check(&[&args[..], &["."]].concat());
+    assert_eq!(r.findings(), whole.findings());
+    assert!(!r.stdout.contains("Filtered to"), "{}", r.stdout);
+    // Only one cache, in the workspace root.
+    assert!(p.path(".pymapper_cache").is_dir());
+    assert!(!p.path("libs/app/.pymapper_cache").exists());
+    // JSON reports the same restricted set.
+    let r = p.check(&["--confidence", "0", "--format", "json", "libs/app"]);
+    assert_eq!(r.stdout.matches("\"code\":").count(), restricted(&whole, &["libs/app"]).len(), "{}", r.stdout);
+}
+
+/// A `pyproject.toml` shipped inside a package (pandas' wheel) is not a project root.
+#[test]
+fn nested_pyproject_inside_a_package_is_not_the_root() {
+    let p = Project::new("scope-nested");
+    p.file("pyproject.toml", "[project]\nname = \"pkg\"\n")
+        .file("pkg/__init__.py", "from pkg.core.window.rolling import Rolling\n\n__all__ = [\"Rolling\"]\n")
+        .file("pkg/pyproject.toml", "[project]\nname = \"pkg\"\n[build-system]\nbuild-backend = \"mesonpy\"\n")
+        .file("pkg/core/__init__.py", "")
+        .file("pkg/core/window/__init__.py", "")
+        .file("pkg/core/window/rolling.py", "import sys\n\n\nclass Rolling:\n    pass\n")
+        .file("pkg/core/window/ewm.py", "def ewm():\n    return 1\n");
+    let whole = p.check(&["--confidence", "0"]);
+    let all = whole.findings().join("\n");
+    assert!(all.contains("pkg/core/window/rolling.py:1:8: PM405"), "{all}");
+    for dir in ["pkg/core/window", "pkg", "pkg/core/window/rolling.py"] {
+        let r = p.check(&["--confidence", "0", dir]);
+        assert_eq!(r.findings(), restricted(&whole, &[dir]), "{dir}\n{}{}", r.stdout, r.stderr);
+        assert!(!r.stdout.contains("module core.window") && !r.stdout.contains("`core."), "{dir}: {}", r.stdout);
+    }
+}
+
+#[test]
+fn paths_outside_the_project_and_symlinks() {
+    let p = simple_project("scope-outside");
+    let other = Project::new("scope-other");
+    other.file("pyproject.toml", "[project]\nname = \"other\"\n").file("other/__init__.py", "").file("other/x.py", "import os\n");
+    // The first path picks the project: findings are relative to the other project's root.
+    let o = other.path("other");
+    let r = p.check(&[o.to_str().expect("utf-8")]);
+    r.expect_code(1);
+    assert!(r.stdout.contains("other/x.py:1:8: PM405"), "{}", r.stdout);
+    assert!(!r.stderr.contains("outside the project root"), "{}", r.stderr);
+    // A second path outside the first one's project is not checked, and says so.
+    let r = p.check(&["app", o.to_str().expect("utf-8")]);
+    r.expect_code(0);
+    assert!(r.stderr.contains("is outside the project root") && r.stderr.contains("is not checked"), "{}", r.stderr);
+    assert!(r.stdout.contains("(3 of 3 first-party files)"), "{}", r.stdout);
+
+    // Symlinks are not followed: neither inside the project nor as a positional path.
+    std::os::unix::fs::symlink(other.path("other"), p.path("linked")).expect("symlink");
+    let r = p.check(&["--confidence", "0"]);
+    assert!(!r.stdout.contains("linked") && !r.stdout.contains("x.py"), "{}", r.stdout);
+    let r = p.check(&["linked"]);
+    r.expect_code(0);
+    assert!(r.stderr.contains("no first-party Python files found under"), "{}", r.stderr);
+    assert!(!r.stdout.contains("x.py"), "{}", r.stdout);
+}
+
+#[test]
+fn malformed_suppressions_are_reported() {
+    let p = simple_project("bad-sup");
+    p.file(
+        "app/util.py",
+        "import os  # pymapper: ignore[pm405]\nimport re  # pymapper: ignore[E501]\nimport io  # pymapper: ignore[]\n\
+         import sys  # pymapper: ignore[PM999, PM405]\n\n\ndef helper():\n    return 1\n",
+    );
+    let r = p.check(&["--no-cache"]);
+    r.expect_code(1);
+    for needle in [
+        "app/util.py:1: invalid suppression code `pm405` suppresses nothing; did you mean `PM405`?",
+        "app/util.py:2: `E501` is not a pymapper rule code",
+        "app/util.py:3: empty `# pymapper: ignore[]` suppresses nothing",
+        "app/util.py:4: suppression code `PM999` matches no known rule",
+    ] {
+        assert!(r.stderr.contains(needle), "{needle}:\n{}", r.stderr);
+    }
+    // The malformed ones suppress nothing; the valid code next to an unknown one still works.
+    assert_eq!(r.codes(), ["PM405", "PM405", "PM405"], "{}", r.stdout);
+    assert!(!r.stdout.contains("`sys`"), "{}", r.stdout);
+    // Files outside the positional paths are not diagnosed.
+    let r = p.check(&["--no-cache", "app/main.py"]);
+    assert!(!r.stderr.contains("suppression"), "{}", r.stderr);
+}
+
+#[test]
+fn entrypoint_patterns_that_match_nothing_warn() {
+    let p = monorepo("ep-unmatched");
+    let args = ["--no-cache", "--select", "PM401", "--mode", "application"];
+    let set = "entrypoints.names = [\"libkg.api\", \"no_such_name\", \"pkg.gone:*\"]";
+    let r = p.check(&[&args[..], &["--set", set, "--set", "entrypoints.decorators = [\"never.used\"]"]].concat());
+    // A bare module name means `module:*`.
+    assert!(!r.stdout.contains("libkg.api:"), "{}", r.stdout);
+    for pat in ["no_such_name", "pkg.gone:*", "never.used"] {
+        assert!(r.stderr.contains(&format!("entrypoint pattern `{pat}`")), "{pat}:\n{}", r.stderr);
+    }
+    assert!(!r.stderr.contains("pattern `libkg.api`"), "{}", r.stderr);
+    assert_eq!(r.stderr.matches("matches nothing").count(), 3, "{}", r.stderr);
+    // No dead-code pass, no matching, no warning.
+    let r = p.check(&["--no-cache", "--select", "PM1", "--set", set]);
+    assert!(!r.stderr.contains("matches nothing"), "{}", r.stderr);
+}
+
+/// Whole-program warnings about units are limited to units overlapping the positional paths.
+#[test]
+fn unit_warnings_follow_the_positional_paths() {
+    let p = monorepo("scope-unit-warn");
+    let args = ["--no-cache", "--select", "PM401", "--mode", "application"];
+    let r = p.check(&args);
+    assert!(r.stderr.contains("no entry points found in") && r.stderr.contains("libs/lib"), "{}", r.stderr);
+    let r = p.check(&[&args[..], &["apps/app"]].concat());
+    assert!(!r.stderr.contains("no entry points found"), "{}", r.stderr);
+    let r = p.check(&[&args[..], &["libs/lib/libkg/api.py"]].concat());
+    assert!(r.stderr.contains("no entry points found"), "{}", r.stderr);
 }

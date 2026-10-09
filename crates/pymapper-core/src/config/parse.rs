@@ -64,9 +64,9 @@ pub(super) const THRESHOLD_KEYS: &[&str] = &[
     "dupes-min-tokens",
     "dupes-min-lines",
 ];
-pub(super) const ENTRYPOINT_KEYS: &[&str] = &["decorators", "bases", "names", "project-scripts"];
+pub(super) const ENTRYPOINT_KEYS: &[&str] = &["decorators", "bases", "names", "members", "project-scripts"];
 pub(super) const ANALYSIS_KEYS: &[&str] =
-    &["dupes", "exact-reachability", "name-fallback", "unique-method-fallback", "type-checking-cycles", "coverage"];
+    &["dupes", "exact-reachability", "name-fallback", "config-evidence", "config-evidence-globs", "unique-method-fallback", "type-checking-cycles", "include-tests-in-metrics", "coverage"];
 pub(super) const CONTRACT_COMMON_KEYS: &[&str] = &["name", "kind", "allow-type-checking", "transitive", "ignore-imports"];
 pub(super) const LAYERS_KEYS: &[&str] = &["layers", "containers", "independent-siblings"];
 pub(super) const FORBIDDEN_KEYS: &[&str] = &["source", "forbidden"];
@@ -572,6 +572,7 @@ fn apply_entrypoints(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, cfg: &mut Config) {
             "decorators" => set(&mut ep.decorators, cx.glob_list(&path, v)),
             "bases" => set(&mut ep.bases, cx.glob_list(&path, v)),
             "names" => set(&mut ep.names, cx.glob_list(&path, v)),
+            "members" => set(&mut ep.members, cx.glob_list(&path, v)),
             "project-scripts" => set(&mut ep.project_scripts, cx.bool(&path, v)),
             _ => cx.unknown_key("entrypoints", k, ENTRYPOINT_KEYS),
         }
@@ -587,8 +588,11 @@ fn apply_analysis(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, cfg: &mut Config) {
             "dupes" => set(&mut an.dupes, cx.bool(&path, v)),
             "exact-reachability" => set(&mut an.exact_reachability, cx.bool(&path, v)),
             "name-fallback" => set(&mut an.name_fallback, cx.bool(&path, v)),
+            "config-evidence" => set(&mut an.config_evidence, cx.bool(&path, v)),
+            "config-evidence-globs" => set(&mut an.config_evidence_globs, cx.string_list(&path, v)),
             "unique-method-fallback" => set(&mut an.unique_method_fallback, cx.bool(&path, v)),
             "type-checking-cycles" => set(&mut an.type_checking_cycles, cx.bool(&path, v)),
+            "include-tests-in-metrics" => set(&mut an.include_tests_in_metrics, cx.bool(&path, v)),
             "coverage" => set(&mut an.coverage, cx.path(&path, v).map(Some)),
             _ => cx.unknown_key("analysis", k, ANALYSIS_KEYS),
         }

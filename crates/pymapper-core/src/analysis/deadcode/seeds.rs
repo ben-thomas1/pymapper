@@ -2,7 +2,10 @@
 
 use super::Why;
 use super::prop::DefGraph;
-use crate::extract::facts::{DefKind, def_flags, evidence_hash, file_flags, import_flags};
+use crate::config::EntrypointMatcher;
+use crate::extract::facts::{DECL_GETATTR_PREFIX, DefKind, FileView, def_flags, evidence_hash, file_flags, import_flags};
+use crate::intern::FxHashSet;
+use crate::roots::Origin;
 use crate::index::{FileId, Index, NONE, NodeId};
 use crate::reach::FileModes;
 use crate::intern::Sym;
@@ -31,19 +34,28 @@ pub const WRAPPERS: &[&[u8]] = &[
 ];
 
 /// Names whose presence in a file's evidence means dynamic access to its namespace or its
-/// objects' attributes.
-const DYNAMIC_NAMES: &[&[u8]] = &[b"getattr", b"globals", b"locals", b"vars", b"__dict__", b"__getattr__"];
+/// objects' attributes. `getattr` is not among them: the extractor classifies its attribute
+/// name ([`file_flags::DYNAMIC_GETATTR`] for a variable one, [`DECL_GETATTR_PREFIX`] rows for a
+/// constant prefix, nothing for a constant).
+const DYNAMIC_NAMES: &[&[u8]] = &[b"globals", b"locals", b"vars", b"__dict__", b"__getattr__"];
+
+/// `getattr` prefixes at least this long apply to matching defs in every file; shorter ones
+/// (`f"_{x}"`) only to the defs of their own file.
+const GLOBAL_PREFIX: usize = 3;
 
 /// Per-file facts shared by the def and import passes.
 pub(super) struct FileInfo {
     /// The file contributes (origin selected, runtime `.py` file).
     pub included: Vec<bool>,
-    /// The file uses dynamic access ([`DYNAMIC_NAMES`] or a module-level `__getattr__`).
+    /// The file uses dynamic access ([`DYNAMIC_NAMES`], a module-level `__getattr__`, a
+    /// variable `getattr`).
     pub dynamic: Vec<bool>,
 }
 
 /// Interned names the seed pass compares against.
-struct Names {
+struct Names<'a> {
+    /// Member rules ([`EntrypointMatcher::member`]), when any.
+    members: Option<&'a EntrypointMatcher>,
     protocol: Option<Sym>,
     override_: Option<Sym>,
     getattr: Option<Sym>,
@@ -51,12 +63,13 @@ struct Names {
     dynamic: Vec<u32>,
 }
 
-impl Names {
-    fn new(ix: &Index) -> Names {
+impl<'a> Names<'a> {
+    fn new(ix: &Index, members: Option<&'a EntrypointMatcher>) -> Names<'a> {
         let g = |s: &[u8]| ix.strings().get(s);
         let mut wrappers: Vec<Sym> = WRAPPERS.iter().filter_map(|w| g(w)).collect();
         wrappers.sort_unstable();
         Names {
+            members: members.filter(|m| m.has_members()),
             protocol: g(b"Protocol"),
             override_: g(b"override"),
             getattr: g(b"__getattr__"),
@@ -81,6 +94,8 @@ struct Scratch {
     marks: Vec<u8>,
     /// `(parent row, name, node)` of the file's defs, for sibling rings.
     named: Vec<(u32, Sym, NodeId)>,
+    /// Dotted decorator names being matched.
+    buf: Vec<u8>,
 }
 
 const PROTOCOL: u8 = 1;
@@ -90,12 +105,69 @@ const PUBLIC: u8 = 4;
 /// dispatch such as `getattr(self, "_print_" + name)` in a base printer or visitor).
 const DYNAMIC_BASE: u8 = 8;
 
+/// Constant `getattr` name prefixes ([`DECL_GETATTR_PREFIX`]) of the included files.
+struct Prefixes<'a> {
+    /// Prefixes of [`GLOBAL_PREFIX`] bytes or more, from any included file.
+    global: FxHashSet<&'a [u8]>,
+    /// Their distinct lengths, ascending.
+    lens: Vec<usize>,
+    /// Shorter prefixes of the current file.
+    local: Vec<&'a [u8]>,
+}
+
+impl<'a> Prefixes<'a> {
+    fn new(ix: &'a Index, included: &[bool]) -> Prefixes<'a> {
+        let mut p = Prefixes { global: FxHashSet::default(), lens: Vec::new(), local: Vec::new() };
+        let decls = &ix.facts().decls;
+        for f in 0..ix.file_count() {
+            if !included[f as usize] {
+                continue;
+            }
+            for r in ix.file_facts(f).decls.range() {
+                let pre = ix.str(decls.name[r]);
+                if decls.kind[r] == DECL_GETATTR_PREFIX && pre.len() >= GLOBAL_PREFIX && p.global.insert(pre) {
+                    p.lens.push(pre.len());
+                }
+            }
+        }
+        p.lens.sort_unstable();
+        p.lens.dedup();
+        p
+    }
+
+    /// Loads the short prefixes of file `f`.
+    fn load_local(&mut self, ix: &'a Index, f: FileId) {
+        self.local.clear();
+        let decls = &ix.facts().decls;
+        for r in ix.file_facts(f).decls.range() {
+            let pre = ix.str(decls.name[r]);
+            if decls.kind[r] == DECL_GETATTR_PREFIX && pre.len() < GLOBAL_PREFIX {
+                self.local.push(pre);
+            }
+        }
+    }
+
+    /// Whether `name` starts with a global prefix or a local one of the loaded file.
+    #[inline]
+    fn matches(&self, name: &[u8]) -> bool {
+        self.local.iter().any(|p| name.starts_with(p))
+            || self.lens.iter().take_while(|&&l| l <= name.len()).any(|&l| self.global.contains(&name[..l]))
+    }
+}
+
 /// Fills the child seeds and sibling rings of `g` for the files `include` selects, and returns
 /// the per-file facts. Files in library mode (`modes`) get library-mode public seeds, the
 /// others application-mode exported seeds. O(defs + decorators of decorated defs + bases of
 /// classes + import rows).
-pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, modes: &FileModes, include: impl Fn(FileId) -> bool) -> FileInfo {
-    let names = Names::new(ix);
+pub(super) fn fill(
+    ix: &Index,
+    imp: &Imports,
+    g: &mut DefGraph<'_>,
+    modes: &FileModes,
+    members: Option<&EntrypointMatcher>,
+    include: impl Fn(FileId) -> bool,
+) -> FileInfo {
+    let names = Names::new(ix, members);
     let files = ix.file_count();
     let mut info = FileInfo { included: Vec::with_capacity(files as usize), dynamic: Vec::with_capacity(files as usize) };
     let mut sc = Scratch::default();
@@ -104,11 +176,14 @@ pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, modes: &File
         info.included.push(inc);
         info.dynamic.push(inc && is_dynamic(ix, f, &names));
     }
+    let mut prefixes = Prefixes::new(ix, &info.included);
     for f in 0..files {
         if info.included[f as usize] {
-            file_seeds(ix, imp, g, f, modes.library(f), &info.dynamic, &names, &mut sc);
+            prefixes.load_local(ix, f);
+            file_seeds(ix, imp, g, f, modes.library(f), &info.dynamic, &names, &prefixes, &mut sc);
         }
     }
+    external_overrides(ix, g, &info.included);
     if modes.library_units() > 0 {
         star_exports(ix, imp, g, &info.included, modes);
     }
@@ -181,8 +256,69 @@ fn star_exports(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, included: &[boo
     }
 }
 
-/// Whether file `f` uses dynamic access.
-fn is_dynamic(ix: &Index, f: FileId, names: &Names) -> bool {
+/// Methods of first-party classes that override a method of a third-party or stdlib class
+/// later in the MRO of some first-party class (directly, through a subclass, or as a mixin
+/// before the external base: `class C(Mixin, ExtBase)`): the framework calls them, so they
+/// are live with their class ([`Why::ExternalOverride`]). When the base is not loaded, the
+/// methods of base-less first-party mixins of the class get [`Why::ExternalBase`]. O(classes with an external ancestor
+/// x (MRO + methods of the classes in it) x log).
+fn external_overrides(ix: &Index, g: &mut DefGraph<'_>, included: &[bool]) {
+    let cl = g.classes;
+    let external = |k: u32| ix.file(cl.node(k)).is_some_and(|f| ix.file_origin(f) != Origin::FirstParty);
+    let mut names: Vec<Sym> = Vec::new();
+    for c in 0..cl.len() {
+        // Base not loaded: a mixin (a first-party class without bases of its own) among the
+        // class's direct bases may override the unknown base's methods, like the class itself
+        // ([`Why::ExternalBase`]).
+        if cl.flags(c) & class_flags::INCOMPLETE != 0 && ix.file(cl.node(c)).is_some_and(|f| included[f as usize]) {
+            for &k in cl.bases(c) {
+                let kv = cl.node(k);
+                if cl.bases(k).is_empty() && cl.flags(k) & class_flags::INCOMPLETE == 0 && ix.file(kv).is_some_and(|f| included[f as usize]) {
+                    for m in ix.children(kv) {
+                        if ix.kind(m) == crate::index::NodeKind::Function {
+                            put(&mut g.seed[m as usize], Why::ExternalBase);
+                        }
+                    }
+                }
+            }
+        }
+        let mro = cl.mro(c);
+        if !ix.file(cl.node(c)).is_some_and(|f| included[f as usize]) || !mro.iter().skip(1).any(|&k| external(k)) {
+            continue;
+        }
+        names.clear();
+        // From the most basic class up: the external names seen so far are overridden by the
+        // first-party classes before them.
+        for &k in mro.iter().rev() {
+            let kv = cl.node(k);
+            if external(k) {
+                let at = names.len();
+                for ch in ix.children(kv) {
+                    if ix.kind(ch) == crate::index::NodeKind::Function {
+                        names.push(ix.name_sym(ch));
+                    }
+                }
+                if names.len() > at {
+                    names.sort_unstable();
+                    names.dedup();
+                }
+            } else if !names.is_empty() && ix.file(kv).is_some_and(|f| included[f as usize]) {
+                for m in ix.children(kv) {
+                    if ix.kind(m) == crate::index::NodeKind::Function && names.binary_search(&ix.name_sym(m)).is_ok() {
+                        put(&mut g.seed[m as usize], Why::ExternalOverride);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether file `f` uses dynamic access: a variable `getattr`, a [`DYNAMIC_NAMES`] name or a
+/// module-level `__getattr__`.
+fn is_dynamic(ix: &Index, f: FileId, names: &Names<'_>) -> bool {
+    if ix.file_facts(f).has(file_flags::DYNAMIC_GETATTR) {
+        return true;
+    }
     let view = ix.file_view(f);
     let ev = view.evidence();
     if names.dynamic.iter().any(|h| ev.binary_search(h).is_ok()) {
@@ -201,7 +337,8 @@ fn file_seeds(
     f: FileId,
     library: bool,
     dynamic_files: &[bool],
-    names: &Names,
+    names: &Names<'_>,
+    prefixes: &Prefixes<'_>,
     sc: &mut Scratch,
 ) {
     let dynamic = dynamic_files[f as usize];
@@ -260,6 +397,12 @@ fn file_seeds(
             } else if pmark & INCOMPLETE != 0 {
                 put(seed, Why::ExternalBase);
             }
+            if let Some(mt) = names.members
+                && kind == DefKind::Function
+                && is_member(ix, &view, mt, d as u32, defs.name[row], defs.decorators_len[row], &mut sc.buf)
+            {
+                put(seed, Why::Member);
+            }
         } else if flags & def_flags::DUNDER != 0 {
             put(seed, Why::Member);
         }
@@ -273,8 +416,14 @@ fn file_seeds(
                 }
             }
         }
-        if dynamic || (in_class && pmark & DYNAMIC_BASE != 0) {
+        if dynamic {
             put(seed, Why::Dynamic);
+        } else if in_class && pmark & DYNAMIC_BASE != 0 {
+            put(seed, Why::DynamicBase);
+        } else if let Some(s) = defs.name[row]
+            && prefixes.matches(ix.str(s))
+        {
+            put(seed, Why::DynamicPrefix);
         }
         if library {
             if mark & PUBLIC != 0 {
@@ -294,6 +443,29 @@ fn file_seeds(
     if has_dups {
         siblings(ix, g, f, sc);
     }
+}
+
+/// Whether method `d` of a file matches a member rule by name or by a decorator's dotted name.
+fn is_member(ix: &Index, view: &FileView<'_>, mt: &EntrypointMatcher, d: u32, name: Option<Sym>, decorators: u8, buf: &mut Vec<u8>) -> bool {
+    if name.is_some_and(|s| mt.member(ix.str(s))) {
+        return true;
+    }
+    if decorators == 0 {
+        return false;
+    }
+    for r in view.decorators(d) {
+        buf.clear();
+        for (i, &s) in view.decorator_chain(r).iter().enumerate() {
+            if i > 0 {
+                buf.push(b'.');
+            }
+            buf.extend_from_slice(ix.str(s));
+        }
+        if !buf.is_empty() && mt.member(buf) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Links same-name siblings of file `f` into rings.

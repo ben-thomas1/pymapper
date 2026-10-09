@@ -9,11 +9,52 @@ use toml::de::{DeTable, DeValue};
 
 use super::is_identifier;
 use super::pyvenv::parse_version_prefix;
-use crate::config::{PYPROJECT_FILE, PythonVersion, normalize};
+use crate::config::{PYPROJECT_FILE, PythonVersion, STANDALONE_FILE, normalize};
 
-/// The nearest ancestor of `start` (inclusive) containing a `pyproject.toml`, else `start`.
-pub fn find_project_root(start: &Path) -> PathBuf {
-    start.ancestors().find(|d| d.join(PYPROJECT_FILE).is_file()).unwrap_or(start).to_path_buf()
+/// The project root for a run that starts in the directory `start` (absolute, normalised),
+/// independent of how deep below the root `start` is. Walking up from `start` (inclusive):
+///
+/// 1. the outermost directory whose `pyproject.toml` has a `[tool.uv.workspace]` table;
+/// 2. else the top of the git repository: the nearest directory holding `.git` (a directory,
+///    or the file of a worktree / submodule);
+/// 3. else the outermost directory with a `pyproject.toml` or `pymapper.toml`;
+/// 4. else `start`.
+///
+/// The walk stops at the first `.git` boundary (a project never spans repositories). When
+/// `start` lies strictly below `home`, `home` and its ancestors are not considered: a stray
+/// `~/pyproject.toml` must not swallow every project. One `stat` per ancestor plus one read of
+/// each `pyproject.toml` found.
+pub fn find_project_root(start: &Path, home: Option<&Path>) -> PathBuf {
+    let home = home.filter(|h| start != *h && start.starts_with(h));
+    let mut workspace: Option<&Path> = None;
+    let mut marker: Option<&Path> = None;
+    for dir in start.ancestors() {
+        if home.is_some_and(|h| dir == h) {
+            break;
+        }
+        let pyproject = dir.join(PYPROJECT_FILE);
+        if pyproject.is_file() {
+            marker = Some(dir);
+            if fs::read_to_string(&pyproject).is_ok_and(|t| has_uv_workspace(&t)) {
+                workspace = Some(dir);
+            }
+        } else if dir.join(STANDALONE_FILE).is_file() {
+            marker = Some(dir);
+        }
+        if dir.join(".git").exists() {
+            return workspace.unwrap_or(dir).to_path_buf();
+        }
+    }
+    workspace.or(marker).unwrap_or(start).to_path_buf()
+}
+
+/// Whether a `pyproject.toml` declares a uv workspace (`[tool.uv.workspace]`).
+pub fn has_uv_workspace(text: &str) -> bool {
+    // Cheap prefilter: most files never mention it.
+    if !text.contains("workspace") {
+        return false;
+    }
+    DeTable::parse(text).is_ok_and(|doc| table(doc.get_ref(), &["tool", "uv", "workspace"]).is_some())
 }
 
 /// What we use from `pyproject.toml`.
@@ -30,6 +71,10 @@ pub struct PyprojectInfo {
     /// Entry point targets (`pkg.mod:attr`, extras kept verbatim) of `[project.scripts]`,
     /// `[project.gui-scripts]` and every group of `[project.entry-points]`, in file order.
     pub scripts: Vec<String>,
+    /// How many of `scripts` (the first ones) come from `[project.scripts]` /
+    /// `[project.gui-scripts]`: commands, i.e. an application (plugin entry-point groups are
+    /// roots too, but libraries declare them).
+    pub app_scripts: u32,
 }
 
 type Table<'i> = DeTable<'i>;
@@ -71,20 +116,21 @@ pub fn parse_pyproject(text: &str) -> Option<PyprojectInfo> {
     if let Some(project) = table(doc, &["project"]) {
         info.name = string(get(project, "name")).map(str::to_owned);
         info.requires_python = string(get(project, "requires-python")).and_then(requires_python_floor);
-        let mut targets = |t: &Table<'_>| {
+        let targets = |t: &Table<'_>, out: &mut Vec<String>| {
             for (_, v) in t.iter() {
-                info.scripts.extend(string(Some(v.get_ref())).map(str::to_owned));
+                out.extend(string(Some(v.get_ref())).map(str::to_owned));
             }
         };
         for key in ["scripts", "gui-scripts"] {
             if let Some(DeValue::Table(t)) = get(project, key) {
-                targets(t);
+                targets(t, &mut info.scripts);
             }
         }
+        info.app_scripts = info.scripts.len() as u32;
         if let Some(DeValue::Table(groups)) = get(project, "entry-points") {
             for (_, g) in groups.iter() {
                 if let DeValue::Table(t) = g.get_ref() {
-                    targets(t);
+                    targets(t, &mut info.scripts);
                 }
             }
         }
@@ -108,10 +154,28 @@ pub fn parse_pyproject(text: &str) -> Option<PyprojectInfo> {
         }
     }
     if let Some(wheel) = table(doc, &["tool", "hatch", "build", "targets", "wheel"]) {
-        for p in array(get(wheel, "packages")) {
-            if let Some(s) = string(Some(p.get_ref())) {
-                let s = s.trim_end_matches('/');
-                dirs.push(s.rsplit_once('/').map_or("", |(parent, _)| parent));
+        // `sources` (prefix rewrites) overrides the parent stripping `packages` implies: a
+        // prefix rewritten to "" is a source directory (`"src" = ""`; `"" = ""` keeps paths).
+        match get(wheel, "sources") {
+            Some(DeValue::Table(t)) => {
+                for (k, v) in t.iter() {
+                    if string(Some(v.get_ref())) == Some("") {
+                        dirs.push(k.get_ref().trim_end_matches('/'));
+                    }
+                }
+            }
+            Some(DeValue::Array(a)) => {
+                for v in a {
+                    dirs.extend(string(Some(v.get_ref())).map(|s| s.trim_end_matches('/')));
+                }
+            }
+            _ => {
+                for p in array(get(wheel, "packages")) {
+                    if let Some(s) = string(Some(p.get_ref())) {
+                        let s = s.trim_end_matches('/');
+                        dirs.push(s.rsplit_once('/').map_or("", |(parent, _)| parent));
+                    }
+                }
             }
         }
     }
