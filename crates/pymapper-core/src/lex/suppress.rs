@@ -53,7 +53,7 @@ fn trim(mut s: &[u8]) -> &[u8] {
 const MIN_LEN: usize = 5;
 
 /// Scans the comment `src[start..end]` (starting at its `#`) for directives.
-pub(super) fn scan(src: &[u8], start: usize, end: usize, out: &mut Vec<Suppression>) {
+pub(crate) fn scan(src: &[u8], start: usize, end: usize, out: &mut Vec<Suppression>) {
     if end - start < MIN_LEN {
         return;
     }

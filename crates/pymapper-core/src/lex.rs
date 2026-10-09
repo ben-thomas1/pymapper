@@ -28,6 +28,9 @@ mod token;
 mod tests;
 
 pub use suppress::Suppression;
+/// Scans one comment (`src[start..end]`, starting at its `#`) for suppression directives (also
+/// used for the comments of `pyproject.toml`).
+pub(crate) use suppress::scan as scan_suppressions;
 pub use token::{Token, TokenKind};
 
 use scan::{IDENT, find2, find4, skip_ident, skip_spaces};

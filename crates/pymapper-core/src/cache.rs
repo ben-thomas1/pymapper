@@ -82,7 +82,7 @@ use crate::intern::{FxHashSet, FxHasher, Interner, hash_bytes};
 use crate::roots::{Origin, Roots};
 
 /// Bump whenever the extractor changes the facts or metrics it produces for some input.
-pub const FACTS_VERSION: u32 = 4;
+pub const FACTS_VERSION: u32 = 5;
 
 /// Kind of a facts segment in the container header.
 const KIND_FACTS: u32 = 1;

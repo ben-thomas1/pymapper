@@ -394,3 +394,43 @@ fn code_map_renders_and_reveals_children_on_zoom() {
     assert!(map.bands.rects.len() > fit_rects, "{} -> {}", fit_rects, map.bands.rects.len());
     assert_ne!(map.bands.curves.len(), fit_curves, "edges switch rollup level");
 }
+
+/// Selection marks draw in the overlay pass, and swapping scenes (view tabs) re-uploads
+/// everything and restores the saved camera.
+#[test]
+fn selection_marks_and_scene_swaps_render() {
+    use pymapper_gui::map::scene::RectInstance;
+    use pymapper_gui::views::scene::SELECT_COLOR;
+    let Some(g) = gpu() else { return };
+    let size = [1000, 500];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = test_scene();
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [500.0, 250.0];
+    map.camera.zoom = 1.0;
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    // An outline in empty space.
+    let mark = RectInstance { min: [550.0, 100.0], max: [850.0, 200.0], fill: Rgba::TRANSPARENT, stroke: SELECT_COLOR, radius: 0.0, stroke_width: 3.0 };
+    map.set_marks(&[mark]);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 700, 101), rgb(SELECT_COLOR)), "mark stroke {:?}", px(&p, size, 700, 101));
+    assert!(close(px(&p, size, 700, 150), bg), "mark is hollow");
+    map.set_marks(&[]);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 700, 101), bg), "mark cleared");
+    // Swap to another scene (fitted), then back with the saved camera.
+    let saved = map.fitted_camera().expect("fitted");
+    let first = Arc::clone(&map.scene);
+    let mut b = SceneBuilder::new();
+    b.add_rect(9, 0, WorldRect::new(0.0, 0.0, 50.0, 50.0), RectStyle { fill: GREEN, stroke: GREEN, radius: 0.0, stroke_width: 0.0 }, None);
+    map.show_scene(Arc::new(b.build()), None);
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert!(close(px(&p, size, 500, 250), rgb(GREEN)), "other scene fitted {:?}", px(&p, size, 500, 250));
+    map.show_scene(first, Some(saved));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    assert_eq!((map.camera.center, map.camera.zoom), (saved.center, saved.zoom));
+    assert!(close(px(&p, size, 250, 200), rgb(FILL_A)), "first scene again {:?}", px(&p, size, 250, 200));
+    assert!(close(px(&p, size, 700, 50), rgb(GREEN)), "its line re-uploaded {:?}", px(&p, size, 700, 50));
+}

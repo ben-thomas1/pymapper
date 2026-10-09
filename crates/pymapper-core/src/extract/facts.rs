@@ -47,7 +47,8 @@
 //!   ├── bases       owner u32 | chain Sym+u8 | keyword Option<Sym> | flags u8  14 B/row
 //!   ├── params      name Sym | kind+flags u8                                    5 B/row
 //!   ├── imports     scope u32 | module Sym+u8 | name,alias Option<Sym> |
-//!   │               level u8 | flags u8 | line,col u32                         27 B/row
+//!   │               level u8 | flags u8 | line,col u32 |
+//!   │               module_dline u8 | module_col u32                           32 B/row
 //!   ├── calls       scope u32 | chain Sym+u8 | flags+receiver u8 |
 //!   │               line,col u32                                               18 B/row
 //!   ├── bindings    scope u32 | target Sym+u8 | kind u8 | flags+value u8 |
@@ -610,8 +611,14 @@ soa! {
         level: u8,
         /// [`import_flags`].
         flags: u8,
+        /// Position of the imported name (of the module for plain `import`, of `*`).
         line: u32,
         col: u32,
+        /// `line` minus the line of the module token (saturating at 255; nonzero for the
+        /// names of a multi-line `from` statement): see [`FileView::import_module_pos`].
+        module_dline: u8,
+        /// 0-based column of the module token (of the `from` keyword for `from . import x`).
+        module_col: u32,
     }
 }
 
@@ -1147,6 +1154,15 @@ impl<'a> FileView<'a> {
     #[inline]
     pub fn import_module(&self, row: usize) -> &'a [Sym] {
         self.chain_at(&self.store.imports.module, &self.store.imports.module_len, row)
+    }
+
+    /// `(line, 0-based column)` of the module token of import `row`: one position per
+    /// statement, shared by every name of `from m import (a, b)`. A statement spanning more
+    /// than 255 lines gets a later line.
+    #[inline]
+    pub fn import_module_pos(&self, row: usize) -> (u32, u32) {
+        let st = &self.store.imports;
+        (st.line[row] - st.module_dline[row] as u32, st.module_col[row])
     }
 
     /// Target chain of binding `row`.

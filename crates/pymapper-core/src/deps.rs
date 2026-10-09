@@ -32,14 +32,23 @@
 //! whole program (third-party code included) dominates; see "Deps (S6.1)" in
 //! `docs/benchmarks.md`.
 
+mod declared;
+mod hygiene;
+mod names;
 mod report;
+mod requires;
 mod score;
 mod store;
 mod usage;
 
 #[cfg(test)]
+mod hygiene_tests;
+#[cfg(test)]
 mod tests;
 
+pub use declared::{DeclStatus, DeclaredDep, Declarations, DepKind, UnitDecl, parse_requirement, toml_suppressions};
+pub use hygiene::{HygieneContext, HygieneCtx, HygieneRules, HygieneStats, analyse as hygiene, is_private};
+pub use names::Mapping;
 pub use report::{DepRow, DepsReport, ReportOptions};
 pub use score::{Grade, SCORE_VERSION, ScoreCtx, Scorecard, Scratch, compute as compute_scorecard};
 pub use store::{SCORES_FILE, ScoreStats, ScoreStore};
