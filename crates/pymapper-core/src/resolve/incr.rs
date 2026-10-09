@@ -407,17 +407,19 @@ pub(crate) fn reresolve_imports(
     let g = timing::phase("incremental.affected");
     let mut affected = vec![false; n];
     deps.readers(dirty, &mut affected);
-    // Safety net: a carried result must not point at a node that is gone (re-export rows of
-    // re-extracted files are covered by the dependencies: the lookup that found them read
-    // their file).
-    if carry.dead {
-        for (f, a) in affected.iter_mut().enumerate() {
-            if !*a {
-                let rows = &old.p2[carry.imports[f] as usize..carry.imports[f + 1] as usize];
-                *a = rows.iter().any(|r| r.target != NONE && carry.node(r.target) == NONE);
-            }
+    // Safety net: a carried result must not point at a node that is gone, nor at a re-export
+    // row of a re-extracted file (the dependencies already cover both: the lookup that found
+    // them read their file). Re-export rows are rare, so the row check costs one compare per
+    // row; nodes are only checked when some node is gone.
+    affected.par_iter_mut().enumerate().with_min_len(256).for_each(|(f, a)| {
+        if !*a {
+            let rows = &old.p2[carry.imports[f] as usize..carry.imports[f + 1] as usize];
+            *a = rows.iter().any(|r| {
+                (r.via != NONE && dirty[carry.imports.partition_point(|&s| s <= r.via) - 1])
+                    || (carry.dead && r.target != NONE && carry.node(r.target) == NONE)
+            });
         }
-    }
+    });
     drop(g);
     let fresh = listed(&affected);
     let fresh_dirty = listed(dirty);
@@ -739,11 +741,11 @@ pub(crate) fn reresolve_calls(
     }
     // Safety net: carried edges must not point at nodes that are gone.
     if carry.dead {
-        for (f, a) in affected.iter_mut().enumerate() {
+        affected.par_iter_mut().enumerate().with_min_len(256).for_each(|(f, a)| {
             if !*a {
                 *a = old.file_edges(f as FileId).iter().any(|e| carry.node(e.src) == NONE || carry.node(e.dst) == NONE);
             }
-        }
+        });
     }
     drop(g);
     let fresh = listed(&affected);
