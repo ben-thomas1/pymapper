@@ -116,7 +116,7 @@ impl Session {
                 root.display()
             ));
         }
-        // A path covering the whole project (`. ` at the root) filters nothing.
+        // A path covering the whole project (`.` at the root) filters nothing.
         if scope.iter().any(|s| root.starts_with(s)) {
             scope.clear();
         }
@@ -164,10 +164,23 @@ impl Session {
     pub fn node_in_scope(&self, v: NodeId) -> bool {
         let Some(s) = &self.in_scope else { return true };
         let ix = &self.project.index;
-        match ix.file(v) {
-            Some(f) => s[f as usize],
-            None => ix.subtree(v).any(|w| !ix.kind(w).is_def() && ix.file(w).is_some_and(|f| s[f as usize])),
+        if let Some(f) = ix.file(v) {
+            return s[f as usize];
         }
+        // The packages and modules below `v`, jumping over def subtrees.
+        let end = ix.subtree(v).end;
+        let mut w = v;
+        while w < end {
+            if ix.kind(w).is_def() {
+                w = ix.subtree(w).end;
+                continue;
+            }
+            if ix.file(w).is_some_and(|f| s[f as usize]) {
+                return true;
+            }
+            w += 1;
+        }
+        false
     }
 
     /// A writer over stdout for this session's format.

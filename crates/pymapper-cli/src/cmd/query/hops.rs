@@ -45,7 +45,7 @@ pub fn write_rows(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, walk: &Walk, s
     let mut counts = RowCounts::default();
     let mut shown: Vec<&Hop> = Vec::new();
     for h in &walk.hops {
-        let inside = ix.file(h.node).is_none_or(|f| s.file_in_scope(f));
+        let inside = s.node_in_scope(h.node);
         if !inside {
             counts.outside += 1;
             continue;
