@@ -11,6 +11,10 @@
 //! evidence of the file) x log), not O(files x members). Whether an occurrence is explained by a
 //! call site is a binary search in the file's own short list of called names.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use rayon::prelude::*;
+
 use super::level;
 use crate::extract::facts::evidence_hash;
 use crate::index::{FileId, Index, NodeId};
@@ -73,8 +77,36 @@ struct Groups {
     members: Vec<[u32; 4]>,
     /// `start` of each group, plus `members.len()` at the end.
     start: Vec<u32>,
-    /// Per group: distinct files with an unexplained occurrence (saturating at 2) and the first.
-    seen: Vec<(u8, FileId)>,
+    /// Per group: [`UNSEEN`], the one file with an unexplained occurrence, or [`MANY`].
+    seen: Vec<AtomicU32>,
+}
+
+/// No unexplained occurrence yet.
+const UNSEEN: u32 = u32::MAX;
+/// Unexplained occurrences in two files or more.
+const MANY: u32 = u32::MAX - 1;
+
+/// A bit set written concurrently.
+struct AtomicBits(Vec<AtomicU64>);
+
+impl AtomicBits {
+    fn new(n: usize) -> AtomicBits {
+        AtomicBits((0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    #[inline]
+    fn set(&self, i: u32) {
+        let w = &self.0[(i >> 6) as usize];
+        let bit = 1u64 << (i & 63);
+        if w.load(Ordering::Relaxed) & bit == 0 {
+            w.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        self.0[i >> 6].load(Ordering::Relaxed) & (1 << (i & 63)) != 0
+    }
 }
 
 impl Groups {
@@ -96,7 +128,7 @@ impl Groups {
         }
         let n = start.len();
         start.push(members.len() as u32);
-        Groups { members, start, seen: vec![(0, 0); n] }
+        Groups { members, start, seen: (0..n).map(|_| AtomicU32::new(UNSEEN)).collect() }
     }
 
     #[inline]
@@ -104,23 +136,32 @@ impl Groups {
         &self.members[self.start[g as usize] as usize..self.start[g as usize + 1] as usize]
     }
 
-    /// Records an unexplained occurrence of group `g` in file `f` (each file at most once per
-    /// group: evidence hashes are unique per file).
+    /// Records an unexplained occurrence of group `g` in file `f`. Concurrent calls agree on
+    /// the result whatever their order: unseen, one file, or many.
     #[inline]
-    fn see(&mut self, g: u32, f: FileId) {
-        let s = &mut self.seen[g as usize];
-        if s.0 == 0 {
-            *s = (1, f);
-        } else if s.1 != f {
-            s.0 = 2;
+    fn see(&self, g: u32, f: FileId) {
+        let s = &self.seen[g as usize];
+        let mut cur = s.load(Ordering::Relaxed);
+        loop {
+            let next = if cur == UNSEEN {
+                f
+            } else if cur == f || cur == MANY {
+                return;
+            } else {
+                MANY
+            };
+            match s.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
         }
     }
 
     /// Whether group `g` occurs, unexplained, in a file other than `own`.
     #[inline]
     fn elsewhere(&self, g: u32, own: Option<FileId>) -> bool {
-        let (n, first) = self.seen[g as usize];
-        n >= 2 || (n == 1 && Some(first) != own)
+        let v = self.seen[g as usize].load(Ordering::Relaxed);
+        v == MANY || (v != UNSEEN && Some(v) != own)
     }
 
     fn len(&self) -> u32 {
@@ -202,48 +243,57 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
     let module_of = |d: NodeId| ix.file(d).map_or(u32::MAX, |f| ix.file_node(f));
     let defs: Vec<[u32; 4]> =
         c.defs.iter().enumerate().map(|(i, &d)| [name_hash(d), ix.name_sym(d).to_raw(), module_of(d), i as u32]).collect();
-    let mut dg = Groups::new(defs, &mut map, 0);
-    let mut mg = Groups::new(c.modules.iter().enumerate().map(|(i, &m)| [name_hash(m), 0, 0, i as u32]).collect(), &mut map, 1);
+    let dg = Groups::new(defs, &mut map, 0);
+    let mg = Groups::new(c.modules.iter().enumerate().map(|(i, &m)| [name_hash(m), 0, 0, i as u32]).collect(), &mut map, 1);
     let by_module = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, ix.file_node(f), i as u32]).collect();
     let ig = Groups::new(by_module, &mut map, 2);
     // Same hashes, so the same group indices as `ig`; keyed by the module's name hash.
     let by_name = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, name_hash(ix.file_node(f)), i as u32]).collect();
     let ig2 = Groups::new(by_name, &mut FxHashMap::default(), 2);
-    let mut used = vec![false; ni];
-    let mut elsewhere = vec![false; ni];
-    for f in 0..ix.file_count() {
-        if !included[f as usize] {
-            continue;
-        }
-        let ev = ix.file_view(f).evidence();
-        let edges = imp.module_edges(f);
-        let imports_module = |m: u32| edges.binary_search_by_key(&m, |e| e.dst).is_ok();
-        hits.probes += ev.len() as u64;
-        for &h in ev {
-            let Some(r) = map.get(&h) else { continue };
-            for g in r[0].0..r[0].1 {
-                let members = dg.group(g);
-                if explained.contains(members[0][1], f) {
-                    continue;
+    let linked = AtomicBits::new(nd);
+    let used = AtomicBits::new(ni);
+    let elsewhere = AtomicBits::new(ni);
+    // Parallel over files: every write is an idempotent atomic update (see `Groups::see`), so
+    // the result does not depend on scheduling.
+    hits.probes = (0..ix.file_count())
+        .into_par_iter()
+        .with_min_len(64)
+        .map(|f| {
+            if !included[f as usize] {
+                return 0;
+            }
+            let ev = ix.file_view(f).evidence();
+            let edges = imp.module_edges(f);
+            let imports_module = |m: u32| edges.binary_search_by_key(&m, |e| e.dst).is_ok();
+            let in_ev = |k: u32| ev.binary_search(&k).is_ok();
+            for &h in ev {
+                let Some(r) = map.get(&h) else { continue };
+                for g in r[0].0..r[0].1 {
+                    let members = dg.group(g);
+                    if explained.contains(members[0][1], f) {
+                        continue;
+                    }
+                    // `import mod` then `mod.name`, or `from pkg import mod`.
+                    intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| linked.set(i));
+                    dg.see(g, f);
                 }
-                // `import mod` then `mod.name`, or `from pkg import mod`.
-                intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| hits.defs[i as usize] = level::LINKED);
-                dg.see(g, f);
+                for g in r[1].0..r[1].1 {
+                    mg.see(g, f);
+                }
+                for g in r[2].0..r[2].1 {
+                    intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used.set(i));
+                    intersect(ig2.group(g), ev.iter().copied(), in_ev, |i| elsewhere.set(i));
+                }
             }
-            for g in r[1].0..r[1].1 {
-                mg.see(g, f);
-            }
-            for g in r[2].0..r[2].1 {
-                intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used[i as usize] = true);
-                let in_ev = |k: u32| ev.binary_search(&k).is_ok();
-                intersect(ig2.group(g), ev.iter().copied(), in_ev, |i| elsewhere[i as usize] = true);
-            }
-        }
-    }
+            ev.len() as u64
+        })
+        .sum();
     for g in 0..dg.len() {
         for m in dg.group(g) {
             let i = m[3] as usize;
-            if hits.defs[i] < level::LINKED && dg.elsewhere(g, ix.file(c.defs[i])) {
+            if linked.get(i) {
+                hits.defs[i] = level::LINKED;
+            } else if hits.defs[i] < level::LINKED && dg.elsewhere(g, ix.file(c.defs[i])) {
                 hits.defs[i] = level::EVIDENCE;
             }
         }
@@ -255,9 +305,9 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
         }
     }
     for i in 0..ni {
-        hits.imports[i] = if used[i] {
+        hits.imports[i] = if used.get(i) {
             import_hit::USED
-        } else if elsewhere[i] {
+        } else if elsewhere.get(i) {
             import_hit::ELSEWHERE
         } else {
             import_hit::NONE
