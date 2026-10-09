@@ -369,7 +369,7 @@ fn code_map_renders_and_reveals_children_on_zoom() {
     use pymapper_gui::codemap::{CodeMap, MapParams};
     let Some(g) = gpu() else { return };
     let corpus = std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/sample_python")).expect("corpus");
-    let lp = LoadParams { path: corpus, isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true };
+    let lp = LoadParams { path: corpus, isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true, watch: false };
     let cm = CodeMap::build(Arc::new(load(&lp, &|_| {}).expect("load")), MapParams::default());
     let (scene, legend, _) = cm.scene(&SceneParams::default());
     assert!(legend.edges > 0);

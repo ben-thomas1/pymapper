@@ -269,7 +269,7 @@ fn run(s: &Shared, notify: &Notify) {
                 if adj.key != key {
                     adj = Adjacencies { key, ..Adjacencies::default() };
                 }
-                let ix = &map.analysis.index;
+                let ix = map.analysis.index();
                 let calls = node < ix.node_count() && focus_uses_calls(ix, node);
                 let a = if calls {
                     Arc::clone(adj.calls.get_or_insert_with(|| Arc::new(Adjacency::calls(ix.node_count(), &map.analysis.rollup))))

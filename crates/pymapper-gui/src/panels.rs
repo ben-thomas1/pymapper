@@ -55,6 +55,8 @@ pub struct UiState {
     pub legend: Option<Legend>,
     /// Input: code map status over the canvas (loading phase or error; empty: none).
     pub map_status: String,
+    /// Watch mode: the last update (details panel).
+    pub watch_info: String,
     /// The secondary views' tabs, options and texts.
     pub views: ViewsUi,
 }
@@ -74,6 +76,7 @@ impl UiState {
             map_request_changed: false,
             legend: None,
             map_status: String::new(),
+            watch_info: String::new(),
             views: ViewsUi::default(),
         }
     }
@@ -200,6 +203,11 @@ fn right(ui: &mut egui::Ui, state: &mut UiState) {
         ui.label(&state.hover_text);
     }
     ui.separator();
+    if !state.watch_info.is_empty() {
+        ui.strong("Watching");
+        ui.label(&state.watch_info);
+        ui.separator();
+    }
     if !state.map_info.is_empty() {
         ui.collapsing("Map", |ui| {
             ui.monospace(&state.map_info);

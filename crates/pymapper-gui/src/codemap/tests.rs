@@ -52,7 +52,7 @@ impl Drop for TempProject {
 }
 
 fn params(path: &Path) -> LoadParams {
-    LoadParams { path: path.to_path_buf(), isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true }
+    LoadParams { path: path.to_path_buf(), isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true, watch: false }
 }
 
 /// Nested packages, cross-module calls (functions, constructors, methods), module-level
@@ -90,7 +90,7 @@ fn fixture() -> (TempProject, CodeMap) {
 }
 
 fn ix(m: &CodeMap) -> &Index {
-    &m.analysis.index
+    m.analysis.index()
 }
 
 fn node(m: &CodeMap, qid: &str) -> NodeId {
@@ -503,9 +503,9 @@ fn colours_and_ramps() {
 fn load_reports_phases_and_tables() {
     let p = TempProject::new(PROJ);
     let a = p.analysis();
-    assert!(a.index.node_count() > 10);
+    assert!(a.index().node_count() > 10);
     assert!(a.rollup.stats().call_pairs > 0);
-    assert_eq!(a.agg.len(), a.index.node_count() as usize);
+    assert_eq!(a.agg.len(), a.index().node_count() as usize);
     let names: Vec<&str> = a.phases.iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["config", "walk", "index", "resolve imports", "resolve calls", "rollup + aggregates"]);
     assert!(a.warnings.is_empty(), "{:?}", a.warnings);

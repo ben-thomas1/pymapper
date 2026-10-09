@@ -203,6 +203,26 @@ impl Views {
         self.dirty = true;
     }
 
+    /// Drops every reference to the current code map (watch mode: the map thread is about to
+    /// update the analysis in place). The views thread stops after its current step; the
+    /// active view is rebuilt for the next code map. The code map scene shown stays.
+    pub fn release(&mut self) {
+        self.worker = None;
+        for slot in &mut self.slots {
+            *slot = Slot::default();
+        }
+        self.dirty = true;
+    }
+
+    /// Carries the selection and the matrix scope over a watch-mode update (`node_map`: new
+    /// node of every old node, `NONE` when gone; empty after a reload, which clears them).
+    pub fn remap(&mut self, node_map: &[NodeId]) {
+        let tr = |v: Option<NodeId>| v.and_then(|v| node_map.get(v as usize).copied()).filter(|&n| n != pymapper_core::index::NONE);
+        self.selection = tr(self.selection);
+        self.matrix_scope = tr(self.matrix_scope);
+        self.dirty = true;
+    }
+
     /// The secondary-view worker is building something.
     pub fn busy(&self) -> bool {
         self.worker.as_ref().is_some_and(ViewWorker::busy)

@@ -396,6 +396,7 @@ impl MapRenderer {
     fn sync_hover(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &MapState) {
         self.overlay_rects.clear();
         self.overlay_edges.clear();
+        self.overlay_rects.extend_from_slice(&state.overlay);
         self.overlay_rects.extend_from_slice(&state.marks);
         if let Some(h) = state.hover {
             let scene = &*state.scene;

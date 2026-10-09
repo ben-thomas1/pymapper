@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pymapper_core::cache::{self, Cache};
+use pymapper_core::incremental::{IndexDiff, Program, UpdateStats};
 use pymapper_core::config::{self, Config, Overrides};
 use pymapper_core::graph::CallFilter;
 use pymapper_core::index::{self, Index, Inputs, LoadOptions};
@@ -21,6 +22,7 @@ use pymapper_core::resolve::{Attribution, Imports, ResolvedCalls, resolve_calls,
 use pymapper_core::rollup::{Aggregates, Rollup};
 use pymapper_core::roots::{self, ProjectUnits, RootOptions, Roots, Source};
 use pymapper_core::walk::{self, PathList, WalkOptions};
+use pymapper_core::watch::{self, Changes};
 
 /// What to load.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,14 +39,30 @@ pub struct LoadParams {
     pub cache_dir: Option<PathBuf>,
     /// Disable the cache.
     pub no_cache: bool,
+    /// Resolve with dependency tracking so [`Analysis::update`] can apply file changes
+    /// incrementally (watch mode).
+    pub watch: bool,
+}
+
+/// The resolved program: plain, or tracked for incremental updates. One per analysis, so
+/// the size difference of the variants (both a few KiB inline) does not matter.
+#[allow(clippy::large_enum_variant)]
+enum Resolved {
+    Plain { index: Index, imports: Imports, calls: ResolvedCalls },
+    Tracked(Program),
+}
+
+/// What a rewalk needs (watch mode): the configuration and the import roots of the load.
+struct WalkCtx {
+    config: Config,
+    roots: Roots,
 }
 
 /// A loaded, resolved project with the tables the map draws from.
 pub struct Analysis {
     pub root: PathBuf,
-    pub index: Index,
-    pub imports: Imports,
-    pub calls: ResolvedCalls,
+    resolved: Resolved,
+    walk: Option<WalkCtx>,
     pub rollup: Rollup,
     pub agg: Aggregates,
     /// Wall time per phase, in order.
@@ -57,7 +75,60 @@ pub struct Analysis {
 
 impl std::fmt::Debug for Analysis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Analysis").field("root", &self.root).field("nodes", &self.index.node_count()).finish_non_exhaustive()
+        f.debug_struct("Analysis").field("root", &self.root).field("nodes", &self.index().node_count()).finish_non_exhaustive()
+    }
+}
+
+impl Analysis {
+    #[inline]
+    pub fn index(&self) -> &Index {
+        match &self.resolved {
+            Resolved::Plain { index, .. } => index,
+            Resolved::Tracked(p) => p.index(),
+        }
+    }
+
+    #[inline]
+    pub fn imports(&self) -> &Imports {
+        match &self.resolved {
+            Resolved::Plain { imports, .. } => imports,
+            Resolved::Tracked(p) => p.imports(),
+        }
+    }
+
+    #[inline]
+    pub fn calls(&self) -> &ResolvedCalls {
+        match &self.resolved {
+            Resolved::Plain { calls, .. } => calls,
+            Resolved::Tracked(p) => p.calls().expect("watch mode resolves calls"),
+        }
+    }
+
+    /// Loaded for incremental updates ([`LoadParams::watch`]).
+    pub fn watchable(&self) -> bool {
+        matches!(self.resolved, Resolved::Tracked(_))
+    }
+
+    /// Applies a classified batch of file changes (watch mode; `changes.reload` is the
+    /// caller's business): walks again when the file set may have changed, updates the
+    /// program incrementally, then rebuilds the rollup and the aggregates (O(nodes + edges)).
+    /// Walk problems are appended to `warnings`.
+    ///
+    /// # Panics
+    /// If the analysis was not loaded with [`LoadParams::watch`].
+    pub fn update(&mut self, changes: &Changes<'_>, warnings: &mut Vec<String>) -> (IndexDiff, UpdateStats, Duration) {
+        let Resolved::Tracked(program) = &mut self.resolved else { panic!("Analysis::update needs a watch-mode load") };
+        let ctx = self.walk.as_ref().expect("watch mode keeps the walk context");
+        let root = &self.root;
+        let (diff, st) = watch::update(program, changes, || {
+            let (files, _) = collect_files(&ctx.roots, &ctx.config, root, warnings);
+            Inputs::from_roots(&ctx.roots, &files)
+        });
+        let t = Instant::now();
+        let (ix, imp) = (program.index(), program.imports());
+        self.rollup = Rollup::build(ix, imp, program.calls().expect("watch mode resolves calls"), CallFilter::default(), 0);
+        self.agg = Aggregates::build(ix);
+        (diff, st, t.elapsed())
     }
 }
 
@@ -124,17 +195,39 @@ pub fn load(p: &LoadParams, progress: &dyn Fn(&'static str)) -> anyhow::Result<A
     lap("index", &mut phases);
 
     progress("resolve");
-    let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
-    lap("resolve imports", &mut phases);
-    let calls = resolve_calls(&index, &imports);
-    lap("resolve calls", &mut phases);
+    let attr = Attribution::from_roots(&roots);
+    let resolved = if p.watch {
+        // Imports and calls with dependency tracking, in one step.
+        let program = Program::from_parts(index, attr, true);
+        lap("resolve (tracked)", &mut phases);
+        Resolved::Tracked(program)
+    } else {
+        let imports = resolve_imports(&index, &attr);
+        lap("resolve imports", &mut phases);
+        let calls = resolve_calls(&index, &imports);
+        lap("resolve calls", &mut phases);
+        Resolved::Plain { index, imports, calls }
+    };
 
     progress("rollup");
-    let rollup = Rollup::build(&index, &imports, &calls, CallFilter::default(), 0);
-    let agg = Aggregates::build(&index);
+    let mut a = Analysis {
+        root,
+        resolved,
+        walk: None,
+        rollup: Rollup::default(),
+        agg: Aggregates::default(),
+        phases: Vec::new(),
+        warnings,
+        cache_dir: cache.map(|c| c.dir().to_path_buf()),
+    };
+    a.rollup = Rollup::build(a.index(), a.imports(), a.calls(), CallFilter::default(), 0);
+    a.agg = Aggregates::build(a.index());
     lap("rollup + aggregates", &mut phases);
-    let cache_dir = cache.map(|c| c.dir().to_path_buf());
-    Ok(Analysis { root, index, imports, calls, rollup, agg, phases, warnings, cache_dir })
+    a.phases = phases;
+    if p.watch {
+        a.walk = Some(WalkCtx { config, roots });
+    }
+    Ok(a)
 }
 
 /// Walk options equal for grouping purposes (as the CLI pipeline).

@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     lp.path = std::fs::canonicalize(path.unwrap_or_else(|| PathBuf::from(".")))?;
     let t = Instant::now();
     let analysis = Arc::new(load(&lp, &|_| {})?);
-    let ix = &analysis.index;
+    let ix = analysis.index();
     println!("views_bench: {}", lp.path.display());
     println!("load: {:.0} ms ({} files, {} nodes, {} call pairs); peak RSS {:.1} MiB", ms(t.elapsed()), ix.file_count(), ix.node_count(), analysis.rollup.stats().call_pairs, rss());
     let t = Instant::now();
@@ -195,7 +195,7 @@ fn matrix(map: &CodeMap) {
 
 fn focus(map: &CodeMap) {
     let a = &map.analysis;
-    let ix = &a.index;
+    let ix = a.index();
     let t = Instant::now();
     let calls = Adjacency::calls(ix.node_count(), &a.rollup);
     let tc = t.elapsed();

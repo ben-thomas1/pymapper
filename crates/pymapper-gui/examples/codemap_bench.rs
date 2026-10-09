@@ -138,7 +138,7 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let analysis = Arc::new(load(&lp, &|_| {})?);
     let load_time = t.elapsed();
-    let ix = &analysis.index;
+    let ix = analysis.index();
     println!("codemap_bench: {}", lp.path.display());
     println!(
         "load: {:.0} ms ({} files, {} nodes, {} call pairs, {} import edges); peak RSS {:.1} MiB",

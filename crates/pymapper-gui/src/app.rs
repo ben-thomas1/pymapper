@@ -12,17 +12,19 @@ use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::args::{MeasureOpts, Options};
 use crate::codemap::load::LoadParams;
-use crate::codemap::worker::{MapWorker, Published, Status};
+use crate::codemap::transition::Transition;
+use crate::codemap::worker::{MapWorker, Published, Status, Update};
 use crate::codemap::{CodeMap, MapParams};
 use crate::map::hit::HitKind;
 use crate::canvas::PhysicalRect;
 use crate::gpu;
+use crate::map::scene::RectInstance;
 use crate::map::{MapState, stress};
 use crate::measure::{self, FrameTimes, Measure, STALL};
 use crate::panels::{self, UiState};
 use crate::render::{FrameInput, Renderer};
 use crate::schedule::{Scheduler, Wake, earliest};
-use crate::views::Views;
+use crate::views::{ViewKind, Views};
 
 /// Events sent to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +52,10 @@ pub struct App {
     codemap: Option<Arc<CodeMap>>,
     /// Secondary views (graph, matrix, focus) and the shared selection.
     views: Views,
+    /// The overlay animation of the last watch-mode update, while it runs.
+    transition: Option<Transition>,
+    /// Scratch for the transition's overlay rects.
+    overlay: Vec<RectInstance>,
     /// Last status shown (the status line is rewritten only when it changes).
     status: Option<Status>,
     /// `--measure` with a project: measuring starts once the first scene is shown.
@@ -101,6 +107,7 @@ impl App {
                     stdlib: opts.stdlib,
                     cache_dir: opts.cache_dir.clone(),
                     no_cache: opts.no_cache,
+                    watch: opts.watch,
                 };
                 // The worker wakes the loop through egui's repaint callback.
                 let ctx = egui_ctx.clone();
@@ -136,6 +143,8 @@ impl App {
             worker,
             codemap: None,
             views,
+            transition: None,
+            overlay: Vec::new(),
             status,
             pending_measure,
             win: None,
@@ -200,7 +209,10 @@ impl App {
             window.theme(),
             Some(max_dim as usize),
         );
-        let ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
+        let mut ui = UiState::new(self.project.clone(), gpu::describe(&adapter));
+        if self.opts.watch && self.opts.stress.is_none() {
+            ui.watch_info.push_str("waiting for changes");
+        }
         Ok(WindowState {
             renderer,
             surface,
@@ -220,7 +232,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, views, status, pending_measure, scene_build, .. } = self;
+        let Self { win, egui_ctx, sched, measure, launched, map, worker, codemap, views, status, pending_measure, scene_build, transition, overlay, .. } = self;
         let Some(w) = win.as_mut() else { return };
         if w.occluded || !w.configured {
             // Dropped; un-occluding or resizing requests a new frame.
@@ -271,12 +283,17 @@ impl App {
 
         if let Some(wk) = worker.as_ref() {
             if let Some(p) = wk.take() {
-                apply_published(p, map, codemap, views, &mut w.ui, scene_build);
+                *transition = apply_published(p, map, codemap, views, &mut w.ui, scene_build);
                 if let Some(m) = pending_measure.take() {
                     *measure = Some(Measure::new(m, t1));
                 }
             }
             let st = wk.status();
+            if status.as_ref() != Some(&st)
+                && let Some(e) = wk.watch_error()
+            {
+                w.ui.watch_info = format!("cannot watch for changes: {e}");
+            }
             if status.as_ref() != Some(&st) {
                 status_line(&st, map.scene.bounds.is_positive(), &mut w.ui.map_status);
                 *status = Some(st);
@@ -313,6 +330,17 @@ impl App {
             let (center, zoom) = stress::camera_path(t, &map.scene.bounds, fit, 7.0);
             map.camera.center = center;
             map.camera.zoom = zoom.clamp(map.camera.min_zoom, map.camera.max_zoom);
+        }
+        // Watch-mode transition: overlay rects animated over the new scene (code map only).
+        let mut animating = false;
+        if let Some(t) = transition.as_mut() {
+            t.start(t1);
+            animating = views.active == ViewKind::CodeMap && t.frame(t1, overlay);
+            if !animating {
+                overlay.clear();
+                *transition = None;
+            }
+            map.set_overlay(overlay);
         }
         let t2 = Instant::now();
 
@@ -356,8 +384,9 @@ impl App {
                 st.label_rebuilds.count
             );
         }
-        if views_changed {
-            // The panels were laid out before the views updated their texts.
+        if views_changed || animating {
+            // The panels were laid out before the views updated their texts; or the next
+            // frame of the transition.
             sched.request(t3, Duration::ZERO);
         }
         if hover_changed {
@@ -380,14 +409,47 @@ impl App {
 }
 
 /// Shows a published code map scene: keeps the camera when replacing a scene of the same
-/// world, and seeds the controls from the first request.
-fn apply_published(p: Published, map: &mut MapState, codemap: &mut Option<Arc<CodeMap>>, views: &mut Views, ui: &mut UiState, scene_build: &mut Option<Duration>) {
+/// world, and seeds the controls from the first request. A watch-mode update also carries
+/// the selection over to the new nodes and returns its transition.
+fn apply_published(
+    p: Published,
+    map: &mut MapState,
+    codemap: &mut Option<Arc<CodeMap>>,
+    views: &mut Views,
+    ui: &mut UiState,
+    scene_build: &mut Option<Duration>,
+) -> Option<Transition> {
     views.show_codemap_scene(map, p.scene);
     *scene_build = Some(p.map_build.unwrap_or_default() + p.scene_build);
     *codemap = Some(p.map);
     ui.legend = Some(p.legend);
     ui.map_request.get_or_insert(p.request);
     ui.hover_text.clear();
+    let u = p.update?;
+    views.remap(&u.node_map);
+    watch_info(&u, &mut ui.watch_info);
+    (!u.transition.is_empty()).then_some(u.transition)
+}
+
+/// The details panel's line about the last watch-mode update.
+fn watch_info(u: &Update, out: &mut String) {
+    use std::fmt::Write as _;
+    out.clear();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let (re, add, rm) = u.files;
+    if u.node_map.is_empty() {
+        out.push_str("reloaded (configuration changed)");
+    } else {
+        let _ = write!(out, "{re} re-extracted, {add} added, {rm} removed");
+    }
+    let _ = write!(
+        out,
+        "\nedit to map {:.0} ms (update {:.1}, rebuild {:.1}, release {:.1} ms)",
+        ms(u.latency),
+        ms(u.update),
+        ms(u.rebuild),
+        ms(u.release)
+    );
 }
 
 /// The canvas status line for a worker status (`has_scene`: a map is already shown).
@@ -403,7 +465,7 @@ fn status_line(st: &Status, has_scene: bool, out: &mut String) {
             out.push_str("cannot load the project: ");
             out.push_str(e);
         }
-        Status::Building | Status::Ready => {}
+        Status::Building | Status::Updating | Status::Ready => {}
     }
 }
 
@@ -515,6 +577,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        // Watch mode: the map thread needs the analysis to itself. Handled here, not in
+        // `redraw`, so an occluded window does not hold an update back.
+        if let Some(wk) = &self.worker
+            && wk.wants_release()
+        {
+            self.codemap = None;
+            self.views.release();
+            if let Some(w) = self.win.as_mut() {
+                w.ui.hover_text.clear();
+            }
+            wk.released();
+        }
         if self.pending_measure.is_some()
             && let Some(Status::Failed(e)) = &self.status
         {

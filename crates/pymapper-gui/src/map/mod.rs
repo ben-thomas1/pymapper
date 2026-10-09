@@ -145,8 +145,11 @@ pub struct MapState {
     /// Selection outlines drawn over the scene with the hover highlight (see
     /// [`Self::set_marks`]).
     pub marks: Vec<RectInstance>,
-    /// Bumped by [`Self::set_marks`].
+    /// Bumped by [`Self::set_marks`] and [`Self::set_overlay`].
     pub marks_generation: u64,
+    /// Transient overlay rects drawn under the marks (watch-mode transitions, see
+    /// [`Self::set_overlay`]).
+    pub overlay: Vec<RectInstance>,
     needs_fit: bool,
     /// Inputs of the last hover hit test: (pointer, camera, band and scene generation, ppp).
     hover_key: Option<HoverKey>,
@@ -183,6 +186,7 @@ impl MapState {
             force_all: false,
             marks: Vec::new(),
             marks_generation: 0,
+            overlay: Vec::new(),
             needs_fit: true,
             hover_key: None,
             query: QueryScratch::default(),
@@ -252,6 +256,15 @@ impl MapState {
         if self.marks != marks {
             self.marks.clear();
             self.marks.extend_from_slice(marks);
+            self.marks_generation += 1;
+        }
+    }
+
+    /// Replaces the transient overlay rects (drawn with the marks; no scene rebuild).
+    pub fn set_overlay(&mut self, rects: &[RectInstance]) {
+        if self.overlay != rects {
+            self.overlay.clear();
+            self.overlay.extend_from_slice(rects);
             self.marks_generation += 1;
         }
     }

@@ -213,7 +213,7 @@ impl TempProject {
     }
 
     fn map(&self) -> CodeMap {
-        let lp = LoadParams { path: self.0.clone(), isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true };
+        let lp = LoadParams { path: self.0.clone(), isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true, watch: false };
         CodeMap::build(Arc::new(load(&lp, &|_| {}).expect("load")), MapParams::default())
     }
 }
@@ -236,7 +236,7 @@ const PROJ: &[(&str, &str)] = &[
 ];
 
 fn ix(m: &CodeMap) -> &Index {
-    &m.analysis.index
+    m.analysis.index()
 }
 
 fn node(m: &CodeMap, qid: &str) -> NodeId {
