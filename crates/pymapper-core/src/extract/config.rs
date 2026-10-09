@@ -149,6 +149,12 @@ pub(crate) enum FileTokens {
 /// Whether `src` (a config file's contents) is the output of a tool that lists code by name
 /// rather than configuration: pymapper's own baselines and JSON / SARIF reports, and
 /// coverage.py JSON reports. Only the first 512 bytes of JSON files are looked at.
+///
+/// A coverage.py report (`coverage json`, format 3) starts with a `"meta"` object such as
+/// `{"meta": {"format": 3, "version": "7.15.2", "timestamp": ..., "branch_coverage": false,
+/// "show_contexts": false}, "files": ...}` and, since 7.5, names every function and class of
+/// every file: read as configuration it would mark all of them used. The report configured as
+/// `analysis.coverage` is also left out of the config files by path, whatever its contents.
 pub fn is_tool_output(path: &std::path::Path, src: &[u8]) -> bool {
     let json = path.extension().is_some_and(|e| e == "json" || e == "sarif");
     if !json {
@@ -156,7 +162,9 @@ pub fn is_tool_output(path: &std::path::Path, src: &[u8]) -> bool {
     }
     let head = &src[..src.len().min(512)];
     let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
-    has(b"pymapper") || has(b"\"coverage_version\"")
+    let coverage_py =
+        has(b"\"meta\"") && has(b"\"format\"") && (has(b"\"show_contexts\"") || has(b"\"branch_coverage\""));
+    has(b"pymapper") || coverage_py || has(b"\"coverage_version\"")
 }
 
 /// Tokenizes one file's contents (sorted, unique hashes), or `Generated` for tool output.
@@ -345,6 +353,15 @@ mod tests {
         assert_eq!(tokens_of(Path::new("baseline.json"), baseline), FileTokens::Generated);
         let cov = b"{\"meta\": {\"format\": 3, \"version\": \"7.6\", \"coverage_version\": \"7.6\"}, \"files\": {}}";
         assert_eq!(tokens_of(Path::new("coverage.json"), cov), FileTokens::Generated);
+        // Real coverage.py output (7.15.2) has no `coverage_version` key.
+        let cov = b"{\"meta\": {\"format\": 3, \"version\": \"7.15.2\", \"timestamp\": \"2026-10-09T10:00:00\", \
+                    \"branch_coverage\": false, \"show_contexts\": false}, \"files\": {\"app/util.py\": \
+                    {\"functions\": {\"helper\": {}}}}}";
+        assert_eq!(tokens_of(Path::new("coverage.json"), cov), FileTokens::Generated);
+        let cov = b"{\"meta\":{\"format\":3,\"version\":\"7.4\",\"branch_coverage\":true},\"files\":{}}";
+        assert_eq!(tokens_of(Path::new("cov.json"), cov), FileTokens::Generated);
+        // A `meta` object alone is not enough.
+        assert!(matches!(tokens_of(Path::new("app.json"), b"{\"meta\": {\"format\": 1}}"), FileTokens::Hashes(..)));
         // Only JSON is sniffed: `[tool.pymapper]` in a TOML file is configuration.
         assert!(matches!(tokens_of(Path::new("pyproject.toml"), b"[tool.pymapper]\nx = 1\n"), FileTokens::Hashes(..)));
         assert!(matches!(tokens_of(Path::new("app.json"), b"{\"handler\": \"f\"}"), FileTokens::Hashes(..)));

@@ -133,8 +133,9 @@ application-mode unit with no entry point at all gets a warning, since everythin
 look unused. Functions a framework loads by name from non-Python configuration (YAML tool
 lists, plugin registries) are found through config-file evidence (`analysis.config-evidence`,
 on by default): `*.yaml`, `*.yml`, `*.toml`, `*.json`, `*.cfg` and `*.ini` files of the
-first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles and pymapper /
-coverage.py reports are skipped) are tokenized once and cached. A full dotted path
+first-party walk (gitignore and excludes apply; files over 1 MiB, lockfiles, pymapper /
+coverage.py JSON reports and the configured `analysis.coverage` report are skipped) are
+tokenized once and cached. A full dotted path
 (`pkg.mod.func`, `pkg.mod:Class`) keeps a definition or module; a bare name lowers the
 confidence to 50 (10 when the file also names the module). Cost: one read per config file on a
 cold cache (a few ms for hundreds of files), a stat per file when warm. Rules you know better
@@ -184,6 +185,12 @@ only when nothing refers to the symbol, and the reasons are listed, e.g.
 `(confidence 50: name-elsewhere)` in text and `"reasons": ["name-elsewhere"]` in JSON. Every
 first-party Python file counts as evidence, importable or not; a symbol mentioned only by tests
 is test-only API, reported below the gate as `used-only-in-tests`.
+
+Runtime evidence from a test run sharpens the scores: pass a coverage.py JSON report with
+`pymapper check --coverage coverage.json` (or `analysis.coverage`). Code that ran is never
+reported; code that never ran and has only weak static evidence of use moves above the gate
+(`(confidence 84: name-elsewhere, never-executed)`). Create the report with
+`coverage run -m pytest && coverage json`.
 
 ## Performance
 
