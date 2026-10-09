@@ -144,11 +144,20 @@ within a version.
 
 ```
 $ pymapper deps --check
-app/api.py:3:8: PM601 `yaml` is provided by `PyYAML`, which is not a declared dependency
-app/api.py:7:6: PM603 `requests._internal` is private to `requests`
-pyproject.toml:9:5: PM602 dependency `idle` is declared but never imported
-Found 3 findings in 2 files (41 files checked).
+...
+apps/aiml-ais-backend/aiml_ais_backend/listeners.py:10:24: PM601 `sqlalchemy` is provided by `SQLAlchemy`, which is not a declared dependency
+...
+apps/aiml-ais-backend/pyproject.toml:14:5: PM602 dependency `gunicorn` is declared but never imported
+...
+src/cogito-evaluations/cogito_evaluations/_legacy/datasets/hypothesis_verification/data.py:5:37: PM603 `numpy.random._generator` is private to `numpy`
+...
+Found 535 findings in 263 files (1803 files checked).
+Not shown: 39 below min-confidence.
 ```
+
+(Lines taken from a real run on a uv workspace of 15 project units; most of its PM601 findings
+are imports of distributions that a workspace member pulls in, which `--extend-select PM604`
+reports as transitive instead.)
 
 `--check` runs the PM6xx rules ([`rules.md`](rules.md#dependencies)) with everything `check`
 has: the formats (`concise`, `json`, `sarif`, `github`), the rule selection (`select`,
@@ -230,8 +239,15 @@ distribution), never a guess.
 
 ## Cost
 
-Measured numbers are in [`benchmarks.md`](benchmarks.md#deps-s61). Scorecards cost one pass over
+Measured numbers are in [`benchmarks.md`](benchmarks.md#deps-s61) (hygiene:
+[`benchmarks.md`](benchmarks.md#dependency-hygiene-s62)). Scorecards cost one pass over
 the definitions and module edges of the scored distributions (19 ms on one thread, 5 ms on 14,
 for 491 distributions and 16.2M lines; 0.1 ms warm), usage one pass over the first-party imports and the call
 edges plus a BFS over the call and import graphs (20 ms). Loading the venv and resolving calls
 dominate, as for `check --deps`.
+
+`--check` costs one pass over the first-party import rows (O(1) per row: 1 ms for 1,803 files,
+7.6 ms for 901k import rows) plus one TOML parse per unit; it loads no third-party code unless
+`--deps` is given, so a warm run takes about as long as a warm `check` (107-158 ms against
+170 ms). PM604 adds the parallel reads of the `METADATA` of the distributions reachable from the
+declared ones (16 ms for 394 files).
