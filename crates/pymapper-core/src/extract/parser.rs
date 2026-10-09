@@ -5,6 +5,7 @@
 
 use super::events::{DiagKind, Diagnostic, End, Param, Pos, Visitor};
 use super::expr::{Level, TargetRec};
+use super::lines::LineCursor;
 use crate::lex::{Lexer, Suppression, Token, TokenKind};
 
 /// Ring buffer slots (power of two). `peek(k)` supports `k < RING`.
@@ -26,109 +27,6 @@ pub fn parse_with_suppressions<V: Visitor>(src: &[u8], visitor: V) -> (V, Vec<Su
     let mut p = Parser::new(src, visitor);
     p.parse_file();
     p.finish()
-}
-
-/// Forward line counter. Offsets are usually queried in increasing order, so
-/// each byte is scanned about once; backward queries walk back locally.
-pub(super) struct LineCursor {
-    off: u32,
-    line: u32,
-    line_start: u32,
-    /// The source contains `\r` (old Mac or Windows line ends): use the slow
-    /// byte-wise path. Otherwise lines end only at `\n` and counting vectorises.
-    cr: bool,
-}
-
-impl LineCursor {
-    pub(super) fn new(src: &[u8]) -> Self {
-        LineCursor { off: 0, line: 1, line_start: 0, cr: src.contains(&b'\r') }
-    }
-
-    /// Counts `\n` in `src[cur..end]` (no `\r` in the source), 8 bytes at a
-    /// time with an exact SWAR zero-byte mask, tracking the last one. The final
-    /// partial word is read whole when the source has the bytes (masked to the
-    /// range), so short ranges between nearby queries take one or two words and
-    /// no byte loop.
-    #[inline]
-    fn advance_lf(&mut self, src: &[u8], cur: usize, end: usize) {
-        const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-        const NL: u64 = 0x0a0a_0a0a_0a0a_0a0a;
-        let mut i = cur;
-        while i < end {
-            let take = (end - i).min(8);
-            let mut w = [0u8; 8];
-            if i + 8 <= src.len() {
-                w.copy_from_slice(&src[i..i + 8]);
-            } else {
-                // End of the source: bytes past it stay 0 (not `\n`).
-                w[..src.len() - i].copy_from_slice(&src[i..]);
-            }
-            let x = u64::from_le_bytes(w) ^ NL;
-            // High bit set exactly in the bytes of `x` that are zero.
-            let mut m = !(((x & LO7).wrapping_add(LO7)) | x | LO7);
-            if take < 8 {
-                // Little endian: byte k of the word is bits 8k..8k+8.
-                m &= (1u64 << (take * 8)) - 1;
-            }
-            if m != 0 {
-                self.line += m.count_ones();
-                let last = 7 - (m.leading_zeros() / 8) as usize;
-                self.line_start = (i + last + 1) as u32;
-            }
-            i += take;
-        }
-    }
-
-    #[inline]
-    pub(super) fn pos(&mut self, src: &[u8], off: u32) -> Pos {
-        let end = (off as usize).min(src.len());
-        let cur = self.off as usize;
-        if end >= cur {
-            if self.cr {
-                for i in cur..end {
-                    if is_line_end(src, i) {
-                        self.line += 1;
-                        self.line_start = i as u32 + 1;
-                    }
-                }
-            } else {
-                self.advance_lf(src, cur, end);
-            }
-        } else {
-            // Walk back (queries go backwards only a little: decorator starts,
-            // block ends after lookahead).
-            let mut crossed = false;
-            for i in (end..cur).rev() {
-                if is_line_end(src, i) {
-                    self.line -= 1;
-                    crossed = true;
-                }
-            }
-            // No line end in `[end, cur)`: `end` is on the same line and the
-            // cached `line_start` (<= end) is still right. Rescanning it here
-            // would cost O(line length) per query on long one-line inputs.
-            if crossed {
-                let mut j = end;
-                while j > 0 && !is_line_end(src, j - 1) {
-                    j -= 1;
-                }
-                self.line_start = j as u32;
-            }
-        }
-        self.off = end as u32;
-        // Offsets past the end are clamped to it (like the line).
-        Pos { line: self.line, col: end as u32 - self.line_start }
-    }
-}
-
-/// `src[i]` ends a line: `\n`, or a `\r` not followed by `\n` (so `\r\n` counts once).
-#[inline(always)]
-fn is_line_end(src: &[u8], i: usize) -> bool {
-    match src[i] {
-        b'\n' => true,
-        b'\r' => src.get(i + 1) != Some(&b'\n'),
-        _ => false,
-    }
 }
 
 /// Recursive descent parser over the pull lexer. See the module docs of
@@ -361,7 +259,7 @@ impl<'src, V: Visitor> Parser<'src, V> {
     /// Position of byte offset `off`.
     #[inline]
     pub(super) fn pos(&mut self, off: u32) -> Pos {
-        self.lines.pos(self.src, off)
+        self.lines.pos(off)
     }
 
     /// End marker at the last consumed token.

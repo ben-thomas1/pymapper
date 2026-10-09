@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Context;
+use pymapper_core::analysis::deadcode::coverage::Coverage;
 use pymapper_core::analysis::deadcode::{self, DeadCode, DeadCodeOptions, DeadCodeStats, unit_flags};
 use pymapper_core::analysis::dupes::{self, DupesParams, Fingerprints};
 use pymapper_core::analysis::{coupling, cycles, hotspot, layers};
@@ -105,12 +106,22 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         (None, Some(path)) => Some(read_baseline(path)?),
         _ => None,
     };
+    // Likewise a missing coverage report (read after the index is built).
+    let coverage_path = config.analysis.coverage.as_deref().filter(|_| engine.should_run(Pass::DeadCode));
+    if let Some(path) = coverage_path {
+        std::fs::File::open(path)
+            .with_context(|| format!("cannot read coverage report {} (create it with `coverage json`)", path.display()))?;
+    }
 
     let mut project = pipeline::load(config, root, DupesParams::from_engine(&engine));
     // Matching consumes the fingerprints.
     let fps = project.fingerprints.take();
     let matcher = config.entrypoint_matcher();
-    let (mut findings, dead, modes) = analyse(config, &engine, &project, &matcher, scope, fps, args.stats);
+    let coverage = match coverage_path {
+        Some(path) => Some(timing::time("coverage", || load_coverage(&project.index, path, root))?),
+        None => None,
+    };
+    let (mut findings, dead, modes) = analyse(config, &engine, &project, &matcher, coverage.as_ref(), scope, fps, args.stats);
     if dead.is_some() {
         for (key, pattern) in matcher.unmatched() {
             warn(format_args!(
@@ -209,6 +220,20 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
                 ("cache_written_kb", cs.written_bytes / 1000),
             ]);
         }
+        if let Some(c) = &coverage {
+            let s = c.stats();
+            counters.extend([
+                ("coverage_files", u64::from(s.report_files)),
+                ("coverage_matched", u64::from(s.matched)),
+                ("coverage_executed", u64::from(s.executed)),
+                ("coverage_not_executed", u64::from(s.not_executed)),
+            ]);
+        }
+        if let Some(d) = &dead
+            && coverage.is_some()
+        {
+            counters.extend([("deadcode.executed", d.executed), ("deadcode.lowered", d.not_executed)]);
+        }
         if let Some(ce) = &project.config_evidence {
             counters.extend([("config_files", u64::from(ce.stats.files)), ("config_files_cached", u64::from(ce.stats.cached))]);
         }
@@ -306,14 +331,39 @@ pub(crate) fn warn_bad_code(path: impl std::fmt::Display, line: u32, code: &[u8]
     }
 }
 
+/// Reads the coverage report at `path` and maps it to `ix`; warns when it matches no analysed
+/// file or looks stale.
+fn load_coverage(ix: &Index, path: &Path, root: &Path) -> anyhow::Result<Coverage> {
+    let c = Coverage::load(ix, path, root).with_context(|| format!("invalid coverage report {}", path.display()))?;
+    let s = c.stats();
+    if s.matched == 0 && s.report_files > 0 {
+        let first = String::from_utf8_lossy(c.first_unmatched().unwrap_or_default());
+        warn(format_args!(
+            "coverage report {} matches no analysed file (first path: {first}); it is ignored",
+            path.display()
+        ));
+    }
+    if s.stale_files > 0 {
+        warn(format_args!(
+            "coverage report {}: {} file(s) have line numbers past their end; the report may be stale (rerun the tests and `coverage json`)",
+            path.display(),
+            s.stale_files
+        ));
+    }
+    Ok(c)
+}
+
 /// Runs every analysis with an enabled rule and returns their findings (unfiltered), the
 /// dead-code counters (when that pass ran) and, with `describe_modes`, one line per project
-/// unit with files describing its dead-code mode and why.
+/// unit with files describing its dead-code mode and why. `coverage`: dead-code evidence from
+/// a coverage report.
+#[allow(clippy::too_many_arguments)]
 fn analyse(
     config: &Config,
     engine: &RuleEngine,
     p: &Project,
     matcher: &EntrypointMatcher,
+    coverage: Option<&Coverage>,
     scope: &[PathBuf],
     fps: Option<Fingerprints>,
     describe_modes: bool,
@@ -350,7 +400,8 @@ fn analyse(
     if let (true, Some(calls)) = (dead_code, &calls) {
         let scripts: Vec<&[u8]> = p.units.all_scripts().iter().map(|s| s.as_bytes()).collect();
         let opts = DeadCodeOptions::from_config(config, matcher, Some(&p.units), &scripts)
-            .with_config_evidence(p.config_evidence.as_ref());
+            .with_config_evidence(p.config_evidence.as_ref())
+            .with_coverage(coverage);
         let dc = timing::time("deadcode", || deadcode::analyse(ix, imp, calls, &opts, engine, &mut out));
         warn_no_entry_points(&dc, &p.units, scope);
         if describe_modes {

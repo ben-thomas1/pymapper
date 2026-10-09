@@ -83,14 +83,39 @@ pub fn parse_only(paths: &PathList) -> (ReadStats, Vec<(String, u64)>) {
 pub fn extract_mem(paths: &PathList) -> anyhow::Result<(ReadStats, Vec<(String, u64)>)> {
     let stages = Stages::from_env()?;
     let (read, loaded) = timing::time("load", || load_files(paths));
-    let workers = timing::time("parse", || {
+    // `XTASK_EXTRACT_REPS=N` repeats the in-memory pass N times and keeps the fastest (less
+    // noise on a loaded machine than best-of-N processes; peak RSS then holds two passes).
+    let reps = match std::env::var("XTASK_EXTRACT_REPS") {
+        Ok(v) => v.parse::<usize>().map_err(|_| anyhow::anyhow!("XTASK_EXTRACT_REPS: expected a count, got {v:?}"))?.max(1),
+        Err(_) => 1,
+    };
+    let mut best: Option<(std::time::Duration, Vec<Worker>)> = None;
+    // Fewest instructions / cycles of one pass (macOS; 0 elsewhere).
+    let (mut instr, mut cycles) = (u64::MAX, u64::MAX);
+    for _ in 0..reps {
+        let c0 = super::rusage::cpu_counters();
+        let t0 = Instant::now();
         let workers = PerThread::new(|| Worker { stages, ..Worker::default() });
         loaded.files.par_iter().for_each(|&(b, s, e)| {
             workers.with(|_, w| w.extract(&loaded.bufs[b as usize][s..e]));
         });
-        workers.into_vec()
-    });
-    let (mut stats, counters) = summarise(&workers);
+        let workers = workers.into_vec();
+        let el = t0.elapsed();
+        if let (Some((i0, y0)), Some((i1, y1))) = (c0, super::rusage::cpu_counters()) {
+            instr = instr.min(i1 - i0);
+            cycles = cycles.min(y1 - y0);
+        }
+        if best.as_ref().is_none_or(|(b, _)| el < *b) {
+            best = Some((el, workers));
+        }
+    }
+    let (el, workers) = best.expect("reps >= 1: at least one pass ran");
+    timing::record("parse", el);
+    let (mut stats, mut counters) = summarise(&workers);
+    if cycles != u64::MAX {
+        counters.push(("parse_kinstr".to_owned(), instr / 1000));
+        counters.push(("parse_kcycles".to_owned(), cycles / 1000));
+    }
     stats.errors += read.errors;
     Ok((stats, counters))
 }

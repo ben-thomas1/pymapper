@@ -658,7 +658,7 @@ impl Rng {
 
 #[test]
 fn line_cursor_matches_naive_count() {
-    use super::parser::LineCursor;
+    use super::lines::LineCursor;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for round in 0..600 {
         let len = rng.below(if round % 3 == 0 { 2000 } else { 200 });
@@ -679,7 +679,7 @@ fn line_cursor_matches_naive_count() {
                 _ => (last + rng.below(30) as u32).min(len as u32 + 3),
             };
             last = off.min(len as u32);
-            let got = lc.pos(&src, off);
+            let got = lc.pos(off);
             // Naive: lines end at `\n`, `\r\n` (once) and lone `\r`.
             let off = off.min(len as u32);
             let (mut line, mut start) = (1u32, 0u32);

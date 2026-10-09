@@ -338,3 +338,59 @@ fn glyph_atlas_grows_when_full() {
     assert!(!map.text.as_ref().unwrap().atlas_full);
     assert!(map.stats.glyphs > 0);
 }
+
+#[test]
+fn label_only_rects_draw_only_their_label() {
+    let Some(g) = gpu() else { return };
+    let size = [600, 300];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut b = SceneBuilder::new();
+    let fill = RectStyle { fill: FILL_B, stroke: Rgba::TRANSPARENT, radius: 0.0, stroke_width: 0.0 };
+    b.add_rect(1, 0, WorldRect::new(50.0, 50.0, 550.0, 250.0), fill, None);
+    b.add_rect(1, 0, WorldRect::new(50.0, 50.0, 550.0, 250.0), RectStyle::label_only(FILL_B), Some(b"Carrier_label"));
+    let mut map = MapState::new(Arc::new(b.build()));
+    render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    map.camera.center = [300.0, 150.0];
+    map.camera.zoom = 1.0;
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 1.0);
+    let at = |x, y| px(&p, size, x, y);
+    assert!(close(at(300, 200), rgb(FILL_B)), "the carrier hides nothing {:?}", at(300, 200));
+    let bright = (52..250).flat_map(|x| (52..72).map(move |y| (x, y))).filter(|&(x, y)| at(x, y)[1] > 150).count();
+    assert!(bright > 30, "label pixels: {bright}");
+    assert_eq!(map.stats.labels, 1);
+}
+
+#[test]
+fn code_map_renders_and_reveals_children_on_zoom() {
+    use pymapper_gui::codemap::load::{LoadParams, load};
+    use pymapper_gui::codemap::scene::SceneParams;
+    use pymapper_gui::codemap::{CodeMap, MapParams};
+    let Some(g) = gpu() else { return };
+    let corpus = std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/sample_python")).expect("corpus");
+    let lp = LoadParams { path: corpus, isolated: true, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true };
+    let cm = CodeMap::build(Arc::new(load(&lp, &|_| {}).expect("load")), MapParams::default());
+    let (scene, legend, _) = cm.scene(&SceneParams::default());
+    assert!(legend.edges > 0);
+    let size = [1200, 800];
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = offscreen_target(&g, format, size);
+    let mut renderer = Renderer::new(&g.device, format);
+    let mut map = MapState::new(Arc::new(scene));
+    let p = render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    let bg = to_u8(CanvasStyle::DEFAULT.background);
+    let covered = p.as_chunks::<4>().0.iter().filter(|c| !close([c[0], c[1], c[2]], bg)).count();
+    assert!(covered > (size[0] * size[1] / 2) as usize, "covered {covered}");
+    let (fit_rects, fit_curves) = (map.bands.rects.len(), map.bands.curves.len());
+    assert!(fit_rects > 0);
+    // Zooming far in shows deeper cells (children revealed) and switches edge levels.
+    let max_band = cm.reveal.change_bands().last().copied().expect("bands");
+    let zoom = pymapper_gui::map::scene::band_zoom(max_band) as f32 * 1.5;
+    map.camera.zoom = zoom.min(map.camera.max_zoom);
+    let rebuilds = map.stats.band_rebuilds.count;
+    render_map(&g, &mut renderer, &texture, &mut map, size, 2.0);
+    assert!(map.stats.band_rebuilds.count > rebuilds);
+    assert!(map.bands.rects.len() > fit_rects, "{} -> {}", fit_rects, map.bands.rects.len());
+    assert_ne!(map.bands.curves.len(), fit_curves, "edges switch rollup level");
+}

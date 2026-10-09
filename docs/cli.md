@@ -38,7 +38,12 @@ pymapper check [paths]
 
 Third-party (`--deps`) and stdlib (`--stdlib`) code is loaded so first-party code links to it
 (imports, base classes, calls), but it is never reported by `check` and never affects the exit
-code. Only first-party importable `.py` files are analysed for findings.
+code. Only first-party `.py` files are analysed for findings: importable modules and files that
+cannot be imported (tests in hyphenated directories such as `tests/my-service/test_x.py`,
+scripts such as `scripts/bump-version.py`; never reported as unused modules). Stubs and files
+shadowed by another file of the same module are not analysed, but every first-party `.py` file
+contributes dead-code name evidence; a name used only by test code gets the reason
+`used-only-in-tests`.
 
 The PM6xx dependency-hygiene rules are run by `pymapper deps --check`, not `check` (see
 "Rules that cannot run" below and [`deps.md`](deps.md#hygiene---check)).
@@ -109,6 +114,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root (see below) |
 | `--threads N` / `-j N` | `threads` | 0 = one per logical CPU |
 | `--mode` | `mode` | dead code: `auto` (per `pyproject.toml` unit), `application`, `library` (every unit) |
+| `--coverage FILE` / `--no-coverage` | `analysis.coverage` | coverage.py JSON report (`coverage json`) as dead-code evidence (see below); accepted by every command, read only by `check` |
 | `--preset` | `presets` | flask, fastapi, django, click, pytest, pydantic |
 | `--exclude GLOB` | `extend-exclude` | gitignore syntax, relative to the project root |
 | `--set 'KEY = VALUE'` | any | TOML fragment, e.g. `--set 'analysis.dupes = true'` |
@@ -128,6 +134,20 @@ paths and suppress nothing; they never change the exit code. An application-mode
 `pyproject.toml`, see "Choosing a dead-code mode" in the README) without any entry point
 (`__main__` guard, scripts, entrypoint rules, tests) prints one warning per unit, or one for
 the project when `--mode application` is forced and no unit has one.
+
+With a coverage report (`--coverage FILE` or `analysis.coverage`), code the report shows
+executed is live (never reported, nor what it calls), and the remaining doubt of code below
+confidence 100 that never ran is divided by 3, with the reason `never-executed` (`name-elsewhere`
+50 becomes 84). Statically reachable code that never ran (untested) is not affected. Report
+paths are matched to files absolute, relative to the report's directory or the project root,
+or by their longest unique path suffix (a report made in another checkout, such as CI). A
+report that cannot be read or is not a coverage.py JSON report is an error (exit 2), checked
+before the project is loaded when it is missing; one that matches no analysed file, or has line
+numbers past the end of a file (stale), prints a warning. The report is read only when a PM4xx
+rule runs. The report is never config-file evidence (`analysis.config-evidence`), even inside
+the project tree, where `coverage json` writes it by default: it names every function, run or
+not. `--stats` adds `coverage_files`, `coverage_matched`, `coverage_executed`,
+`coverage_not_executed`, `deadcode.executed` (seeds) and `deadcode.lowered`.
 
 The default cache directory is `.pymapper_cache` in the project root (see "Project root").
 So `pymapper check /some/dir` with no config and no marker above it writes

@@ -71,6 +71,13 @@ pub struct ConfigArgs {
     /// Worker threads (0 = one per logical CPU).
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(0..=config::MAX_THREADS as i64), help_heading = "Configuration")]
     pub threads: Option<u32>,
+    /// coverage.py JSON report (`coverage json`) used as dead-code evidence (overrides
+    /// `analysis.coverage`). Only `check` reads it.
+    #[arg(long, value_name = "FILE", overrides_with = "no_coverage", help_heading = "Configuration")]
+    pub coverage: Option<PathBuf>,
+    /// Ignore the configured coverage report.
+    #[arg(long, overrides_with = "coverage", help_heading = "Configuration")]
+    pub no_coverage: bool,
 }
 
 /// `--flag` / `--no-flag` pair to an optional override.
@@ -107,6 +114,8 @@ impl ConfigArgs {
             venv: self.venv,
             mode: self.mode,
             threads: self.threads,
+            coverage: self.coverage,
+            no_coverage: self.no_coverage,
         }
     }
 

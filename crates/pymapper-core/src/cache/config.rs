@@ -23,8 +23,8 @@ use crate::intern::FxHashMap;
 use crate::walk::PathList;
 
 const MAGIC: &[u8; 8] = b"PMCFGEV\0";
-/// Bump when the tokenizer's output changes.
-const VERSION: u32 = 1;
+/// Bump when the tokenizer's output (or tool-output detection) changes.
+const VERSION: u32 = 2;
 /// File name in the cache directory.
 pub const CONFIG_EVIDENCE_FILE: &str = "config-evidence.pmc";
 
