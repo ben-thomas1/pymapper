@@ -244,6 +244,9 @@ pub struct Import<'a> {
     pub keyword: Token,
     /// Line of `keyword` (differs from `pos.line` for names on continuation lines).
     pub stmt_line: u32,
+    /// Position of the first module token (of `keyword` when the module is empty:
+    /// `from . import x`); shared by every name of a `from` statement.
+    pub module_pos: Pos,
     pub pos: Pos,
 }
 

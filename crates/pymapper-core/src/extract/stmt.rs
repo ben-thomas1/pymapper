@@ -224,6 +224,7 @@ impl<V: Visitor> Parser<'_, V> {
                 from: false,
                 keyword,
                 stmt_line,
+                module_pos: pos,
                 pos,
             });
             if self.eat(K::Comma).is_none() {
@@ -244,14 +245,16 @@ impl<V: Visitor> Parser<'_, V> {
             }
             self.bump();
         }
-        if self.at(K::Name) {
+        let module_pos = if self.at(K::Name) {
             self.dotted_name();
+            self.pos(self.names[0].start)
         } else {
             self.names.clear();
             if level == 0 {
                 self.diag(DiagKind::ExpectedName);
             }
-        }
+            self.pos(keyword.start)
+        };
         if self.eat(K::Import).is_none() {
             self.diag(DiagKind::UnexpectedToken);
             return;
@@ -267,6 +270,7 @@ impl<V: Visitor> Parser<'_, V> {
                 from: true,
                 keyword,
                 stmt_line,
+                module_pos,
                 pos,
             });
             return;
@@ -294,6 +298,7 @@ impl<V: Visitor> Parser<'_, V> {
                 from: true,
                 keyword,
                 stmt_line,
+                module_pos,
                 pos,
             });
             if self.eat(K::Comma).is_none() {

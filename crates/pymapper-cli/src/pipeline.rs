@@ -97,7 +97,10 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
     }
-    let (files, pyprojects, configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    let (files, pyprojects, mut configs, walk_errors) = timing::time("walk", || collect_files(&roots, config, project_root));
+    if let Some(report) = &config.analysis.coverage {
+        exclude_file(&mut configs, report);
+    }
     let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
     drop(pyprojects);
     for d in &diags {
@@ -134,6 +137,23 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
     let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
         .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
     Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
+}
+
+/// Removes `file` from `paths`: the same path, or another path to the same file (symlinks,
+/// hard links, `..`), compared by device and inode among the paths with the same file name.
+/// Used to keep the coverage report (`analysis.coverage`) out of the config-evidence files,
+/// whatever its contents: it names every function, executed or not.
+fn exclude_file(paths: &mut PathList, file: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let id = std::fs::metadata(file).ok().map(|m| (m.dev(), m.ino()));
+    let name = file.file_name();
+    paths.remove_if(|p| {
+        if p == file {
+            return true;
+        }
+        let Some(id) = id else { return false };
+        p.file_name() == name && std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == id)
+    });
 }
 
 /// Walk options equal for grouping purposes (walks with equal options share one walk).
@@ -239,7 +259,13 @@ fn flush_walk(
 /// Inline `# pymapper: ignore[...]` and F401 `# noqa` suppressions of every file, from the facts.
 /// Malformed codes suppress nothing; they, unknown codes and empty lists (`ignore[]`) are passed
 /// to `bad(file, line, code, kind)` (`code` is empty for an empty list), in file and line order.
-pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+pub fn suppressions(ix: &Index, bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> Suppressions {
+    suppressions_builder(ix, bad).build()
+}
+
+/// [`suppressions`] before `build`, so callers can add entries for files beyond the index
+/// (`pyproject.toml` files, with ids above every index file).
+pub fn suppressions_builder(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind)) -> SuppressionsBuilder {
     let mut b = SuppressionsBuilder::new();
     let st = &ix.facts().suppressions;
     let mut entries = Vec::new();
@@ -270,5 +296,5 @@ pub fn suppressions(ix: &Index, mut bad: impl FnMut(u32, u32, &[u8], BadCodeKind
         }
         b.push_file(rules::FileId(f), &entries);
     }
-    b.build()
+    b
 }

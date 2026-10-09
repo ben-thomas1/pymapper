@@ -610,7 +610,7 @@ fn empty_scene_is_harmless() {
     m.update([800.0, 600.0], 1.0);
     assert!(m.bands.rects.is_empty());
     assert_eq!(m.hit_test([10.0, 10.0], 3.0), None);
-    let input = CanvasInput { hover: Some([1.0, 1.0]), drag: [3.0, 3.0], zoom: 1.5, zoom_anchor: None, fit: true };
+    let input = CanvasInput { hover: Some([1.0, 1.0]), drag: [3.0, 3.0], zoom: 1.5, zoom_anchor: None, fit: true, click: false };
     assert!(!m.apply_input(&input, 1.0));
     assert!(m.labels.glyphs.is_empty());
 }

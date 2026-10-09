@@ -9,7 +9,8 @@
 //! ```
 //!
 //! Scorecards are information, never findings: the exit code is 0 whatever the grades, 2 only
-//! for usage and fatal errors (as `check`).
+//! for usage and fatal errors (as `check`). `--check` runs the dependency-hygiene rules instead
+//! (PM601-PM604, see [`hygiene`]), with the findings, formats and exit codes of `check`.
 
 use std::io;
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ use pymapper_core::deps::{self, DepsReport, GroupFiles, ReportOptions, ScoreCtx,
 use pymapper_core::resolve::resolve_calls;
 use pymapper_core::roots::Origin;
 use pymapper_core::timing;
+
+mod hygiene;
 
 use super::config::ConfigArgs;
 use crate::pipeline::{self, warn};
@@ -39,6 +42,16 @@ pub struct Args {
     /// List every loaded distribution, not only those first-party code imports or calls.
     #[arg(long)]
     all: bool,
+    /// Run the dependency-hygiene rules (PM601-PM604) instead of listing distributions:
+    /// findings, formats, suppressions, baselines and exit codes as `pymapper check`.
+    #[arg(long, conflicts_with_all = ["score", "all"])]
+    check: bool,
+    /// With --check: report only findings not recorded in this baseline file.
+    #[arg(long, value_name = "FILE", requires = "check", help_heading = "Baseline")]
+    baseline: Option<PathBuf>,
+    /// With --check: record every reported finding in this baseline file and exit 0.
+    #[arg(long, value_name = "FILE", requires = "check", help_heading = "Baseline")]
+    save_baseline: Option<PathBuf>,
     #[command(flatten)]
     config: ConfigArgs,
     /// Print phase timings, counters and peak RSS to stderr.
@@ -59,6 +72,12 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
     pipeline::require_paths(&loaded.scope, true, None)?;
     pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
+    if args.check {
+        // Loaded like `check`: installed metadata maps imports whether or not third-party code
+        // is loaded (`--deps`).
+        let opts = hygiene::Opts { baseline: args.baseline, save_baseline: args.save_baseline, stats: args.stats };
+        return hygiene::run(loaded, opts, t0);
+    }
     if no_deps {
         warn(format_args!("`pymapper deps` always loads third-party code; --no-deps is ignored"));
     }

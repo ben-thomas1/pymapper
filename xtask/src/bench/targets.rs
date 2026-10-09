@@ -120,7 +120,9 @@ pub enum Target {
     /// (`deadcode.propagate`), the evidence scan plus the second propagation
     /// (`deadcode.evidence`) and the findings (`deadcode.findings`). Application mode with no
     /// entrypoints (the fewest roots: the most candidates); `XTASK_DEADCODE_MODE=library` for
-    /// library mode. Peak RSS includes the index, the import resolution and the resolved calls.
+    /// library mode; `XTASK_DEADCODE_COVERAGE=synthetic` adds a generated coverage report
+    /// (`coverage.generate`, `coverage.parse`). Peak RSS includes the index, the import
+    /// resolution and the resolved calls.
     Deadcode,
     /// `calls`, then the query API (`pymapper_core::query`): the query state (`query.build`:
     /// call graph; `query.names`: name index; `query.imports`: import graph;
@@ -1131,7 +1133,16 @@ fn deadcode_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let calls = resolve_calls(&ix, &imp);
     let config = Config::new(root);
     let engine = RuleEngine::new(&config);
-    let opts = DeadCodeOptions { mode, ..DeadCodeOptions::default() };
+    // `XTASK_DEADCODE_COVERAGE=synthetic`: a generated coverage.py report as evidence.
+    let report = (std::env::var("XTASK_DEADCODE_COVERAGE").as_deref() == Ok("synthetic"))
+        .then(|| timing::time("coverage.generate", || synthetic_coverage(&ix)));
+    let cov = match &report {
+        Some(r) => Some(timing::time("coverage.parse", || deadcode::coverage::Coverage::parse(&ix, r, &[]))?),
+        None => None,
+    };
+    // The CLI drops the report bytes once mapped.
+    let report_bytes = report.map_or(0, |r| r.len() as u64);
+    let opts = DeadCodeOptions { mode, coverage: cov.as_ref(), ..DeadCodeOptions::default() };
     let mut out = Findings::new();
     let dc = deadcode::analyse(&ix, &imp, &calls, &opts, &engine, &mut out);
     let s = ix.stats();
@@ -1160,7 +1171,65 @@ fn deadcode_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
         ("calls_kb".to_owned(), calls.heap_bytes() as u64 / 1000),
         ("index_kb".to_owned(), ix.heap_bytes() as u64 / 1000),
     ]);
+    if let Some(c) = &cov {
+        let cs = c.stats();
+        counters.extend([
+            ("coverage_report_kb".to_owned(), report_bytes / 1000),
+            ("coverage_matched".to_owned(), u64::from(cs.matched)),
+            ("coverage_executed".to_owned(), u64::from(cs.executed)),
+            ("coverage_not_executed".to_owned(), u64::from(cs.not_executed)),
+            ("coverage_kb".to_owned(), c.heap_bytes() as u64 / 1000),
+            ("deadcode_executed".to_owned(), st.executed),
+            ("deadcode_lowered".to_owned(), st.not_executed),
+        ]);
+    }
     Ok((stats, counters))
+}
+
+/// A coverage.py JSON report for every file of `ix` (absolute paths): every line executed
+/// except the bodies of every third function, which are missing. Lines stand in for
+/// statements, so the report is somewhat larger than a real one.
+fn synthetic_coverage(ix: &pymapper_core::index::Index) -> Vec<u8> {
+    use pymapper_core::extract::facts::DefKind;
+    use std::fmt::Write as _;
+    let defs = &ix.facts().defs;
+    let mut s = String::from("{\"meta\": {\"format\": 3, \"version\": \"7.6.1\"}, \"files\": {");
+    let mut missing: Vec<bool> = Vec::new();
+    let list = |s: &mut String, missing: &[bool], want: bool| {
+        let mut first = true;
+        for (l, &m) in missing.iter().enumerate().skip(1) {
+            if m == want {
+                let _ = write!(s, "{}{l}", if first { "" } else { ", " });
+                first = false;
+            }
+        }
+    };
+    for f in 0..ix.file_count() {
+        let ff = ix.file_facts(f);
+        missing.clear();
+        missing.resize(ff.lines as usize + 1, false);
+        let mut k = 0;
+        for row in ff.defs.range() {
+            if DefKind::from_u8(defs.kind[row]) == DefKind::Function {
+                k += 1;
+                if k % 3 == 0 {
+                    for l in defs.name_line[row] + 1..=defs.end_line[row].min(ff.lines) {
+                        missing[l as usize] = true;
+                    }
+                }
+            }
+        }
+        if f > 0 {
+            s.push_str(", ");
+        }
+        let _ = write!(s, "\"{}\": {{\"executed_lines\": [", ix.file_path(f).display());
+        list(&mut s, &missing, false);
+        s.push_str("], \"missing_lines\": [");
+        list(&mut s, &missing, true);
+        s.push_str("], \"excluded_lines\": []}");
+    }
+    s.push_str("}, \"totals\": {}}");
+    s.into_bytes()
 }
 
 /// Cache directory of the `load-cold` / `load-warm` targets for `root`.

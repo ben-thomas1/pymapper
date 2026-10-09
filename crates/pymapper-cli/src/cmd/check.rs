@@ -18,7 +18,7 @@
 //! Analyses run only when one of their rules is enabled (`RuleEngine::should_run`), and call
 //! resolution only when an enabled rule needs it (dead code, god classes).
 
-mod plan;
+pub(crate) mod plan;
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Context;
+use pymapper_core::analysis::deadcode::coverage::Coverage;
 use pymapper_core::analysis::deadcode::{self, DeadCode, DeadCodeOptions, DeadCodeStats, unit_flags};
 use pymapper_core::analysis::dupes::{self, DupesParams, Fingerprints};
 use pymapper_core::analysis::{coupling, cycles, hotspot, layers};
@@ -105,12 +106,22 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         (None, Some(path)) => Some(read_baseline(path)?),
         _ => None,
     };
+    // Likewise a missing coverage report (read after the index is built).
+    let coverage_path = config.analysis.coverage.as_deref().filter(|_| engine.should_run(Pass::DeadCode));
+    if let Some(path) = coverage_path {
+        std::fs::File::open(path)
+            .with_context(|| format!("cannot read coverage report {} (create it with `coverage json`)", path.display()))?;
+    }
 
     let mut project = pipeline::load(config, root, DupesParams::from_engine(&engine));
     // Matching consumes the fingerprints.
     let fps = project.fingerprints.take();
     let matcher = config.entrypoint_matcher();
-    let (mut findings, dead, modes) = analyse(config, &engine, &project, &matcher, scope, fps, args.stats);
+    let coverage = match coverage_path {
+        Some(path) => Some(timing::time("coverage", || load_coverage(&project.index, path, root))?),
+        None => None,
+    };
+    let (mut findings, dead, modes) = analyse(config, &engine, &project, &matcher, coverage.as_ref(), scope, fps, args.stats);
     if dead.is_some() {
         for (key, pattern) in matcher.unmatched() {
             warn(format_args!(
@@ -209,6 +220,20 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
                 ("cache_written_kb", cs.written_bytes / 1000),
             ]);
         }
+        if let Some(c) = &coverage {
+            let s = c.stats();
+            counters.extend([
+                ("coverage_files", u64::from(s.report_files)),
+                ("coverage_matched", u64::from(s.matched)),
+                ("coverage_executed", u64::from(s.executed)),
+                ("coverage_not_executed", u64::from(s.not_executed)),
+            ]);
+        }
+        if let Some(d) = &dead
+            && coverage.is_some()
+        {
+            counters.extend([("deadcode.executed", d.executed), ("deadcode.lowered", d.not_executed)]);
+        }
         if let Some(ce) = &project.config_evidence {
             counters.extend([("config_files", u64::from(ce.stats.files)), ("config_files_cached", u64::from(ce.stats.cached))]);
         }
@@ -242,7 +267,7 @@ impl std::fmt::Display for DisplayPaths<'_> {
 
 /// Per file: whether it lies under one of the positional paths (`None`: no paths, everything
 /// is in scope). Component-wise prefix tests on first-party files only; O(files * paths).
-fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
+pub(crate) fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
     if scope.is_empty() {
         return None;
     }
@@ -258,7 +283,7 @@ fn file_scope(ix: &Index, scope: &[PathBuf]) -> Option<Vec<bool>> {
 }
 
 /// First-party files loaded: `(in scope, total)`.
-fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
+pub(crate) fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
     let mut checked = 0;
     let mut total = 0;
     for f in 0..ix.file_count() {
@@ -273,7 +298,7 @@ fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, u32) {
 }
 
 /// `path` relative to the project root when below it, else as is.
-fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
+pub(crate) fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
     match path.strip_prefix(root) {
         Ok(rel) if !rel.as_os_str().is_empty() => rel.display(),
         _ => path.display(),
@@ -283,7 +308,11 @@ fn display_rel<'p>(path: &'p Path, root: &Path) -> std::path::Display<'p> {
 /// Warns about one malformed or unknown code of an inline suppression (`code` empty: an empty
 /// list). Never fatal: the directive just suppresses less than intended.
 fn warn_bad_suppression(ix: &Index, root: &Path, f: u32, line: u32, code: &[u8], kind: BadCodeKind) {
-    let path = display_rel(ix.file_path(f), root);
+    warn_bad_code(display_rel(ix.file_path(f), root), line, code, kind);
+}
+
+/// [`warn_bad_suppression`] for a display path.
+pub(crate) fn warn_bad_code(path: impl std::fmt::Display, line: u32, code: &[u8], kind: BadCodeKind) {
     let code = String::from_utf8_lossy(code);
     match kind {
         BadCodeKind::Malformed if code.is_empty() => warn(format_args!(
@@ -302,14 +331,39 @@ fn warn_bad_suppression(ix: &Index, root: &Path, f: u32, line: u32, code: &[u8],
     }
 }
 
+/// Reads the coverage report at `path` and maps it to `ix`; warns when it matches no analysed
+/// file or looks stale.
+fn load_coverage(ix: &Index, path: &Path, root: &Path) -> anyhow::Result<Coverage> {
+    let c = Coverage::load(ix, path, root).with_context(|| format!("invalid coverage report {}", path.display()))?;
+    let s = c.stats();
+    if s.matched == 0 && s.report_files > 0 {
+        let first = String::from_utf8_lossy(c.first_unmatched().unwrap_or_default());
+        warn(format_args!(
+            "coverage report {} matches no analysed file (first path: {first}); it is ignored",
+            path.display()
+        ));
+    }
+    if s.stale_files > 0 {
+        warn(format_args!(
+            "coverage report {}: {} file(s) have line numbers past their end; the report may be stale (rerun the tests and `coverage json`)",
+            path.display(),
+            s.stale_files
+        ));
+    }
+    Ok(c)
+}
+
 /// Runs every analysis with an enabled rule and returns their findings (unfiltered), the
 /// dead-code counters (when that pass ran) and, with `describe_modes`, one line per project
-/// unit with files describing its dead-code mode and why.
+/// unit with files describing its dead-code mode and why. `coverage`: dead-code evidence from
+/// a coverage report.
+#[allow(clippy::too_many_arguments)]
 fn analyse(
     config: &Config,
     engine: &RuleEngine,
     p: &Project,
     matcher: &EntrypointMatcher,
+    coverage: Option<&Coverage>,
     scope: &[PathBuf],
     fps: Option<Fingerprints>,
     describe_modes: bool,
@@ -346,7 +400,8 @@ fn analyse(
     if let (true, Some(calls)) = (dead_code, &calls) {
         let scripts: Vec<&[u8]> = p.units.all_scripts().iter().map(|s| s.as_bytes()).collect();
         let opts = DeadCodeOptions::from_config(config, matcher, Some(&p.units), &scripts)
-            .with_config_evidence(p.config_evidence.as_ref());
+            .with_config_evidence(p.config_evidence.as_ref())
+            .with_coverage(coverage);
         let dc = timing::time("deadcode", || deadcode::analyse(ix, imp, calls, &opts, engine, &mut out));
         warn_no_entry_points(&dc, &p.units, scope);
         if describe_modes {
@@ -395,7 +450,7 @@ fn warn_no_entry_points(dc: &DeadCode, units: &ProjectUnits, scope: &[PathBuf]) 
 
 /// `per-file-ignores` patterns compiled once each (gitignore syntax, relative to the project
 /// root). An invalid pattern is a configuration error.
-fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
+pub(crate) fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
     let mut out = Vec::with_capacity(config.rules.per_file_ignores.len());
     for e in &config.rules.per_file_ignores {
         Gitignore::check_pattern(e.pattern.as_bytes())
@@ -408,11 +463,16 @@ fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
 /// Whether a `per-file-ignores` pattern matches file `f`: its path relative to the project
 /// root, or one of its parent directories (as an excluded directory excludes its contents).
 /// Files outside the root are matched by their absolute path without the leading `/`.
-fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool {
+pub(crate) fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool {
     if f.0 >= ix.file_count() {
         return false;
     }
-    let p = ix.file_path(f.0).as_os_str().as_bytes();
+    per_file_path_matches(ix.file_path(f.0), root, gi)
+}
+
+/// [`per_file_matches`] for a path (absolute).
+pub(crate) fn per_file_path_matches(path: &Path, root: &Path, gi: &Gitignore) -> bool {
+    let p = path.as_os_str().as_bytes();
     let rel = match p.strip_prefix(root.as_os_str().as_bytes()) {
         Some([b'/', rest @ ..]) => rest,
         _ => p.strip_prefix(b"/").unwrap_or(p),
@@ -426,7 +486,7 @@ fn per_file_matches(ix: &Index, root: &Path, gi: &Gitignore, f: FileId) -> bool 
     gi.matched(rel, false) == Match::Ignore
 }
 
-fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
+pub(crate) fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
     let text = std::fs::read(path).with_context(|| {
         format!("cannot read baseline {} (create it with `pymapper check --save-baseline FILE`)", path.display())
     })?;
@@ -434,7 +494,7 @@ fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
 }
 
 /// Writes the baseline of `report` to `path` atomically (temporary file + rename).
-fn save_baseline(report: &Report<'_>, path: &Path) -> anyhow::Result<()> {
+pub(crate) fn save_baseline(report: &Report<'_>, path: &Path) -> anyhow::Result<()> {
     // Per-process temp name: concurrent saves to the same baseline must not share it.
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
