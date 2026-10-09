@@ -213,11 +213,11 @@ impl<'c, 'a> Analysis<'c, 'a> {
         }
     }
 
-    /// The effective unit of every first-party file, in one pass (consecutive files of one
-    /// directory share the lookup).
-    fn file_units(&self) -> Vec<(IxFile, u32)> {
+    /// The unit of every first-party file (`NONE` for other files), in one pass: consecutive
+    /// files of one directory share the lookup. 4 bytes per file.
+    fn file_units(&self) -> Vec<u32> {
         let ix = self.cx.ix;
-        let mut out = Vec::new();
+        let mut out = vec![NONE; ix.file_count() as usize];
         let mut last_dir: &[u8] = &[];
         let mut last_unit = NONE;
         for f in 0..ix.file_count() {
@@ -229,7 +229,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 last_dir = dir;
                 last_unit = self.cx.units.unit_of_dir(dir);
             }
-            out.push((f, self.cx.decls.effective(last_unit)));
+            out[f as usize] = last_unit;
         }
         out
     }
@@ -237,7 +237,13 @@ impl<'c, 'a> Analysis<'c, 'a> {
     fn imports(&mut self, names: &mut Interner, out: &mut Findings) {
         let ix = self.cx.ix;
         let st = &ix.facts().imports;
-        for (f, eu) in self.file_units() {
+        let file_units = self.file_units();
+        for f in 0..ix.file_count() {
+            let unit = file_units[f as usize];
+            if unit == NONE {
+                continue;
+            }
+            let eu = self.cx.decls.effective(unit);
             self.stats.files += 1;
             if eu == NONE {
                 self.stats.undeclared_files += 1;
@@ -258,7 +264,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 let Some(p) = self.provider(row, chain, name, names) else { continue };
                 let third = match p {
                     Provider::FirstParty(target) => {
-                        self.first_party_use(eu, target);
+                        self.first_party_use(eu, file_units[target as usize]);
                         continue;
                     }
                     Provider::Third(t) => t,
@@ -348,15 +354,14 @@ impl<'c, 'a> Analysis<'c, 'a> {
         }
     }
 
-    /// Records that a file of effective unit `eu` imports first-party file `target`: when that
-    /// belongs to another unit with a `[project]` name (a workspace member), the member counts
-    /// as a used dependency of `eu`.
-    fn first_party_use(&mut self, eu: u32, target: IxFile) {
-        if eu == NONE {
+    /// Records that a file of effective unit `eu` imports a first-party file of unit
+    /// `target_unit`: when that unit's declarations belong to another unit with a `[project]`
+    /// name (a workspace member), the member counts as a used dependency of `eu`.
+    fn first_party_use(&mut self, eu: u32, target_unit: u32) {
+        if eu == NONE || target_unit == NONE {
             return;
         }
-        let dir = self.cx.ix.file_path(target).parent().map_or(&[][..], |p| p.as_os_str().as_encoded_bytes());
-        let tu = self.cx.decls.effective(self.cx.units.unit_of_dir(dir));
+        let tu = self.cx.decls.effective(target_unit);
         if tu != NONE
             && tu != eu
             && let Some(p) = self.cx.decls.unit(tu).project
