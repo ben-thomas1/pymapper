@@ -478,7 +478,7 @@ pub(crate) fn run(
             let keys: Vec<(u32, FileId)> =
                 icands.iter().map(|c| (evidence_hash(ix.str(c.name)), c.file)).collect();
             let cands = evidence::Candidates { defs: &defs, modules: &mods, imports: &keys };
-            let hits = evidence::scan(ix, imp, calls, &info.included, &cands);
+            let hits = evidence::scan(ix, imp, calls, &g.over, &info.included, &cands);
             stats.candidates = (defs.len() + mods.len() + keys.len()) as u64;
             stats.probes = hits.probes;
             for (i, &d) in defs.iter().enumerate() {

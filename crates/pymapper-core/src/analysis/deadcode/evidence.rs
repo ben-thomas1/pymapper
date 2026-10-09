@@ -9,7 +9,10 @@
 //! search into the larger side. So a common name (`get`, `Any`) shared by thousands of
 //! candidates and mentioned by thousands of files costs O(files x min(members, edges or
 //! evidence of the file) x log), not O(files x members). Whether an occurrence is explained by a
-//! call site is a binary search in the file's own short list of called names.
+//! call site is a binary search in the file's own short list of explained candidates; a file
+//! that explains some member of a hit group is set aside and its members are settled after the
+//! scan (the first such file usually decides, so this stays linear in members plus explained
+//! pairs).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -18,9 +21,10 @@ use rayon::prelude::*;
 use super::level;
 use crate::extract::facts::evidence_hash;
 use crate::index::{FileId, Index, NodeId};
-use crate::intern::{FxHashMap, FxHashSet, Sym};
+use crate::graph::{Graph, Scc};
+use crate::intern::{FxHashMap, Sym};
 use crate::reach::BitSet;
-use crate::resolve::{Imports, Reason, ResolvedCalls};
+use crate::resolve::{Confidence, Imports, Reason, ResolvedCalls};
 
 /// What the scan found for an import candidate.
 pub(super) mod import_hit {
@@ -52,18 +56,23 @@ pub(super) struct Hits {
     pub probes: u64,
 }
 
-/// Per file, the sorted names explained by its call sites.
+/// Per file, the sorted def candidates whose name occurrences there are explained by call
+/// sites (see [`explained_and_importers`]).
 struct Explained {
-    names: Vec<u32>,
-    /// Start of each file's run in `names`, plus the end.
+    cands: Vec<u32>,
+    /// Start of each file's run in `cands`, plus the end.
     off: Vec<u32>,
 }
 
 impl Explained {
     #[inline]
-    fn contains(&self, name: u32, f: FileId) -> bool {
-        let run = &self.names[self.off[f as usize] as usize..self.off[f as usize + 1] as usize];
-        run.binary_search(&name).is_ok()
+    fn run(&self, f: FileId) -> &[u32] {
+        &self.cands[self.off[f as usize] as usize..self.off[f as usize + 1] as usize]
+    }
+
+    #[inline]
+    fn contains(&self, i: u32, f: FileId) -> bool {
+        self.run(f).binary_search(&i).is_ok()
     }
 }
 
@@ -197,8 +206,16 @@ fn intersect(
     }
 }
 
-/// Runs the scan over the files `included` selects (see the module docs of `deadcode`).
-pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &[bool], c: &Candidates<'_>) -> Hits {
+/// Runs the scan over the files `included` selects (see the module docs of `deadcode`). `over`
+/// is the override graph (base method -> overriding method).
+pub(super) fn scan(
+    ix: &Index,
+    imp: &Imports,
+    calls: &ResolvedCalls,
+    over: &Graph,
+    included: &[bool],
+    c: &Candidates<'_>,
+) -> Hits {
     let (nd, nm, ni) = (c.defs.len(), c.modules.len(), c.imports.len());
     let mut hits = Hits { defs: vec![0; nd], modules: vec![false; nm], imports: vec![import_hit::NONE; ni], probes: 0 };
     if nd + nm + ni == 0 {
@@ -214,7 +231,7 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
         }
         c.defs.binary_search(&v).ok().map(|i| i as u32)
     };
-    let (explained, importers) = explained_and_importers(ix, imp, calls, included, c.defs, &def_idx);
+    let (explained, importers) = explained_and_importers(ix, imp, calls, over, included, c.defs, &def_idx);
     let name_hash = |d: NodeId| evidence_hash(ix.name(d));
     let has = |f: FileId, h: u32| ix.file_view(f).evidence().binary_search(&h).is_ok();
     // Occurrences in the def's own file (its own `__all__` entry is not a use).
@@ -224,7 +241,7 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
         let module_level = ix.parent(d) == Some(ix.file_node(fd));
         if included[fd as usize]
             && has(fd, name_hash(d))
-            && !explained.contains(s.to_raw(), fd)
+            && !explained.contains(i as u32, fd)
             && !(module_level && imp.in_all(fd, s))
         {
             hits.defs[i] = level::LINKED;
@@ -232,8 +249,7 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
     }
     // Occurrences in files importing the def directly.
     for &(i, f) in &importers {
-        let d = c.defs[i as usize];
-        if has(f, name_hash(d)) && !explained.contains(ix.name_sym(d).to_raw(), f) {
+        if has(f, name_hash(c.defs[i as usize])) && !explained.contains(i, f) {
             hits.defs[i as usize] = level::LINKED;
         }
     }
@@ -244,6 +260,12 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
     let defs: Vec<[u32; 4]> =
         c.defs.iter().enumerate().map(|(i, &d)| [name_hash(d), ix.name_sym(d).to_raw(), module_of(d), i as u32]).collect();
     let dg = Groups::new(defs, &mut map, 0);
+    let mut group_of = vec![0u32; nd];
+    for g in 0..dg.len() {
+        for m in dg.group(g) {
+            group_of[m[3] as usize] = g;
+        }
+    }
     let mg = Groups::new(c.modules.iter().enumerate().map(|(i, &m)| [name_hash(m), 0, 0, i as u32]).collect(), &mut map, 1);
     let by_module = c.imports.iter().enumerate().map(|(i, &(h, f))| [h, 0, ix.file_node(f), i as u32]).collect();
     let ig = Groups::new(by_module, &mut map, 2);
@@ -254,47 +276,80 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
     let used = AtomicBits::new(ni);
     let elsewhere = AtomicBits::new(ni);
     // Parallel over files: every write is an idempotent atomic update (see `Groups::see`), so
-    // the result does not depend on scheduling.
-    hits.probes = (0..ix.file_count())
+    // the result does not depend on scheduling. Files that explain some member of a hit group
+    // are returned as `(group, file)` for a per-member pass.
+    let (probes, mut partial) = (0..ix.file_count())
         .into_par_iter()
         .with_min_len(64)
-        .map(|f| {
-            if !included[f as usize] {
-                return 0;
-            }
-            let ev = ix.file_view(f).evidence();
-            let edges = imp.module_edges(f);
-            let imports_module = |m: u32| edges.binary_search_by_key(&m, |e| e.dst).is_ok();
-            let in_ev = |k: u32| ev.binary_search(&k).is_ok();
-            for &h in ev {
-                let Some(r) = map.get(&h) else { continue };
-                for g in r[0].0..r[0].1 {
-                    let members = dg.group(g);
-                    if explained.contains(members[0][1], f) {
-                        continue;
+        .fold(
+            || (0u64, Vec::new()),
+            |(mut probes, mut partial), f| {
+                if !included[f as usize] {
+                    return (probes, partial);
+                }
+                let ev = ix.file_view(f).evidence();
+                let edges = imp.module_edges(f);
+                let ex = explained.run(f);
+                let imports_module = |m: u32| edges.binary_search_by_key(&m, |e| e.dst).is_ok();
+                let in_ev = |k: u32| ev.binary_search(&k).is_ok();
+                probes += ev.len() as u64;
+                for &h in ev {
+                    let Some(r) = map.get(&h) else { continue };
+                    for g in r[0].0..r[0].1 {
+                        let members = dg.group(g);
+                        // `import mod` then `mod.name`, or `from pkg import mod`.
+                        if ex.iter().any(|&i| group_of[i as usize] == g) {
+                            partial.push((g, f));
+                            let link = |i: u32| {
+                                if ex.binary_search(&i).is_err() {
+                                    linked.set(i);
+                                }
+                            };
+                            intersect(members, edges.iter().map(|e| e.dst), imports_module, link);
+                        } else {
+                            intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| linked.set(i));
+                            dg.see(g, f);
+                        }
                     }
-                    // `import mod` then `mod.name`, or `from pkg import mod`.
-                    intersect(members, edges.iter().map(|e| e.dst), imports_module, |i| linked.set(i));
-                    dg.see(g, f);
+                    for g in r[1].0..r[1].1 {
+                        mg.see(g, f);
+                    }
+                    for g in r[2].0..r[2].1 {
+                        intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used.set(i));
+                        intersect(ig2.group(g), ev.iter().copied(), in_ev, |i| elsewhere.set(i));
+                    }
                 }
-                for g in r[1].0..r[1].1 {
-                    mg.see(g, f);
-                }
-                for g in r[2].0..r[2].1 {
-                    intersect(ig.group(g), edges.iter().map(|e| e.dst), imports_module, |i| used.set(i));
-                    intersect(ig2.group(g), ev.iter().copied(), in_ev, |i| elsewhere.set(i));
-                }
-            }
-            ev.len() as u64
-        })
-        .sum();
+                (probes, partial)
+            },
+        )
+        .reduce(
+            || (0u64, Vec::new()),
+            |(p1, mut v1), (p2, mut v2)| {
+                v1.append(&mut v2);
+                (p1 + p2, v1)
+            },
+        );
+    hits.probes = probes;
+    partial.sort_unstable();
+    let mut pi = 0;
     for g in 0..dg.len() {
+        let lo = pi;
+        while pi < partial.len() && partial[pi].0 == g {
+            pi += 1;
+        }
+        let events = &partial[lo..pi];
         for m in dg.group(g) {
-            let i = m[3] as usize;
-            if linked.get(i) {
-                hits.defs[i] = level::LINKED;
-            } else if hits.defs[i] < level::LINKED && dg.elsewhere(g, ix.file(c.defs[i])) {
-                hits.defs[i] = level::EVIDENCE;
+            let i = m[3];
+            let own = ix.file(c.defs[i as usize]);
+            if linked.get(i as usize) {
+                hits.defs[i as usize] = level::LINKED;
+            } else if hits.defs[i as usize] < level::LINKED
+                && (dg.elsewhere(g, own)
+                    // Usually the first event qualifies; skipping one means `(i, f)` is
+                    // explained or `f` is the def's own file.
+                    || events.iter().any(|&(_, f)| Some(f) != own && !explained.contains(i, f)))
+            {
+                hits.defs[i as usize] = level::EVIDENCE;
             }
         }
     }
@@ -316,56 +371,114 @@ pub(super) fn scan(ix: &Index, imp: &Imports, calls: &ResolvedCalls, included: &
     hits
 }
 
-/// Names explained by the call sites of each included file: every call / decorator edge of the
-/// file to a def with a candidate's name, and every class of the file whose resolved base has
-/// one. Also the `(candidate, file)` pairs of files importing a candidate directly.
+/// Per included file, the def candidates whose name occurrences there are explained by call
+/// sites: a call or decorator edge of the file to the def, or to a base method the def
+/// overrides (dynamic dispatch), unless the caller is a candidate in the def's own call cycle
+/// (recursion does not explain a reference made elsewhere in the file); and a class of the
+/// file whose resolved base is the def. A candidate is not explained in a file that also has
+/// an unresolved call of its name. Also the `(candidate, file)` pairs of files importing a
+/// candidate directly.
 fn explained_and_importers(
     ix: &Index,
     imp: &Imports,
     calls: &ResolvedCalls,
+    over: &Graph,
     included: &[bool],
     defs: &[NodeId],
     def_idx: &impl Fn(NodeId) -> Option<u32>,
 ) -> (Explained, Vec<(u32, FileId)>) {
-    let mut names: FxHashSet<Sym> = FxHashSet::default();
-    for &d in defs {
-        names.insert(ix.name_sym(d));
+    let edges = calls.edges();
+    // Call cycles among the candidates.
+    let cg = Graph::build(defs.len() as u32, || {
+        edges.iter().filter(|e| e.reason != Reason::Override).filter_map(|e| Some((def_idx(e.src)?, def_idx(e.dst)?)))
+    });
+    let scc = Scc::of(&cg);
+    drop(cg);
+    // Base methods whose calls may dispatch to a candidate override: (base, candidate).
+    let mut bases: Vec<(NodeId, u32)> = Vec::new();
+    let mut is_base = BitSet::new(ix.node_count());
+    for (i, &d) in defs.iter().enumerate() {
+        for &b in over.pred(d) {
+            bases.push((b, i as u32));
+            is_base.insert(b);
+        }
     }
+    bases.sort_unstable();
     let cl = calls.classes();
     let files = ix.file_count();
-    let mut ex = Explained { names: Vec::new(), off: Vec::with_capacity(files as usize + 1) };
+    let mut ex = Explained { cands: Vec::new(), off: Vec::with_capacity(files as usize + 1) };
     let mut importers: Vec<(u32, FileId)> = Vec::new();
+    let mut unresolved: Vec<Sym> = Vec::new();
     for f in 0..files {
-        let at = ex.names.len();
+        let at = ex.cands.len();
         ex.off.push(at as u32);
         if !included[f as usize] {
             continue;
         }
         for e in calls.file_edges(f) {
-            // Any edge with a target: the call site explains the name, however sure it is and
-            // whichever def of that name it reached (overrides follow their class).
-            let s = ix.name_sym(e.dst);
-            if e.reason != Reason::Override && names.contains(&s) {
-                ex.names.push(s.to_raw());
+            if e.reason == Reason::Override {
+                continue;
+            }
+            let src = def_idx(e.src);
+            let outside = |i: u32| src.is_none_or(|j| scc.comp(j) != scc.comp(i));
+            if let Some(i) = def_idx(e.dst)
+                && outside(i)
+            {
+                ex.cands.push(i);
+            }
+            if is_base.contains(e.dst) {
+                let lo = bases.partition_point(|p| p.0 < e.dst);
+                for &(b, i) in &bases[lo..] {
+                    if b != e.dst {
+                        break;
+                    }
+                    if outside(i) {
+                        ex.cands.push(i);
+                    }
+                }
             }
         }
         for k in cl.file_classes(f) {
             for &b in cl.bases(k) {
-                let s = ix.name_sym(cl.node(b));
-                if names.contains(&s) {
-                    ex.names.push(s.to_raw());
+                if let Some(i) = def_idx(cl.node(b)) {
+                    ex.cands.push(i);
                 }
             }
         }
-        ex.names[at..].sort_unstable();
+        ex.cands[at..].sort_unstable();
         let mut w = at;
-        for r in at..ex.names.len() {
-            if w == at || ex.names[w - 1] != ex.names[r] {
-                ex.names[w] = ex.names[r];
+        for r in at..ex.cands.len() {
+            if w == at || ex.cands[w - 1] != ex.cands[r] {
+                ex.cands[w] = ex.cands[r];
                 w += 1;
             }
         }
-        ex.names.truncate(w);
+        ex.cands.truncate(w);
+        if w > at {
+            // A call of the same name that did not resolve (ambiguous receiver, parameter,
+            // ...) is an occurrence no resolved call explains.
+            unresolved.clear();
+            let view = ix.file_view(f);
+            for row in ix.file_facts(f).calls.range() {
+                if calls.call(row).0 == Confidence::Unresolved
+                    && let Some(&s) = view.call_chain(row).last()
+                {
+                    unresolved.push(s);
+                }
+            }
+            if !unresolved.is_empty() {
+                unresolved.sort_unstable();
+                let mut w = at;
+                for r in at..ex.cands.len() {
+                    let i = ex.cands[r];
+                    if unresolved.binary_search(&ix.name_sym(defs[i as usize])).is_err() {
+                        ex.cands[w] = i;
+                        w += 1;
+                    }
+                }
+                ex.cands.truncate(w);
+            }
+        }
         for row in ix.file_facts(f).imports.range() {
             if let Some(t) = imp.target(row)
                 && let Some(i) = def_idx(t)
@@ -374,7 +487,7 @@ fn explained_and_importers(
             }
         }
     }
-    ex.off.push(ex.names.len() as u32);
+    ex.off.push(ex.cands.len() as u32);
     (ex, importers)
 }
 
@@ -398,7 +511,7 @@ fn aliased_imports(
             let (Some(alias), Some(t)) = (st.imports.alias[row], imp.target(row)) else { continue };
             if let Some(i) = def_idx(t)
                 && Some(alias) != st.imports.name[row]
-                && !explained.contains(ix.name_sym(t).to_raw(), f)
+                && !explained.contains(i, f)
                 && view.evidence().binary_search(&evidence_hash(ix.str(alias))).is_ok()
             {
                 out[i as usize] = level::LINKED;

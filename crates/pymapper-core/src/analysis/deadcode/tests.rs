@@ -464,8 +464,30 @@ fn flask_routes_are_never_reported_with_high_confidence() {
     assert!(!lines.iter().any(|l| l.rsplit(' ').next().is_some_and(|c| c.parse::<u8>().is_ok_and(|c| (80..100).contains(&c)))));
     // Methods reached through the unique-method fallback (`user.validate()` on a parameter).
     assert_eq!(dc.confidence(f.node("models.base:BaseModel.validate")), 50);
-    // `cycles.ping` is called from `main`, which carries an unknown first-party decorator.
-    assert_eq!(dc.confidence(f.node("cycles:ping")), 40);
+    // `cycles.ping` is called from `main`, which carries an unknown first-party decorator (40),
+    // and `ping` / `pong` call each other: that recursion does not explain the names in
+    // `cycles.py`, so they count as references there (10).
+    assert_eq!(dc.confidence(f.node("app:main")), 40);
+    assert_eq!(dc.confidence(f.node("cycles:ping")), 10);
+
+    // Explanations are per def: `threading`-like code where `self._restore()` resolves to the
+    // class's own method must not hide the attribute reference to another class's method.
+    let f = fx(&[(
+        "app.py",
+        "class Lock:\n    def _restore(self):\n        pass\n\n\
+         class Cond:\n    def __init__(self, lock):\n        self._restore = lock._restore\n\
+         \x20   def _restore(self):\n        pass\n    def wait(self):\n        self._restore()\n\n\
+         def make():\n    def walk(n):\n        return walk(n - 1) if n else 0\n    return walk\n\n\
+         def fact(n):\n    return n * fact(n - 1)\n\n\
+         def run():\n    Lock()\n    Cond(None).wait()\n    make()\n\n\
+         if __name__ == '__main__':\n    run()\n",
+    )]);
+    let (dc, _) = f.app();
+    assert_eq!(dc.level(f.node("app:Lock._restore")), level::LINKED);
+    // A closure that calls itself and is returned: the recursion does not explain `return walk`.
+    assert_eq!(dc.level(f.node("app:make.walk")), level::LINKED);
+    // The price: a dead recursive function also looks referenced.
+    assert_eq!(dc.level(f.node("app:fact")), level::LINKED);
 }
 
 /// Suppressions of the analysed files, from the facts.
@@ -552,4 +574,35 @@ fn name_groups_link_through_module_imports() {
     assert_eq!(lvl("m1:handler"), (level::EVIDENCE, Why::Evidence));
     assert_eq!(lvl("m4:handler"), (level::EVIDENCE, Why::Evidence));
     assert_eq!(lines.iter().filter(|l| l.starts_with("PM404")).count(), 2, "{lines:?}");
+}
+
+#[test]
+#[ignore]
+fn tmp_dump_path() {
+    let p = std::env::var("PYMAPPER_DC_PATH").expect("path");
+    let f = load_dir(Path::new(&p));
+    let mode = if std::env::var("PYMAPPER_DC_LIB").is_ok() { Mode::Library } else { Mode::Application };
+    let (_, lines) = f.run_with(&DeadCodeOptions { mode, ..DeadCodeOptions::default() });
+    let rule = std::env::var("PYMAPPER_DC_RULE").unwrap_or_default();
+    for l in lines.iter().filter(|l| l.starts_with(&rule) && l.rsplit(' ').next().is_some_and(|c| c.parse::<u8>().is_ok_and(|c| c >= 80))) {
+        println!("{l}");
+    }
+}
+
+#[test]
+fn results_do_not_depend_on_the_thread_count() {
+    let f = corpus();
+    let run_on = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        pool.install(|| {
+            let (dc, lines) = f.app();
+            let levels: Vec<(u8, Why)> = (0..f.ix.node_count()).map(|v| (dc.level(v), dc.why(v))).collect();
+            (levels, lines)
+        })
+    };
+    let one = run_on(1);
+    assert!(!one.1.is_empty());
+    for threads in [2, 8] {
+        assert_eq!(run_on(threads), one, "{threads} threads");
+    }
 }
