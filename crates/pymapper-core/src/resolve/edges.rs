@@ -52,6 +52,18 @@ pub(super) fn row_dst(mods: &ModuleTable, p: ModRes, r: NameRes) -> NodeId {
     mods.node(p.module).unwrap_or(NONE)
 }
 
+/// The external edge key of a row (the rule the external edges are built with): `(kind,
+/// key)` for imports of code that is not loaded, else `None`.
+#[inline]
+pub(super) fn row_ext(p: ModRes) -> Option<(ExtKind, u32)> {
+    match ImportStatus::from_u8(p.status) {
+        ImportStatus::Stdlib => Some((ExtKind::Stdlib, p.ext)),
+        ImportStatus::ThirdParty => Some((ExtKind::ThirdParty, p.ext)),
+        ImportStatus::External if p.ext != NONE => Some((ExtKind::Unknown, p.ext)),
+        _ => None,
+    }
+}
+
 /// Flags of an edge after adding a row with flags `f`: AND of the edge-wide flags, OR of
 /// `STAR`; everything else dropped.
 fn merge_flags(acc: u8, f: u8) -> u8 {
@@ -88,14 +100,8 @@ pub(super) fn file_edges(ix: &Index, mods: &ModuleTable, p1: &[ModRes], p2: &[Na
 pub(super) fn file_ext_edges(ix: &Index, p1: &[ModRes], p2: &[NameRes], f: FileId, out: &mut Vec<ExtEdge>) {
     let base = out.len();
     for row in ix.file_facts(f).imports.range() {
-        let p = p1[row];
-        let kind = match ImportStatus::from_u8(p.status) {
-            ImportStatus::Stdlib => ExtKind::Stdlib,
-            ImportStatus::ThirdParty => ExtKind::ThirdParty,
-            ImportStatus::External if p.ext != NONE => ExtKind::Unknown,
-            _ => continue,
-        };
-        out.push(ExtEdge { key: p.ext, rows: 1, kind, flags: p2[row].flags });
+        let Some((kind, key)) = row_ext(p1[row]) else { continue };
+        out.push(ExtEdge { key, rows: 1, kind, flags: p2[row].flags });
     }
     if out.len() - base > 1 {
         // `Sym` values depend on scheduling: order names by their bytes.

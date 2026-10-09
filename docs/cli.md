@@ -49,10 +49,9 @@ The PM6xx dependency-hygiene rules are run by `pymapper deps --check`, not `chec
 "Rules that cannot run" below and [`deps.md`](deps.md#hygiene---check)).
 
 `pymapper deps` (third-party distributions, their use by first-party code, `--score`
-scorecards and the `--check` dependency-hygiene rules) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
-`impact`, `path`, `cycles`, `summary`) are not implemented yet: they are hidden from
-`pymapper --help`, accept any operands and the configuration flags, and exit 2 with "not
-implemented".
+scorecards and the `--check` dependency-hygiene rules) is described in [`deps.md`](deps.md).
+The query subcommands (`callers`, `callees`, `impact`, `path`, `imports`, `cycles`, `summary`)
+are described in [Query subcommands](#query-subcommands) below.
 
 ## Project root
 
@@ -272,3 +271,263 @@ the selected rules that ran / could not run, followed by one `skipped CODES: rea
 reason. `deadcode.units` counts the project units with
 analysed files, split into the library / application modes they resolved to. Measured numbers are in
 [`benchmarks.md`](benchmarks.md#check-s45).
+
+# Query subcommands
+
+Questions about the code for agents and humans: who calls what, what a change can break, how
+two symbols connect, what a module imports, where the cycles are, what the codebase looks like.
+Every query loads the program exactly as `check` does (same project root, configuration,
+import roots, walk, cache and configuration flags: `--deps`, `--stdlib`, `--venv`, `--exclude`,
+`--set`, `--config`, `--isolated`, `--cache-dir`, `--no-cache`, `-j`), resolves imports and
+calls, and answers from the core query API (the one the GUI uses).
+
+```
+pymapper callers SYMBOL [PATHS]...   [--depth N | --transitive] [--edges LEVEL] [--no-overrides] [--scope S] [--limit N]
+pymapper callees SYMBOL [PATHS]...   (as callers)
+pymapper impact  SYMBOL [PATHS]...   [--depth N] [--edges LEVEL] [--no-overrides] [--scope S] [--limit N]
+pymapper path    FROM TO             [--imports] [--edges LEVEL] [--no-overrides] [--node] [--max-len N] [--root DIR]
+pymapper imports SYMBOL [PATHS]...   [--depth N] [--direction in|out] [--runtime] [--limit N]
+pymapper cycles  [PATHS]...          [--symbol SYMBOL [--calls]] [--edges LEVEL] [--no-overrides] [--limit N]
+pymapper summary [PATHS]...          [--top N] [--include-tests] [--all-origins]
+```
+
+Every query also takes `--format concise|json` (`sarif` and `github` are usage errors) and
+`--stats` (phases `query.build`, `lookup`, `query`, `output`, `output.sites` and peak RSS on
+stderr).
+
+## Symbols
+
+`SYMBOL` is looked up in this order, the first form that matches wins:
+
+1. the exact qualified id: `pkg.mod:Class.method`, `pkg.mod`, `@distribution`, with `#N`
+   suffixes for same-named siblings (as in `check` findings and baselines);
+2. the dotted name `pkg.mod.Class.method` (the longest prefix naming a module is the module);
+3. the last segments of qualified ids (`Class.method`, `method`, `mod.Class.method`): unique
+   means found, several means ambiguous;
+4. nothing matched: similar names (case-insensitive equal, prefix, substring, then a small edit
+   distance) as suggestions.
+
+An **ambiguous** symbol lists its candidates on stdout, one per line
+(`app/util.py:1:5: app.util:helper (function)`; third-party and stdlib candidates are tagged),
+first-party first, and exits 2 with `pymapper: error: `helper` is ambiguous: 2 matches (listed on
+stdout); pass a qualified id such as `app.cli:helper`` on stderr. An **unknown** symbol lists
+similar names the same way and exits 2. With `--format json` stdout holds one document:
+`{"version":2,"tool":{...},"query":"callers","error":"ambiguous"|"not-found","input":"helper","candidates":[...]}`
+with `symbol`, `kind`, `path`, `line`, `col`, `origin` and `match` (`suffix`, `fuzzy`) per
+candidate.
+
+A package, module or class stands for everything in it (`--scope auto`, the default): a
+module's callers are the callers of any of its functions and of its module-level code, and
+calls inside it are never reported. `--scope node` uses the node alone, `--scope subtree` the
+subtree of a function too (its nested functions).
+
+## Output
+
+Concise output is one fact per line, then one summary line. A line starts with the location it
+is about (`path:line:col: `; paths relative to the project root, 1-based lines, byte columns),
+names symbols by their qualified id and tags call edges with their confidence:
+
+- `[certain]` statically determined, `[likely]` from a hint (`x = Foo()`, an alias),
+  `[possible]` a guess (a unique method name);
+- `, dispatch` when only an override edge links the two (a base method to the method that
+  overrides it: dynamic dispatch, not a call in the source).
+
+Import facts (`imports` rows, `impact` importers, import edges of `path --imports` and import
+cycles) start at the import statement and have no confidence tag: an import edge is a fact of
+the source, not a guess. They carry their flags instead (`type-only`, `conditional`, `try`,
+`lazy`, `star`).
+
+`--edges certain` (or `likely`) follows only edges at least that sure; `--no-overrides` drops
+dispatch edges. JSON follows `check`'s conventions: one document, `version` 2, `tool`, the
+`query` name, one result object per line, a `summary`; paths relative to the project root,
+`null` for unknown lines and columns (packages and modules have no line), invalid UTF-8
+replaced by U+FFFD. A closed stdout (`| head`) stops output quietly.
+
+Positional `PATHS` filter the rows, never what is loaded: the program, its module names and
+every walk are the whole project's, so `pymapper callers helper src/api` prints exactly the rows
+of `pymapper callers helper` that lie under `src/api`, and the summary line counts the rest
+(`; 4 outside PATHS not shown`). A row is under the paths when the file of the symbol it lists
+is (the caller for `callers` / `impact`, the callee for `callees`, the other module for
+`imports`, any member for `cycles`; `summary` ranks only code under them). As for `check`, a
+path covering the project root filters nothing, a path that does not exist is a usage error,
+and config discovery starts at the first path.
+
+`--limit N` (default 200) caps the rows printed, closest first; `--limit 0` prints every row.
+`impact` applies one cap to its call rows and importers together (call rows first, importers
+with what is left); `imports` caps each direction separately. Summary counts always cover every
+row.
+
+## Exit codes
+
+| code | meaning |
+|------|---------|
+| 0 | answered (an empty answer included: no callers, no cycles) |
+| 1 | `path` found no path |
+| 2 | usage error, ambiguous or unknown symbol, invalid configuration, a path that does not exist, unsupported format, fatal I/O error |
+
+## `callers` / `callees`
+
+Breadth-first over the call graph, `--depth N` hops (default 1), `--transitive` for every hop.
+Each reached symbol is one line at its first call site, with the number of further sites to the
+same symbol, and for hops beyond the first the symbol it reaches the target through:
+
+```
+$ pymapper callers app.util:helper --depth 2
+app/main.py:6:9: app.main:run [certain] +1 site
+app/util.py:7:16: app.util:Base.run [certain]
+tests/test_util.py:5:12: tests.test_util:test_helper [certain]
+app/cli.py:10:12: app.cli:main [certain] depth 2 via app.main:run
+app/main.py:11:5: app.main (module level) [certain] depth 2 via app.main:run
+5 callers of app.util:helper (function, app/util.py:1), up to depth 2
+
+$ pymapper callees app.main:run
+app/main.py:7:27: app.core.engine:start [certain] def app/core/engine.py:4:5
+app/main.py:6:9: app.util:helper [certain] +1 site def app/util.py:1:5
+2 callees of app.main:run (function, app/main.py:5)
+```
+
+(Rows are in breadth-first order, by depth, then by symbol order in the index.)
+
+`(module level)` marks a module's top-level code (it runs on import). A dispatch site is the
+overriding definition. JSON results: the symbol fields (`symbol`, `kind`, `path`, `line`,
+`col`), `confidence` (the edge), `path_confidence` (the least sure edge back to the target),
+`dispatch`, `depth`, `via`, `site` (`{path, line, col}`) and `sites`; `summary` has `results`,
+`shown`, `outside_paths` and `truncated`.
+
+## `impact`
+
+Everything that transitively calls the symbol (`--depth N` to bound it), i.e. what a change to
+it can break, then the modules that import its module directly or transitively (every import
+edge, type-only and lazy ones included). Rows are tagged with the least sure edge on the path
+back to the symbol, so `[possible]` means one hop of the chain is a guess:
+
+```
+$ pymapper impact app.util:helper
+app/main.py:6:9: app.main:run [certain] +1 site
+...
+app/cli.py:10:12: app.cli:main [certain] depth 2 via app.main:run
+app/main.py:11:5: app.main (module level) [certain] depth 2 via app.main:run
+app/cli.py:5:26: app.cli [importer] imports app.util
+app/main.py:1:22: app.main [importer] imports app.util
+tests/test_util.py:1:22: tests.test_util [importer] imports app.util
+impact of app.util:helper (function, app/util.py:1): 5 affected (4 symbols, 1 module level), 1 in tests, 4 files; 3 importing modules; most affected: app.main 2, app.cli 1, app.util 1
+```
+
+An importer line sits at its first import statement of the module that brought it in: one of
+the symbol's modules (its own module for a class or function) for a direct importer, else an
+importer listed before it (`app/cli.py:9:26: app.cli [importer] imports app.main` under
+`impact app.core.db`), with `+N rows` when more statements import that module. Counts cover
+the whole program, positional paths only filter the rows. JSON adds `importers` (the symbol
+fields, `imports`, `direct`, `site` (`{path, line, col}`) and `rows`), `modules` (per
+package/module: `affected`, most first) and `summary` with `symbols`, `module_scopes`, `tests`,
+`files`, `importers`.
+
+## `path`
+
+A shortest chain from `FROM` to `TO`: calls by default, `--imports` for module imports (a
+class or function stands for its module). One line per edge, at the call site or the import
+statement that makes it; exit 1 when there is none (`--max-len N` bounds the search). There are
+no positional paths: a chain is one fact. Config and project-root discovery start at the working
+directory, or at `--root DIR` to query a project from outside it.
+
+```
+$ pymapper path app.cli:main app.util:helper
+app/cli.py:10:12: app.cli:main -> app.main:run [certain]
+app/main.py:6:9: app.main:run -> app.util:helper [certain]
+call path from app.cli:main (function, app/cli.py:8) to app.util:helper (function, app/util.py:1): 2 edges, least sure certain
+```
+
+Import edges carry their flags: `[import, type-only, conditional]`, `lazy` (inside a function),
+`try`, `star`; an edge with several import statements shows the flags all of them share. JSON:
+`graph`, `from`, `to`, `found`, `nodes` (symbol objects), `edges` (`from`, `to`, `confidence` and
+`dispatch` or `flags`, `site`) and `summary` (`length`, `worst`).
+
+## `imports`
+
+Module-level import dependencies of a package, module, class or function: what it imports
+(`out`) and what imports it (`in`; nothing imports a class or function, so those have only
+`out`, the import statements inside them). A package covers every module below it, and imports
+between its own modules are not listed. Imports of code that is not loaded (the stdlib without
+`--stdlib`, third-party code without `--deps`, unknown modules) are listed by top-level name.
+Every line sits at the first import statement behind it, where it can be removed or moved: in
+the symbol's files for `out` (followed by `def path` of the imported module when it is loaded),
+in the importer's file for `in`. `(N rows)` counts the statements:
+
+```
+$ pymapper imports app.cli
+app/cli.py:9:26: imports app.main (1 row, lazy) def app/main.py
+app/cli.py:5:26: imports app.util (1 row, type-only, conditional) def app/util.py
+app/cli.py:1:8: imports os (stdlib, not loaded, 1 row)
+app/cli.py:2:20: imports typing (stdlib, not loaded, 1 row)
+imports of app.cli (module, app/cli.py): 4 out (2 not loaded), 0 in
+
+$ pymapper imports app.core.db --direction in
+app/core/engine.py:1:22: imported by app.core.engine (1 row)
+imports of app.core.db (module, app/core/db.py): 1 in
+```
+
+With `--runtime`, a line whose module is also imported under `if TYPE_CHECKING:` sits at a
+runtime statement. `--direction in` on a class or function is a usage error (exit 2).
+
+`--depth N` rolls the other side up to its package of N dotted components (`--depth 1`:
+top-level packages), never to a package containing the symbol itself: a sibling stays at its
+shallowest ancestor outside the symbol's package (`imports app.main --depth 1` lists
+`app.core`, not `app`). Rows are heaviest first (import statements); `--direction in|out` keeps
+one side, `--runtime` skips imports only type checkers see. JSON rows have `direction`, the
+symbol fields (where the other module is), `origin`, `rows`, `flags` and `site` (`{path, line,
+col}` of the import statement, `null` if unknown), or `external`, `origin` (`stdlib`,
+`third-party`, `unknown`), `rows` and `site` for code that is not loaded. Positional paths
+select the other module, so imports of code that is not loaded are listed only without them.
+
+## `cycles`
+
+Every import cycle of the project: the cyclic strongly connected components of the graph PM301
+checks (first-party runtime imports; `analysis.type-checking-cycles` keeps type-only ones), one
+line each at the import that starts its witness, a shortest cycle through the component (no
+confidence tag: import edges are facts of the source):
+
+```
+$ pymapper cycles
+app/core/engine.py:1:22: import cycle (2 modules): app.core.engine -> app.core.db -> app.core.engine
+1 import cycle
+```
+
+`--symbol SYMBOL` keeps the components holding the symbol's modules; `--symbol SYMBOL --calls`
+reports the call cycle through it instead (direct or mutual recursion, following `--edges` /
+`--no-overrides`), tagged with its least sure edge. JSON results: `size`, `members` (every
+module or function of the component), `witness`, `site` and, for calls, `worst`; `summary`:
+`cycles`, `largest`.
+
+## `summary`
+
+The codebase at a glance: per origin files, lines, packages, modules, classes and functions;
+import rows, unresolved imports and module edges; call sites by confidence and distinct
+caller-callee pairs; import cycles; then the top `--top N` (default 10) functions by cognitive
+and cyclomatic complexity, the most called classes and functions (distinct real callers) and
+the most imported modules. Rankings skip tests (`--include-tests`), third-party and stdlib code
+(`--all-origins`), and entries of 0; positional paths restrict the rankings, never the counts.
+
+```
+$ pymapper summary
+first-party: 630 files, 304805 lines, 46 packages, 586 modules, 2565 classes, 15557 functions
+imports: 4471 rows, 48 unresolved (1.1%), 2618 module edges
+calls: 60154 sites: 32.9% certain, 5.2% likely, 4.1% possible, 57.9% unresolved; 25290 caller-callee pairs
+import cycles: 9 (largest: 223 modules)
+re/_parser.py:511:5: cognitive re._parser:_parse 422
+...
+posixpath.py:72:5: most called posixpath:join (155 callers)
+os.py: most imported os (156 importers)
+```
+
+(The CPython 3.13 standard library loaded as a project.) JSON: `origins`, `imports`, `calls`,
+`import_cycles`, and one array per ranking (`cognitive`, `cyclomatic`, `most_called`,
+`most_imported`) of symbol objects with a `value`.
+
+## Cost
+
+A query costs the load `check` pays (walk, cached facts, import and call resolution) plus
+building the query's call graph (O(V + E)); the query itself visits only what it reports. On
+the 17.8M-LOC `aiml-lectio` project with `--deps --stdlib`, warm cache, a query runs in
+0.41-0.45 s of which the query graph is 35 ms and the query below 35 ms; printing 284k
+transitive callers of `warnings:warn` with `--limit 0` adds 0.34 s. Numbers:
+[`benchmarks.md`](benchmarks.md#query-subcommands-s52).

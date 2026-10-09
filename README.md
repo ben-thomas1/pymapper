@@ -6,9 +6,8 @@ codes, config, suppressions, baselines and exit codes. ruff and ty check one fil
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. `pymapper check`, `pymapper deps` and `pymapper config` work end to
-end; the query subcommands (`callers`, `callees`, `impact`, `path`, `cycles`, `summary`) are not
-implemented yet (hidden from `--help`; running one exits 2).
+**Status:** under rewrite. Every subcommand works end to end: `check`, the queries (`callers`,
+`callees`, `impact`, `path`, `imports`, `cycles`, `summary`), `deps` and `config`.
 See [`docs/design.md`](docs/design.md) for the design.
 
 ## Install
@@ -63,6 +62,39 @@ Output to a closed pipe (`| head`) stops quietly.
 
 Full reference (pipeline, every flag, output formats, baselines, `--stats`):
 [`docs/cli.md`](docs/cli.md).
+
+### Queries
+
+Questions about the code, answered from the same whole-program load as `check` (same root,
+config, flags and cache). The output is meant for agents: one fact per line, at the
+`path:line:col` it is about (a call site, an import statement), call edges tagged with their
+confidence, then one summary line; `--format json` gives one document with `check`'s
+conventions.
+
+```
+pymapper callers app.util:helper             # who calls it (--depth N, --transitive)
+pymapper callees Engine.run                  # what it calls; a last-segments suffix is enough
+pymapper impact app.models:User --depth 3    # everything that transitively calls it, tests, importers
+pymapper path app.cli:main app.db:connect    # a shortest call chain (--imports: import chain)
+pymapper imports app.billing --depth 1       # module imports in and out, rolled up to packages
+pymapper cycles                              # every import cycle (--symbol X [--calls])
+pymapper summary                             # sizes, resolution rates, cycles, top hotspots
+```
+
+```
+$ pymapper callers app.util:helper
+app/main.py:6:9: app.main:run [certain] +1 site
+app/util.py:7:16: app.util:Base.run [certain]
+tests/test_util.py:5:12: tests.test_util:test_helper [certain]
+3 callers of app.util:helper (function, app/util.py:1)
+```
+
+A symbol is a qualified id (`pkg.mod:Class.method`), a dotted name (`pkg.mod.Class.method`) or
+its last segments (`Class.method`, `method`). An ambiguous symbol lists its candidates on stdout
+and exits 2; an unknown one lists similar names and exits 2. Positional paths filter the rows
+(`pymapper callers helper src/api`), never what is loaded; `path` takes `--root DIR` to query
+a project from outside it. Details:
+[`docs/cli.md`](docs/cli.md#query-subcommands).
 
 ## Configuration
 
@@ -226,7 +258,7 @@ crates/pymapper-gui    the `pymapper-gui` binary (native GUI; see docs/gui.md)
 xtask                  dev tooling: cargo xtask bench | diff-ruff | fuzz
 tests/corpus           Python inputs used by tests and benchmarks
 docs/design.md         design document (source of truth)
-docs/cli.md            `pymapper check` reference
+docs/cli.md            `pymapper check` and query subcommand reference
 docs/rules.md          rule reference (generated)
 ```
 

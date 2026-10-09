@@ -65,7 +65,7 @@ mod walk;
 mod tests;
 
 pub use cycles::CycleHit;
-pub use deps::{DepOptions, Dependency, Deps, Direction, ExternalDep};
+pub use deps::{DepOptions, Dependency, Deps, Direction, ExternalDep, ImportSite};
 pub use lookup::{LookupOptions, Match, MatchKind, NameIndex, Resolved};
 pub use path::{PathGraph, PathOptions, ShortestPath};
 pub use summary::{OriginCounts, Ranked, Summary, SummaryOptions};
@@ -78,7 +78,7 @@ use std::sync::OnceLock;
 use crate::analysis::cycles::{CycleOptions, cycle_graph};
 use crate::graph::{Csr, Graph, ModuleGraph, Scc, import_graph};
 use crate::index::{FileId, Index, NodeId, NodeKind};
-use crate::resolve::{Confidence, Imports, Reason, ResolvedCalls};
+use crate::resolve::{CallEdge, Confidence, Imports, Reason, ResolvedCalls};
 use crate::roots::Origin;
 
 /// "No edge of this kind" in a call graph label field (`Unresolved` edges are never in the
@@ -264,6 +264,13 @@ impl<'a> Query<'a> {
             .chain(other.iter().filter(|e| e.reason == Reason::Override))
             .filter(move |e| e.src == caller && e.dst == callee)
             .map(move |e| Site::of(ix, e.src, e.dst, e.site, e.conf, e.reason))
+    }
+
+    /// The site of one call edge (from [`ResolvedCalls::file_edges`]), for callers that
+    /// locate many edges in one pass over a file's edges. O(1).
+    #[inline]
+    pub fn edge_site(&self, e: &CallEdge) -> Site {
+        Site::of(self.ix, e.src, e.dst, e.site, e.conf, e.reason)
     }
 }
 

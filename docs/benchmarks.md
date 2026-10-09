@@ -1351,6 +1351,65 @@ importable ones) and keeps test-code occurrences in a second slot per name group
   warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
   analysed files; peak RSS +1.5 MB.
 
+### Query subcommands (S5.2)
+
+The `pymapper` query subcommands end to end (config, roots, walk, cached load, import and call
+resolution, query graph, query, output to `/dev/null`), measured with `--stats` (`total`
+is wall time in-process; peak RSS from `getrusage`). 14-core M4 Pro, release, warm cache, best
+total of 3 (RSS of the last run), load average about 7 from other worktrees. `lines` is the
+stdout line count (rows plus the summary line). `query.build` is the labelled call graph,
+`query` the query proper, `output` the rendering (of which `output.sites` locates call sites).
+
+| corpus | command | total | query.build | query | output (sites) | lines | peak RSS |
+|--------|---------|-------|-------------|-------|----------------|-------|----------|
+| stdlib | `summary` | 10.5 ms | 0.5 ms | 0.8 ms | 0.0 ms | 44 | 23.8 MB |
+| stdlib | `callers posixpath:join` | 10.1 ms | 0.5 ms | 0.0 ms | 0.1 ms | 156 | 26.6 MB |
+| stdlib | `callers posixpath:join --transitive --limit 0` | 12.6 ms | 0.5 ms | 0.1 ms | 2.3 ms | 3,464 | 24.7 MB |
+| stdlib | `impact posixpath:join --limit 0` | 12.3 ms | 0.5 ms | 0.2 ms | 2.3 ms | 3,918 | 27.7 MB |
+| stdlib | `callees json:dumps --depth 3` | 9.7 ms | 0.5 ms | 0.0 ms | 0.0 ms | 6 | 25.5 MB |
+| stdlib | `imports email --depth 1` | 10.4 ms | 0.5 ms | 0.1 ms | 0.0 ms | 29 | 25.0 MB |
+| stdlib | `cycles` | 9.6 ms | 0.6 ms | 0.1 ms | 0.0 ms | 10 | 23.8 MB |
+| lectio | `summary` | 101.7 ms | 0.7 ms | 1.0 ms | 0.0 ms | 44 | 44.1 MB |
+| lectio | `callers BaseAgentConfig` (287 callers) | 101.9 ms | 0.6 ms | 0.0 ms | 0.1 ms | 201 | 49.4 MB |
+| lectio | `impact BaseAgentConfig --limit 0` | 103.5 ms | 0.6 ms | 0.2 ms | 0.9 ms | 1,136 | 47.7 MB |
+| lectio | `imports cogito.forge.agents --depth 1` | 100.8 ms | 0.6 ms | 0.2 ms | 0.0 ms | 53 | 50.3 MB |
+| lectio | `cycles` | 102.5 ms | 0.6 ms | 0.2 ms | 0.0 ms | 11 | 50.2 MB |
+| lectio `--deps --stdlib` | `summary` | 450.9 ms | 33.8 ms | 31.2 ms | 0.1 ms | 46 | 657.0 MB |
+| lectio `--deps --stdlib` | `callers warnings:warn` (19,733 callers) | 418.5 ms | 35.5 ms | 0.1 ms | 0.2 ms | 201 | 676.8 MB |
+| lectio `--deps --stdlib` | `callers warnings:warn --transitive --limit 0` | 776.8 ms | 33.6 ms | 4.2 ms | 339.0 ms (88.2) | 284,287 | 696.4 MB |
+| lectio `--deps --stdlib` | `impact warnings:warn --limit 0` | 842.4 ms | 34.7 ms | 30.8 ms | 366.2 ms (87.5) | 342,086 | 696.5 MB |
+| lectio `--deps --stdlib` | `callees spawn_agent_toolset --depth 3` | 411.8 ms | 34.9 ms | 0.1 ms | 0.2 ms | 127 | 681.5 MB |
+| lectio `--deps --stdlib` | `path spawn_agent_toolset warnings:warn` | 434.9 ms | 34.8 ms | 0.3 ms | 0.0 ms | 4 | 679.6 MB |
+| lectio `--deps --stdlib` | `imports cogito.forge --depth 1` | 451.1 ms | 33.6 ms | 16.7 ms | 0.0 ms | 61 | 685.0 MB |
+| lectio `--deps --stdlib` | `cycles` | 436.1 ms | 34.1 ms | 11.3 ms | 0.0 ms | 11 | 661.0 MB |
+| lectio `--deps --stdlib` | unknown symbol (fuzzy lookup, exit 2) | 426.2 ms | 34.4 ms | | | 1 | 691.2 MB |
+
+- **Where time goes.** A query costs the load `check` pays (warm: 10 ms on the stdlib, 0.1 s on
+  lectio, 0.4 s on lectio with 17M LOC of third-party and stdlib code), plus the query call
+  graph (35 ms on 17.8M LOC) and the query itself, which visits only what it reports (below
+  35 ms everywhere; `summary`, `imports` of a large package and `impact` with its importer walk
+  are the heaviest). With the default `--limit 200`, rendering is below 1 ms.
+- **Large answers.** Printing all 284k transitive callers of `warnings:warn` (every caller of
+  every caller across 17.8M LOC) takes 0.34 s: 88 ms to locate the first call site and site
+  count of every row (rows sorted once, each file holding a row scanned once, a node bit set
+  skipping edges from other callers, then a binary search; a first version without the bit set
+  took 118 ms), the rest rendering qualified ids. Per-pair `Query::call_sites` would rescan a
+  file per row.
+- **Memory.** Peak RSS is that of a `check` run on the same corpus (the index dominates) plus the
+  query state (`query_kb`: 29-33 MB on lectio `--deps --stdlib`, the call graph and the lazy
+  module graphs) and the result. `locate` adds 12 bytes per row plus `V / 8` bytes.
+- The stdlib rows were measured before the bit set was added to `locate` (it only changes
+  `output.sites`, at most 0.1 ms there).
+- **Import sites.** `imports` rows and `impact` importers were later placed at their import
+  statement (`output.sites` covers it). `Query::import_sites` makes one pass over the import
+  rows of the files `Query::deps` scans (a binary search per row); an `impact` importer scans
+  its own file's rows once (every importer is a distinct file). Measured afterwards (same
+  machine, other worktrees busy): `imports warnings --direction in --limit 0` on lectio
+  `--deps --stdlib` (12,935 rows) 1.0 ms of `output.sites`; `impact warnings:warn --limit 0`
+  there 108 ms of `output.sites` (was 88 ms: about 20 ms for 57,799 importers), total 0.97 s;
+  `impact posixpath:join --limit 0` on the stdlib 0.8 ms, total 14.8 ms, peak RSS 25.6 MB.
+  Peak RSS does not change (the sites of the shown rows only: 12 bytes per row).
+
 ### Coverage evidence (S6.3)
 
 `deadcode` target with `XTASK_DEADCODE_COVERAGE=synthetic`, 14-core M4 Pro, release, warm, best

@@ -302,6 +302,14 @@ impl Imports {
         edges::row_dst(&self.modules, self.p1[row], self.p2[row])
     }
 
+    /// The external edge `row` adds (as [`Imports::ext_edges`]): `(kind, key)` for imports of
+    /// code that is not loaded, else `None`. Unlike [`Imports::dist`] / [`Imports::ext_name`],
+    /// re-export chains are not followed.
+    #[inline]
+    pub fn ext_key(&self, row: usize) -> Option<(ExtKind, u32)> {
+        edges::row_ext(self.p1[row])
+    }
+
     /// The distribution of a [`ImportStatus::ThirdParty`] row (also when re-exported).
     #[inline]
     pub fn dist(&self, row: usize) -> Option<DistId> {

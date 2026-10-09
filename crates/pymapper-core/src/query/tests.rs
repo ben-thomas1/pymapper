@@ -420,6 +420,13 @@ fn impact_counts() {
     assert_eq!(mods, vec![("app.main".into(), 2), ("pkg.core".into(), 2), ("pkg.util".into(), 1)]);
     // pkg.util is imported by pkg.core (`from pkg import util`), which pkg and app.main import.
     assert_eq!(f.sorted_qids(imp.importers.iter().copied()), strs(&["app.main", "pkg", "pkg.core"]));
+    // Each importer with the module that brought it in (breadth-first: pkg.core first).
+    let via: Vec<(String, String)> =
+        imp.importers.iter().zip(&imp.importer_via).map(|(&m, &v)| (f.ix.qid_string(m), f.ix.qid_string(v))).collect();
+    assert_eq!(via[0], ("pkg.core".into(), "pkg.util".into()));
+    let mut via_rest = via[1..].to_vec();
+    via_rest.sort();
+    assert_eq!(via_rest, vec![("app.main".into(), "pkg.core".into()), ("pkg".into(), "pkg.core".into())]);
 }
 
 // -- path -----------------------------------------------------------------------------------
@@ -537,6 +544,95 @@ fn function_level_imports_count_for_def_targets() {
     assert_eq!(deps_of(&f, &runtime), vec![("b".into(), 1, 0)]);
 }
 
+/// `(path, line, col)` of import sites.
+fn site_strs(f: &Fx, v: &[Option<ImportSite>]) -> Vec<Option<(String, u32, u32)>> {
+    v.iter().map(|s| s.map(|s| (f.ix.file_path(s.file).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()), s.line, s.col))).collect()
+}
+
+#[test]
+fn import_sites_of_deps() {
+    let f = fx(&[
+        ("p/__init__.py", ""),
+        ("p/a.py", "import os\nfrom typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import p.b\nimport p.b\nimport os.path\n\ndef f():\n    from p import c\n"),
+        ("p/b.py", "X = 1\n"),
+        ("p/c.py", "import p.a\n"),
+        ("q.py", "from p import a\nfrom p import b\n"),
+    ]);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let o = DepOptions::default();
+    // Out: the first row of each dependency in the target's file, externals included.
+    let a = f.node("p.a");
+    let out = q.deps(a, Direction::Out, &o, &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("p.b".into(), 0, 2), ("p.c".into(), 0, 1)]);
+    let (sites, ext) = q.import_sites(a, Direction::Out, &o, &out.deps, &out.external, &mut s);
+    let a_py = |l, c| Some(("a.py".to_owned(), l, c));
+    assert_eq!(site_strs(&f, &sites), vec![a_py(4, 12), a_py(9, 19)]);
+    assert_eq!(site_strs(&f, &ext), vec![a_py(1, 8), a_py(2, 20)]);
+    // A subset (the shown rows) is located on its own.
+    let (sites, ext) = q.import_sites(a, Direction::Out, &o, &out.deps[1..], &[], &mut s);
+    assert_eq!((site_strs(&f, &sites), ext.len()), (vec![a_py(9, 19)], 0));
+    // Runtime: a runtime row is preferred over a type-only row of a kept edge.
+    let rt = DepOptions { import_exclude: res_flags::TYPE_ONLY, ..o };
+    let out = q.deps(a, Direction::Out, &rt, &mut s);
+    let (sites, _) = q.import_sites(a, Direction::Out, &rt, &out.deps, &out.external, &mut s);
+    assert_eq!(site_strs(&f, &sites)[0], a_py(5, 8));
+    // In, rolled up: importers of p.b; with a package target the importer's rows into it.
+    let b = f.node("p.b");
+    let inn = q.deps(b, Direction::In, &o, &mut s);
+    assert_eq!(deps_of(&f, &inn), vec![("p.a".into(), 0, 2), ("q".into(), 0, 1)]);
+    let (sites, ext) = q.import_sites(b, Direction::In, &o, &inn.deps, &inn.external, &mut s);
+    assert_eq!(site_strs(&f, &sites), vec![a_py(4, 12), Some(("q.py".into(), 2, 15))]);
+    assert!(ext.is_empty());
+    let p = f.node("p");
+    let inn = q.deps(p, Direction::In, &o, &mut s);
+    let (sites, _) = q.import_sites(p, Direction::In, &o, &inn.deps, &inn.external, &mut s);
+    assert_eq!(site_strs(&f, &sites), vec![Some(("q.py".into(), 1, 15))]);
+    // A def target: rows inside it; no incoming side.
+    let df = f.node("p.a:f");
+    let out = q.deps(df, Direction::Out, &o, &mut s);
+    let (sites, _) = q.import_sites(df, Direction::Out, &o, &out.deps, &out.external, &mut s);
+    assert_eq!(site_strs(&f, &sites), vec![a_py(9, 19)]);
+    let (sites, _) = q.import_sites(df, Direction::In, &o, &out.deps, &[], &mut s);
+    assert_eq!(sites, vec![None]);
+}
+
+/// On the corpus: every dependency with import rows gets a site, and the site's row is one of
+/// the dependency's rows (its module edge leaves the target's side and maps to the row).
+#[test]
+fn import_sites_on_the_corpus() {
+    let f = load_dir(&corpus("sample_python"));
+    let q = f.q();
+    let ix = &f.ix;
+    let mut s = Scratch::default();
+    let mut checked = 0;
+    for v in 0..ix.node_count() {
+        if ix.kind(v).is_def() {
+            continue;
+        }
+        for level in [Level::Module, Level::Depth(1)] {
+            let o = DepOptions { level, ..DepOptions::default() };
+            for dir in [Direction::Out, Direction::In] {
+                let d = q.deps(v, dir, &o, &mut s);
+                let (sites, ext) = q.import_sites(v, dir, &o, &d.deps, &d.external, &mut s);
+                for (dep, site) in d.deps.iter().zip(&sites) {
+                    assert_eq!(site.is_some(), dep.imports > 0, "{} {:?}", ix.qid_string(dep.node), dir);
+                    let Some(site) = site else { continue };
+                    let src = ix.file_node(site.file);
+                    let row = ix.file_facts(site.file).imports.range().find(|&r| f.imp.module_node(r) != crate::index::NONE && ix.facts().imports.line[r] == site.line && ix.facts().imports.col[r] + 1 == site.col).expect("site row");
+                    let dst = f.imp.module_node(row);
+                    let (inner, outer) = if dir == Direction::Out { (src, dst) } else { (dst, src) };
+                    assert!(ix.is_descendant(v, inner) && !ix.is_descendant(v, outer));
+                    assert!(ix.is_descendant(dep.node, outer), "{} not in {}", ix.qid_string(outer), ix.qid_string(dep.node));
+                    checked += 1;
+                }
+                assert!(ext.iter().all(Option::is_some));
+            }
+        }
+    }
+    assert!(checked > 50, "too few rows checked: {checked}");
+}
+
 // -- cycles ---------------------------------------------------------------------------------
 
 #[test]
@@ -592,6 +688,35 @@ fn summary_counts_and_rankings() {
     assert!(s.most_called.iter().all(|r| r.value >= 1));
     let top1 = q.summary(&SummaryOptions { top: 1, ..SummaryOptions::default() });
     assert_eq!((top1.cognitive.len(), top1.most_called.len(), top1.most_imported.len()), (1, 1, 1));
+}
+
+#[test]
+fn summary_where_restricts_rankings_only() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let opts = SummaryOptions::default();
+    let all = q.summary(&opts);
+    assert_eq!(q.summary_where(&opts, |_| true), all);
+    let none = q.summary_where(&opts, |_| false);
+    assert_eq!((none.origins, none.call_sites, none.import_cycles), (all.origins, all.call_sites, all.import_cycles));
+    assert!(none.cognitive.is_empty() && none.cyclomatic.is_empty() && none.most_called.is_empty() && none.most_imported.is_empty());
+    // One file: every ranked node lies in it.
+    let core = f.ix.file(f.node("pkg.core")).expect("file");
+    let one = q.summary_where(&opts, |file| file == core);
+    for r in one.cognitive.iter().chain(&one.cyclomatic).chain(&one.most_called).chain(&one.most_imported) {
+        assert_eq!(f.ix.file(r.node), Some(core));
+    }
+    assert!(!one.most_called.is_empty() || !one.cognitive.is_empty());
+}
+
+#[test]
+fn edge_site_agrees_with_call_sites() {
+    let f = corpus_fx();
+    let q = f.q();
+    for e in f.calls.edges().iter().filter(|e| e.conf != Confidence::Unresolved).take(5000) {
+        let site = q.edge_site(e);
+        assert!(q.call_sites(e.src, e.dst).any(|s| s == site), "{e:?}");
+    }
 }
 
 // -- brute-force references on the corpus ---------------------------------------------------
