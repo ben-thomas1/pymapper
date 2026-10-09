@@ -29,10 +29,13 @@ impl Mapping {
 }
 
 /// `(top-level import name, distribution name)` pairs where the two differ beyond PEP 503
-/// normalisation. Sorted by import name (byte order) for binary search.
+/// normalisation. Sorted by import name (byte order) for binary search. A name several
+/// distributions provide (`cv2`: the four OpenCV builds) has one entry each, the usual one
+/// first (it is the one named in findings).
 pub const KNOWN: &[(&str, &str)] = &[
     ("Bio", "biopython"),
     ("Crypto", "pycryptodome"),
+    ("Crypto", "pycrypto"),
     ("Cryptodome", "pycryptodomex"),
     ("MySQLdb", "mysqlclient"),
     ("OpenGL", "PyOpenGL"),
@@ -44,12 +47,16 @@ pub const KNOWN: &[(&str, &str)] = &[
     ("attr", "attrs"),
     ("bs4", "beautifulsoup4"),
     ("cv2", "opencv-python"),
+    ("cv2", "opencv-python-headless"),
+    ("cv2", "opencv-contrib-python"),
+    ("cv2", "opencv-contrib-python-headless"),
     ("dateutil", "python-dateutil"),
     ("dns", "dnspython"),
     ("docx", "python-docx"),
     ("dotenv", "python-dotenv"),
     ("engineio", "python-engineio"),
     ("faiss", "faiss-cpu"),
+    ("faiss", "faiss-gpu"),
     ("fitz", "PyMuPDF"),
     ("gi", "PyGObject"),
     ("git", "GitPython"),
@@ -90,35 +97,48 @@ pub const KNOWN: &[(&str, &str)] = &[
 /// Top-level names that are never distributions: type-checker-only modules.
 const NOT_DISTRIBUTIONS: &[&str] = &["_typeshed"];
 
-/// The distribution of an import name that is not installed: the [`KNOWN`] table, else the
-/// name itself as a guess. `None` for names that are not distributions.
-pub fn distribution_of(top: &[u8]) -> Option<(&[u8], Mapping)> {
+/// The distributions of an import name that is not installed: its [`KNOWN`] entries (first =
+/// the one to name), else the name itself as a guess. `None` for names that are not
+/// distributions.
+pub fn distributions_of(top: &[u8]) -> Option<Known<'_>> {
     if NOT_DISTRIBUTIONS.iter().any(|n| n.as_bytes() == top) {
         return None;
     }
-    match KNOWN.binary_search_by(|(m, _)| m.as_bytes().cmp(top)) {
-        Ok(i) => Some((KNOWN[i].1.as_bytes(), Mapping::Table)),
-        Err(_) => Some((top, Mapping::Guess)),
-    }
+    let start = KNOWN.partition_point(|(m, _)| m.as_bytes() < top);
+    let len = KNOWN[start..].iter().take_while(|(m, _)| m.as_bytes() == top).count();
+    Some(match len {
+        0 => Known::Guess(top),
+        _ => Known::Table(&KNOWN[start..start + len]),
+    })
+}
+
+/// Result of [`distributions_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known<'a> {
+    /// The [`KNOWN`] entries of the name (one or more), [`Mapping::Table`].
+    Table(&'static [(&'static str, &'static str)]),
+    /// The import name as the distribution name, [`Mapping::Guess`].
+    Guess(&'a [u8]),
 }
 
 /// Import names of a distribution that is not installed, by normalised name (`norm`): its
-/// [`KNOWN`] entries, if any, with [`Mapping::Table`]; else the guess (`-` and `.` as `_`) in
-/// `scratch`. Calls `f` once per name. The table is tiny and only asked for declared
+/// [`KNOWN`] entries with [`Mapping::Table`], then the guess (`-` and `.` as `_`, in
+/// `scratch`) with [`Mapping::Guess`] unless an entry already named it (`attrs` installs both
+/// `attr` and `attrs`). Calls `f` once per name. The table is tiny and only asked for declared
 /// dependencies that are not installed.
 pub fn import_names_of(norm: &[u8], scratch: &mut Vec<u8>, mut f: impl FnMut(&[u8], Mapping)) {
-    let mut found = false;
+    let mut guess = Vec::with_capacity(norm.len());
+    guess.extend(norm.iter().map(|&b| if b == b'-' || b == b'.' { b'_' } else { b }));
+    let mut named = false;
     for &(m, d) in KNOWN {
         crate::roots::normalize_name(d.as_bytes(), scratch);
         if scratch.as_slice() == norm {
             f(m.as_bytes(), Mapping::Table);
-            found = true;
+            named |= m.as_bytes() == guess.as_slice();
         }
     }
-    if !found {
-        scratch.clear();
-        scratch.extend(norm.iter().map(|&b| if b == b'-' || b == b'.' { b'_' } else { b }));
-        f(scratch, Mapping::Guess);
+    if !named {
+        f(&guess, Mapping::Guess);
     }
 }
 
@@ -128,7 +148,7 @@ mod tests {
 
     #[test]
     fn known_table_is_sorted_and_differs_from_guesses() {
-        assert!(KNOWN.windows(2).all(|w| w[0].0.as_bytes() < w[1].0.as_bytes()), "KNOWN must be sorted");
+        assert!(KNOWN.windows(2).all(|w| w[0].0.as_bytes() <= w[1].0.as_bytes() && w[0] != w[1]), "KNOWN must be sorted");
         let mut a = Vec::new();
         let mut b = Vec::new();
         for (m, d) in KNOWN {
@@ -140,27 +160,38 @@ mod tests {
 
     #[test]
     fn maps_known_names_then_guesses() {
-        assert_eq!(distribution_of(b"yaml"), Some((&b"PyYAML"[..], Mapping::Table)));
-        assert_eq!(distribution_of(b"sklearn"), Some((&b"scikit-learn"[..], Mapping::Table)));
-        assert_eq!(distribution_of(b"requests"), Some((&b"requests"[..], Mapping::Guess)));
-        assert_eq!(distribution_of(b"_typeshed"), None);
+        assert_eq!(distributions_of(b"yaml"), Some(Known::Table(&[("yaml", "PyYAML")])));
+        assert_eq!(distributions_of(b"sklearn"), Some(Known::Table(&[("sklearn", "scikit-learn")])));
+        assert_eq!(distributions_of(b"requests"), Some(Known::Guess(b"requests")));
+        assert_eq!(distributions_of(b"_typeshed"), None);
+        // Several distributions provide `cv2`: every one is listed, the usual one first.
+        let Some(Known::Table(cv2)) = distributions_of(b"cv2") else { panic!("cv2 is known") };
+        let dists: Vec<&str> = cv2.iter().map(|(_, d)| *d).collect();
+        assert_eq!(dists, ["opencv-python", "opencv-python-headless", "opencv-contrib-python", "opencv-contrib-python-headless"]);
         assert!(Mapping::Metadata.confidence() > Mapping::Table.confidence());
         assert!(Mapping::Table.confidence() > Mapping::Guess.confidence());
     }
 
-    #[test]
-    fn reverse_lookup_by_normalised_name() {
+    fn names_of(norm: &[u8]) -> Vec<(String, Mapping)> {
         let mut s = Vec::new();
         let mut got = Vec::new();
-        import_names_of(b"pywin32", &mut s, |n, m| got.push((String::from_utf8_lossy(n).into_owned(), m)));
+        import_names_of(norm, &mut s, |n, m| got.push((String::from_utf8_lossy(n).into_owned(), m)));
+        got
+    }
+
+    #[test]
+    fn reverse_lookup_by_normalised_name() {
+        let got = names_of(b"pywin32");
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["pythoncom", "pywintypes", "win32api", "win32con"]);
-        assert!(got.iter().all(|(_, m)| *m == Mapping::Table));
-        got.clear();
-        import_names_of(b"flask-sqlalchemy", &mut s, |n, m| got.push((String::from_utf8_lossy(n).into_owned(), m)));
-        assert_eq!(got, [("flask_sqlalchemy".to_owned(), Mapping::Guess)]);
-        got.clear();
-        import_names_of(b"pyyaml", &mut s, |n, m| got.push((String::from_utf8_lossy(n).into_owned(), m)));
-        assert_eq!(got, [("_yaml".to_owned(), Mapping::Table), ("yaml".to_owned(), Mapping::Table)]);
+        assert_eq!(names, ["pythoncom", "pywintypes", "win32api", "win32con", "pywin32"]);
+        assert_eq!(got.last().map(|g| g.1), Some(Mapping::Guess));
+        assert_eq!(names_of(b"flask-sqlalchemy"), [("flask_sqlalchemy".to_owned(), Mapping::Guess)]);
+        assert_eq!(
+            names_of(b"pyyaml"),
+            [("_yaml".to_owned(), Mapping::Table), ("yaml".to_owned(), Mapping::Table), ("pyyaml".to_owned(), Mapping::Guess)]
+        );
+        // `attrs` installs `attr` and `attrs`: the guess is kept.
+        assert_eq!(names_of(b"attrs"), [("attr".to_owned(), Mapping::Table), ("attrs".to_owned(), Mapping::Guess)]);
+        assert_eq!(names_of(b"opencv-python-headless"), [("cv2".to_owned(), Mapping::Table), ("opencv_python_headless".to_owned(), Mapping::Guess)]);
     }
 }

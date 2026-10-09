@@ -17,7 +17,10 @@
 //! A unit that declares nothing (no `[project]` table and no poetry dependencies) inherits the
 //! declarations of the nearest enclosing unit that does ([`Declarations::effective`]); one whose
 //! `[project] dynamic` lists `dependencies` has unknown dependencies, so PM601, PM602 and PM604
-//! are not reported for it. Cost: one TOML parse per unit, a few allocations per dependency.
+//! are not reported for it, unless it keeps them in `[tool.poetry.dependencies]` (Poetry 2).
+//! The development groups of a uv workspace root (`[tool.uv.workspace]`) count as declared for
+//! the files of the members below it. Cost: one TOML parse per unit, a few allocations per
+//! dependency.
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +83,9 @@ pub struct UnitDecl {
     pub dynamic_optional: bool,
     /// `[project] name` (or poetry `name`), normalised.
     pub project: Option<Sym>,
+    /// Has a `[tool.uv.workspace]` table: its development groups count as declared for the
+    /// files of the workspace members below it (see [`Declarations::workspace`]).
+    pub workspace_root: bool,
     /// Dependencies: `deps[start..start + len]` of [`Declarations::deps`].
     deps_start: u32,
     deps_len: u32,
@@ -99,6 +105,8 @@ pub struct Declarations {
     extras: Vec<Sym>,
     /// Per unit: the unit whose declarations apply to its files (`NONE`: none does).
     effective: Vec<u32>,
+    /// Per unit: the nearest strictly enclosing uv workspace root (`NONE`: none).
+    workspace: Vec<u32>,
     /// `(unit, normalised name)` -> index of its first declaration in `deps`.
     by_name: FxHashMap<(u32, Sym), u32>,
     /// [`FileId`] of unit 0's `pyproject.toml`; unit `u`'s is `file_base + u`.
@@ -141,6 +149,7 @@ impl Declarations {
                 status: DeclStatus::None,
                 dynamic_optional: false,
                 project: None,
+                workspace_root: false,
                 deps_start,
                 deps_len: 0,
                 suppressions: Vec::new(),
@@ -182,6 +191,14 @@ impl Declarations {
                 cur = parents.get(cur as usize).copied().unwrap_or(NONE);
             }
             d.effective.push(eff);
+            let mut ws = parents.get(u).copied().unwrap_or(NONE);
+            for _ in 0..d.units.len() {
+                if ws == NONE || d.units[ws as usize].workspace_root {
+                    break;
+                }
+                ws = parents.get(ws as usize).copied().unwrap_or(NONE);
+            }
+            d.workspace.push(ws);
         }
         d
     }
@@ -216,6 +233,24 @@ impl Declarations {
     #[inline]
     pub fn effective(&self, u: u32) -> u32 {
         self.effective.get(u as usize).copied().unwrap_or(NONE)
+    }
+
+    /// The uv workspace root strictly enclosing unit `u` (`NONE`: none). Development tools
+    /// are usually declared once, in the root's `[dependency-groups]` or `[tool.uv]
+    /// dev-dependencies`, and installed for the whole workspace.
+    #[inline]
+    pub fn workspace(&self, u: u32) -> u32 {
+        self.workspace.get(u as usize).copied().unwrap_or(NONE)
+    }
+
+    /// Whether unit `u` declares `norm` in a development group. O(1) unless `norm` is first
+    /// declared in another group.
+    pub fn declares_group(&self, u: u32, norm: Sym) -> bool {
+        match self.find(u, norm) {
+            None => false,
+            Some(d) if d.kind == DepKind::Group => true,
+            Some(_) => self.deps(u).iter().any(|d| d.norm == norm && d.kind == DepKind::Group),
+        }
     }
 
     /// First declaration of the normalised name `norm` by unit `u`, in any group. O(1).
@@ -340,8 +375,11 @@ impl Parser<'_> {
                 self.array(group, DepKind::Group);
             }
         }
-        if let Some(v) = table(doc, &["tool", "uv"]).and_then(|uv| get(uv, "dev-dependencies")) {
-            self.array(v, DepKind::Group);
+        if let Some(uv) = table(doc, &["tool", "uv"]) {
+            if let Some(v) = get(uv, "dev-dependencies") {
+                self.array(v, DepKind::Group);
+            }
+            unit.workspace_root = table(uv, &["workspace"]).is_some();
         }
         if let Some(pdm) = table(doc, &["tool", "pdm", "dev-dependencies"]) {
             for (_, group) in pdm.iter() {
@@ -357,6 +395,10 @@ impl Parser<'_> {
             if let Some(main) = table(poetry, &["dependencies"]) {
                 declares = true;
                 self.poetry(main, DepKind::Main);
+                // Poetry 2: `[project] dynamic = ["dependencies"]` with the list kept here.
+                if unit.status == DeclStatus::Dynamic {
+                    unit.status = DeclStatus::Declared;
+                }
             }
             if let Some(dev) = table(poetry, &["dev-dependencies"]) {
                 self.poetry(dev, DepKind::Group);

@@ -8,8 +8,10 @@
 //!        not loaded:                        stdlib | ThirdParty(dist, by top_level.txt / RECORD) | external
 //!        third-party group without dist, external: built-in name table, else a guess (names.rs)
 //!     ──> PM603 private component (`pkg._internal`, `from pkg import _helper`)
-//!     ──> declared in the effective unit (any group)?  no ──> PM604 if a declared dependency
-//!         requires it (Requires-Dist closure, read lazily), else PM601
+//!     ──> declared in the effective unit (any group; or in a development group of the uv
+//!         workspace root above it)?  no ──> PM604 if a declared dependency requires it
+//!         (Requires-Dist closure, read lazily), else PM601; once per import statement and
+//!         distribution, at the module token
 //!     ──> mark (unit, distribution) used
 //!   each unit's [project] dependencies not marked used ──> PM602 (located in its pyproject.toml)
 //! ```
@@ -29,7 +31,7 @@ use std::fmt;
 use std::path::Path;
 
 use super::declared::{DeclStatus, Declarations, DepKind, display_path};
-use super::names::{self, Mapping};
+use super::names::{self, Known, Mapping};
 use super::requires::RequiresCache;
 use crate::extract::facts::import_flags;
 use crate::index::{FileId as IxFile, Index, NONE, NodeId};
@@ -115,6 +117,10 @@ struct Third {
     /// the module, or the only provider of the top-level name. Otherwise (a namespace package
     /// whose module no `RECORD` lists) any provider of the top-level name counts.
     exact: bool,
+    /// Every distribution the name table lists for the top-level name when there are several
+    /// (`cv2`: `opencv-python`, `opencv-python-headless`, ...): declaring any one of them
+    /// declares the import. Empty otherwise.
+    alts: &'static [(&'static str, &'static str)],
 }
 
 /// Interned names per distribution, filled on first use.
@@ -184,8 +190,20 @@ struct Analysis<'c, 'a> {
     /// directly (see [`Analysis::meta_packages`]).
     meta: FxHashMap<(u32, Sym), Sym>,
     requires: RequiresCache,
+    stmt: Stmt,
     scratch: Vec<u8>,
     stats: HygieneStats,
+}
+
+/// What the import statement being scanned has reported.
+#[derive(Default)]
+struct Stmt {
+    /// Position of its module token.
+    pos: Option<(u32, u32)>,
+    /// Distributions reported as PM601/PM604 (a namespace package's names may map to several).
+    dists: Vec<Sym>,
+    /// A private module component reported as PM603.
+    private_module: bool,
 }
 
 impl<'c, 'a> Analysis<'c, 'a> {
@@ -208,6 +226,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
             closures: FxHashMap::default(),
             meta: FxHashMap::default(),
             requires: RequiresCache::default(),
+            stmt: Stmt::default(),
             scratch: Vec::new(),
             stats: HygieneStats::default(),
         }
@@ -251,8 +270,11 @@ impl<'c, 'a> Analysis<'c, 'a> {
                 self.unit_files[eu as usize] += 1;
             }
             let view = ix.file_view(f);
-            // Last reported (line, distribution): `from m import a, b` reports once.
-            let mut last: (u32, Option<Sym>) = (0, None);
+            // Rows of one statement are consecutive and share the module token's position:
+            // `from m import (a,\n b)` reports PM601/PM604 (and a private module) once per
+            // distribution, at the module token, so a suppression on the statement's first
+            // line covers it. `self.stmt` holds what the current statement reported.
+            self.stmt = Stmt::default();
             for row in ix.file_facts(f).imports.range() {
                 if st.level[row] != 0 {
                     continue;
@@ -270,9 +292,16 @@ impl<'c, 'a> Analysis<'c, 'a> {
                     Provider::Third(t) => t,
                 };
                 self.stats.third_party_rows += 1;
-                let loc = Location::new(FileId(f), st.line[row], st.col[row] + 1);
+                let (mline, mcol) = view.import_module_pos(row);
+                if self.stmt.pos != Some((mline, mcol)) {
+                    self.stmt.pos = Some((mline, mcol));
+                    self.stmt.dists.clear();
+                    self.stmt.private_module = false;
+                }
+                let loc = Location::new(FileId(f), mline, mcol + 1);
                 if self.rules.private && third.known {
-                    self.private(row, chain, third, loc, names, out);
+                    let name_loc = Location::new(FileId(f), st.line[row], st.col[row] + 1);
+                    self.private(row, chain, third, loc, name_loc, names, out);
                 }
                 if eu == NONE {
                     continue;
@@ -286,14 +315,20 @@ impl<'c, 'a> Analysis<'c, 'a> {
                     self.used.insert((eu, n));
                     declared |= self.declared(eu, n);
                 }
+                for &(_, alt) in third.alts {
+                    crate::roots::normalize_name(alt.as_bytes(), &mut self.scratch);
+                    let n = names.intern(&self.scratch);
+                    self.used.insert((eu, n));
+                    declared |= self.declared(eu, n);
+                }
                 let decl = self.cx.decls.unit(eu);
                 if declared || decl.status != DeclStatus::Declared || decl.dynamic_optional {
                     continue;
                 }
-                if !(self.rules.undeclared || self.rules.transitive) || last == (loc.line, Some(third.norm)) {
+                if !(self.rules.undeclared || self.rules.transitive) || self.stmt.dists.contains(&third.norm) {
                     continue;
                 }
-                last = (loc.line, Some(third.norm));
+                self.stmt.dists.push(third.norm);
                 let mut conf = third.mapping.confidence();
                 if st.flags[row] & import_flags::TRY_IMPORT_ERROR != 0 {
                     conf = conf.min(OPTIONAL_IMPORT_CONFIDENCE);
@@ -321,10 +356,15 @@ impl<'c, 'a> Analysis<'c, 'a> {
         }
     }
 
-    /// Whether unit `u` declares `norm` or is (or contains) the project named `norm`.
+    /// Whether unit `u` declares `norm` (or its uv workspace root does, in a development
+    /// group) or is (or contains) the project named `norm`.
     #[inline]
     fn declared(&self, u: u32, norm: Sym) -> bool {
-        self.cx.decls.find(u, norm).is_some() || self.projects.contains(&norm) || self.meta.contains_key(&(u, norm))
+        let decls = self.cx.decls;
+        decls.find(u, norm).is_some()
+            || self.projects.contains(&norm)
+            || self.meta.contains_key(&(u, norm))
+            || (decls.workspace(u) != NONE && decls.declares_group(decls.workspace(u), norm))
     }
 
     /// Declared dependencies that are installed but provide no importable name are
@@ -410,7 +450,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
 
     fn dist(&mut self, d: DistId, exact: bool, names: &mut Interner) -> Provider {
         let (norm, display) = self.dist_names.get(self.cx.dists, d, names);
-        Provider::Third(Third { norm, display, mapping: Mapping::Metadata, known: true, exact })
+        Provider::Third(Third { norm, display, mapping: Mapping::Metadata, known: true, exact, alts: &[] })
     }
 
     /// For a top-level name several distributions provide (namespace packages such as
@@ -456,22 +496,41 @@ impl<'c, 'a> Analysis<'c, 'a> {
             let (d, exact) = self.refine(d, chain, name);
             return Some(self.dist(d, exact, names));
         }
-        let (dist, mapping) = names::distribution_of(top)?;
+        let (dist, mapping, alts) = match names::distributions_of(top)? {
+            Known::Table(all) => (all[0].1.as_bytes(), Mapping::Table, if all.len() > 1 { all } else { &[] }),
+            Known::Guess(n) => (n, Mapping::Guess, &[][..]),
+        };
         crate::roots::normalize_name(dist, &mut self.scratch);
         let norm = names.intern(&self.scratch);
         let display = names.intern(dist);
-        Some(Provider::Third(Third { norm, display, mapping, known, exact: true }))
+        Some(Provider::Third(Third { norm, display, mapping, known, exact: true, alts }))
     }
 
-    /// PM603 for `row` when a component of its path is private.
-    fn private(&mut self, row: usize, chain: &[Sym], third: Third, loc: Location, names: &mut Interner, out: &mut Findings) {
+    /// PM603 for `row` when a component of its path is private: located at the module token
+    /// (`module_loc`, once per statement) for a private module, at the name (`name_loc`) for a
+    /// private name imported from a public module.
+    #[allow(clippy::too_many_arguments)]
+    fn private(
+        &mut self,
+        row: usize,
+        chain: &[Sym],
+        third: Third,
+        module_loc: Location,
+        name_loc: Location,
+        names: &mut Interner,
+        out: &mut Findings,
+    ) {
         let ix = self.cx.ix;
         let st = &ix.facts().imports;
         let name = if st.flags[row] & import_flags::STAR == 0 { st.name[row] } else { None };
-        let cut = match chain.iter().position(|&s| is_private(ix.str(s))) {
-            Some(i) => (i + 1, None),
+        let (cut, loc) = match chain.iter().position(|&s| is_private(ix.str(s))) {
+            Some(_) if self.stmt.private_module => return,
+            Some(i) => {
+                self.stmt.private_module = true;
+                ((i + 1, None), module_loc)
+            }
             None => match name {
-                Some(n) if is_private(ix.str(n)) => (chain.len(), Some(n)),
+                Some(n) if is_private(ix.str(n)) => ((chain.len(), Some(n)), name_loc),
                 _ => return,
             },
         };
@@ -549,25 +608,19 @@ impl<'c, 'a> Analysis<'c, 'a> {
             if !expand {
                 continue;
             }
-            let all = seen[&d].clone();
-            let reqs: Vec<(Sym, Vec<Sym>, Vec<Sym>)> = self
-                .requires
-                .get(dists, d, names)
-                .iter()
-                .map(|r| (r.norm, r.extras.clone(), r.when_extra.clone()))
-                .collect();
-            for (rn, rextras, when) in reqs {
-                if !when.is_empty() && !when.iter().any(|w| all.contains(w)) {
+            let all = &seen[&d];
+            for r in self.requires.get(dists, d, names) {
+                if !r.when_extra.is_empty() && !r.when_extra.iter().any(|w| all.contains(w)) {
                     continue;
                 }
-                reached.entry(rn).or_insert(via);
-                if let Some(rd) = dists.by_name(names.resolve(rn)) {
+                reached.entry(r.norm).or_insert(via);
+                if let Some(rd) = dists.by_name(names.resolve(r.norm)) {
                     let more = match seen.get(&rd) {
                         None => true,
-                        Some(k) => rextras.iter().any(|e| !k.contains(e)),
+                        Some(k) => r.extras.iter().any(|e| !k.contains(e)),
                     };
                     if more {
-                        queue.push((rd, rextras, via));
+                        queue.push((rd, r.extras.clone(), via));
                     }
                 }
             }
@@ -606,7 +659,7 @@ impl<'c, 'a> Analysis<'c, 'a> {
                         let mut mapping = Mapping::Guess;
                         let used_top = &self.used_top;
                         names::import_names_of(names.resolve(dep.norm), &mut self.scratch, |n, m| {
-                            mapping = m;
+                            mapping = mapping.min(m);
                             used |= ix.strings().get(n).is_some_and(|s| used_top.contains(&(u, s)));
                         });
                         if used {

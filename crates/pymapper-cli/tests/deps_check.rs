@@ -156,7 +156,7 @@ fn reports_undeclared_unused_and_private() {
         r.findings(),
         [
             "app/__init__.py:4:8: PM601 `urllib3` is provided by `urllib3`, which is not a declared dependency",
-            "app/__init__.py:5:32: PM603 `requests._internal` is private to `requests`",
+            "app/__init__.py:5:6: PM603 `requests._internal` is private to `requests`",
             "app/__init__.py:6:22: PM603 `requests._private` is private to `requests`",
             "app/__init__.py:7:8: PM601 `numpy` is provided by `numpy`, which is not a declared dependency",
             "pyproject.toml:7:5: PM602 dependency `idle` is declared but never imported",
@@ -343,7 +343,7 @@ fn namespace_packages_map_to_the_distribution_listing_the_module() {
         .dist("protobuf", "5.0", &["google/protobuf"], &[]);
     let want = [
         "app/__init__.py:1:8: PM601 `google.protobuf` is provided by `protobuf`, which is not a declared dependency",
-        "app/__init__.py:4:26: PM601 `google.cloud` is provided by `google-cloud-bigquery`, which is not a declared dependency",
+        "app/__init__.py:4:6: PM601 `google.cloud` is provided by `google-cloud-bigquery`, which is not a declared dependency",
     ];
     for args in [&[][..], &["--deps"][..]] {
         let r = p.run(args);
@@ -371,4 +371,57 @@ fn no_venv_maps_by_name_below_the_gate() {
     // The default gate hides the guess only.
     let r = p.run(&[]);
     assert_eq!(r.findings().len(), 1, "{}", r.stdout);
+}
+
+#[test]
+fn multi_line_from_imports_report_once_per_statement() {
+    let p = Project::new("multiline");
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"requests\"]\n")
+        .file(
+            "app/__init__.py",
+            "import os\nfrom yaml import (\n    safe_load,\n    dump,\n)\nfrom requests._internal import (\n    a,\n    b,\n)\nfrom yaml import load\n",
+        )
+        .file(".venv/pyvenv.cfg", "version = 3.12.4\n")
+        .dist("requests", "2.0", &["requests"], &[])
+        .dist("PyYAML", "6.0", &["yaml"], &[]);
+    let r = p.run(&[]);
+    r.expect_code(1);
+    // One finding per statement and distribution, at the module token; the separate
+    // `from yaml import load` statement reports on its own.
+    assert_eq!(
+        r.findings(),
+        [
+            "app/__init__.py:2:6: PM601 `yaml` is provided by `PyYAML`, which is not a declared dependency",
+            "app/__init__.py:6:6: PM603 `requests._internal` is private to `requests`",
+            "app/__init__.py:10:6: PM601 `yaml` is provided by `PyYAML`, which is not a declared dependency",
+        ],
+        "{}",
+        r.stdout
+    );
+    // A suppression on the statement's first line covers every name of it.
+    p.file(
+        "app/__init__.py",
+        "from yaml import (  # pymapper: ignore[PM601]\n    safe_load,\n    dump,\n)\nfrom requests._internal import (  # pymapper: ignore[PM603]\n    a,\n    b,\n)\n",
+    );
+    let r = p.run(&[]);
+    r.expect_code(0);
+    assert!(r.findings().is_empty(), "{}", r.stdout);
+    // The names of a namespace package may map to several distributions: one finding for
+    // each undeclared one.
+    p.file("pyproject.toml", "[project]\nname = \"app\"\ndependencies = [\"google-cloud-storage\"]\n")
+        .file("app/__init__.py", "from google.cloud import (\n    storage,\n    bigquery,\n    pubsub,\n)\n")
+        .dist("google-cloud-bigquery", "3.0", &["google/cloud/bigquery"], &[])
+        .dist("google-cloud-pubsub", "2.0", &["google/cloud/pubsub"], &[])
+        .dist("google-cloud-storage", "2.0", &["google/cloud/storage"], &[]);
+    let r = p.run(&[]);
+    r.expect_code(1);
+    assert_eq!(
+        r.findings(),
+        [
+            "app/__init__.py:1:6: PM601 `google.cloud` is provided by `google-cloud-bigquery`, which is not a declared dependency",
+            "app/__init__.py:1:6: PM601 `google.cloud` is provided by `google-cloud-pubsub`, which is not a declared dependency",
+        ],
+        "{}",
+        r.stdout
+    );
 }
