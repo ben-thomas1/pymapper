@@ -7,8 +7,10 @@
 //! the endpoint's shallowest ancestor outside the target's ancestry is used instead.
 //!
 //! - Out: the call edges of the target's files with a caller in the target and a callee
-//!   outside it, plus the module import edges of its files (and import rows inside a def
-//!   target), plus imports of code that is not loaded ([`ExternalDep`]).
+//!   outside it (override edges live in the overriding class's file: when the filter keeps
+//!   them, the files of the target's callees are scanned too), plus the module import edges
+//!   of its files (and import rows inside a def target), plus imports of code that is not
+//!   loaded ([`ExternalDep`]).
 //! - In: callers come from the reverse call graph (the files to scan are the files of the
 //!   callers of the target's nodes), importers from the reverse import graph. A def target has
 //!   no incoming import edges here (imports name modules).
@@ -217,7 +219,25 @@ impl Query<'_> {
         let rep = |w: NodeId| representative(ix, opts.level, target, w);
         match dir {
             Direction::Out => {
-                for &f in &files {
+                // Override edges (base method -> override) live in the overriding class's file:
+                // with a filter that keeps them, also scan the files of callees outside.
+                let extra = &mut scratch.buf;
+                extra.clear();
+                if opts.calls.keeps(Confidence::Certain, Reason::Override) {
+                    for v in ix.subtree(target) {
+                        for &w in self.graph.succ(v) {
+                            if !inside(w)
+                                && let Some(f) = ix.file(w)
+                                && files.binary_search(&f).is_err()
+                            {
+                                extra.push(f);
+                            }
+                        }
+                    }
+                    extra.sort_unstable();
+                    extra.dedup();
+                }
+                for &f in files.iter().chain(extra.iter()) {
                     for e in self.calls.file_edges(f) {
                         if !opts.calls.keeps(e.conf, e.reason) || !inside(e.src) || inside(e.dst) {
                             continue;
@@ -337,7 +357,7 @@ impl Query<'_> {
         }
     }
 
-    /// Files of the package/module nodes in `target`'s subtree (its file for a def).
+    /// Files of the package/module nodes in `target`'s subtree (its file for a def), ascending.
     pub(super) fn files_of(&self, target: NodeId) -> Vec<FileId> {
         let ix = self.ix;
         if ix.kind(target).is_def() {
@@ -356,6 +376,7 @@ impl Query<'_> {
             }
             v += 1;
         }
+        out.sort_unstable();
         out
     }
 }

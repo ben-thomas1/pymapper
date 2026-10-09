@@ -1,14 +1,14 @@
 //! Query tests: a hand-checked fixture, origin ranking, and brute-force references on the test
 //! corpus.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
 use crate::graph::CallFilter;
-use crate::index::{Inputs, NONE, load};
+use crate::index::{Inputs, load};
 use crate::resolve::{Attribution, Imports, ResolvedCalls, res_flags, resolve_calls, resolve_imports};
 use crate::rollup::Level;
 use crate::roots::{FileStatus, Origin};
@@ -418,4 +418,457 @@ fn shortest_paths() {
     assert_eq!(p.conf(0), None);
     assert_eq!(p.import_flags(0) & res_flags::TYPE_ONLY, 0);
     assert!(q.path(f.node("pkg.util"), f.node("app.main"), &o, &mut s).is_none());
+}
+
+// -- deps -----------------------------------------------------------------------------------
+
+/// `(qid, sites, imports)` of every dependency.
+fn deps_of(f: &Fx, d: &Deps) -> Vec<(String, u32, u32)> {
+    d.deps.iter().map(|e| (f.ix.qid_string(e.node), e.sites, e.imports)).collect()
+}
+
+#[test]
+fn module_deps_in_and_out() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let o = DepOptions::default();
+    let core = f.node("pkg.core");
+    // pkg.core imports pkg.util (one row, `from pkg import util`) and calls util.helper once.
+    let out = q.deps(core, Direction::Out, &o, &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("pkg.util".into(), 1, 1)]);
+    assert_eq!(out.deps[0].best(), Some(Confidence::Certain));
+    // Into pkg.core: app.main (import + make() + e.run()), pkg (__init__ imports .core).
+    let inn = q.deps(core, Direction::In, &o, &mut s);
+    assert_eq!(deps_of(&f, &inn), vec![("app.main".into(), 2, 1), ("pkg".into(), 0, 1)]);
+    let main_dep = inn.deps[0];
+    assert_eq!((main_dep.best(), main_dep.worst()), (Some(Confidence::Certain), Some(Confidence::Possible)));
+    // Calls only / imports only.
+    let calls_only = q.deps(core, Direction::In, &DepOptions { imports: false, ..o }, &mut s);
+    assert_eq!(deps_of(&f, &calls_only), vec![("app.main".into(), 2, 0)]);
+    let sure = q.deps(core, Direction::In, &DepOptions { calls: CallFilter::at_least(Confidence::Likely), imports: false, ..o }, &mut s);
+    assert_eq!(deps_of(&f, &sure), vec![("app.main".into(), 1, 0)]);
+}
+
+#[test]
+fn deps_roll_up_without_swallowing_the_target() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let mut s = Scratch::default();
+    // At depth 1, app.main's dependencies roll up to the package `pkg`.
+    let o = DepOptions { level: Level::Depth(1), ..DepOptions::default() };
+    let out = q.deps(f.node("app.main"), Direction::Out, &o, &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("pkg".into(), 2, 1)]);
+    // pkg.core's dependency pkg.util would roll up to pkg, an ancestor of pkg.core: it stays
+    // pkg.util. Its dependents roll up to `app` and stay `pkg` (the __init__ module itself).
+    let out = q.deps(f.node("pkg.core"), Direction::Out, &o, &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("pkg.util".into(), 1, 1)]);
+    let inn = q.deps(f.node("pkg.core"), Direction::In, &o, &mut s);
+    assert_eq!(deps_of(&f, &inn), vec![("app".into(), 2, 1), ("pkg".into(), 0, 1)]);
+    // A package target: everything inside it is internal.
+    let out = q.deps(f.node("pkg"), Direction::Out, &DepOptions::default(), &mut s);
+    assert!(out.deps.is_empty(), "{:?}", deps_of(&f, &out));
+    let inn = q.deps(f.node("pkg"), Direction::In, &DepOptions::default(), &mut s);
+    assert_eq!(deps_of(&f, &inn), vec![("app.main".into(), 2, 1)]);
+    // A def target: calls of its subtree; incoming calls from its callers.
+    let step = f.node("pkg.core:Engine.step");
+    let out = q.deps(step, Direction::Out, &DepOptions::default(), &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("pkg.util".into(), 1, 0)]);
+    let inn = q.deps(step, Direction::In, &DepOptions { level: Level::Depth(u32::MAX), ..DepOptions::default() }, &mut s);
+    assert_eq!(deps_of(&f, &inn), vec![("pkg.core:Engine.run".into(), 1, 0)]);
+}
+
+#[test]
+fn deps_external_imports() {
+    let f = fx(&[("m.py", "import os\nimport os.path\nimport requests\nfrom json import dumps\n")]);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let out = q.deps(f.node("m"), Direction::Out, &DepOptions::default(), &mut s);
+    let ext: Vec<(String, u32)> =
+        out.external.iter().map(|e| (String::from_utf8_lossy(e.name(&f.ix).unwrap_or(b"?")).into_owned(), e.rows)).collect();
+    assert_eq!(ext, vec![("os".into(), 2), ("json".into(), 1), ("requests".into(), 1)]);
+    assert!(out.external.iter().all(|e| e.dist().is_none()));
+}
+
+#[test]
+fn function_level_imports_count_for_def_targets() {
+    let f = fx(&[("a.py", "def f():\n    import b\n    b.g()\n"), ("b.py", "def g():\n    pass\n")]);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let out = q.deps(f.node("a:f"), Direction::Out, &DepOptions::default(), &mut s);
+    assert_eq!(deps_of(&f, &out), vec![("b".into(), 1, 1)]);
+    assert_ne!(out.deps[0].import_flags & res_flags::LAZY, 0);
+    let runtime = q.deps(f.node("a"), Direction::Out, &DepOptions { import_exclude: res_flags::LAZY, ..DepOptions::default() }, &mut s);
+    assert_eq!(deps_of(&f, &runtime), vec![("b".into(), 1, 0)]);
+}
+
+// -- cycles ---------------------------------------------------------------------------------
+
+#[test]
+fn import_cycles_containing_a_target() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let hits = q.import_cycles(f.node("cyc.a"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(f.qids(hits[0].members.iter().copied()), strs(&["cyc.a", "cyc.b"]));
+    assert_eq!(hits[0].witness.len(), 2);
+    // A def stands for its module; a package for its modules.
+    assert_eq!(q.import_cycles(f.node("cyc.a:fa")), hits);
+    assert_eq!(q.import_cycles(f.node("cyc")), hits);
+    assert!(q.import_cycles(f.node("pkg")).is_empty());
+}
+
+#[test]
+fn call_cycles_through_a_node() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let o = WalkOptions::default();
+    let rec = f.node("pkg.util:rec");
+    let hit = q.call_cycle(rec, &o, &mut s).expect("self recursion");
+    assert_eq!((hit.members.clone(), hit.witness.clone()), (vec![rec], vec![rec]));
+    let hit = q.call_cycle(f.node("pkg.util:pong"), &o, &mut s).expect("mutual recursion");
+    assert_eq!(f.qids(hit.members.iter().copied()), strs(&["pkg.util:ping", "pkg.util:pong"]));
+    assert_eq!(f.qids(hit.witness.iter().copied()), strs(&["pkg.util:pong", "pkg.util:ping"]));
+    assert!(q.call_cycle(f.node("pkg.util:helper"), &o, &mut s).is_none());
+}
+
+// -- summary --------------------------------------------------------------------------------
+
+#[test]
+fn summary_counts_and_rankings() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let s = q.summary(&SummaryOptions::default());
+    let fp = s.origins[Origin::FirstParty as usize];
+    assert_eq!((fp.files, fp.packages, fp.modules), (8, 3, 5));
+    assert_eq!(fp.classes, 1);
+    assert_eq!(fp.functions, 12);
+    assert_eq!(fp.lines, PROJECT.iter().map(|(_, src)| src.lines().count() as u64).sum::<u64>());
+    assert_eq!(s.origins[Origin::Stdlib as usize], OriginCounts::default());
+    assert_eq!((s.import_cycles, s.largest_import_cycle), (1, 2));
+    assert_eq!(s.call_sites, f.calls.len() as u64);
+    assert_eq!(s.calls_by_conf.iter().sum::<u64>(), s.call_sites);
+    assert!(s.cognitive.len() <= 10 && !s.cognitive.is_empty());
+    assert!(s.cognitive.windows(2).all(|w| w[0].value >= w[1].value));
+    // pkg.core is imported by pkg and app.main; most called: each called symbol once.
+    assert_eq!(s.most_imported[0], Ranked { node: f.node("pkg.core"), value: 2 });
+    assert!(s.most_called.iter().all(|r| r.value >= 1));
+    let top1 = q.summary(&SummaryOptions { top: 1, ..SummaryOptions::default() });
+    assert_eq!((top1.cognitive.len(), top1.most_called.len(), top1.most_imported.len()), (1, 1, 1));
+}
+
+// -- brute-force references on the corpus ---------------------------------------------------
+
+/// Adjacency of the kept call edges: node -> neighbours (forward or reverse).
+fn adjacency(f: &Fx, min_conf: Confidence, reverse: bool) -> HashMap<NodeId, Vec<NodeId>> {
+    let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for e in f.calls.edges() {
+        if e.conf == Confidence::Unresolved || e.conf > min_conf {
+            continue;
+        }
+        let (a, b) = if reverse { (e.dst, e.src) } else { (e.src, e.dst) };
+        adj.entry(a).or_default().push(b);
+    }
+    adj
+}
+
+/// Plain BFS distances from `s` (itself at 0).
+fn distances(adj: &HashMap<NodeId, Vec<NodeId>>, s: NodeId) -> HashMap<NodeId, u32> {
+    let mut dist = HashMap::from([(s, 0)]);
+    let mut queue = VecDeque::from([s]);
+    while let Some(u) = queue.pop_front() {
+        let d = dist[&u];
+        for &w in adj.get(&u).map_or(&[][..], |v| &v[..]) {
+            if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(w) {
+                e.insert(d + 1);
+                queue.push_back(w);
+            }
+        }
+    }
+    dist
+}
+
+/// The test corpus plus a deterministic synthetic project with dense cross-module calls,
+/// imports, classes and cycles, loaded as one root.
+fn corpus_fx() -> Fx {
+    let dir = temp_dir("corpus");
+    let src = corpus("");
+    let w = walk(&[src.as_path()], &FsWalk::everything());
+    for i in 0..w.files.len() {
+        let p = w.files.get(i);
+        let rel = p.strip_prefix(&src).expect("under corpus");
+        let dst = dir.join("corpus").join(rel);
+        fs::create_dir_all(dst.parent().expect("parent")).expect("mkdir");
+        fs::copy(p, &dst).expect("copy");
+    }
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    let (pkgs, mods, funcs) = (3u64, 4u64, 6u64);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for p in 0..pkgs {
+        files.push((format!("syn{p}/__init__.py"), String::new()));
+        for m in 0..mods {
+            let mut imports = String::new();
+            let mut body = String::new();
+            for fi in 0..funcs {
+                body.push_str(&format!("def f{fi}(x):\n"));
+                for _ in 0..2 {
+                    let (tp, tm, tf) = (next(pkgs), next(mods), next(funcs));
+                    if (tp, tm) == (p, m) {
+                        body.push_str(&format!("    f{tf}(x)\n"));
+                    } else {
+                        let alias = format!("s{tp}m{tm}f{tf}");
+                        imports.push_str(&format!("from syn{tp}.m{tm} import f{tf} as {alias}\n"));
+                        body.push_str(&format!("    {alias}(x)\n"));
+                    }
+                }
+                body.push('\n');
+            }
+            body.push_str(&format!(
+                "class K{m}:\n    def run(self):\n        return self.go()\n\n    def go(self):\n        return f{}(1)\n",
+                next(funcs)
+            ));
+            // A subclass of another module's class: a cross-file override edge.
+            let (bp, bm) = (next(pkgs), next(mods));
+            if (bp, bm) != (p, m) {
+                imports.push_str(&format!("from syn{bp}.m{bm} import K{bm} as Base\n"));
+                body.push_str(&format!("\nclass Sub{m}(Base):\n    def go(self):\n        return f{}(2)\n", next(funcs)));
+            }
+            files.push((format!("syn{p}/m{m}.py"), format!("{imports}\n{body}")));
+        }
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    write_files(&dir, &refs);
+    let out = load_dir(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn walks_match_plain_bfs() {
+    let f = corpus_fx();
+    let q = f.q();
+    let mut s = Scratch::default();
+    let mut checked = 0;
+    for min_conf in [Confidence::Possible, Confidence::Likely, Confidence::Certain] {
+        let rev = adjacency(&f, min_conf, true);
+        let fwd = adjacency(&f, min_conf, false);
+        for v in 0..f.ix.node_count() {
+            for (adj, callers) in [(&rev, true), (&fwd, false)] {
+                let o = WalkOptions { min_conf, scope: Scope::Node, ..WalkOptions::transitive() };
+                let w = if callers { q.callers(v, &o, &mut s) } else { q.callees(v, &o, &mut s) };
+                let mut want = distances(adj, v);
+                want.remove(&v);
+                let got: HashMap<NodeId, u32> = w.hops.iter().map(|h| (h.node, h.depth)).collect();
+                assert_eq!(got.len(), w.hops.len(), "each node once");
+                assert_eq!(got, want, "node {} callers={callers} {min_conf:?}", f.ix.qid_string(v));
+                // Depth-bounded walks are the prefix of the unbounded one.
+                let d2 = WalkOptions { depth: 2, ..o };
+                let w2 = if callers { q.callers(v, &d2, &mut s) } else { q.callees(v, &d2, &mut s) };
+                assert_eq!(w2.hops.len(), want.values().filter(|&&d| d <= 2).count());
+                // Every hop's path is made of kept edges and has depth + 1 nodes.
+                for i in 0..w.hops.len() {
+                    let p = w.path_from(i);
+                    assert_eq!(p.len() as u32, w.hops[i].depth + 1);
+                    assert_eq!(*p.last().expect("target"), v);
+                    for pair in p.windows(2) {
+                        assert!(adj[&pair[1]].contains(&pair[0]));
+                    }
+                }
+                checked += w.hops.len();
+            }
+        }
+    }
+    assert!(checked > 100, "the corpus has call chains ({checked})");
+}
+
+#[test]
+fn paths_match_plain_bfs() {
+    let f = corpus_fx();
+    let q = f.q();
+    let mut s = Scratch::default();
+    let fwd = adjacency(&f, Confidence::Possible, false);
+    let mut found = 0;
+    let n = f.ix.node_count();
+    for a in 0..n {
+        let dist = distances(&fwd, a);
+        for b in (0..n).step_by(3) {
+            let o = PathOptions { scope: Scope::Node, ..PathOptions::default() };
+            let p = q.path(a, b, &o, &mut s);
+            match dist.get(&b) {
+                None => assert!(p.is_none(), "{} -> {}", f.ix.qid_string(a), f.ix.qid_string(b)),
+                Some(&d) => {
+                    let p = p.expect("reachable");
+                    assert_eq!(p.len() as u32, d);
+                    assert_eq!((p.nodes[0], *p.nodes.last().expect("end")), (a, b));
+                    for pair in p.nodes.windows(2) {
+                        assert!(fwd[&pair[0]].contains(&pair[1]));
+                    }
+                    found += usize::from(d > 1);
+                }
+            }
+        }
+    }
+    assert!(found > 20, "multi-hop paths checked ({found})");
+}
+
+#[test]
+fn call_cycles_match_tarjan() {
+    let f = corpus_fx();
+    let q = f.q();
+    let mut s = Scratch::default();
+    let g = q.call_graph();
+    let scc = Scc::of(g);
+    let mut cyclic = 0;
+    for v in 0..f.ix.node_count() {
+        let c = scc.comp(v);
+        let hit = q.call_cycle(v, &WalkOptions::default(), &mut s);
+        if !scc.is_cyclic(g, c) {
+            assert!(hit.is_none());
+            continue;
+        }
+        cyclic += 1;
+        let hit = hit.expect("cyclic");
+        let mut want = scc.members(c).to_vec();
+        want.sort_unstable();
+        assert_eq!(hit.members, want);
+        assert_eq!(hit.witness[0], v);
+        for i in 0..hit.witness.len() {
+            assert!(g.has_edge(hit.witness[i], hit.witness[(i + 1) % hit.witness.len()]));
+        }
+    }    assert!(cyclic > 10, "{cyclic}");
+}
+
+#[test]
+fn import_cycles_match_the_analysis() {
+    let f = fx(&[
+        ("p/__init__.py", "from . import a\n"),
+        ("p/a.py", "from . import b\n"),
+        ("p/b.py", "from . import c\nfrom . import a\n"),
+        ("p/c.py", "from . import a\n"),
+        ("p/d.py", "import p.e\n"),
+        ("p/e.py", "import p.d\n"),
+        ("p/f.py", "import p.a\n"),
+    ]);
+    let q = f.q();
+    let all = crate::analysis::cycles::import_cycles(&f.ix, &f.imp, &CycleOptions::default());
+    assert_eq!(all.len(), 2);
+    for i in 0..all.len() {
+        for &m in all.members(i) {
+            let hits = q.import_cycles(m);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].members, all.members(i));
+            assert!(hits[0].witness.contains(&m), "the witness goes through the target");
+            let mg = &q.cycle_graph().0;
+            let w = &hits[0].witness;
+            for k in 0..w.len() {
+                let (x, y) = (mg.local(w[k]).expect("x"), mg.local(w[(k + 1) % w.len()]).expect("y"));
+                assert!(mg.graph().has_edge(x, y));
+            }
+        }
+    }
+    assert!(q.import_cycles(f.node("p.f")).is_empty());
+    // The package holds both cycles.
+    assert_eq!(q.import_cycles(f.node("p")).len(), 2);
+}
+
+#[test]
+fn deps_match_brute_force() {
+    let f = corpus_fx();
+    let q = f.q();
+    let mut s = Scratch::default();
+    let module_of = |v: NodeId| Level::Module.apply(&f.ix, v);
+    let mut checked = 0;
+    let mut overrides = 0;
+    let mut targets = crate::graph::module_nodes(&f.ix);
+    // Classes too (override edges cross class boundaries).
+    targets.extend((0..f.ix.node_count()).filter(|&v| f.ix.kind(v) == NodeKind::Class));
+    let with_overrides = DepOptions { calls: CallFilter::default(), imports: false, ..DepOptions::default() };
+    for (x, o) in targets.iter().flat_map(|&x| [(x, DepOptions::default()), (x, with_overrides)]) {
+        let inside = |v: NodeId| f.ix.is_descendant(x, v);
+        for dir in [Direction::Out, Direction::In] {
+            // Call edges and import rows per representative.
+            let mut want: HashMap<NodeId, (u32, u32)> = HashMap::new();
+            for e in f.calls.edges() {
+                if !o.calls.keeps(e.conf, e.reason) {
+                    continue;
+                }
+                let (near, far) = if dir == Direction::Out { (e.src, e.dst) } else { (e.dst, e.src) };
+                if inside(near) && !inside(far) {
+                    want.entry(representative_ref(&f.ix, x, module_of(far), far)).or_default().0 += 1;
+                }
+            }
+            if o.imports && dir == Direction::Out && f.ix.kind(x).is_def() {
+                let file = f.ix.file(x).expect("def file");
+                for row in f.ix.file_facts(file).imports.range() {
+                    let near = f.ix.def_node(file, f.ix.facts().imports.scope[row]);
+                    let far = f.imp.module_node(row);
+                    if inside(near) && far != crate::index::NONE && !inside(far) {
+                        want.entry(representative_ref(&f.ix, x, module_of(far), far)).or_default().1 += 1;
+                    }
+                }
+            }
+            for file in 0..f.ix.file_count() {
+                if !o.imports || f.ix.kind(x).is_def() {
+                    break;
+                }
+                let src = f.ix.file_node(file);
+                for me in f.imp.module_edges(file) {
+                    let (near, far) = if dir == Direction::Out { (src, me.dst) } else { (me.dst, src) };
+                    if inside(near) && !inside(far) {
+                        want.entry(representative_ref(&f.ix, x, module_of(far), far)).or_default().1 += me.rows;
+                    }
+                }
+            }
+            let got: HashMap<NodeId, (u32, u32)> = q.deps(x, dir, &o, &mut s).deps.iter().map(|d| (d.node, (d.calls, d.imports))).collect();
+            assert_eq!(got, want, "{} {dir:?}", f.ix.qid_string(x));
+            checked += got.len();
+            overrides += f.calls.edges().iter().filter(|e| e.reason == Reason::Override && o.calls.keeps(e.conf, e.reason) && f.ix.is_descendant(x, e.src) && !f.ix.is_descendant(x, e.dst) && f.ix.file(e.dst) != f.ix.file(x)).count();
+        }
+    }
+    assert!(checked > 10, "{checked}");
+    assert!(overrides > 0, "cross-file override edges checked");
+}
+
+/// Reference of the representative rule: `m` unless it is an ancestor of `x`, then the
+/// shallowest ancestor of `w` that is not.
+fn representative_ref(ix: &Index, x: NodeId, m: NodeId, w: NodeId) -> NodeId {
+    if !ix.is_descendant(m, x) {
+        return m;
+    }
+    let mut chain = vec![w];
+    let mut v = w;
+    while let Some(p) = ix.parent(v) {
+        chain.push(p);
+        v = p;
+    }
+    chain.into_iter().rev().find(|&a| !ix.is_descendant(a, x)).unwrap_or(w)
+}
+
+#[test]
+fn scratch_reuse_and_generation_wrap() {
+    let f = fx(PROJECT);
+    let q = f.q();
+    let mut s = Scratch::default();
+    let helper = f.node("pkg.util:helper");
+    let want = q.callers(helper, &WalkOptions::transitive(), &mut s);
+    // Force the stamp to wrap: marks are cleared, results unchanged.
+    s.a.stamp = u32::MAX - 1;
+    for _ in 0..4 {
+        assert_eq!(q.callers(helper, &WalkOptions::transitive(), &mut s), want);
+    }
+    assert!(s.heap_bytes() > 0);
+    // Callers and callees of every node with one scratch never see stale marks.
+    let mut fresh = Scratch::default();
+    for v in 0..f.ix.node_count() {
+        let o = WalkOptions::transitive();
+        assert_eq!(q.callers(v, &o, &mut s), q.callers(v, &o, &mut fresh));
+        fresh = Scratch::default();
+    }
 }

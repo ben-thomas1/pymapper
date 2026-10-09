@@ -64,7 +64,7 @@ mod walk;
 mod tests;
 
 pub use cycles::CycleHit;
-pub use deps::{DepOptions, Dependency, Direction, ExternalDep};
+pub use deps::{DepOptions, Dependency, Deps, Direction, ExternalDep};
 pub use lookup::{LookupOptions, Match, MatchKind, NameIndex, Resolved};
 pub use path::{PathGraph, PathOptions, ShortestPath};
 pub use summary::{OriginCounts, Ranked, Summary, SummaryOptions};
