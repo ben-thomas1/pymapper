@@ -43,9 +43,11 @@ code. Only first-party importable `.py` files are analysed for findings.
 The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not run them (see
 "Rules that cannot run" below).
 
-The other subcommands (`callers`, `callees`, `impact`, `path`, `deps`, `cycles`, `summary`) are
-not implemented yet: they are hidden from `pymapper --help`, accept any operands and the
-configuration flags, and exit 2 with "not implemented".
+`pymapper deps` (third-party distributions, their use by first-party code and `--score`
+scorecards) is described in [`deps.md`](deps.md). The other subcommands (`callers`, `callees`,
+`impact`, `path`, `cycles`, `summary`) are not implemented yet: they are hidden from
+`pymapper --help`, accept any operands and the configuration flags, and exit 2 with "not
+implemented".
 
 ## Project root
 

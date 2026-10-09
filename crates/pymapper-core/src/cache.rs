@@ -59,7 +59,8 @@ pub use format::CacheError;
 pub use segment::Stamp;
 
 pub(crate) use segment::Segment;
-pub(crate) use format::write_atomic_with;
+/// The container, for other cache files of the crate (`deps` scorecards).
+pub(crate) use format::{Reader, Writer, write_atomic_with};
 
 use std::io;
 use std::os::unix::ffi::OsStrExt;

@@ -1029,3 +1029,40 @@ Observations:
   cache benchmarks); warm 1.36 s / 0.66 s / 0.52 s.
 - **dupes** is the only gated analysis: +20-30 ms on 305k LOC, +3.1 s matching and +0.2 s of
   fingerprinting on 17M LOC (peak 0.70 -> 1.0 GB), which is why it is off by default.
+
+### Deps (S6.1)
+
+`pymapper deps [--score] --stats` on `lectio` (1,803 first-party files) with its venv (491
+distributions, 62,331 files, 17.5M LOC in total; the stdlib off), cache in a temporary
+directory. 14-core Apple M4 Pro, release build, warm OS file cache. "Cold" = cache directory
+removed (every file extracted, every scorecard computed); "warm facts, cold scores" =
+`scores.pmc` deleted, facts cached; "warm" = everything cached. Phases from `--stats`; peak RSS
+is `ru_maxrss`. Warm rows: 2-3 runs, range shown.
+
+| run | threads | total | resolve.calls | deps.usage | deps.score | scorecards | peak RSS |
+|-----|---------|-------|---------------|------------|------------|------------|----------|
+| `--score`, cold | 14 | 6.96 s (load.extract 5.74 s) | 59.9 ms | 20.4 ms | 4.5 ms | 491 computed | 634 MB |
+| `--score`, warm facts, cold scores | 14 | 428 ms | | 19.9 ms | 5.4 ms | 491 computed | 655 MB |
+| `--score`, warm facts, cold scores | 1 | 1.34 s | 471 ms | 20.4 ms | 18.8 ms | 491 computed | 566 MB |
+| `--score`, warm | 14 | 503-748 ms | 52-79 ms | 20.4-22.0 ms | 0.1 ms (+0.1-0.9 ms read) | 490 cached, 1 computed | 628-656 MB |
+| no `--score`, warm | 14 | 575-593 ms | | 20.0-20.1 ms | - | - | 625-635 MB |
+| `check --deps`, warm (reference) | 14 | 732-787 ms | 54-60 ms | - | - | - | 659-686 MB |
+
+The cold `load.extract` (5.7 s) was I/O-bound in that session; "Check (S4.5)" measured 2.16 s
+for the same files. `scores.pmc` holds 491 scorecards in 47 KB. The one scorecard computed on
+every warm run is a distribution without a `RECORD` hash (no cache key).
+
+Observations:
+
+- **Scorecards are cheap**: one pass over the definitions and module edges of 491
+  distributions costs 18.8 ms on one thread and 5.4 ms on 14 (parallel per distribution). The
+  cache turns that into a 0.1 ms lookup plus reading a 47 KB file.
+- **Usage** (one pass over the first-party imports and all call edges, a forward CSR of the
+  call and import graphs, a BFS from the first-party nodes that reached 109k of 1.02M nodes,
+  then summing exclusive lines per distribution) is 20 ms, sequential. Its transient memory is,
+  by construction, 4 bytes per node and per edge for the forward CSR, 4 bytes per node of line
+  weights, two bits per node (BFS and used-symbol sets) and the BFS queue (4 bytes per reached
+  node); it is freed before the report and stays below the load's peak, so peak RSS is that of
+  loading the venv (as `check --deps`).
+- **Whole-run cost** is the venv load plus call resolution, as for `check --deps`: `deps` is
+  15-25% faster than `check --deps` warm because it runs no rule analyses.
