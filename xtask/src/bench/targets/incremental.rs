@@ -46,6 +46,12 @@ fn median(v: &mut [Duration]) -> u64 {
     v[v.len() / 2].as_micros() as u64
 }
 
+fn median_u32(v: impl Iterator<Item = u32>) -> u64 {
+    let mut v: Vec<u32> = v.collect();
+    v.sort_unstable();
+    v.get(v.len() / 2).map_or(0, |&x| u64::from(x))
+}
+
 pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Counters)> {
     let (files, walk_errors, _) = walk_corpus(root, &corpus_options())?;
     let total: u64 = (0..files.len()).map(|i| fs::metadata(files.get(i)).map_or(0, |m| m.len())).sum();
@@ -76,6 +82,7 @@ pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Coun
     let mut prog = Program::load(inputs(&paths), Attribution::new(), true);
     let s = *prog.index().stats();
     let heap_before = prog.heap_bytes();
+    let deps = prog.dependency_entries();
 
     // Files to edit: quantiles of the size distribution, then the hot modules.
     let mut by_size: Vec<(u64, usize)> =
@@ -142,6 +149,11 @@ pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Coun
         ("resolve_imports_us".to_owned(), median(&mut col(|s| s.resolve_imports))),
         ("resolve_calls_us".to_owned(), median(&mut col(|s| s.resolve_calls))),
         ("diff_us".to_owned(), median(&mut col(|s| s.diff))),
+        ("reresolved_imports_median".to_owned(), median_u32(all.iter().map(|s| s.reresolved_imports))),
+        ("reresolved_calls_median".to_owned(), median_u32(all.iter().map(|s| s.reresolved_calls))),
+        ("deps_imports".to_owned(), deps.0 as u64),
+        ("deps_calls".to_owned(), deps.1 as u64),
+        ("tracking_kb".to_owned(), prog.tracking_bytes() as u64 / 1000),
         ("heap_kb_before".to_owned(), heap_before as u64 / 1000),
         ("heap_kb_after".to_owned(), prog.heap_bytes() as u64 / 1000),
     ];

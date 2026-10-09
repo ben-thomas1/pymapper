@@ -70,7 +70,8 @@ use crate::timing;
 
 /// Interners smaller than this are never compacted (the mark pass would cost more than the
 /// memory it frees).
-const MIN_COMPACT_STRINGS: usize = 1 << 16;
+/// Tests compact tiny interners to exercise the path.
+const MIN_COMPACT_STRINGS: usize = if cfg!(test) { 16 } else { 1 << 16 };
 
 /// Counters and phase times of one [`Program::update`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,6 +211,8 @@ impl Program {
         let old = std::mem::replace(&mut self.index, index::load(Inputs::new()));
         let (index, shift) = timing::time("incremental.patch", || old.patch(inputs, &plan.src, fresh, plan.same_meta));
         self.index = index;
+        // Node matching compares names by `Sym`: before any compaction renumbers them.
+        let mut d = timing::time("incremental.nodes", || snap.diff_nodes(&self.index, &plan.src, &plan.old_of));
         let mut compacted = false;
         let n = self.index.strings().len();
         if n >= MIN_COMPACT_STRINGS && n >= 2 * self.strings_base {
@@ -218,7 +221,6 @@ impl Program {
             compacted = dead > 0;
             st.strings_dropped = dead as u32;
         }
-        let mut d = timing::time("incremental.nodes", || snap.diff_nodes(&self.index, &plan.src, &plan.old_of));
         d.strings_compacted = compacted;
         let t3 = Instant::now();
         st.patch = t3 - t2;

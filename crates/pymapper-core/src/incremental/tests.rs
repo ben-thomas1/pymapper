@@ -932,3 +932,35 @@ fn tracked_resolution_equals_the_plain_one() {
     let calls = crate::resolve::resolve_calls(&ix, &imp);
     assert_same(&dump(&p), &dump_parts(&ix, &imp, Some(&calls)), "tracked vs plain resolution");
 }
+
+#[test]
+fn interner_compaction_keeps_the_program_equal() {
+    let t = TempDir::new("compact");
+    t.write("a.py", "import b\n\ndef f():\n    b.g()\n");
+    t.write("b.py", "def g():\n    pass\n");
+    let mut p = full(t.path());
+    let mut dropped = 0;
+    for round in 0..6 {
+        // A file full of names nothing else uses, then gone again: its strings are tombstones.
+        let mut text = String::new();
+        for k in 0..40 {
+            text.push_str(&format!("def unique_{round}_{k}():\n    pass\n"));
+        }
+        let c = t.write("c.py", &text);
+        let (d, st) = p.update(inputs(t.path()), std::slice::from_ref(&c));
+        assert_same(&dump(&p), &dump(&full(t.path())), "file added");
+        check_diff(&d, &p);
+        dropped += st.strings_dropped;
+        fs::remove_file(&c).expect("remove");
+        let (d, st) = p.update(inputs(t.path()), &[] as &[&Path]);
+        assert_same(&dump(&p), &dump(&full(t.path())), "file removed");
+        check_diff(&d, &p);
+        assert_eq!(d.strings_compacted, st.strings_dropped > 0);
+        dropped += st.strings_dropped;
+        // An edit with carried resolution right after a compaction.
+        let b = t.write("b.py", &format!("def g():\n    return {round}\n"));
+        step_matches(&t, &mut p, &[b], "edit after compaction");
+    }
+    assert!(dropped > 0, "the interner was compacted");
+    assert!(p.index().strings().len() < 400, "tombstones were dropped: {}", p.index().strings().len());
+}

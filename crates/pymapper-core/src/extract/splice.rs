@@ -42,6 +42,11 @@ pub(crate) fn splice_col<T: Copy>(col: &mut Vec<T>, plan: &[Splice], src: &[T]) 
     }
     assert!(prev_end <= old_len, "splice beyond the column");
     let new_len = new_len as usize;
+    if new_len > col.capacity() {
+        // Headroom of 1/8 instead of doubling: repeated small growths reallocate rarely and
+        // spare capacity stays below 12.5% (big columns are patched on every update).
+        col.reserve_exact((new_len - old_len).max(old_len / 8));
+    }
     if new_len > old_len {
         // Any value works as filler: every new slot is written below.
         let fill = match plan.iter().find(|s| s.new > 0) {

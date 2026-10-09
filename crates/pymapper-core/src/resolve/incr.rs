@@ -121,6 +121,10 @@ fn push_log(log: &mut Vec<FileId>, f: FileId, out: &mut Vec<FileId>) -> u32 {
     (out.len() - before) as u32
 }
 
+/// Lists of at most this many files are resolved on the calling thread (waking the pool
+/// costs more than resolving them).
+const INLINE_FILES: usize = 4;
+
 /// Per-chunk output of a tracked pass over a list of files.
 #[derive(Default)]
 struct Part<T> {
@@ -137,21 +141,21 @@ fn par_files<T: Send, S: Default>(
     per: impl Fn(&mut S, FileId, &mut Vec<T>, &mut Vec<FileId>) + Sync,
 ) -> (Vec<T>, Vec<u32>, Vec<FileId>, Vec<u32>) {
     let chunk = chunk_size(files.len());
-    let parts: Vec<Part<T>> = files
-        .par_chunks(chunk.max(1))
-        .map(|fs| {
-            let mut st = S::default();
-            let mut p = Part { rows: Vec::new(), lens: Vec::with_capacity(fs.len()), deps: Vec::new(), dep_lens: Vec::new() };
-            let mut log = Vec::new();
-            for &f in fs {
-                let before = p.rows.len();
-                per(&mut st, f, &mut p.rows, &mut log);
-                p.lens.push((p.rows.len() - before) as u32);
-                p.dep_lens.push(push_log(&mut log, f, &mut p.deps));
-            }
-            p
-        })
-        .collect();
+    let run = |fs: &[FileId]| {
+        let mut st = S::default();
+        let mut p = Part { rows: Vec::new(), lens: Vec::with_capacity(fs.len()), deps: Vec::new(), dep_lens: Vec::new() };
+        let mut log = Vec::new();
+        for &f in fs {
+            let before = p.rows.len();
+            per(&mut st, f, &mut p.rows, &mut log);
+            p.lens.push((p.rows.len() - before) as u32);
+            p.dep_lens.push(push_log(&mut log, f, &mut p.deps));
+        }
+        p
+    };
+    // A few files (the usual update): on this thread, without waking the pool.
+    let parts: Vec<Part<T>> =
+        if files.len() <= INLINE_FILES { vec![run(files)] } else { files.par_chunks(chunk.max(1)).map(run).collect() };
     let (mut rows, mut lens, mut deps, mut dep_lens) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     rows.reserve_exact(parts.iter().map(|p| p.rows.len()).sum());
     deps.reserve_exact(parts.iter().map(|p| p.deps.len()).sum());
@@ -556,21 +560,23 @@ struct FreshCalls {
 fn calls_of(ix: &Index, imp: &Imports, t: &CallTables, files: &[FileId]) -> FreshCalls {
     let parts: Vec<CallPart> = timing::time("resolve.calls", || {
         let cx = Cx { ix, imp, classes: &t.classes, tables: &t.tables, names: t.names };
-        files
-            .par_chunks(chunk_size(files.len()).max(1))
-            .map(|fs| {
-                let mut sc = FileScratch::default();
-                sc.loc.logging = true;
-                let mut p = CallPart::default();
-                let mut log = Vec::new();
-                for &f in fs {
-                    file_calls(&cx, &t.methods, &mut sc, f, &mut p.out);
-                    log.append(sc.loc.log.get_mut());
-                    p.dep_lens.push(push_log(&mut log, f, &mut p.deps));
-                }
-                p
-            })
-            .collect()
+        let run = |fs: &[FileId]| {
+            let mut sc = FileScratch::default();
+            sc.loc.logging = true;
+            let mut p = CallPart::default();
+            let mut log = Vec::new();
+            for &f in fs {
+                file_calls(&cx, &t.methods, &mut sc, f, &mut p.out);
+                log.append(sc.loc.log.get_mut());
+                p.dep_lens.push(push_log(&mut log, f, &mut p.deps));
+            }
+            p
+        };
+        if files.len() <= INLINE_FILES {
+            vec![run(files)]
+        } else {
+            files.par_chunks(chunk_size(files.len()).max(1)).map(run).collect()
+        }
     });
     let mut out = FreshCalls {
         info: Vec::with_capacity(parts.iter().map(|p| p.out.info.len()).sum()),
