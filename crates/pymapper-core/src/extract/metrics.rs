@@ -168,6 +168,35 @@ impl MetricsTable {
         self.doc_lines.clear();
     }
 
+    /// Replaces row runs by rows of `src`, in place (incremental updates; see
+    /// [`super::splice`]).
+    pub(crate) fn splice(&mut self, plan: &[super::splice::Splice], src: &MetricsTable) {
+        use super::splice::splice_col;
+        // Exhaustive on purpose: a new column must be spliced too (compile error until it is).
+        let MetricsTable {
+            cyclomatic: _,
+            cognitive: _,
+            max_nesting: _,
+            loc: _,
+            distinct_operators: _,
+            distinct_operands: _,
+            operators: _,
+            operands: _,
+            params: _,
+            doc_lines: _,
+        } = self;
+        splice_col(&mut self.cyclomatic, plan, &src.cyclomatic);
+        splice_col(&mut self.cognitive, plan, &src.cognitive);
+        splice_col(&mut self.max_nesting, plan, &src.max_nesting);
+        splice_col(&mut self.loc, plan, &src.loc);
+        splice_col(&mut self.distinct_operators, plan, &src.distinct_operators);
+        splice_col(&mut self.distinct_operands, plan, &src.distinct_operands);
+        splice_col(&mut self.operators, plan, &src.operators);
+        splice_col(&mut self.operands, plan, &src.operands);
+        splice_col(&mut self.params, plan, &src.params);
+        splice_col(&mut self.doc_lines, plan, &src.doc_lines);
+    }
+
     /// Row `i` as a struct (volume and MI computed). Panics if out of range.
     pub fn row(&self, i: usize) -> DefMetrics {
         DefMetrics {

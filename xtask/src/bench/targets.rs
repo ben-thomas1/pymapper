@@ -21,6 +21,8 @@ use pymapper_core::walk::{self as core_walk, DiagnosticKind, PathList, WalkOptio
 use super::rusage;
 use super::walk::{PathStore, walk_python};
 
+mod incremental;
+
 /// A named benchmark target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Target {
@@ -141,6 +143,11 @@ pub enum Target {
     /// Like `load-cold` but keeps the cache: with the default warm-up run, every file is a
     /// cache hit (no read, no parse).
     LoadWarm,
+    /// Single-file edit latency of `pymapper_core::incremental::Program::update` on a copy of
+    /// the corpus (phase `copy`), after `calls`' load and resolution: files across the size
+    /// distribution (and the stdlib's hot modules) are edited and restored one at a time
+    /// (phase `incremental.update` = all updates; per-update medians as counters).
+    Incremental,
 }
 
 impl Target {
@@ -173,6 +180,7 @@ impl Target {
             Target::Query => "query",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
+            Target::Incremental => "incremental",
         }
     }
 }
@@ -508,6 +516,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Deadcode => deadcode_target(root)?,
         Target::Query => super::query::query_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
+        Target::Incremental => incremental::incremental_target(root)?,
         Target::Read
         | Target::ParseOnly
         | Target::Lex
@@ -1489,6 +1498,7 @@ mod tests {
             Target::Query,
             Target::LoadCold,
             Target::LoadWarm,
+            Target::Incremental,
         ] {
             let rec = run(target, &root).expect("run");
             // The corpus has no ignore files or hidden directories, so all walks agree.
@@ -1580,6 +1590,10 @@ mod tests {
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
                 }
+                Target::Incremental => &[
+                    "walk", "copy", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "incremental.update",
+                ],
                 Target::Roots => unreachable!("checked below"),
             };
             assert_eq!(names, expected, "{target:?}");
@@ -1712,6 +1726,13 @@ mod tests {
                     assert_eq!(counter("misses"), Some(0));
                     assert_eq!(counter("hits").unwrap() + counter("verified").unwrap(), rec.files);
                 }
+            } else if target == Target::Incremental {
+                assert_eq!(counter("inplace"), Some(0));
+                // Each picked file is edited and restored once per round.
+                let updates = counter("updates").unwrap();
+                assert!(updates > 0 && updates % 6 == 0, "{updates}");
+                assert!(counter("update_best_us") <= counter("update_median_us"));
+                assert!(counter("update_median_us") <= counter("update_worst_us"));
             } else if !matches!(target, Target::Walk | Target::WalkGit) {
                 assert!(rec.counters.is_empty(), "{target:?}");
             }

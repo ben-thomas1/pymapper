@@ -115,6 +115,7 @@ mod calls;
 mod classes;
 mod edges;
 mod imports;
+pub(crate) mod incr;
 mod lookup;
 mod modules;
 mod namespace;
@@ -195,7 +196,7 @@ pub fn resolve_imports(ix: &Index, attr: &Attribution) -> Imports {
         rayon::join(|| ModuleTable::build(ix), || Namespaces::build(ix))
     });
     let t1 = Instant::now();
-    let getattr = ix.strings().get(b"__getattr__");
+    let getattr = ix.strings().get(builtins::texts::GETATTR);
     let files = ix.file_count() as usize;
     let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
     let (p1, p2) = timing::time("resolve.imports", || {

@@ -148,6 +148,17 @@ impl ModuleTable {
         }
     }
 
+    /// The table after a content-only update (same files, names and statuses): only the
+    /// target and stub nodes move (`map` translates old nodes; package/module nodes survive).
+    pub(super) fn remap_nodes(mut self, map: impl Fn(NodeId) -> NodeId) -> ModuleTable {
+        for v in self.node.iter_mut().chain(self.stub.iter_mut()) {
+            if *v != NONE {
+                *v = map(*v);
+            }
+        }
+        self
+    }
+
     /// Number of names.
     #[inline]
     pub fn len(&self) -> u32 {

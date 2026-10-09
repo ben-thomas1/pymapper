@@ -58,6 +58,25 @@ pub const BUILTIN_METHODS: &[&str] = &[
     "mro",
 ];
 
+/// Every name the resolvers look up in the interner by text, besides [`BUILTINS`] and
+/// [`BUILTIN_METHODS`]. Resolution results carried over an incremental update are only valid
+/// while these intern to the same ids ([`super::incr::names_key`] is built from these lists),
+/// so every lookup by text must go through a constant here.
+pub(super) mod texts {
+    /// PEP 562 module `__getattr__` (import and call resolution).
+    pub const GETATTR: &[u8] = b"__getattr__";
+    /// Calls that bind names dynamically (namespaces).
+    pub const DYNAMIC: [&[u8]; 2] = [b"globals", b"exec"];
+    /// Names of the call resolver's `Names`, in field order.
+    pub const CALLS: [&[u8]; 11] =
+        [b"self", b"__init__", b"__new__", b"__call__", GETATTR, b"__class__", b"metaclass", b"object", b"Generic", b"Protocol", b"ABC"];
+
+    /// Every text above.
+    pub fn all() -> impl Iterator<Item = &'static [u8]> {
+        CALLS.into_iter().chain(DYNAMIC)
+    }
+}
+
 /// A sorted table of interned names (binary search over raw `Sym` values).
 #[derive(Debug, Default)]
 pub(super) struct SymSet {

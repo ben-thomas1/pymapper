@@ -105,6 +105,7 @@ pub use render::render;
 pub use strs::{SpanStrs, StrSink};
 
 use super::events::{AssignKind, DeclKind, DiagKind, ParamKind, Receiver};
+use super::splice::{Splice, splice_col};
 use crate::intern::Sym;
 
 // ---------------------------------------------------------------------------------------------
@@ -489,6 +490,11 @@ macro_rules! soa {
 
             fn shrink_to_fit(&mut self) {
                 $(self.$f.shrink_to_fit();)+
+            }
+
+            /// Replaces row runs by rows of `src` (see [`super::splice`]).
+            fn splice(&mut self, plan: &[Splice], src: &Self) {
+                $(splice_col(&mut self.$f, plan, &src.$f);)+
             }
 
             fn append(&mut self, other: &mut Self) -> u32 {
@@ -915,6 +921,57 @@ impl FactStore {
         // Validates the merged lengths.
         let _ = self.bases();
         b
+    }
+
+    /// Replaces the rows of some files by rows of `src`, in place (incremental updates).
+    ///
+    /// `edits` are `(old, new)` header pairs sorted by position in `self`: the runs of `old`
+    /// (rows of `self`) become the runs of `new` (rows of `src`). A removal has empty `new`
+    /// runs; an insertion has empty `old` runs starting where the rows go. Every table is
+    /// patched with one pass of [`splice_col`]; headers of the files after an edit must be
+    /// rebased by the caller. `plan` is a reused buffer.
+    pub(crate) fn splice(&mut self, edits: &[(FileFacts, FileFacts)], src: &FactStore, plan: &mut Vec<Splice>) {
+        // Exhaustive on purpose: a new table must be spliced too (compile error until it is).
+        let FactStore {
+            defs: _,
+            decorators: _,
+            bases: _,
+            params: _,
+            imports: _,
+            calls: _,
+            bindings: _,
+            decls: _,
+            names: _,
+            exports: _,
+            evidence: _,
+            diags: _,
+            suppressions: _,
+            scratch: _,
+        } = self;
+        macro_rules! table {
+            ($t:ident, $apply:expr) => {{
+                plan.clear();
+                for (o, n) in edits {
+                    plan.push(Splice { at: o.$t.start, old: o.$t.len, src: n.$t.start, new: n.$t.len });
+                }
+                $apply;
+            }};
+        }
+        table!(defs, self.defs.splice(plan, &src.defs));
+        table!(decorators, self.decorators.splice(plan, &src.decorators));
+        table!(bases, self.bases.splice(plan, &src.bases));
+        table!(params, self.params.splice(plan, &src.params));
+        table!(imports, self.imports.splice(plan, &src.imports));
+        table!(calls, self.calls.splice(plan, &src.calls));
+        table!(bindings, self.bindings.splice(plan, &src.bindings));
+        table!(decls, self.decls.splice(plan, &src.decls));
+        table!(names, splice_col(&mut self.names, plan, &src.names));
+        table!(exports, splice_col(&mut self.exports, plan, &src.exports));
+        table!(evidence, splice_col(&mut self.evidence, plan, &src.evidence));
+        table!(diags, self.diags.splice(plan, &src.diags));
+        table!(suppressions, self.suppressions.splice(plan, &src.suppressions));
+        // Validates the lengths.
+        let _ = self.bases();
     }
 
     /// Releases spare capacity of every table (e.g. once a worker is done).

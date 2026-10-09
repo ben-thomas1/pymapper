@@ -79,6 +79,7 @@
 mod build;
 mod inputs;
 mod load;
+mod patch;
 pub(crate) mod qid;
 
 #[cfg(test)]
@@ -87,6 +88,7 @@ mod tests;
 pub use inputs::{Group, Inputs};
 pub use load::{LoadOptions, LoadStats, ReadError, load, load_with};
 pub(crate) use load::load_cached;
+pub(crate) use patch::{NodeShift, Src};
 
 use std::ops::Range;
 use std::path::Path;
@@ -272,6 +274,9 @@ impl Index {
         &self.read_errors
     }
 
+    /// Load statistics. After [`Index::patch`] (an incremental update), `files` and `lines`
+    /// still describe the whole program, but `bytes` and `extract` describe only the files
+    /// re-extracted by that update, and `merge` / `build` its patch phases.
     pub fn stats(&self) -> &LoadStats {
         &self.stats
     }

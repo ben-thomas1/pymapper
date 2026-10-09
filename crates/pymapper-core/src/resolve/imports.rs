@@ -235,6 +235,10 @@ pub(crate) struct Scratch {
     /// lookup. Keyed by name too: a re-export followed inside the lookup searches the same
     /// modules for another name. Bounded by [`MAX_STAR_VISITS`].
     visited: Vec<(ModId, Sym)>,
+    /// Record the files every lookup reads (incremental updates, see `crate::incremental`).
+    pub(crate) logging: bool,
+    /// Files read while `logging` (unsorted, with repeats; drained by the caller).
+    pub(crate) log: Vec<FileId>,
 }
 
 /// Phase 2 over phase-1 results of every row.
@@ -394,6 +398,9 @@ impl Names<'_> {
         }
         let Some(node) = cx.mods.node(m) else { return Found::Miss };
         let files = [cx.ix.file(node), cx.mods.stub(m).and_then(|s| cx.ix.file(s))];
+        if sc.logging {
+            sc.log.extend(files.iter().flatten());
+        }
         let mut entry: Option<(FileId, Entry)> = None;
         let (mut in_all, mut has_all) = (false, false);
         for f in files.into_iter().flatten() {

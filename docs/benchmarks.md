@@ -71,6 +71,7 @@ entered, and symlinks are not followed.
 | `query`      | `calls` phases, `query.build`, `query.names`, `query.imports`, `query.cycle_graph`, then one `query.<kind>` phase per batch | `calls`, then `pymapper_core::query`: `query.build` = `Query::new` (the labelled call graph), `query.names` = the name index, `query.imports` = the import graph, `query.cycle_graph` = the cycle import graph and its SCCs (all lazy in the API, forced here), then batches over up to 1000 evenly spaced defs and 200 packages/modules with one reused `Scratch`: `lookup_exact` (each def's qid), `lookup_name` (its last segment), `lookup_suffix2` (last two segments), `lookup_fuzzy` (the name minus its first byte, 100 samples), `callers1`, `callees3` (depth 3), `callers_all` (unbounded), `impact`, `path` (from the deepest transitive caller of each def to the def: a path exists), `path_random` (def `i` to def `n - 1 - i`: mostly no path), `deps_out` / `deps_in` (module level), `import_cycles`, `call_cycle`, `summary` (once). Counters `loc`, `nodes`, `call_edges`, `query_kb` (`Query::heap_bytes`), `names_kb`, `calls_kb`, `index_kb`, per kind `<kind>_queries`, `<kind>_avg_ns`, `<kind>_max_us`, `<kind>_avg_items` (mean result size), and `scratch_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
+| `incremental` | `walk`, `copy`, `load.*`, `resolve.*`, `incremental.update` | single-file edit latency of `pymapper_core::incremental::Program::update`: the corpus is copied to `$TMPDIR` (`copy`; corpora over 200 MB are not copied and their files are re-extracted with unchanged contents instead, counter `inplace`), loaded and resolved with dependency tracking (`load.*`, `resolve.*`), then 6 files across the size distribution (plus `typing.py`, `os.py`, `collections/__init__.py`, `functools.py`, `re/__init__.py` when present) are each edited and restored, one update per edit and per restore, 3 rounds; three kinds of edit: a function appended, a method added to the first class at column 0 (skipped for files without one), a module-level import appended (in-place corpora: one unchanged re-extraction per file and round). `incremental.update` is the sum of all updates. Counters: `updates`, `update_median_us` / `update_best_us` / `update_worst_us`, `hot_median_us` (the hot stdlib modules), `append_median_us` / `method_median_us` / `import_median_us` (per kind of edit), per-phase medians `plan_us`, `extract_us`, `patch_us` (splice + hierarchy + node map), `resolve_imports_us`, `resolve_calls_us`, `diff_us`, `reresolved_imports_median` / `reresolved_calls_median` (files resolved again per update), `deps_imports` / `deps_calls` (recorded (file, file read) pairs), `tracking_kb`, `heap_kb_before` / `heap_kb_after` (`Program::heap_bytes` before and after the updates) |
 
 Walk-only targets report 0 MB (they do not stat files) and add the walker's counters
 (`dirs`, `entries`, `ignored`, `hidden`; not for `walk-seq`).
@@ -1435,3 +1436,68 @@ drops the report bytes (as `check` does) and runs the analysis with it.
   The report bytes are held only while they are mapped (`Coverage::load` reads, maps and drops
   them), so they add to the peak only when the report is larger than what the analysis
   allocates later; here the peak did not move.
+
+### Incremental updates (S3.6)
+
+`incremental` target: `Program::update` after a single-file edit, against the full load and
+resolution of the `calls` target (same session). 14-core Apple M4 Pro, release (fat LTO), warm
+OS file cache, 14 threads, best of 3 (RSS worst of 3); load average 4-9 from other worktrees,
+so times are upper bounds. Medians are over all updates of a run (an edit and its restore count
+as two updates).
+
+| corpus | files | full load + resolve (`calls` total) | update median | best | worst | hot modules | files re-resolved (imports / calls, median) | tracking | peak RSS MB (`calls` / `incremental`) |
+|--------|-------|--------------------------------------|---------------|------|-------|-------------|----------------------------------------------|----------|----------------------------------------|
+| tests  | 29     | 1.75 ms | 0.35 ms | 0.20 ms | 0.49 ms | -       | 1 / 1 | 0 KB    | 5.1 / 6.0     |
+| stdlib | 1,043  | 47.6 ms | 2.13 ms | 1.34 ms | 3.49 ms | 3.00 ms | 1 / 6 | 34 KB   | 29.7 / 37.2   |
+| venv   | 60,529 | 3.13 s  | 25.5 ms | 24.2 ms | 64.5 ms | -       | 2 / 2 | 3.4 MB  | 596.4 / 671.5 |
+
+The venv (650 MB) is not copied: its files are re-extracted with unchanged contents, which runs
+the whole pipeline (extraction, splice, hierarchy, node map, dependency check, carried
+resolution, diff) but produces empty diffs. The stdlib and tests rows edit for real, three
+kinds of edit per file, each followed by its restore: a top-level function appended, a method
+added to the first class (a new method name: the method index changes, so every call and
+decorator row of the program is scanned for it, in parallel), and a module-level import
+appended (the file's namespace changes: its readers are re-resolved).
+
+The table above was measured with the appended-function edit only. Per kind of edit (stdlib,
+median over the edits and their restores, best of 3, load average around 5): appended function 2.04 ms, added method 2.46 ms, appended import 1.97 ms (overall
+median 2.10 ms, best 1.24 ms, worst 5.12 ms, hot modules 2.90 ms). On the tests corpus:
+0.35 / - (no class at column 0 with an indented body after it) / 0.34 ms.
+
+Phase medians per update (µs):
+
+| corpus | plan | extract | patch (splice + hierarchy + node map) | resolve imports | resolve calls | diff |
+|--------|------|---------|----------------------------------------|-----------------|---------------|------|
+| stdlib | 38    | 330     | 214                                    | 383             | 1,129         | 2    |
+| venv   | 2,123 | 192     | 7,065                                  | 2,174           | 13,723        | 49   |
+
+- **What an update costs.** Reading and extracting, the bulk of a load, is paid for the changed
+  file only. The splice of the fact columns is a memmove of the rows behind the file. The
+  hierarchy is copied in runs with only the changed file's def block rebuilt (no sort, no
+  hashing of other files). Per-file resolution runs for the files that read the changed file
+  (median 1-6 on the stdlib, 2 on the venv), and every other file's results are translated in
+  place, in parallel; the module trie and namespaces are patched. What remains is linear in
+  the program with small constants: the old -> new node map (4 bytes per node, part of the
+  diff, filled by offset), the hierarchy copy (`patch` on the venv is mostly that), the class
+  table, C3 MROs and method index (rebuilt: on the venv `resolve.classes` + `resolve.mro` are
+  about 11 ms of the 25 ms) and the plan (path comparison of 60k files).
+- **Speedup**: 22x on the stdlib, 123x on the venv against a full load and resolution.
+- **Dependency tracking** costs 4 bytes per (file, file read) pair: 384k import and 280k call
+  pairs on the venv (3.4 MB, 0.7% of the program), 1.8k and 3.7k on the stdlib. The tracked
+  resolution of the initial load costs 5-10% more than the plain one on the venv
+  (`resolve.imports` 7.1 vs 6.5 ms, `resolve.calls` 49.4 vs 46.1 ms; the `resolve.*` columns
+  of the two targets).
+- **Memory.** `Program::heap_bytes` stays flat across updates (venv 464.3 -> 464.2 MB; stdlib
+  10.67 -> 10.90 MB: spliced columns grow with 1/8 headroom, not by doubling). Peak RSS is 12%
+  above a one-shot load on the venv: an update rebuilds the class table, MROs and method index
+  next to the old ones, copies the node table once and holds the node map. Before results were
+  carried in place (old and new resolution tables alive together) the venv peaked at 760 MB,
+  and before exact reservations of the edge arrays peak RSS crept up by 40 MB per update
+  (1.6 GB after 36 updates).
+- **When the whole program is resolved again** (still re-extracting only what changed): files
+  added, removed, renamed or reordered, a module name or status changed (a new stub, a new
+  `__init__.py`), the interner compacted, or a name the resolvers look up by text (`object`,
+  `__init__`, a builtin) interned for the first time. Then an update costs the extraction of
+  the changed files plus a full tracked resolution (the `resolve.*` phases of `calls`).
+- **Follow-ups**: patch the class table, MROs and method index per file (the largest remaining
+  cost on 17M LOC); a fixed-size node map representation for the diff when only offsets move.

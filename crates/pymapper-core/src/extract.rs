@@ -15,6 +15,7 @@ pub mod facts;
 pub mod metrics;
 pub mod parser;
 mod soft;
+pub(crate) mod splice;
 mod stmt;
 mod tee;
 
