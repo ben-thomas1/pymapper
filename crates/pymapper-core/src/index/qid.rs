@@ -21,7 +21,7 @@ fn push_dup(out: &mut Vec<u8>, dup: u16) {
 
 /// Splits a `name#N` segment into the name and the duplicate ordinal (`N - 1`). `None` for a
 /// malformed suffix (`#`, `#0`, `#1`, non-digits, overflow).
-fn split_dup(seg: &[u8]) -> Option<(&[u8], u16)> {
+pub(crate) fn split_dup(seg: &[u8]) -> Option<(&[u8], u16)> {
     let Some(h) = seg.iter().rposition(|&c| c == b'#') else { return Some((seg, 0)) };
     let digits = &seg[h + 1..];
     if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) || digits.len() > 5 {

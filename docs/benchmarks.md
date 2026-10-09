@@ -68,6 +68,7 @@ entered, and symlinks are not followed.
 | `hotspot`    | `load` phases, `hotspot.scan`, `hotspot.top` | `load`, then `pymapper_core::analysis::hotspot::analyse` with the default config (`hotspot.scan`: PM101-PM107 findings plus the per-module aggregates) and `top_functions` for the 100 worst functions by cognitive complexity (`hotspot.top`). Counters `loc`, `functions`, `classes`, `flagged` (functions over any function threshold), `findings`, `top_len`, `top_cognitive`, `hotspot_kb` = `ModuleHotspots::heap_bytes`, `index_kb` |
 | `coupling`   | `calls` phases, `graph.build`, `coupling.analyse` | `calls`, then the call graph over every node (all edges with a target) and `pymapper_core::analysis::coupling::analyse` with the default config (module Ca/Ce, abstractness, PM201-PM204). Counters `loc`, `modules` (files), `import_edges` (counted edges = sum of Ce), `class_candidates` (classes above `max-class-wmc`), `findings`, `coupling_kb` = `ModuleCoupling::heap_bytes`, `callgraph_kb`, `calls_kb`, `index_kb` |
 | `deadcode`   | `calls` phases, `deadcode.roots`, `deadcode.graph`, `deadcode.propagate`, `deadcode.evidence`, `deadcode.findings` | `calls`, then `pymapper_core::analysis::deadcode::analyse` with every PM4xx rule and the name fallback, in application mode with no entrypoints (the fewest roots, so the most candidates; `XTASK_DEADCODE_MODE=library` or `auto` changes the mode): roots, the call and override graphs plus seeds, the level propagation of defs and modules (module graphs included), the evidence scan plus the second propagation, the findings. Counters `loc`, `nodes`, `library`, `roots`, `live` (nodes at level 100), `candidates` (defs, modules and imports probed by the name fallback), `probes` (evidence hashes scanned), `expansions`, `pm401`..`pm405`, `findings` (emitted, confidence >= 10), `reported` (confidence >= 80), `graph_kb` (call + override graphs and seeds), `deadcode_kb` = `DeadCode::heap_bytes`, `calls_kb`, `index_kb` |
+| `query`      | `calls` phases, `query.build`, `query.names`, `query.imports`, `query.cycle_graph`, then one `query.<kind>` phase per batch | `calls`, then `pymapper_core::query`: `query.build` = `Query::new` (the labelled call graph), `query.names` = the name index, `query.imports` = the import graph, `query.cycle_graph` = the cycle import graph and its SCCs (all lazy in the API, forced here), then batches over up to 1000 evenly spaced defs and 200 packages/modules with one reused `Scratch`: `lookup_exact` (each def's qid), `lookup_name` (its last segment), `lookup_suffix2` (last two segments), `lookup_fuzzy` (the name minus its first byte, 100 samples), `callers1`, `callees3` (depth 3), `callers_all` (unbounded), `impact`, `path` (from the deepest transitive caller of each def to the def: a path exists), `path_random` (def `i` to def `n - 1 - i`: mostly no path), `deps_out` / `deps_in` (module level), `import_cycles`, `call_cycle`, `summary` (once). Counters `loc`, `nodes`, `call_edges`, `query_kb` (`Query::heap_bytes`), `names_kb`, `calls_kb`, `index_kb`, per kind `<kind>_queries`, `<kind>_avg_ns`, `<kind>_max_us`, `<kind>_avg_items` (mean result size), and `scratch_kb` |
 | `load-cold`  | inputs, `load.extract`, `load.merge`, `load.build`, `cache.write` | `pymapper_core::cache::load` after clearing the cache: the `load` pipeline plus encoding and atomically writing every segment. Inputs are built the way the CLI builds them: a venv's site-packages through import roots (phases `discover`, `files`: file lists from `RECORD`, no walk of distribution files; one trusted segment per distribution), a stdlib through a walk without the base interpreter's `site-packages` plus import roots (one trusted segment per interpreter), anything else as one first-party group validated per file (`walk`). The cache lives in `$TMPDIR/pymapper-bench-cache/<corpus hash>`. Counters: `segments`, `opened`, `hits`, `verified`, `misses`, `written`, `opened_kb`, `written_kb`, `index_kb` |
 | `load-warm`  | same as `load-cold`    | like `load-cold` but keeps the cache, so after the warm-up run every file is a cache hit (no read, no parse; first-party files cost one `stat` each) |
 
@@ -1157,6 +1158,70 @@ Observations:
   cache benchmarks); warm 1.36 s / 0.66 s / 0.52 s.
 - **dupes** is the only gated analysis: +20-30 ms on 305k LOC, +3.1 s matching and +0.2 s of
   fingerprinting on 17M LOC (peak 0.70 -> 1.0 GB), which is why it is off by default.
+
+### Query API (S5.1)
+
+`query` target: `calls`, then `pymapper_core::query` (see the target table). 14-core M4 Pro,
+release, warm cache, best of 3 (RSS worst of 3), other worktrees busy. Per-query latencies
+are means over the batch with one reused `Scratch`. The worst case is the slowest single query
+of the best run. Only the fuzzy lookup uses more than one thread.
+
+Query state, built once (lazy tables forced in their own phases):
+
+| corpus | nodes   | call edges | query.build | query.names | query.imports | query.cycle_graph | `query_kb` (of which names) | `scratch_kb` | peak RSS MB (`calls` / `query`) |
+|--------|---------|------------|-------------|-------------|---------------|-------------------|-----------------------------|--------------|---------------------------------|
+| stdlib | 25,441  | 31,873     | 0.71ms      | 0.13ms      | 0.12ms        | 0.13ms            | 734 (101)                   | 416          | 28.1 / 30.3                     |
+| venv   | 998,345 | 1,382,184  | 33.8ms      | 5.99ms      | 12.1ms        | 13.9ms            | 35,181 (3,993)              | 16,055       | 595.3 / 646.9                   |
+
+Per query (mean / worst; mean result size in brackets):
+
+| query                         | stdlib (437k LOC)       | venv (17M LOC)            |
+|-------------------------------|-------------------------|---------------------------|
+| lookup exact qid              | 0.78us / 6us            | 10.6us / 149us            |
+| lookup bare name (suffix)     | 1.9us / 23us (6)        | 60us / 1.0ms (9)          |
+| lookup two segments (suffix)  | 0.63us / 3us (1)        | 10.5us / 141us (2)        |
+| lookup fuzzy (one edit)       | 130us / 293us (10)      | 4.7ms / 13.7ms (11)       |
+| callers, depth 1              | 0.06us / 7us (1)        | 0.62us / 432us (1)        |
+| callees, depth 3              | 0.13us / 3us (5)        | 2.1us / 63us (350)        |
+| callers, transitive           | 0.48us / 66us (36)      | 6.1us / 480us (752)       |
+| impact, transitive            | 3.2us / 166us (36)      | 93us / 2.1ms (752)        |
+| path, reachable pair          | 0.47us / 8us (5 nodes)  | 4.5us / 294us (5 nodes)   |
+| path, random pair (no path)   | 0.12us / 4us            | 0.94us / 58us             |
+| deps out, module level        | 0.80us / 24us (6)       | 3.0us / 77us (10)         |
+| deps in, module level         | 1.3us / 14us (4)        | 3.1us / 94us (4)          |
+| import cycles of a module     | 0.51us / 5us            | 2.3us / 103us             |
+| call cycle through a def      | 0.28us / 14us           | 4.8us / 172us (96)        |
+| summary                       | 0.96ms                  | 46.3ms                    |
+
+- **Time**: every query except summary and fuzzy lookup answers in microseconds on 17M LOC.
+  The cost tracks what the query visits, not the program size: a bounded walk reads a few CSR
+  rows. A bidirectional path search grows the smaller frontier and stops at the first meet.
+  `deps` scans only the target's files plus the files of its callers or callees. Building the
+  query state costs 34 ms (two passes over the 2.2M call edges into a labelled CSR). The lazy
+  tables add 6 ms (name index: an LSD radix sort of node ids by name), 12 ms (import graph) and
+  14 ms (cycle import graph plus Tarjan).
+- **Lookup**: an exact or dotted qid is one hash lookup per module prefix plus a child scan
+  per def segment. A bare name is a binary search in the name index plus a ranking of all its
+  candidates (`__init__` alone has over 20k, hence the 1 ms worst case). Fuzzy matching only
+  runs when nothing else matched. It scans the 403k distinct venv names (8 MB) in parallel
+  chunks. A byte-set prefilter drops most names after one pass over their bytes, and the edit
+  distance is banded (O(len x budget)) and stops as soon as a whole row exceeds the budget.
+  Sequential and unfiltered, it took 67 ms per query (201 ms worst).
+- **impact** is the transitive callers plus a per-module count (sort and run-length), a
+  test-file check per distinct file, and a breadth-first walk of the reverse import graph for
+  the transitive importers. The importer walk is most of the gap to plain callers (6 us).
+- **summary** is O(V + E): one pass over the nodes and files, the resolution counters already
+  kept, the cycle SCCs, and bounded heaps for the rankings, including two `top_functions` passes
+  over every def row.
+- **Memory**: the query state is 35 MB on the venv: the labelled call graph (forward and
+  reverse CSR, `8 (V + 1) + 10 E` bytes) and a 4 MB name index (4 B per node), plus the module
+  graphs. A scratch is 8 B per node per side and the long-lived queries use both sides (16 MB).
+  Its zeroed pages are only touched where queries go. Peak RSS is 52 MB above `calls`, which is
+  the query state plus the scratch. Results hold node ids and small `Copy` rows, never strings.
+- Correctness: `query::tests` compares walks, paths, deps (three filters, modules and classes)
+  and call cycles against plain BFS, Tarjan and hash-map brute force. It runs them on the test
+  corpus plus a generated project with dense cross-module calls, cycles and cross-file
+  overrides.
 
 ### Deps (S6.1)
 

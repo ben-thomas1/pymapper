@@ -171,7 +171,7 @@ pub fn find_cycles(g: &Graph) -> LocalCycles {
 
 /// Appends a shortest cycle through `s` inside component `c`, rotated to start at the node
 /// whose edge closes it (`u -> s`): `u, s, ..., parent(u)`.
-fn witness(g: &Graph, scc: &Scc, c: u32, s: u32, parent: &mut [u32], queue: &mut Vec<u32>, out: &mut Vec<u32>) {
+pub(crate) fn witness(g: &Graph, scc: &Scc, c: u32, s: u32, parent: &mut [u32], queue: &mut Vec<u32>, out: &mut Vec<u32>) {
     if g.has_edge(s, s) {
         out.push(s);
         return;
