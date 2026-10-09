@@ -116,6 +116,36 @@ impl Namespaces {
         Namespaces { entries, start }
     }
 
+    /// The namespaces of `ix` from those of the index before a content-only update, in place:
+    /// the runs of the `fresh` files (ascending) are rebuilt, the rows of every other file move
+    /// by its `delta(file) = (import rows, binding rows)` shift. Def rows are file-relative.
+    pub(super) fn patch(mut self, ix: &Index, fresh: &[FileId], skip: &[bool], delta: impl Fn(usize) -> (i64, i64) + Sync) -> Namespaces {
+        super::incr::par_runs_mut(&mut self.entries, &self.start, skip, |f, run| {
+            let (di, db) = delta(f);
+            if di == 0 && db == 0 {
+                return;
+            }
+            for e in run {
+                match e.base() {
+                    kind::IMPORT | kind::STAR => e.r = (i64::from(e.r) + di) as u32,
+                    kind::VAR => e.r = (i64::from(e.r) + db) as u32,
+                    _ => {}
+                }
+            }
+        });
+        let dynamic = [ix.strings().get(b"globals"), ix.strings().get(b"exec")];
+        let mut rows = Vec::new();
+        let mut lens = Vec::with_capacity(fresh.len());
+        for &f in fresh {
+            let before = rows.len();
+            file_entries(ix, f, dynamic, &mut rows);
+            lens.push((rows.len() - before) as u32);
+        }
+        super::incr::splice_files(&mut self.entries, &self.start, fresh, &rows, &lens);
+        self.start = super::incr::new_starts(&self.start, fresh, &lens);
+        self
+    }
+
     #[inline]
     fn run(&self, f: FileId) -> &[Entry] {
         &self.entries[self.start[f as usize] as usize..self.start[f as usize + 1] as usize]

@@ -179,10 +179,11 @@ pub(crate) struct Carry<'a> {
     /// results are checked for references to it.
     pub dead: bool,
     /// Old run starts per file (`files + 1` entries, the last is the table length) of the
-    /// import, call and decorator tables.
+    /// import, call, decorator and binding tables.
     pub imports: &'a [u32],
     pub calls: &'a [u32],
     pub decorators: &'a [u32],
+    pub bindings: &'a [u32],
 }
 
 impl Carry<'_> {
@@ -220,7 +221,7 @@ fn listed(affected: &[bool]) -> Vec<FileId> {
 
 /// Runs `per(file, run)` in parallel over the runs `start[f]..start[f + 1]` of `v` of every
 /// file not in `skip` (disjoint mutable slices: no copy, no lock).
-fn par_runs_mut<T: Send>(v: &mut [T], start: &[u32], skip: &[bool], per: impl Fn(usize, &mut [T]) + Sync) {
+pub(super) fn par_runs_mut<T: Send>(v: &mut [T], start: &[u32], skip: &[bool], per: impl Fn(usize, &mut [T]) + Sync) {
     let mut runs: Vec<(usize, &mut [T])> = Vec::with_capacity(skip.len());
     let mut rest = v;
     for f in 0..skip.len() {
@@ -269,7 +270,7 @@ impl<T> Saved<T> {
 
 /// Splices the per-file runs of the `files` (ascending) into `v`: the old runs (`old_start`)
 /// become the fresh rows (`fresh`, consecutive per file with lengths `lens`).
-fn splice_files<T: Copy>(v: &mut Vec<T>, old_start: &[u32], files: &[FileId], fresh: &[T], lens: &[u32]) {
+pub(super) fn splice_files<T: Copy>(v: &mut Vec<T>, old_start: &[u32], files: &[FileId], fresh: &[T], lens: &[u32]) {
     let mut plan = Vec::with_capacity(files.len());
     let mut at = 0u32;
     for (k, &f) in files.iter().enumerate() {
@@ -281,7 +282,7 @@ fn splice_files<T: Copy>(v: &mut Vec<T>, old_start: &[u32], files: &[FileId], fr
 }
 
 /// Per-file run starts after replacing the runs of `files` (lengths `lens`).
-fn new_starts(old_start: &[u32], files: &[FileId], lens: &[u32]) -> Vec<u32> {
+pub(super) fn new_starts(old_start: &[u32], files: &[FileId], lens: &[u32]) -> Vec<u32> {
     let n = old_start.len() - 1;
     let mut s = Vec::with_capacity(n + 1);
     s.push(0u32);
@@ -418,10 +419,26 @@ pub(crate) fn reresolve_imports(
     }
     drop(g);
     let fresh = listed(&affected);
+    let fresh_dirty = listed(dirty);
     let Imports { modules, ns, mut p1, mut p2, mut edges, edge_start, mut ext_edges, ext_start, getattr, stats: old_stats } = old;
-    drop((modules, ns));
     let t0 = Instant::now();
-    let (modules, ns) = import_tables(ix);
+    // Same files, names and statuses: the module trie only moves its nodes, namespaces only
+    // shift their rows outside the re-extracted files.
+    let (modules, ns) = timing::time("resolve.modules", || {
+        let imports_start = |f: usize| ix.file_facts(f as FileId).imports.start;
+        let bindings_start = |f: usize| ix.file_facts(f as FileId).bindings.start;
+        rayon::join(
+            || modules.remap_nodes(|v| carry.node(v)),
+            || {
+                ns.patch(ix, &fresh_dirty, dirty, |f| {
+                    (
+                        i64::from(imports_start(f)) - i64::from(carry.imports[f]),
+                        i64::from(bindings_start(f)) - i64::from(carry.bindings[f]),
+                    )
+                })
+            },
+        )
+    });
     let t1 = Instant::now();
     let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
     let new_start = |f: FileId| ix.file_facts(f).imports.start;

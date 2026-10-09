@@ -239,6 +239,7 @@ impl Program {
             imports: &snap.imports,
             calls: &snap.calls,
             decorators: &snap.decorators,
+            bindings: &snap.bindings,
         };
         let dirty: Vec<bool> = plan.src.iter().map(|s| matches!(s, Src::Fresh(_))).collect();
         // Old resolution results: updated in place when carried (only the old edges of the

@@ -143,6 +143,7 @@ pub(super) struct OldSnap {
     pub imports: Vec<u32>,
     pub calls: Vec<u32>,
     pub decorators: Vec<u32>,
+    pub bindings: Vec<u32>,
 }
 
 /// Signature of def `v`: a hash of what it is (kind, flags, decorators, bases, params,
@@ -197,6 +198,7 @@ impl OldSnap {
             imports: run_starts(ix, |ff| (ff.imports.start, ff.imports.len), ix.facts().imports.len()),
             calls: run_starts(ix, |ff| (ff.calls.start, ff.calls.len), ix.facts().calls.len()),
             decorators: run_starts(ix, |ff| (ff.decorators.start, ff.decorators.len), ix.facts().decorators.len()),
+            bindings: run_starts(ix, |ff| (ff.bindings.start, ff.bindings.len), ix.facts().bindings.len()),
         };
         let push_qid = |snap: &mut OldSnap, v: NodeId| {
             let start = snap.qids.len() as u32;
