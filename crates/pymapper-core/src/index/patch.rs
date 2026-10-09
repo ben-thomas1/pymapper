@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Index, Inputs, LoadStats, ReadError, build};
+use super::{Files, Index, Inputs, LoadStats, NONE, NodeId, Nodes, ReadError, build};
 use crate::extract::facts::{FileFacts, Run, TableBases};
 use crate::extract::splice::Splice;
 use crate::index::FileId;
@@ -75,18 +75,99 @@ fn metrics_run(ff: &FileFacts, f: FileId) -> (u32, u32) {
     (ff.defs.start - f, ff.defs.len.saturating_sub(1))
 }
 
+/// Old node -> new node outside the replaced def blocks: old ids at or after the end of
+/// block `k` (`ends[k]`) move by `shift[k]` (cumulative).
+struct Shift {
+    ends: Vec<u32>,
+    shift: Vec<i64>,
+}
+
+impl Shift {
+    fn is_identity(&self) -> bool {
+        self.shift.iter().all(|&d| d == 0)
+    }
+
+    #[inline]
+    fn apply(&self, v: NodeId) -> NodeId {
+        if v == NONE {
+            return NONE;
+        }
+        let k = self.ends.partition_point(|&e| e <= v);
+        if k == 0 { v } else { (i64::from(v) + self.shift[k - 1]) as NodeId }
+    }
+}
+
+/// The hierarchy of the patched tables when only the contents of the `dirty` files changed:
+/// the old nodes with the def block of every dirty file replaced (copied in runs, parents
+/// translated), then subtree ends and ancestor paths recomputed. Returns the nodes, the
+/// ancestor pool, the node of every file and the translation of the kept nodes.
+fn patch_nodes(
+    old: Nodes,
+    old_fnode: &[NodeId],
+    old_ff: &[FileFacts],
+    new_ff: &[FileFacts],
+    dirty: &[bool],
+    store: &crate::extract::facts::FactStore,
+    anonymous: Sym,
+) -> (Nodes, Vec<u32>, Vec<NodeId>, Shift) {
+    // Replaced blocks in node order: (module node, old block end, file).
+    let mut blocks: Vec<(NodeId, NodeId, FileId)> = Vec::new();
+    for (f, &d) in dirty.iter().enumerate() {
+        if d {
+            let m = old_fnode[f];
+            blocks.push((m, m + old_ff[f].defs.len.max(1), f as FileId));
+        }
+    }
+    blocks.sort_unstable();
+    let mut shift = Shift { ends: Vec::with_capacity(blocks.len()), shift: Vec::with_capacity(blocks.len()) };
+    let mut cum = 0i64;
+    for &(_, end, f) in &blocks {
+        cum += i64::from(new_ff[f as usize].defs.len.max(1)) - i64::from(old_ff[f as usize].defs.len.max(1));
+        shift.ends.push(end);
+        shift.shift.push(cum);
+    }
+    let old_len = old.len();
+    let mut out = Nodes::default();
+    out.reserve((i64::from(old_len) + cum) as usize);
+    let mut dd = build::DefDups::default();
+    let copy = |out: &mut Nodes, r: std::ops::Range<usize>| {
+        let base = out.len() as usize;
+        out.kind.extend_from_slice(&old.kind[r.clone()]);
+        out.dup.extend_from_slice(&old.dup[r.clone()]);
+        out.depth.extend_from_slice(&old.depth[r.clone()]);
+        out.name.extend_from_slice(&old.name[r.clone()]);
+        out.file.extend_from_slice(&old.file[r.clone()]);
+        out.parent.extend(old.parent[r.clone()].iter().map(|&p| shift.apply(p)));
+        out.end.extend((base + 1..base + 1 + r.len()).map(|e| e as u32));
+    };
+    let mut c = 0usize;
+    for &(m, end, f) in &blocks {
+        copy(&mut out, c..m as usize + 1);
+        let m_new = out.len() - 1;
+        build::push_defs(&mut out, store, &new_ff[f as usize], m_new, f, anonymous, &mut dd);
+        c = end as usize;
+    }
+    copy(&mut out, c..old_len as usize);
+    drop(old);
+    let chain = build::finish(&mut out);
+    let node = old_fnode.iter().map(|&v| shift.apply(v)).collect();
+    (out, chain, node, shift)
+}
+
 impl Index {
     /// The index of `inputs`, built from this one and `fresh`, an index of the re-extracted
     /// files: `src[i]` says where file `i` of `inputs` comes from. `Old` files must appear in
     /// increasing order (convert out-of-order files to `Fresh` first); old files not referenced
-    /// are removed. See the module docs.
+    /// are removed. `same_meta`: `inputs` has the old files in the old order with the same
+    /// groups, module names and statuses (only contents changed): the hierarchy is patched
+    /// instead of rebuilt. See the module docs.
     ///
     /// # Panics
     /// If `src` does not match `inputs`, or `Old` entries are not increasing.
-    pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index) -> Index {
+    pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index, same_meta: bool) -> Index {
         assert_eq!(src.len(), inputs.len(), "one source per input file");
         let t0 = Instant::now();
-        let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, .. } = self;
+        let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, nodes, group_node, modules, .. } = self;
         let old_ff = files.facts;
         let old_n = old_ff.len();
 
@@ -186,7 +267,29 @@ impl Index {
         };
         let _ = stats;
         let t1 = Instant::now();
-        let mut ix = timing::time("incremental.build", || build::build(inputs, strings, store, metrics, headers, errors, st));
+        if !same_meta {
+            drop((nodes, group_node, modules));
+            let mut ix = timing::time("incremental.build", || build::build(inputs, strings, store, metrics, headers, errors, st));
+            ix.stats.build = t1.elapsed();
+            return ix;
+        }
+        // Same files, names and statuses: the hierarchy only changes inside the def blocks of
+        // re-extracted files.
+        let anonymous = strings.intern(build::ANONYMOUS);
+        let dirty: Vec<bool> = src.iter().map(|s| matches!(s, Src::Fresh(_))).collect();
+        let (nodes, chain, node, shift) = timing::time("incremental.build", || {
+            patch_nodes(nodes, &files.node, &old_ff, &headers, &dirty, &store, anonymous)
+        });
+        let group_node = group_node.into_iter().map(|v| shift.apply(v)).collect();
+        let mut modules = modules;
+        if !shift.is_identity() {
+            for v in modules.values_mut() {
+                *v = shift.apply(*v);
+            }
+        }
+        let Inputs { paths, groups, group, status, .. } = inputs;
+        let files = Files { facts: headers, group, status, module: files.module, node };
+        let mut ix = Index { strings, paths, groups, files, facts: store, metrics, nodes, chain, group_node, modules, read_errors: errors, stats: st };
         ix.stats.build = t1.elapsed();
         ix
     }

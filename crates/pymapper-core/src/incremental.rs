@@ -208,7 +208,7 @@ impl Program {
         st.extract = t2 - t1;
 
         let old = std::mem::replace(&mut self.index, index::load(Inputs::new()));
-        self.index = old.patch(inputs, &plan.src, fresh);
+        self.index = old.patch(inputs, &plan.src, fresh, plan.same_meta);
         let mut compacted = false;
         let n = self.index.strings().len();
         if n >= MIN_COMPACT_STRINGS && n >= 2 * self.strings_base {
