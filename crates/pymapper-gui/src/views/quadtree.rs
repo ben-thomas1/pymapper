@@ -71,8 +71,8 @@ impl QuadTree {
         // A square root cell, slightly enlarged so the maximum lands strictly inside.
         let half = ((hi[0] - lo[0]).max(hi[1] - lo[1]) * 0.5).max(1e-3) * 1.001;
         self.push_cell((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, half, 0);
-        for i in 0..pos.len() {
-            if pos[i][0].is_finite() && pos[i][1].is_finite() {
+        for (i, p) in pos.iter().enumerate() {
+            if p[0].is_finite() && p[1].is_finite() {
                 self.insert(i as u32);
             }
         }

@@ -481,7 +481,7 @@ fn focus_graph_matches_bfs_without_a_budget() {
 #[test]
 fn focus_graph_budget_keeps_the_heaviest() {
     // Focus 0 calls 1..=5 with weights 1..=5 and 5 calls 6.
-    let rows = vec![(0, 1, 1), (0, 2, 2), (0, 3, 3), (0, 4, 4), (0, 5, 5), (5, 6, 7)];
+    let rows = [(0, 1, 1), (0, 2, 2), (0, 3, 3), (0, 4, 4), (0, 5, 5), (5, 6, 7)];
     let adj = Adjacency::build(7, || rows.iter().copied());
     let g = focus_graph(&adj, 0, FocusParams { hops: 2, direction: Direction::Out, max_nodes: 3 });
     assert_eq!(g.nodes, vec![0, 4, 5]);
@@ -598,3 +598,367 @@ fn level_graph_is_the_visible_cut() {
     let dropped_max = full.nodes.iter().filter(|&&v| m.reveal.open[v as usize] > deep && g.local(v).is_none()).map(|&v| loc[v as usize]).max().unwrap();
     assert!(kept_min >= dropped_max);
 }
+
+// ---------------------------------------------------------------------------------------
+// Scenes.
+
+#[test]
+fn node_link_scene_draws_nodes_labels_edges_and_arrows() {
+    use super::scene::{self as vs, NodeLinkStyle, WORLD};
+    use crate::codemap::metrics::ColorMetric;
+    use crate::map::hit::HitKind;
+    let p = TempProject::new(PROJ);
+    let m = p.map();
+    let deep = *m.reveal.change_bands().last().unwrap();
+    let g = level_graph(&m, deep, &world(&m), usize::MAX);
+    assert!(g.nodes.len() >= 4 && !g.edges.is_empty());
+    let pos = radial_layout(&ViewGraphRing::ring(&g));
+    let r = vs::radii(&m, &g);
+    assert!(r.iter().all(|&x| (vs::NODE_MIN..=vs::NODE_MAX).contains(&x)));
+    let style = NodeLinkStyle { color: ColorMetric::Kind, weight: Weight::All, focus: Some(0) };
+    let (scene, nl) = vs::node_link(&m, &g, &pos, &r, &style);
+    assert_eq!(scene.rects.len(), 2 * g.nodes.len(), "a node and a label carrier each");
+    assert_eq!(nl.pos.len(), g.nodes.len());
+    // Lines: one per drawn edge plus up to two arrow strokes; ids are edge indices.
+    assert!(scene.lines.len() >= g.edges.len() / 2);
+    assert!(scene.lines.id.iter().all(|&id| (id as usize) < g.edges.len()));
+    // Everything inside the world box, label carriers included.
+    let b = scene.bounds;
+    assert!(b.min[0] >= -WORLD - 1.0 && b.min[1] >= -WORLD - 1.0 && b.max[1] <= WORLD + 1.0 && b.max[0] <= WORLD + 1.0, "{b:?}");
+    // Rect ids are local node ids; nodes are circles (radius clamped by the shader).
+    assert!(scene.rects.id.iter().all(|&id| (id as usize) < g.nodes.len()));
+    assert!(scene.rects.inst.iter().any(|r| r.radius >= 1e5));
+    // The selection mark surrounds the node.
+    let mk = nl.mark(0).expect("mark");
+    let [x, y] = nl.pos[0];
+    assert!(mk.min[0] < x - nl.radius[0] && mk.max[1] > y + nl.radius[0]);
+    assert!(nl.mark(g.nodes.len() as u32).is_none());
+    // A hit at a node centre finds that node.
+    let mut ms = crate::map::MapState::new(std::sync::Arc::new(scene));
+    ms.update([800.0, 600.0], 1.0);
+    let k = (0..g.nodes.len()).max_by(|&a, &b| nl.radius[a].total_cmp(&nl.radius[b])).unwrap();
+    let s = ms.camera.world_to_screen(nl.pos[k]);
+    let hit = ms.hit_test(s, 1.0).expect("hit");
+    assert_eq!((hit.kind, hit.id), (HitKind::Rect, k as u32));
+}
+
+/// A focus-shaped copy of a graph (every node one hop from node 0) for the radial layout.
+struct ViewGraphRing;
+
+impl ViewGraphRing {
+    fn ring(g: &super::graph::ViewGraph) -> super::graph::ViewGraph {
+        let n = g.nodes.len();
+        super::graph::ViewGraph { hops: (0..n).map(|i| u8::from(i > 0)).collect(), parent: vec![0; n], ..g.clone() }
+    }
+}
+
+#[test]
+fn matrix_scene_ids_and_marks() {
+    use super::scene::{self as vs, ID_BACK, ID_BLOCK, ID_CELL, ID_COL, ID_ROW, MatrixGeom, matrix_id, matrix_item};
+    let p = TempProject::new(PROJ);
+    let m = p.map();
+    let d = dsm::build(&m, DsmParams::default());
+    let (scene, geom) = vs::matrix(&m, &d);
+    let n = d.nodes.len();
+    assert_eq!(geom, MatrixGeom::new(n as u32));
+    assert_eq!(scene.rects.len(), 1 + d.blocks.len() + d.cells.len() + 3 * n);
+    let mut kinds = [0usize; 5];
+    for &id in &scene.rects.id {
+        let (k, i) = matrix_item(id);
+        kinds[k as usize] += 1;
+        match k {
+            ID_CELL => assert!((i as usize) < d.cells.len()),
+            ID_ROW | ID_COL => assert!((i as usize) < n),
+            ID_BLOCK => assert!((i as usize) < d.blocks.len()),
+            ID_BACK => assert_eq!(i, 0),
+            _ => panic!("kind {k}"),
+        }
+    }
+    assert_eq!(kinds, [d.cells.len(), 2 * n, n, d.blocks.len(), 1]);
+    assert_eq!(matrix_item(matrix_id(ID_ROW, 12345)), (ID_ROW, 12345));
+    // Row labels start with the 1-based row number, then the qualified id.
+    let ix = ix(&m);
+    let labelled: Vec<String> = (0..scene.rects.len()).filter(|&i| matrix_item(scene.rects.id[i]).0 == ID_ROW && !scene.label(i).is_empty()).map(|i| String::from_utf8_lossy(scene.label(i)).into_owned()).collect();
+    assert_eq!(labelled.len(), n);
+    let r0 = labelled.iter().find(|l| l.starts_with("1 ")).expect("row 1");
+    assert_eq!(&r0[2..], ix.qid_string(d.nodes[0]));
+    // Marks: the row band and the column band of a row.
+    let [row, col] = geom.marks(2);
+    assert_eq!(row.min[1], 2.0 * geom.cell);
+    assert_eq!(col.min[0], 2.0 * geom.cell);
+    assert!(row.min[0] < 0.0 && col.min[1] < 0.0);
+    // Big matrices stay within the precision budget.
+    let big = MatrixGeom::new(100_000);
+    assert!(big.cell * 100_000.0 <= 14_001.0 && big.header > 0.0);
+    let mut digits = Vec::new();
+    vs::push_u32(&mut digits, 0);
+    vs::push_u32(&mut digits, 4_294_967_295);
+    assert_eq!(digits, b"04294967295");
+}
+
+// ---------------------------------------------------------------------------------------
+// Worker and controller.
+
+#[test]
+fn worker_builds_each_view_and_publishes_progressively() {
+    use super::worker::{Content, GraphParams, Request, ViewWorker};
+    use crate::codemap::metrics::ColorMetric;
+    let p = TempProject::new(PROJ);
+    let m = Arc::new(p.map());
+    let notified = Arc::new(AtomicU32::new(0));
+    let n2 = Arc::clone(&notified);
+    let w = ViewWorker::spawn(Arc::new(move || {
+        n2.fetch_add(1, Ordering::Relaxed);
+    }))
+    .expect("spawn");
+    let deep = *m.reveal.change_bands().last().unwrap();
+    let params = GraphParams { max_nodes: 100, ..GraphParams::default() };
+    let seq = w.request(Request::Graph { map: Arc::clone(&m), band: deep, view: world(&m), params });
+    let mut iters = Vec::new();
+    let done = loop {
+        let r = w.wait();
+        assert_eq!(r.seq, seq);
+        iters.push(r.iters);
+        if r.done {
+            break r;
+        }
+    };
+    assert_eq!(iters[0], 0, "the start layout is published first");
+    assert!(iters.windows(2).all(|x| x[0] <= x[1]));
+    match &done.content {
+        Content::NodeLink { graph, nl, focus, .. } => {
+            assert!(focus.is_none());
+            assert_eq!(nl.pos.len(), graph.nodes.len());
+            assert!(nl.pos.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
+        }
+        Content::Matrix { .. } => panic!("graph expected"),
+    }
+    assert!(notified.load(Ordering::Relaxed) >= 1);
+    // Matrix.
+    let seq = w.request(Request::Matrix { map: Arc::clone(&m), params: DsmParams::default() });
+    let r = w.wait_done(seq);
+    match &r.content {
+        Content::Matrix { dsm, rows, .. } => {
+            assert_eq!(rows.len(), dsm.nodes.len());
+            assert!(rows.windows(2).all(|x| x[0].0 < x[1].0));
+        }
+        Content::NodeLink { .. } => panic!("matrix expected"),
+    }
+    // Focus on a function: the call graph around it, the focus marked.
+    let fa = node(&m, "app.a:fa");
+    let seq = w.request(Request::Focus { map: Arc::clone(&m), node: fa, params: FocusParams::default(), color: ColorMetric::Kind });
+    let r = w.wait_done(seq);
+    match &r.content {
+        Content::NodeLink { graph, focus, calls, .. } => {
+            assert!(*calls);
+            assert_eq!(focus.map(|f| graph.nodes[f as usize]), Some(fa));
+            assert!(graph.nodes.len() > 1);
+        }
+        Content::Matrix { .. } => panic!("focus expected"),
+    }
+    // Requests coalesce: of three quick ones, the last is answered last.
+    let _ = w.request(Request::Matrix { map: Arc::clone(&m), params: DsmParams::default() });
+    let _ = w.request(Request::Focus { map: Arc::clone(&m), node: fa, params: FocusParams::default(), color: ColorMetric::Kind });
+    let last = w.request(Request::Matrix { map: Arc::clone(&m), params: DsmParams { external: true, ..DsmParams::default() } });
+    assert_eq!(w.wait_done(last).seq, last);
+    // An out-of-range focus publishes an empty view instead of panicking.
+    let seq = w.request(Request::Focus { map: Arc::clone(&m), node: u32::MAX - 1, params: FocusParams::default(), color: ColorMetric::Kind });
+    assert!(w.wait_done(seq).scene.rects.is_empty());
+}
+
+#[test]
+fn interrupted_force_layout_resumes() {
+    use super::force::ForceParams;
+    use super::worker::{GraphParams, Request, ViewWorker};
+    let p = TempProject::new(PROJ);
+    let m = Arc::new(p.map());
+    let w = ViewWorker::spawn(Arc::new(|| {})).expect("spawn");
+    let deep = *m.reveal.change_bands().last().unwrap();
+    // Never converges by tolerance: runs its full iteration budget.
+    let force = ForceParams { max_iters: 50_000, tolerance: 0.0, min_temp: 0.0, cooling: 0.99999, ..ForceParams::default() };
+    let params = GraphParams { force, ..GraphParams::default() };
+    let graph = || Request::Graph { map: Arc::clone(&m), band: deep, view: world(&m), params };
+    let a = w.request(graph());
+    // Wait for a snapshot past the start, then interrupt with a matrix.
+    let mut at = 0;
+    while at == 0 {
+        let r = w.wait();
+        assert_eq!(r.seq, a);
+        at = r.iters;
+    }
+    let mx = w.request(Request::Matrix { map: Arc::clone(&m), params: DsmParams::default() });
+    let r = w.wait_done(mx);
+    assert_eq!(r.seq, mx);
+    // Same graph again: the first snapshot continues from where it stopped.
+    let b = w.request(graph());
+    let r = loop {
+        let r = w.wait();
+        if r.seq == b {
+            break r;
+        }
+    };
+    assert!(r.iters >= at, "resumed at {} after stopping past {at}", r.iters);
+    assert!(!r.done);
+    // Different params start over.
+    let c = w.request(Request::Graph { map: Arc::clone(&m), band: deep, view: world(&m), params: GraphParams { max_nodes: 7, ..params } });
+    let r = loop {
+        let r = w.wait();
+        if r.seq == c {
+            break r;
+        }
+    };
+    assert_eq!(r.iters, 0);
+}
+
+/// Runs controller frames until the worker is idle and its last result is shown.
+fn settle(views: &mut super::Views, ui: &mut super::ui::ViewsUi, ms: &mut crate::map::MapState, m: &Arc<CodeMap>) {
+    use crate::codemap::metrics::ColorMetric;
+    for _ in 0..5000 {
+        views.frame(ui, ms, Some(m), ColorMetric::Kind);
+        if !views.busy() {
+            views.frame(ui, ms, Some(m), ColorMetric::Kind);
+            ms.update([800.0, 600.0], 1.0);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("views worker did not settle");
+}
+
+#[test]
+fn views_switch_and_share_the_selection() {
+    use super::ui::ViewsUi;
+    use super::{ViewKind, Views};
+    use crate::codemap::metrics::ColorMetric;
+    use crate::codemap::scene::SceneParams;
+    use crate::map::MapState;
+    use crate::map::hit::{Hit, HitKind};
+    let p = TempProject::new(PROJ);
+    let m = Arc::new(p.map());
+    let color = ColorMetric::Kind;
+    let (cm_scene, _, _) = m.scene(&SceneParams::default());
+    let cm_scene = Arc::new(cm_scene);
+    let mut ms = MapState::default();
+    let mut views = Views::new(Arc::new(|| {}));
+    let mut ui = ViewsUi::default();
+    views.show_codemap_scene(&mut ms, Arc::clone(&cm_scene));
+    ms.update([800.0, 600.0], 1.0);
+    let codemap_cam = ms.camera;
+    assert!(views.frame(&mut ui, &mut ms, Some(&m), color), "first frame fills the texts");
+    assert!(ui.enabled && ui.active == ViewKind::CodeMap);
+    assert!(!views.frame(&mut ui, &mut ms, Some(&m), color), "idle frames change nothing");
+
+    // Click a cell on the code map: selected and outlined.
+    let fa = node(&m, "app.a:fa");
+    let rect = |id| Some(Hit { kind: HitKind::Rect, index: 0, id });
+    views.on_click(rect(fa), &mut ms, Some(&m), color);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert_eq!(views.selection, Some(fa));
+    assert_eq!(ui.selection, "app.a:fa");
+    assert_eq!(ms.marks.len(), 1);
+    let r = m.layout.rect(fa).unwrap();
+    assert_eq!(ms.marks[0].min, [r.x0, r.y0]);
+
+    // The matrix: its own scene, the selection's module row and column outlined.
+    ui.tab = Some(ViewKind::Matrix);
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert_eq!(ui.active, ViewKind::Matrix);
+    assert!(!Arc::ptr_eq(&ms.scene, &cm_scene) && !ms.scene.rects.is_empty());
+    assert_eq!(ms.marks.len(), 2, "row and column of app.a");
+    assert!(ui.info.contains("1 cycles"), "{}", ui.info);
+    // Hover details of a matrix cell.
+    let cell = (0..ms.scene.rects.len()).find(|&i| super::scene::matrix_item(ms.scene.rects.id[i]).0 == super::scene::ID_CELL).expect("a cell");
+    let mut text = String::new();
+    assert!(views.describe(Hit { kind: HitKind::Rect, index: cell as u32, id: ms.scene.rects.id[cell] }, &mut text));
+    assert!(text.contains("depends on"), "{text}");
+    // Click a row header: the selection becomes that module.
+    let base = node(&m, "app.base");
+    let row = (0..ms.scene.rects.len())
+        .find(|&i| {
+            let (k, idx) = super::scene::matrix_item(ms.scene.rects.id[i]);
+            k == super::scene::ID_ROW && ix(&m).qid_string(base) == ix(&m).qid_string(views_dsm_node(&views, idx))
+        })
+        .expect("row of app.base");
+    views.on_click(rect(ms.scene.rects.id[row]), &mut ms, Some(&m), color);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert_eq!(views.selection, Some(base));
+
+    // Focus: around the selection, on the module graph.
+    ui.focus_selection = true;
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert_eq!(ui.active, ViewKind::Focus);
+    assert!(ui.info.contains("around base (module graph)"), "{}", ui.info);
+    assert_eq!(ms.marks.len(), 1, "the focus node outlined");
+    // Clicking another node refocuses on it.
+    let other = (0..ms.scene.rects.len()).map(|i| ms.scene.rects.id[i]).find(|&id| views_focus_node(&views, id) != Some(base)).expect("another node");
+    let target = views_focus_node(&views, other).unwrap();
+    views.on_click(rect(other), &mut ms, Some(&m), color);
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert_eq!(views.selection, Some(target));
+    assert_eq!(views_focus_center(&views), Some(target));
+
+    // The graph view of the code map's level.
+    ui.tab = Some(ViewKind::Graph);
+    settle(&mut views, &mut ui, &mut ms, &m);
+    assert!(ui.info.contains("converged"), "{}", ui.info);
+    assert!(!ms.scene.lines.is_empty() || !ms.scene.rects.is_empty());
+
+    // Back to the code map: same scene, and the camera frames the new selection.
+    ui.tab = Some(ViewKind::CodeMap);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert!(Arc::ptr_eq(&ms.scene, &cm_scene));
+    let tr = m.layout.rect(target).unwrap();
+    let tw = WorldRect::new(tr.x0, tr.y0, tr.x1, tr.y1);
+    assert!(ms.camera.visible().contains_rect(&tw) || ms.camera.zoom == ms.camera.max_zoom);
+    assert!(tw.width().min(tw.height()) * ms.camera.zoom >= super::REFRAME_MIN_PX || ms.camera.zoom == ms.camera.max_zoom);
+    if tw.width().min(tw.height()) * codemap_cam.zoom >= super::REFRAME_MIN_PX {
+        assert_eq!(ms.camera.zoom, codemap_cam.zoom, "a visible, big enough cell does not move the camera");
+    }
+    // A tiny selection made elsewhere is zoomed to.
+    ms.camera.fit(&ms.scene.bounds, 0.95);
+    ms.camera.zoom = 0.005; // below the limit: the project fills the world, cells are big
+    let small = node(&m, "app.base:Store.get");
+    let sr = m.layout.rect(small).unwrap();
+    let sw = WorldRect::new(sr.x0, sr.y0, sr.x1, sr.y1);
+    assert!(sw.width().min(sw.height()) * ms.camera.zoom < super::REFRAME_MIN_PX, "fixture: small when zoomed out");
+    ui.tab = Some(ViewKind::Matrix);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    views.selection = Some(small);
+    views.reframe = true;
+    ui.tab = Some(ViewKind::CodeMap);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert!(ms.camera.visible().contains(sw.center()));
+    assert!(sw.width().min(sw.height()) * ms.camera.zoom >= super::REFRAME_MIN_PX || ms.camera.zoom == ms.camera.max_zoom);
+    assert_eq!(ms.marks.len(), 1);
+    // Empty space clears the selection.
+    views.on_click(None, &mut ms, Some(&m), color);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert!(views.selection.is_none() && ms.marks.is_empty() && ui.selection.is_empty());
+    // Focus without a selection explains itself.
+    ui.tab = Some(ViewKind::Focus);
+    views.frame(&mut ui, &mut ms, Some(&m), color);
+    assert!(ui.status.starts_with("Select a symbol"), "{}", ui.status);
+    assert!(ms.scene.rects.is_empty());
+}
+
+fn views_dsm_node(v: &super::Views, row: u32) -> NodeId {
+    match v.slots[1].content.as_ref() {
+        Some(super::worker::Content::Matrix { dsm, .. }) => dsm.nodes[row as usize],
+        _ => panic!("no matrix"),
+    }
+}
+
+fn views_focus_node(v: &super::Views, id: u32) -> Option<NodeId> {
+    match v.slots[2].content.as_ref() {
+        Some(super::worker::Content::NodeLink { graph, .. }) => graph.nodes.get(id as usize).copied(),
+        _ => None,
+    }
+}
+
+fn views_focus_center(v: &super::Views) -> Option<NodeId> {
+    match v.slots[2].content.as_ref() {
+        Some(super::worker::Content::NodeLink { graph, focus, .. }) => focus.map(|f| graph.nodes[f as usize]),
+        _ => None,
+    }
+}
+

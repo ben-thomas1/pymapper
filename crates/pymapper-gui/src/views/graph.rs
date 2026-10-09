@@ -23,8 +23,6 @@ pub enum Weight {
     /// Distinct call sites.
     #[default]
     Sites,
-    /// Distinct (caller, callee) pairs.
-    Pairs,
     /// Module import rows.
     Imports,
     /// Call sites plus import rows (every dependency).
@@ -32,12 +30,11 @@ pub enum Weight {
 }
 
 impl Weight {
-    pub const ALL: [Weight; 4] = [Weight::All, Weight::Imports, Weight::Sites, Weight::Pairs];
+    pub const ALL: [Weight; 3] = [Weight::All, Weight::Imports, Weight::Sites];
 
     pub fn label(self) -> &'static str {
         match self {
             Weight::Sites => "call sites",
-            Weight::Pairs => "distinct pairs",
             Weight::Imports => "imports",
             Weight::All => "imports + call sites",
         }
@@ -58,11 +55,11 @@ impl ViewEdge {
         ViewEdge { src, dst, sites: e.sites, imports: e.imports }
     }
 
-    /// The weight under `w` ([`Weight::Pairs`] is not kept per view edge: sites stand in).
+    /// The weight under `w`.
     #[inline]
     pub fn weight(&self, w: Weight) -> u32 {
         match w {
-            Weight::Sites | Weight::Pairs => self.sites,
+            Weight::Sites => self.sites,
             Weight::Imports => self.imports,
             Weight::All => self.sites.saturating_add(self.imports),
         }

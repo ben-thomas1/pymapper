@@ -54,7 +54,7 @@ impl DsmCell {
     #[inline]
     pub fn weight(&self, w: Weight) -> u32 {
         match w {
-            Weight::Sites | Weight::Pairs => self.sites,
+            Weight::Sites => self.sites,
             Weight::Imports => self.imports,
             Weight::All => self.sites.saturating_add(self.imports),
         }
@@ -134,7 +134,7 @@ pub fn build(cm: &CodeMap, p: DsmParams) -> Dsm {
     let mut edges: Vec<(u32, u32, u32, u32)> = Vec::new();
     for e in &rows {
         let w = match p.weight {
-            Weight::Sites | Weight::Pairs => e.sites,
+            Weight::Sites => e.sites,
             Weight::Imports => e.imports,
             Weight::All => e.sites.saturating_add(e.imports),
         };
