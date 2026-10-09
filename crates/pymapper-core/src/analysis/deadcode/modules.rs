@@ -49,6 +49,18 @@ impl ModuleLevels {
         self.local(v).is_some_and(|i| self.imported[i])
     }
 
+    /// Divides the level of module `v` by `div` when it is below [`level::LIVE`] and above 0;
+    /// returns whether it changed.
+    pub fn lower(&mut self, v: NodeId, div: u8) -> bool {
+        match self.local(v) {
+            Some(i) if self.level[i] < level::LIVE && self.level[i] > 0 => {
+                self.level[i] /= div;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.nodes.capacity() * 4 + self.level.capacity() + self.why.capacity() + self.origin.capacity() + self.imported.capacity()
     }

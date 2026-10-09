@@ -163,6 +163,8 @@ pub mod reason {
     pub const EXTERNAL_OVERRIDE: u32 = 1 << 23;
     /// Its name occurs only in test code (test files, importable or not): test-only API.
     pub const USED_ONLY_IN_TESTS: u32 = 1 << 24;
+    /// The coverage report (`analysis.coverage`) shows that its code never ran.
+    pub const NEVER_EXECUTED: u32 = 1 << 25;
 
     /// Names of the bits, lowest first (as rendered in output).
     pub const NAMES: &[&str] = &[
@@ -191,6 +193,7 @@ pub mod reason {
         "conditional-import",
         "external-override",
         "used-only-in-tests",
+        "never-executed",
     ];
 }
 
