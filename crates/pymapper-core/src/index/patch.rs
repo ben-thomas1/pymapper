@@ -100,6 +100,24 @@ impl NodeShift {
         if k == 0 { v } else { (i64::from(v) + self.shift[k - 1]) as NodeId }
     }
 
+    /// Writes [`NodeShift::translate`] of every old node into `map` (one sweep, no search).
+    pub(crate) fn fill(&self, map: &mut [NodeId]) {
+        let mut v = 0usize;
+        let mut d = 0i64;
+        for k in 0..self.starts.len() {
+            let (s, e) = (self.starts[k] as usize, self.ends[k] as usize);
+            for (i, m) in map[v..s].iter_mut().enumerate() {
+                *m = (i64::from((v + i) as u32) + d) as NodeId;
+            }
+            map[s..e].fill(NONE);
+            v = e;
+            d = self.shift[k];
+        }
+        for (i, m) in map[v..].iter_mut().enumerate() {
+            *m = (i64::from((v + i) as u32) + d) as NodeId;
+        }
+    }
+
     /// New id of old node `v`; `NONE` for `NONE` and for the defs of re-extracted files (which
     /// have no translation by offset). O(log blocks), no memory access beyond the blocks.
     #[inline]

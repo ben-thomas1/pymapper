@@ -15,7 +15,7 @@
 
 use std::hash::Hasher;
 
-use crate::index::{FileId, Index, NONE, NodeId, Src};
+use crate::index::{FileId, Index, NONE, NodeId, NodeShift, Src};
 use crate::intern::{FxHashMap, FxHasher, Sym};
 
 /// What an update changed, for callers that keep state keyed by node (the GUI).
@@ -175,9 +175,10 @@ fn signature(ix: &Index, v: NodeId) -> (u64, u64) {
 }
 
 impl OldSnap {
-    /// Snapshot of `ix` for an update with `src` (sources of the new files). `structure`: also
-    /// keep duplicate ordinals and parents.
-    pub fn take(ix: &Index, src: &[Src], structure: bool) -> OldSnap {
+    /// Snapshot of `ix` for an update with `src` (sources of the new files). `same_meta`: only
+    /// contents change (nodes outside the re-extracted files move by offset, so nodes without
+    /// a file need no qualified ids); otherwise duplicate ordinals and parents are kept too.
+    pub fn take(ix: &Index, src: &[Src], same_meta: bool) -> OldSnap {
         let n = ix.file_count();
         let mut kept = vec![false; n as usize];
         for s in src {
@@ -223,7 +224,7 @@ impl OldSnap {
             }
         }
         // Nodes without a file: distributions, namespace packages.
-        let mut v = 0;
+        let mut v = if same_meta { ix.node_count() } else { 0 };
         while v < ix.node_count() {
             match ix.file(v) {
                 None => {
@@ -236,7 +237,7 @@ impl OldSnap {
                 Some(_) => v += 1,
             }
         }
-        if structure {
+        if !same_meta {
             let nn = ix.node_count();
             let dup = (0..nn).map(|v| ix.dup(v)).collect();
             let parent = (0..nn).map(|v| ix.parent(v).unwrap_or(NONE)).collect();
@@ -265,9 +266,13 @@ impl OldSnap {
     }
 
     /// Matches old nodes to the nodes of `ix` (the patched index) and fills the node parts of
-    /// a diff. `old_of`: old file of each new file.
-    pub fn diff_nodes(&self, ix: &Index, src: &[Src], old_of: &[u32]) -> IndexDiff {
+    /// a diff. `old_of`: old file of each new file. `shift`: the node translation of a
+    /// content-only patch (every node outside the re-extracted def blocks moves by offset).
+    pub fn diff_nodes(&self, ix: &Index, src: &[Src], old_of: &[u32], shift: Option<&NodeShift>) -> IndexDiff {
         let mut map = vec![NONE; self.nodes as usize];
+        if let Some(sh) = shift {
+            sh.fill(&mut map);
+        }
         let mut changed = Vec::new();
         let mut moved = Vec::new();
         let mut reextracted = Vec::new();
@@ -278,6 +283,7 @@ impl OldSnap {
             let i = i as FileId;
             let nf = ix.file_node(i);
             match *s {
+                Src::Old(_) if shift.is_some() => {}
                 Src::Old(f) => {
                     let of = self.file_node[f as usize];
                     for d in 0..ix.file_facts(i).defs.len {

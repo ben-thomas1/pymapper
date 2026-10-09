@@ -196,7 +196,7 @@ impl Program {
             let node_map = (0..self.index.node_count()).collect();
             return (IndexDiff { node_map, ..IndexDiff::default() }, st);
         }
-        let snap = timing::time("incremental.snapshot", || diff::OldSnap::take(&self.index, &plan.src, !plan.same_meta));
+        let snap = timing::time("incremental.snapshot", || diff::OldSnap::take(&self.index, &plan.src, plan.same_meta));
         st.reextracted = plan.fresh.len() as u32;
         st.added = plan.old_of.iter().filter(|&&f| f == u32::MAX).count() as u32;
         st.removed = plan.new_of.iter().filter(|&&f| f == u32::MAX).count() as u32;
@@ -212,7 +212,7 @@ impl Program {
         let (index, shift) = timing::time("incremental.patch", || old.patch(inputs, &plan.src, fresh, plan.same_meta));
         self.index = index;
         // Node matching compares names by `Sym`: before any compaction renumbers them.
-        let mut d = timing::time("incremental.nodes", || snap.diff_nodes(&self.index, &plan.src, &plan.old_of));
+        let mut d = timing::time("incremental.nodes", || snap.diff_nodes(&self.index, &plan.src, &plan.old_of, shift.as_ref()));
         let mut compacted = false;
         let n = self.index.strings().len();
         if n >= MIN_COMPACT_STRINGS && n >= 2 * self.strings_base {
