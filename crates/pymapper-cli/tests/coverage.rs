@@ -142,3 +142,83 @@ fn bad_reports_are_errors_or_warnings() {
         .expect("run pymapper");
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// One file entry of a coverage.py 7.5+ report: `executed` / `missing` lines plus the
+/// `functions` and `classes` sections, which name every def (`(name, executed, missing)`).
+fn file_entry(executed: &[u32], missing: &[u32], functions: &[(&str, &[u32], &[u32])]) -> String {
+    let lines = |l: &[u32]| l.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    let fields = |e: &[u32], m: &[u32]| {
+        format!(
+            "\"executed_lines\": [{}], \"summary\": {{\"covered_lines\": {}, \"num_statements\": {}, \
+             \"percent_covered\": 0.0, \"percent_covered_display\": \"0\", \"missing_lines\": {}, \
+             \"excluded_lines\": 0}}, \"missing_lines\": [{}], \"excluded_lines\": []",
+            lines(e),
+            e.len(),
+            e.len() + m.len(),
+            m.len(),
+            lines(m)
+        )
+    };
+    let mut fns = String::new();
+    for (name, e, m) in functions {
+        fns.push_str(&format!("\"{name}\": {{{}}}, ", fields(e, m)));
+    }
+    fns.push_str(&format!("\"\": {{{}}}", fields(&[], &[])));
+    let whole = fields(executed, missing);
+    format!("{{{whole}, \"functions\": {{{fns}}}, \"classes\": {{\"\": {{{whole}}}}}}}")
+}
+
+/// A coverage.py 7.15 report of the test project, as written by `coverage json`.
+fn realistic_report() -> String {
+    let util = file_entry(&[1, 2, 5, 9], &[6, 10], &[("helper", &[2], &[]), ("plugin", &[], &[6]), ("maybe", &[], &[10])]);
+    let main = file_entry(&[1, 2, 5, 6, 9, 10], &[], &[("run", &[6], &[])]);
+    let registry = file_entry(&[1], &[], &[]);
+    let init = file_entry(&[], &[], &[]);
+    format!(
+        "{{\"meta\": {{\"format\": 3, \"version\": \"7.15.2\", \"timestamp\": \"2026-10-09T10:00:00.000000\", \
+         \"branch_coverage\": false, \"show_contexts\": false}}, \"files\": {{\"app/__init__.py\": {init}, \
+         \"app/main.py\": {main}, \"app/registry.py\": {registry}, \"app/util.py\": {util}}}, \
+         \"totals\": {{\"covered_lines\": 11, \"num_statements\": 13, \"percent_covered\": 84.6, \
+         \"percent_covered_display\": \"85\", \"missing_lines\": 2, \"excluded_lines\": 0}}}}\n"
+    )
+}
+
+#[test]
+fn a_realistic_report_in_the_project_is_not_config_evidence() {
+    let p = Project::new("realistic");
+    p.file("coverage.json", &realistic_report());
+    // Without `--coverage` the report is recognised as tool output: `plugin` is still never
+    // used (no `config-reference`).
+    let (code, out, err) = p.check(&["--min-confidence", "0"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains(PLUGIN), "{out}");
+    assert!(!out.contains("config-reference"), "{out}");
+
+    // With it, the never-executed weak-evidence def is reported at 84.
+    let (code, out, err) = p.check(&["--coverage", "coverage.json"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains(MAYBE), "{out}");
+    assert!(out.contains(PLUGIN), "{out}");
+    assert!(!out.contains("config-reference"), "{out}");
+}
+
+#[test]
+fn the_configured_report_is_never_config_evidence() {
+    let p = Project::new("by-path");
+    // `files` before `meta`: the head does not look like coverage.py output, so the report is
+    // left out only because it is the configured one.
+    let report = realistic_report();
+    let at = report.find(", \"files\"").expect("files");
+    let reordered = format!("{{{}, {}}}\n", &report[at + 2..report.trim_end().len() - 1], &report[1..at]);
+    p.file("cov-report.json", &reordered);
+    let (_, out, _) = p.check(&["--min-confidence", "0"]);
+    assert!(out.contains("config-reference"), "the report is config evidence without --coverage:\n{out}");
+
+    let (code, out, err) = p.check(&["--coverage", "cov-report.json", "--min-confidence", "0"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("maybe") && out.contains("name-elsewhere, never-executed"), "{out}");
+    assert!(!out.contains("config-reference"), "{out}");
+    // Through another path to the same file.
+    let (_, out, _) = p.check(&["--coverage", "app/../cov-report.json", "--min-confidence", "0"]);
+    assert!(out.contains("name-elsewhere, never-executed") && !out.contains("config-reference"), "{out}");
+}

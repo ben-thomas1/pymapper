@@ -114,7 +114,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root (see below) |
 | `--threads N` / `-j N` | `threads` | 0 = one per logical CPU |
 | `--mode` | `mode` | dead code: `auto` (per `pyproject.toml` unit), `application`, `library` (every unit) |
-| `--coverage FILE` / `--no-coverage` | `analysis.coverage` | coverage.py JSON report (`coverage json`) as dead-code evidence (see below) |
+| `--coverage FILE` / `--no-coverage` | `analysis.coverage` | coverage.py JSON report (`coverage json`) as dead-code evidence (see below); accepted by every command, read only by `check` |
 | `--preset` | `presets` | flask, fastapi, django, click, pytest, pydantic |
 | `--exclude GLOB` | `extend-exclude` | gitignore syntax, relative to the project root |
 | `--set 'KEY = VALUE'` | any | TOML fragment, e.g. `--set 'analysis.dupes = true'` |
@@ -144,7 +144,9 @@ or by their longest unique path suffix (a report made in another checkout, such 
 report that cannot be read or is not a coverage.py JSON report is an error (exit 2), checked
 before the project is loaded when it is missing; one that matches no analysed file, or has line
 numbers past the end of a file (stale), prints a warning. The report is read only when a PM4xx
-rule runs. `--stats` adds `coverage_files`, `coverage_matched`, `coverage_executed`,
+rule runs. The report is never config-file evidence (`analysis.config-evidence`), even inside
+the project tree, where `coverage json` writes it by default: it names every function, run or
+not. `--stats` adds `coverage_files`, `coverage_matched`, `coverage_executed`,
 `coverage_not_executed`, `deadcode.executed` (seeds) and `deadcode.lowered`.
 
 The default cache directory is `.pymapper_cache` in the project root (see "Project root").

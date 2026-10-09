@@ -740,8 +740,7 @@ pub(crate) fn run(
         let mut mp = ModuleProp::new(ix, imp, calls, &roots, &info.included);
         if let Some(c) = cov {
             for v in c.executed_nodes() {
-                if !ix.kind(v).is_def() {
-                    mp.raise(v, level::LIVE, Why::Executed);
+                if !ix.kind(v).is_def() && mp.raise(v, level::LIVE, Why::Executed) {
                     seeded += 1;
                 }
             }

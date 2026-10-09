@@ -323,7 +323,7 @@
 # Dead code: read the non-Python config files of the first-party walk (matching
 # `config-evidence-globs`; .gitignore and excludes apply; files over 1 MiB and lockfiles such as
 # uv.lock / poetry.lock / package-lock.json are skipped, as are pymapper and coverage.py JSON
-# reports) and treat what they name as evidence:
+# reports and the `coverage` report below, whatever its contents) and treat what they name as evidence:
 # a definition or module whose full dotted path (`pkg.mod.func`, `pkg.mod:Class`) appears is
 # kept (reason `config-reference`); one whose bare name appears gets confidence 50 (10 when
 # the same file also names its module, e.g. `module_name: pkg.tools` + `source_name: func`).

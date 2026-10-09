@@ -146,9 +146,14 @@ impl<'a> ModuleProp<'a> {
     }
 
     /// Raises module node `v` to `l` (call [`ModuleProp::finish`] or `lv.run` afterwards).
-    pub fn raise(&mut self, v: NodeId, l: u8, why: Why) {
-        if let Some(i) = self.g.imports.local(v) {
-            self.lv.raise(i, l, why);
+    /// False (and nothing done) when `v` is not in the module graph.
+    pub fn raise(&mut self, v: NodeId, l: u8, why: Why) -> bool {
+        match self.g.imports.local(v) {
+            Some(i) => {
+                self.lv.raise(i, l, why);
+                true
+            }
+            None => false,
         }
     }
 

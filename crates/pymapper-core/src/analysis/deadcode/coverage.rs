@@ -23,7 +23,10 @@
 //! - a function is **not executed** when no body line was executed and either a body line is
 //!   missing or a header line is (the `def` statement itself never ran: module never imported,
 //!   branch not taken). One-line functions (`def f(): ...`) and bodies that are entirely
-//!   excluded are unknown unless their header is missing;
+//!   excluded are unknown unless their header is missing. So are bodies made only of a
+//!   docstring: coverage.py does not count a docstring as a statement, so an uncalled
+//!   `def unused(self): """Doc."""` whose class ran (header executed, no body statement) gives
+//!   no evidence either way;
 //! - a class is never marked executed by its own lines (a class body runs at import); a live
 //!   method makes it live through the usual propagation. It is **not executed** when its header
 //!   is missing, or when it has direct methods / nested classes, none is executed or unknown and
@@ -212,6 +215,11 @@ impl Builder<'_> {
         r.begin_object()?;
         while r.next_key(&mut first, &mut key)? {
             self.cov.stats.report_files += 1;
+            if r.peek() != Some(b'{') {
+                // Not a file entry: neither matched nor unmatched.
+                r.skip_value()?;
+                continue;
+            }
             let file = self.paths.resolve(&key, bases, &mut buf);
             match file {
                 Some((_, by_suffix)) => {
@@ -220,10 +228,6 @@ impl Builder<'_> {
                 }
                 None if self.cov.first_unmatched.is_none() => self.cov.first_unmatched = Some(key.clone()),
                 None => {}
-            }
-            if r.peek() != Some(b'{') {
-                r.skip_value()?;
-                continue;
             }
             exec.clear();
             miss.clear();
