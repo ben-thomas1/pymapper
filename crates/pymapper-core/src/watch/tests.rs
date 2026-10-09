@@ -238,6 +238,9 @@ fn classify_sorts_paths_into_changed_rewalk_reload() {
     assert!(c.reload);
     assert_eq!(c.changed, [a.as_path()]);
     assert!(classify(&batch_of(&[(&bytes(&root.join("sub/pymapper.toml")), 0)]), ix, root).reload);
+    let bt = batch_of(&[(&bytes(&root.join(".venv/lib/pkg/pyproject.toml")), 0), (&bytes(&root.join(".venv/.gitignore")), 0)]);
+    let installed = classify(&bt, ix, root);
+    assert!(installed.is_empty() && installed.ignored == 2, "{installed:?}");
 
     // Lost events.
     let bt = rescan_batch();

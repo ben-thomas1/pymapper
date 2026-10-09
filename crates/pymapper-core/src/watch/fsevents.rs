@@ -92,8 +92,12 @@ unsafe extern "C" {
 // libdispatch is part of libSystem: no framework to link.
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> DispatchQueue;
+    fn dispatch_sync_f(queue: DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
     fn dispatch_release(obj: *mut c_void);
 }
+
+/// Runs on the dispatch queue after every callback queued before it (see `Drop`).
+extern "C" fn drained(_: *mut c_void) {}
 
 /// A root prefix: `(canonical, as given)`.
 type Prefix = (Box<[u8]>, Box<[u8]>);
@@ -148,11 +152,14 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        // SAFETY: the stream is valid and started; after Stop + Invalidate no callback runs or
-        // is queued, so releasing the stream, the dispatch queue and the context is sound.
+        // SAFETY: the stream is valid and started. After Stop + Invalidate no new callback is
+        // queued; the empty block run synchronously on the serial queue waits for one that may
+        // still be running. Then nothing can read the context, so releasing the stream, the
+        // queue and the context is sound.
         unsafe {
             FSEventStreamStop(self.stream);
             FSEventStreamInvalidate(self.stream);
+            dispatch_sync_f(self.dispatch, std::ptr::null_mut(), drained);
             FSEventStreamRelease(self.stream);
             dispatch_release(self.dispatch);
             drop(Box::from_raw(self.ctx));

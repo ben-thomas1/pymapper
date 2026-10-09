@@ -5,8 +5,9 @@
 //! ```text
 //!   path (relative to the watched root)           ->  outcome
 //!   any component `.git`                              ignored
-//!   pyproject.toml, pymapper.toml                     reload   (config, project units, roots)
-//!   .gitignore, .ignore, .git/info/exclude            rewalk   (the walk's file set)
+//!   pyproject.toml, pymapper.toml (outside hidden     reload   (config, project units, roots)
+//!   directories and __pycache__)
+//!   .gitignore, .ignore (same), .git/info/exclude     rewalk   (the walk's file set)
 //!   loaded first-party .py/.pyi that exists           changed  (re-extract)
 //!   loaded first-party .py/.pyi that is gone          rewalk
 //!   other .py/.pyi that exists, outside hidden dirs   rewalk   (a new file, unless excluded)
@@ -90,12 +91,15 @@ pub fn classify<'b>(batch: &'b Batch, ix: &Index, root: &Path) -> Changes<'b> {
             }
             continue;
         }
-        if CONFIG_NAMES.contains(&name) {
-            out.reload = true;
-            continue;
-        }
-        if IGNORE_NAMES.contains(&name) {
-            out.rewalk = true;
+        if CONFIG_NAMES.contains(&name) || IGNORE_NAMES.contains(&name) {
+            // Not inside directories the walk skips (a `pyproject.toml` installed in `.venv`).
+            if hidden(&rel[..rel.len() - name.len()]) {
+                out.ignored += 1;
+            } else if CONFIG_NAMES.contains(&name) {
+                out.reload = true;
+            } else {
+                out.rewalk = true;
+            }
             continue;
         }
         let path = batch.path(i);

@@ -67,13 +67,13 @@ impl Backend {
             close(fd);
             return Err(WatchError::Io(e));
         }
+        // From here on the reader owns `fd` and the read end (closed by its `Drop`).
         let mut r = Reader { fd, stop_r: pipe[0], wds: FxHashMap::default(), roots: Vec::new(), queue, cpath: Vec::new() };
         for root in roots {
             match r.add(root.as_os_str().as_bytes()) {
                 Ok(wd) => r.roots.push(wd),
                 Err(e) => {
-                    close(fd);
-                    close(pipe[0]);
+                    drop(r);
                     close(pipe[1]);
                     return Err(WatchError::Root(root.clone(), e));
                 }
