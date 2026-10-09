@@ -695,6 +695,31 @@ Observations:
   either way; the cache (keyed by hierarchy hash and config) only pays off if the layout gets
   costlier. It is written on the layout thread when idle, so it never delays a frame.
 
+### Code map (S7.4)
+
+`cargo run --release -p pymapper-gui --example codemap_bench -- PATH [--deps] [--isolated]
+[--cache-dir DIR]`: loads the project in-process, builds the code map (layout, semantic-zoom
+reveal bands, edge table) and its scenes, then renders offscreen at 2880x1800 px (2x) and
+waits for the GPU after every frame. Release build, Apple M4 Pro (Metal), warm index cache.
+Details and scenario tables: [docs/gui.md](gui.md#results-s74).
+
+| input                                    | nodes     | load    | code map build | edges (bands) | scene build | fit frame p50 | zoom sweep p95 / max | code map + scene heap | peak RSS |
+|------------------------------------------|-----------|---------|----------------|---------------|-------------|---------------|----------------------|-----------------------|----------|
+| aiml-lectio + venv (`--deps`, 62k files) | 1 023 762 | 679 ms  | 88 ms          | 91 266 (16)   | 92-107 ms   | 1.51 ms       | 5.5 / 10.8 ms        | 38 + 100 MiB          | 1.1 GiB  |
+| aiml-lectio first party                  | 24 866    | 191 ms  | 7.7 ms         | 70 325 (11)   | 4-14 ms     | 1.43 ms       | 3.2 / 5.7 ms         | 3.3 + 16.6 MiB        | 180 MiB  |
+| stdlib 3.13 as a project                 | 18 755    | 73 ms   | 8.0 ms         | 48 078 (10)   | 1.4-6.2 ms  | 1.20 ms       | 4.0 / 7.3 ms         | 2.3 + 6.9 MiB         | 81 MiB   |
+
+Observations:
+
+- Edges for all 16 bands of the venv take 44 ms (4 workers, one rollup pass and one call-pair
+  pass per band). Stopping edges into external code at depth 1 keeps the venv's table at
+  91k edges; the first-party map alone has 70k.
+- A scene build (100 ms on the venv: 1.38M rect instances, cells plus label carriers, and
+  380k curve segments, sorted into grid order) runs on the map thread, never in a frame. It
+  has not been profiled further.
+- Peak RSS on the venv is the index (about 660 MiB after loading) plus a transient second
+  scene while a new one is built.
+
 ### Hotspots and coupling (S4.3a)
 
 `hotspot` target: `load`, then the hotspot pass and the top 100 functions. `coupling` target:

@@ -194,6 +194,17 @@ impl MapState {
         self.needs_fit = true;
     }
 
+    /// Replaces the scene but keeps the camera where it is (same world, other metrics), unless
+    /// the camera was never fitted to a scene.
+    pub fn replace_scene(&mut self, scene: Arc<Scene>) {
+        let keep = !self.needs_fit;
+        self.set_scene(scene);
+        if keep && self.scene.bounds.is_positive() {
+            self.camera.set_limits(&self.scene.bounds);
+            self.needs_fit = false;
+        }
+    }
+
     /// Band used for filtering (the camera's, or the top band when forcing everything).
     pub fn effective_band(&self) -> Band {
         if self.force_all { scene::MAX_BAND } else { self.camera.band() }
