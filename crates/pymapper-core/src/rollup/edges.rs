@@ -319,6 +319,13 @@ impl Rollup {
         &self.stats
     }
 
+    /// The base call pairs `(caller, callee, sites)`, sorted by (caller, callee): one per
+    /// distinct pair, `sites` saturated at 2^28 - 1 (override pairs have none). For callers
+    /// that derive their own per-edge values (e.g. distinct callees per level edge).
+    pub fn call_pairs(&self) -> impl ExactSizeIterator<Item = (NodeId, NodeId, u32)> + '_ {
+        self.calls.iter().map(|p| (p.src, p.dst, p.sites()))
+    }
+
     /// Heap bytes of the base tables (capacity).
     pub fn heap_bytes(&self) -> usize {
         self.calls.capacity() * size_of::<CallPair>()
@@ -344,8 +351,26 @@ impl Rollup {
     /// If `ix` has a different node count than the index the rollup was built from.
     pub fn level_with(&self, ix: &Index, level: Level, scratch: &mut LevelScratch, out: &mut Vec<RollupEdge>) {
         assert_eq!(ix.node_count(), self.node_count, "rollup used with another index");
-        let LevelScratch { map, slot, bs } = scratch;
-        level.fill_map(ix, map);
+        let mut map = std::mem::take(&mut scratch.map);
+        level.fill_map(ix, &mut map);
+        self.map_with(&map, scratch, out);
+        scratch.map = map;
+    }
+
+    /// The edges under an arbitrary cut of the hierarchy into `out` (cleared), sorted by
+    /// (src, dst), as [`Rollup::level_with`] for a [`Level`]. The cut may differ per subtree
+    /// (e.g. the GUI's semantic zoom): `map[v]` is the deepest member of `S` on `v`'s
+    /// ancestor-or-self path, for a node set `S` that contains every distribution, the
+    /// parent of each member, and either all or none of a node's children. That keeps the
+    /// map monotone in pre-order (see the module docs); other maps give unsorted output with
+    /// repeated rows (checked in debug builds).
+    ///
+    /// # Panics
+    /// If `map` does not have one entry per node of the rollup's index.
+    pub fn map_with(&self, map: &[NodeId], scratch: &mut LevelScratch, out: &mut Vec<RollupEdge>) {
+        assert_eq!(map.len(), self.node_count as usize, "map of another index");
+        debug_assert!(map.windows(2).all(|w| w[0] <= w[1]), "map is not monotone in pre-order");
+        let LevelScratch { slot, bs, .. } = scratch;
         slot.resize(map.len(), 0);
         out.clear();
         let (calls, imports, groups) = (&self.calls[..], &self.imports[..], &self.groups[..]);

@@ -407,6 +407,12 @@ fn groups_sorted_and_namespaces_deduplicated() {
         ]
     );
     assert_eq!(ix.group_node(stdlib), find(&ix, "@stdlib"));
+    // Groups were added out of node order; the reverse lookup still finds each one.
+    for g in [protobuf, stdlib, api, proj] {
+        assert_eq!(ix.dist_group(ix.group_node(g)), Some(g));
+    }
+    assert_eq!(ix.dist_group(find(&ix, "google#2")), None);
+    assert_eq!(ix.dist_group(ix.node_count()), None);
     assert_eq!(ix.file_origin(2), Origin::Stdlib);
     assert_eq!(ix.groups()[ix.file_group(0) as usize].name.as_ref(), b"protobuf");
 }

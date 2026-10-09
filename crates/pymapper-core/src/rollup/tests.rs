@@ -95,13 +95,18 @@ struct RefEdge {
 /// The edges of `level` computed naively from the raw call and import edges (hash maps,
 /// [`Level::apply`] per endpoint), in the shape of [`Rollup::level`].
 fn reference(f: &Fx, level: Level, filter: CallFilter, import_exclude: u8) -> Vec<RollupEdge> {
+    reference_map(f, |v| level.apply(&f.ix, v), filter, import_exclude)
+}
+
+/// [`reference`] for any node map.
+fn reference_map(f: &Fx, map: impl Fn(NodeId) -> NodeId, filter: CallFilter, import_exclude: u8) -> Vec<RollupEdge> {
     let ix = &f.ix;
     let mut m: HashMap<(NodeId, NodeId), RefEdge> = HashMap::new();
     for e in f.calls.edges() {
         if !filter.keeps(e.conf, e.reason) {
             continue;
         }
-        let (a, b) = (level.apply(ix, e.src), level.apply(ix, e.dst));
+        let (a, b) = (map(e.src), map(e.dst));
         if a == b {
             continue;
         }
@@ -117,7 +122,7 @@ fn reference(f: &Fx, level: Level, filter: CallFilter, import_exclude: u8) -> Ve
         if e.flags & import_exclude != 0 {
             continue;
         }
-        let (a, b) = (level.apply(ix, ix.file_node(file)), level.apply(ix, e.dst));
+        let (a, b) = (map(ix.file_node(file)), map(e.dst));
         if a == b {
             continue;
         }
@@ -454,6 +459,51 @@ fn level_maps_are_monotone_and_match_apply() {
     // Past the deepest node, depth levels are the identity.
     Level::Depth(max_depth(ix)).fill_map(ix, &mut map);
     assert!(map.iter().enumerate().all(|(v, &r)| r == v as NodeId));
+}
+
+#[test]
+fn mixed_cut_maps_match_reference() {
+    // A cut that differs per subtree (the GUI's semantic zoom): the subtree of the largest
+    // package or module is fully expanded, everything else rolls up to its module.
+    for f in [fx(PROJ), load_dir(&corpus("sample_python"), Origin::FirstParty)] {
+        let ix = &f.ix;
+        let n = ix.node_count();
+        let open = (0..n).filter(|&v| !ix.kind(v).is_def()).max_by_key(|&v| ix.subtree(v).len()).expect("a module");
+        let map: Vec<NodeId> = (0..n).map(|v| if ix.subtree(open).contains(&v) { v } else { Level::Module.apply(ix, v) }).collect();
+        assert!(map.windows(2).all(|w| w[0] <= w[1]));
+        let r = f.rollup();
+        let mut out = Vec::new();
+        let mut scratch = LevelScratch::default();
+        r.map_with(&map, &mut scratch, &mut out);
+        assert!(!out.is_empty());
+        assert_eq!(out, reference_map(&f, |v| map[v as usize], CallFilter::default(), 0));
+        // The scratch is reusable across maps and levels.
+        r.level_with(ix, Level::Module, &mut scratch, &mut out);
+        assert_eq!(out, reference(&f, Level::Module, CallFilter::default(), 0));
+    }
+}
+
+#[test]
+fn call_pairs_are_sorted_and_distinct() {
+    let f = fx(PROJ);
+    let r = f.rollup();
+    let pairs: Vec<_> = r.call_pairs().collect();
+    assert!(!pairs.is_empty());
+    assert_eq!(pairs.len() as u64, r.stats().call_pairs);
+    assert!(pairs.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+    // Under the identity map every pair between distinct nodes is one level pair.
+    let map: Vec<NodeId> = (0..f.ix.node_count()).collect();
+    let mut out = Vec::new();
+    r.map_with(&map, &mut LevelScratch::default(), &mut out);
+    let total: u64 = out.iter().map(|e| u64::from(e.pairs)).sum();
+    assert_eq!(total, pairs.iter().filter(|p| p.0 != p.1).count() as u64);
+}
+
+#[test]
+#[should_panic(expected = "map of another index")]
+fn map_with_rejects_a_short_map() {
+    let f = fx(PROJ);
+    f.rollup().map_with(&[0], &mut LevelScratch::default(), &mut Vec::new());
 }
 
 #[test]
