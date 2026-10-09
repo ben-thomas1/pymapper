@@ -10,6 +10,9 @@
 //! Codes are rule selectors, so `PM4` suppresses every dead-code rule and `ALL` (or a bare
 //! `ignore`) every rule. A finding is reported on its definition's `def` / `class` line, its
 //! import's line, or line 1 for module-level findings.
+//!
+//! Ruff's `# noqa` is honoured for one rule only: a bare `# noqa` or one listing F401 (unused
+//! import) suppresses PM405 on its line ([`noqa_f401`]); other ruff codes suppress nothing.
 
 use crate::config::RuleSelector;
 
@@ -84,6 +87,11 @@ pub fn parse_codes(line: u32, codes: Option<&[u8]>, out: &mut Vec<SuppressionEnt
         // everything would hide it.
         bad(BadCode { start: 0, len: 0, kind: BadCodeKind::Malformed });
     }
+}
+
+/// The entry for a `# noqa` that covers F401 on `line`: suppresses PM405 (unused import) only.
+pub fn noqa_f401(line: u32) -> SuppressionEntry {
+    SuppressionEntry { line, selector: RuleSelector::Prefix { value: 405, digits: 3 } }
 }
 
 fn trim_end(mut s: &[u8]) -> &[u8] {

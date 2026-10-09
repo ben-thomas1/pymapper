@@ -18,6 +18,18 @@
 //!                               import; confidence = 100 - level
 //! ```
 //!
+//! # Modes and project units
+//!
+//! Library vs application mode (design (e)) is decided per file through its project unit
+//! ([`ProjectUnits`]: the root and every directory below it with a `pyproject.toml`; a file
+//! belongs to its nearest unit). `mode = "auto"` resolves each unit on its own ([`FileModes`]):
+//! application when its `pyproject.toml` declares script targets or one of its files is a
+//! `__main__` module or has a `__main__` guard. A forced mode applies to every unit. Everything
+//! that differs between the modes (public-API roots, library-public / API-method / star-export
+//! seeds, application-mode exported seeds, the `__init__` re-export rule of PM405) looks at the
+//! mode of the file at hand: one unit id per file and one flag per unit, no per-def lookup.
+//! Without units ([`DeadCodeOptions::units`] `None`) the whole index is one unit.
+//!
 //! # Liveness levels
 //!
 //! Instead of a live/dead bit, every node gets a *level*: how sure the analysis is that the node
@@ -109,7 +121,10 @@
 //! class, the defs and imports of an unused module): deleting the container deletes them. Only
 //! containers whose rule is enabled count, so with PM404 or PM402 turned off their contents are
 //! reported. Defs are reported at their name; PM404 at line 1, column 1; PM405 at the imported
-//! name. Suppressions, baselines and `per-file-ignores` apply afterwards through
+//! name. The message says "is never used" (PM404: "is never imported") when nothing refers to
+//! the node at all, and "is only used by unused code" ("is only imported by unused modules")
+//! when a `certain` / `likely` call or decorator edge, an import or a loaded subclass (PM404:
+//! an import edge) refers to it from code that is itself not live. Suppressions, baselines and `per-file-ignores` apply afterwards through
 //! [`RuleEngine::filter`](crate::rules::RuleEngine::filter) (design (i)), so suppressing a
 //! container finding also hides what it contains; entrypoint `names` globs are the whitelist.
 //!
@@ -150,10 +165,11 @@ mod tests;
 use crate::config::{EntrypointMatcher, Mode};
 use crate::extract::facts::{DefKind, def_flags, evidence_hash};
 use crate::index::{FileId, Index, NONE, NodeId, NodeKind};
-use crate::reach::{RootOptions, RootSet, is_library, roots};
-use crate::resolve::{Imports, ResolvedCalls};
+use crate::reach::{BitSet, FileModes, RootOptions, RootSet, is_library, root_kind, roots};
+use crate::roots::ProjectUnits;
+use crate::resolve::{Confidence, Imports, ResolvedCalls};
 use crate::rules::codes::{UNUSED_CLASS, UNUSED_FUNCTION, UNUSED_IMPORT, UNUSED_METHOD, UNUSED_MODULE};
-use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId};
+use crate::rules::{self, Arg, Findings, Location, Pass, RuleEngine, SymbolId, USE_NEVER, USE_ONLY_UNUSED};
 use crate::timing;
 use modules::ModuleProp;
 use prop::{DefGraph, Levels};
@@ -315,8 +331,12 @@ impl Why {
 /// Options of the dead-code analysis.
 #[derive(Clone, Copy, Debug)]
 pub struct DeadCodeOptions<'a> {
-    /// Library vs application mode (`Auto` resolves with [`is_library`]).
+    /// Library vs application mode (`Auto` resolves per unit of `units`, or with
+    /// [`is_library`] for the whole index without units).
     pub mode: Mode,
+    /// Project units ([`ProjectUnits`]): `mode = "auto"` is resolved per unit. `None`: one
+    /// unit, with `scripts` as its script targets.
+    pub units: Option<&'a ProjectUnits>,
     /// Name-reference fallback through evidence hashes (`analysis.name-fallback`).
     pub name_fallback: bool,
     /// Entrypoint rules, presets included ([`crate::config::Config::entrypoint_matcher`]).
@@ -327,21 +347,23 @@ pub struct DeadCodeOptions<'a> {
 
 impl Default for DeadCodeOptions<'_> {
     fn default() -> Self {
-        DeadCodeOptions { mode: Mode::Auto, name_fallback: true, entrypoints: None, scripts: &[] }
+        DeadCodeOptions { mode: Mode::Auto, units: None, name_fallback: true, entrypoints: None, scripts: &[] }
     }
 }
 
 impl<'a> DeadCodeOptions<'a> {
-    /// Options of `config` with its compiled entrypoint matcher and the project's script
-    /// targets (dropped when `entrypoints.project-scripts` is off).
+    /// Options of `config` with its compiled entrypoint matcher, the project's units and the
+    /// script targets of every unit (dropped when `entrypoints.project-scripts` is off).
     pub fn from_config(
         config: &crate::config::Config,
         entrypoints: &'a EntrypointMatcher,
+        units: Option<&'a ProjectUnits>,
         scripts: &'a [&'a [u8]],
     ) -> DeadCodeOptions<'a> {
         let scripts = if config.entrypoints.project_scripts { scripts } else { &[] };
         DeadCodeOptions {
             mode: config.mode,
+            units,
             name_fallback: config.analysis.name_fallback,
             entrypoints: Some(entrypoints),
             scripts,
@@ -352,8 +374,11 @@ impl<'a> DeadCodeOptions<'a> {
 /// Counters of one run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeadCodeStats {
-    /// Library mode was used.
+    /// Library mode was used for every unit.
     pub library: bool,
+    /// Project units with analysed files, and how many of them are in library mode.
+    pub units: u32,
+    pub library_units: u32,
     pub roots: u64,
     /// Nodes at level 100.
     pub live: u64,
@@ -376,7 +401,19 @@ pub struct DeadCode {
     why: Vec<u8>,
     modules: modules::ModuleLevels,
     roots: RootSet,
+    modes: FileModes,
+    /// Per unit: [`unit_flags`].
+    unit_flags: Vec<u8>,
     stats: DeadCodeStats,
+}
+
+/// What a unit contains ([`DeadCode::unit_flags`]).
+pub mod unit_flags {
+    /// At least one analysed file.
+    pub const FILES: u8 = 1;
+    /// An entry point: a root other than a `<module>` scope or the public API (`__main__` guard
+    /// or module, test, entrypoint rule match, script target).
+    pub const ENTRY: u8 = 2;
 }
 
 impl DeadCode {
@@ -413,13 +450,34 @@ impl DeadCode {
         &self.roots
     }
 
+    /// The mode of each file and unit.
+    pub fn modes(&self) -> &FileModes {
+        &self.modes
+    }
+
+    /// [`unit_flags`] of unit `u`.
+    pub fn unit_flags(&self, u: u32) -> u8 {
+        self.unit_flags.get(u as usize).copied().unwrap_or(0)
+    }
+
+    /// Application-mode units with analysed files but no entry point: every definition in them
+    /// looks unused.
+    pub fn units_without_entry_points(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.modes.units()).filter(|&u| !self.modes.unit_is_library(u) && self.unit_flags(u) == unit_flags::FILES)
+    }
+
     pub fn stats(&self) -> &DeadCodeStats {
         &self.stats
     }
 
     /// Heap bytes (capacity).
     pub fn heap_bytes(&self) -> usize {
-        self.level.capacity() + self.why.capacity() + self.modules.heap_bytes() + self.roots.heap_bytes()
+        self.level.capacity()
+            + self.why.capacity()
+            + self.modules.heap_bytes()
+            + self.roots.heap_bytes()
+            + self.modes.heap_bytes()
+            + self.unit_flags.capacity()
     }
 }
 
@@ -483,13 +541,18 @@ pub(crate) fn run(
     emit: Emit,
     out: &mut Findings,
 ) -> DeadCode {
-    let library = is_library(ix, opts.mode, !opts.scripts.is_empty());
-    let base = if library { RootOptions::library() } else { RootOptions::application() };
-    let ropts = RootOptions { entrypoints: opts.entrypoints, scripts: opts.scripts, ..base };
+    let use_scripts = !opts.scripts.is_empty();
+    let modes = match opts.units {
+        Some(u) => FileModes::resolve(ix, opts.mode, u, use_scripts),
+        None => FileModes::uniform(is_library(ix, opts.mode, use_scripts), opts.mode != Mode::Auto),
+    };
+    let library_units = modes.library_units();
+    let base = if library_units > 0 { RootOptions::library() } else { RootOptions::application() };
+    let ropts = RootOptions { entrypoints: opts.entrypoints, scripts: opts.scripts, modes: Some(&modes), ..base };
     let roots = timing::time("deadcode.roots", || roots(ix, Some(imp), Some(calls), &ropts));
     let (g, info) = timing::time("deadcode.graph", || {
         let mut g = DefGraph::new(ix, calls);
-        let info = seeds::fill(ix, imp, &mut g, library, |f| analysed_file(ix, f));
+        let info = seeds::fill(ix, imp, &mut g, &modes, |f| analysed_file(ix, f));
         (g, info)
     });
     let mut lv = Levels::new(ix.node_count());
@@ -500,10 +563,19 @@ pub(crate) fn run(
         lv.run(&g);
         ModuleProp::new(ix, imp, calls, &roots, &info.included)
     });
-    let mut stats = DeadCodeStats { library, roots: u64::from(roots.len()), ..DeadCodeStats::default() };
+    let uflags = unit_flags_of(ix, &roots, &modes, &info.included);
+    let with_files = |lib: bool| (0..modes.units()).filter(|&u| uflags[u as usize] != 0 && modes.unit_is_library(u) == lib).count() as u32;
+    let (lib_units, app_units) = (with_files(true), with_files(false));
+    let mut stats = DeadCodeStats {
+        library: library_units == modes.units(),
+        units: lib_units + app_units,
+        library_units: lib_units,
+        roots: u64::from(roots.len()),
+        ..DeadCodeStats::default()
+    };
     // Without the name fallback only the imports are probed (`module.name` uses by importers).
     let (icands, ihits) = timing::time("deadcode.evidence", || {
-        let icands = if emit.import { imports::candidates(ix, imp, &info, library) } else { Vec::new() };
+        let icands = if emit.import { imports::candidates(ix, imp, &info, &modes) } else { Vec::new() };
         let (defs, mods) = if opts.name_fallback {
             (def_candidates(ix, &info.included, &lv.level), module_candidates(ix, &info.included, &mp))
         } else {
@@ -533,17 +605,78 @@ pub(crate) fn run(
     });
     let (modules, mexp) = mp.finish();
     stats.graph_bytes = g.heap_bytes() as u64;
+    let referenced = timing::time("deadcode.referenced", || referenced_defs(ix, imp, &g, &lv.level, &info.included));
     drop(g);
     stats.expansions = lv.expansions + mexp;
     stats.live = lv.live_count();
-    let mut dc = DeadCode { level: lv.level, why: lv.why, modules, roots, stats };
+    let mut dc = DeadCode { level: lv.level, why: lv.why, modules, roots, modes, unit_flags: uflags, stats };
     timing::time("deadcode.findings", || {
-        findings(ix, &info, &mut dc, emit, out);
+        findings(ix, &info, &referenced, &mut dc, emit, out);
         if emit.import {
             import_findings(ix, &icands, &ihits, &mut dc, emit.module, out);
         }
     });
     dc
+}
+
+/// [`unit_flags`] per unit: analysed files, and entry-point roots (any root kind but
+/// `<module>` and public API) in analysed files. O(files + nodes).
+fn unit_flags_of(ix: &Index, roots: &RootSet, modes: &FileModes, included: &[bool]) -> Vec<u8> {
+    let mut flags = vec![0u8; modes.units() as usize];
+    for f in 0..ix.file_count() {
+        if included[f as usize] {
+            flags[modes.unit(f) as usize] |= unit_flags::FILES;
+        }
+    }
+    for v in roots.iter() {
+        if roots.kind(v) & !(root_kind::MODULE | root_kind::PUBLIC) != 0
+            && let Some(f) = ix.file(v)
+            && included[f as usize]
+        {
+            flags[modes.unit(f) as usize] |= unit_flags::ENTRY;
+        }
+    }
+    flags
+}
+
+/// Defs below [`level::LIVE`] that something refers to, live or not: a `certain` / `likely`
+/// call or decorator edge from another def, an import of an included file, or a loaded
+/// subclass. Their findings say "only used by unused code" rather than "never used". O(nodes +
+/// call edges + import rows + class bases); one bit per node.
+fn referenced_defs(ix: &Index, imp: &Imports, g: &DefGraph<'_>, level: &[u8], included: &[bool]) -> BitSet {
+    let n = ix.node_count();
+    let mut out = BitSet::new(n);
+    let rev = g.calls.reverse();
+    for v in 0..n {
+        if level[v as usize] == level::LIVE || !ix.kind(v).is_def() {
+            continue;
+        }
+        let labels = rev.neighbour_labels(v);
+        let sure = |(i, &w): (usize, &u32)| w != v && labels.get(i).is_none_or(|&l| l <= Confidence::Likely as u8);
+        if rev.neighbours(v).iter().enumerate().any(sure) {
+            out.insert(v);
+        }
+    }
+    for f in 0..ix.file_count() {
+        if !included[f as usize] {
+            continue;
+        }
+        for row in ix.file_facts(f).imports.range() {
+            if let Some(t) = imp.target(row)
+                && ix.kind(t).is_def()
+                && ix.file(t) != Some(f)
+            {
+                out.insert(t);
+            }
+        }
+    }
+    let cl = g.classes;
+    for c in 0..cl.len() {
+        for &b in cl.bases(c) {
+            out.insert(cl.node(b));
+        }
+    }
+    out
 }
 
 /// Reportable defs of included files below [`level::LINKED`], ascending.
@@ -592,7 +725,8 @@ fn module_confidence(ix: &Index, dc: &DeadCode, f: FileId) -> u8 {
 }
 
 /// PM401-PM404 findings, files in FileId order (module first, then defs in source order).
-fn findings(ix: &Index, info: &seeds::FileInfo, dc: &mut DeadCode, emit: Emit, out: &mut Findings) {
+/// `referenced`: see [`referenced_defs`] (the wording of PM401-PM403).
+fn findings(ix: &Index, info: &seeds::FileInfo, referenced: &BitSet, dc: &mut DeadCode, emit: Emit, out: &mut Findings) {
     let defs = &ix.facts().defs;
     // Nearest reported ancestor defs: (subtree end, confidence).
     let mut stack: Vec<(NodeId, u8)> = Vec::new();
@@ -605,7 +739,8 @@ fn findings(ix: &Index, info: &seeds::FileInfo, dc: &mut DeadCode, emit: Emit, o
         // A PM404 finding contains the module's defs and imports only when PM404 is emitted.
         let mconf = if emit.module { module_confidence(ix, dc, f) } else { 0 };
         if mconf > 0 {
-            out.push(UNUSED_MODULE, Location::new(file, 1, 1), SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m))]);
+            let phrase = if dc.modules.imported(m) { USE_ONLY_UNUSED } else { USE_NEVER };
+            out.push(UNUSED_MODULE, Location::new(file, 1, 1), SymbolId(m), mconf, &[Arg::Symbol(SymbolId(m)), Arg::Phrase(phrase)]);
             dc.stats.findings[3] += 1;
         }
         let ff = ix.file_facts(f);
@@ -633,7 +768,8 @@ fn findings(ix: &Index, info: &seeds::FileInfo, dc: &mut DeadCode, emit: Emit, o
             if on {
                 stack.push((ix.subtree(v).end, conf));
                 let at = Location::new(file, defs.name_line[row], defs.name_col[row] + 1);
-                out.push(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v))]);
+                let phrase = if referenced.contains(v) { USE_ONLY_UNUSED } else { USE_NEVER };
+                out.push(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)]);
                 dc.stats.findings[slot] += 1;
             }
         }

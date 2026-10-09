@@ -51,9 +51,10 @@ use crate::config::{AnalysisConfig, Thresholds};
 
 pub use docs::render_markdown;
 pub use engine::{FilterStats, RuleEngine, Verdict};
+pub use dead_code::{USE_NEVER, USE_ONLY_UNUSED};
 pub use finding::{Arg, ArgKind, ArgResolver, FileId, Finding, Findings, Location, MessageError, SymbolId};
 pub use ruleset::RuleSet;
-pub use suppress::{BadCode, BadCodeKind, SuppressionEntry, Suppressions, SuppressionsBuilder, parse_codes};
+pub use suppress::{BadCode, BadCodeKind, SuppressionEntry, Suppressions, SuppressionsBuilder, noqa_f401, parse_codes};
 
 /// A rule, by its numeric code (`Rule(101)` is `PM101`). Always a registered code when obtained
 /// from the registry or a `codes` constant.

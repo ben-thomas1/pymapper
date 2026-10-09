@@ -111,7 +111,8 @@ impl KeyBuf {
         for &a in r.findings().args(f) {
             self.text.clear();
             let res = match a {
-                Arg::U32(_) | Arg::F32(_) => continue,
+                // Wording (`never used` / `only used by unused code`) is not identity.
+                Arg::U32(_) | Arg::F32(_) | Arg::Phrase(_) => continue,
                 // The finding's own symbol is already the id.
                 Arg::Symbol(s) if s == f.symbol => continue,
                 Arg::Symbol(s) => {

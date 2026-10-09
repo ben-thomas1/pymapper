@@ -109,12 +109,17 @@
 # Dead-code mode:
 #   "application" - only code reachable from entry points is live.
 #   "library"     - public (non-underscore) names in public modules are also roots.
-#   "auto"        - application if the project declares entry points ([project.scripts],
-#                   [project.gui-scripts], [project.entry-points], entry_points.txt) or has a
-#                   __main__ module / `if __name__ == "__main__":` guard; library otherwise.
-# (CLI: `--mode`.)
+#   "auto"        - decided per project unit: the project root and every directory below it
+#                   with a pyproject.toml (monorepo packages); each file belongs to its
+#                   nearest unit. A unit is application if its pyproject.toml declares entry
+#                   points ([project.scripts], [project.gui-scripts], [project.entry-points])
+#                   or one of its files is a __main__ module / has an
+#                   `if __name__ == "__main__":` guard; library otherwise.
+# "application" / "library" force that mode for every unit. An application-mode unit without
+# any entry point (no __main__ guard, scripts, entrypoint rules or tests) gets a warning: every
+# definition in it looks unused. (CLI: `--mode`; `check --stats` shows the unit counts.)
 # mode = "auto"
-# cost: none.
+# cost: O(files) to assign files to units; one pyproject.toml parse per unit.
 
 # Finding output format: "concise" (path:line:col: CODE message), "json", "sarif", "github"
 # (GitHub Actions annotations). (CLI: `--output-format`.)
@@ -259,9 +264,10 @@
 # cost: O(MRO length) per class.
 
 # Symbol names. Patterns without `.` or `:` match the bare name; others match the stable
-# qualified id `pkg.mod:Class.method`.
+# qualified id `pkg.mod:Class.method`. Use this for functions a framework loads by name from
+# non-Python configuration (YAML, JSON, ...): `"pkg.mod:*"` keeps every definition of a module.
 # names = []
-#   names = ["handle_*", "myapp.hooks:*"]
+#   names = ["handle_*", "myapp.hooks:*", "aiml_ais_mcp.elnb.tools:*"]
 # cost: O(1) amortised per definition.
 
 # Treat [project.scripts], [project.gui-scripts], [project.entry-points] and

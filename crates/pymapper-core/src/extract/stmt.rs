@@ -208,6 +208,7 @@ impl<V: Visitor> Parser<'_, V> {
 
     fn import_stmt(&mut self) {
         let keyword = self.bump();
+        let stmt_line = self.pos(keyword.start).line;
         loop {
             if !self.dotted_name() {
                 return;
@@ -222,6 +223,7 @@ impl<V: Visitor> Parser<'_, V> {
                 star: false,
                 from: false,
                 keyword,
+                stmt_line,
                 pos,
             });
             if self.eat(K::Comma).is_none() {
@@ -232,6 +234,7 @@ impl<V: Visitor> Parser<'_, V> {
 
     fn import_from_stmt(&mut self) {
         let keyword = self.bump();
+        let stmt_line = self.pos(keyword.start).line;
         let mut level = 0u32;
         loop {
             match self.kind(0) {
@@ -263,6 +266,7 @@ impl<V: Visitor> Parser<'_, V> {
                 star: true,
                 from: true,
                 keyword,
+                stmt_line,
                 pos,
             });
             return;
@@ -289,6 +293,7 @@ impl<V: Visitor> Parser<'_, V> {
                 star: false,
                 from: true,
                 keyword,
+                stmt_line,
                 pos,
             });
             if self.eat(K::Comma).is_none() {

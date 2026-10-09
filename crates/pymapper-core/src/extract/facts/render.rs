@@ -203,8 +203,10 @@ pub fn render<'s>(view: FileView<'_>, name: impl Fn(Sym) -> &'s [u8]) -> String 
 
     for i in ff.suppressions.range() {
         let p = &st.suppressions;
-        if p.all[i] != 0 {
+        if p.kind[i] == sup_kind::ALL {
             let _ = writeln!(out, "suppress L{} all", p.line[i]);
+        } else if p.kind[i] == sup_kind::NOQA_F401 {
+            let _ = writeln!(out, "suppress L{} noqa-F401", p.line[i]);
         } else {
             let codes: Vec<String> = view.chain(p.codes[i]).iter().map(|&x| s(x)).collect();
             let _ = writeln!(out, "suppress L{} [{}]", p.line[i], codes.join(", "));

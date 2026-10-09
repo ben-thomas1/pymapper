@@ -67,6 +67,9 @@ pub enum ArgKind {
     File,
     /// An import contract, by index into `Config::contracts`, printed as its name.
     Contract,
+    /// One of a fixed set of wordings ([`Arg::Phrase`] indexes it), so a rule's message can
+    /// vary while staying a template (`is never used` / `is only used by unused code`).
+    Phrase(&'static [&'static str]),
 }
 
 /// A typed message argument (8 bytes). Strings are never stored: names are interned ids.
@@ -84,19 +87,23 @@ pub enum Arg {
     File(FileId),
     /// Index into `Config::contracts`.
     Contract(u32),
+    /// Index into the wordings of an [`ArgKind::Phrase`].
+    Phrase(u32),
 }
 
 impl Arg {
-    /// The argument's kind.
+    /// Whether the argument is of kind `k` (a phrase index must be in range).
     #[inline]
-    pub fn kind(self) -> ArgKind {
-        match self {
-            Arg::U32(_) => ArgKind::U32,
-            Arg::F32(_) => ArgKind::F32,
-            Arg::Symbol(_) => ArgKind::Symbol,
-            Arg::Name(_) => ArgKind::Name,
-            Arg::File(_) => ArgKind::File,
-            Arg::Contract(_) => ArgKind::Contract,
+    pub fn fits(self, k: ArgKind) -> bool {
+        match (self, k) {
+            (Arg::U32(_), ArgKind::U32)
+            | (Arg::F32(_), ArgKind::F32)
+            | (Arg::Symbol(_), ArgKind::Symbol)
+            | (Arg::Name(_), ArgKind::Name)
+            | (Arg::File(_), ArgKind::File)
+            | (Arg::Contract(_), ArgKind::Contract) => true,
+            (Arg::Phrase(i), ArgKind::Phrase(words)) => (i as usize) < words.len(),
+            _ => false,
         }
     }
 }
@@ -387,10 +394,10 @@ impl RuleDef {
     /// kind repeated one or more times.
     pub fn accepts(&self, args: &[Arg]) -> bool {
         let kinds = self.args;
-        let prefix_ok = |n: usize| args.iter().zip(&kinds[..n]).all(|(a, &k)| a.kind() == k);
+        let prefix_ok = |n: usize| args.iter().zip(&kinds[..n]).all(|(a, &k)| a.fits(k));
         if self.is_variadic() {
             let Some((&last, head)) = kinds.split_last() else { return false };
-            args.len() >= kinds.len() && prefix_ok(head.len()) && args[head.len()..].iter().all(|a| a.kind() == last)
+            args.len() >= kinds.len() && prefix_ok(head.len()) && args[head.len()..].iter().all(|a| a.fits(last))
         } else {
             args.len() == kinds.len() && prefix_ok(kinds.len())
         }
@@ -433,9 +440,10 @@ impl RuleDef {
         for piece in pieces(self.message) {
             match piece {
                 Ok(Piece::Lit(s)) => out.write_str(s)?,
-                Ok(Piece::Arg(i)) => match args.get(i) {
-                    Some(&a) => write_arg(a, r, out)?,
-                    None => out.write_str("?")?,
+                Ok(Piece::Arg(i)) => match (args.get(i), self.args.get(i)) {
+                    (Some(&Arg::Phrase(p)), Some(ArgKind::Phrase(words))) => out.write_str(words.get(p as usize).unwrap_or(&"?"))?,
+                    (Some(&a), _) => write_arg(a, r, out)?,
+                    (None, _) => out.write_str("?")?,
                 },
                 Ok(Piece::Rest(i, sep)) => {
                     for (k, &a) in args.iter().skip(i).enumerate() {
@@ -461,5 +469,7 @@ fn write_arg(a: Arg, r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Resu
         Arg::Name(id) => r.write_name(id, out),
         Arg::File(id) => r.write_file(id, out),
         Arg::Contract(i) => r.write_contract(i, out),
+        // Rendered from the rule's wordings by `write_message`; not variadic.
+        Arg::Phrase(_) => out.write_str("?"),
     }
 }

@@ -36,6 +36,10 @@ the import line, or line 1 for module-level findings). Codes are comma-separated
 `# pymapper: ignore` suppresses every rule. Malformed codes (`E501`, `pm101`) are reported as
 diagnostics and ignored.
 
+Ruff's `# noqa` is honoured for unused imports only: a bare `# noqa` or a `# noqa` listing F401
+(`# noqa: F401`, `# noqa:F401,E501`, any case) suppresses PM405 on its line, or on every name of
+a multi-line import when it is on the statement's first line. Other codes suppress nothing.
+
 ## Categories
 
 | range | category | rules |
@@ -348,7 +352,7 @@ Suppress on a line with `# pymapper: ignore[PM304]`.
 
 Module-level or nested function that is never used.
 
-- Message: `function <symbol> is never used`
+- Message: `function <symbol> [is never used | is only used by unused code]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -364,7 +368,7 @@ Suppress on a line with `# pymapper: ignore[PM401]`.
 
 Class that is never instantiated, subclassed or referenced.
 
-- Message: `class <symbol> is never used`
+- Message: `class <symbol> [is never used | is only used by unused code]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -380,7 +384,7 @@ Suppress on a line with `# pymapper: ignore[PM402]`.
 
 Method of a live class that is never called.
 
-- Message: `method <symbol> is never used`
+- Message: `method <symbol> [is never used | is only used by unused code]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)
@@ -396,7 +400,7 @@ Suppress on a line with `# pymapper: ignore[PM403]`.
 
 First-party module that nothing imports and that is not an entry point.
 
-- Message: `module <symbol> is never imported`
+- Message: `module <symbol> [is never imported | is only imported by unused modules]`
 - Severity: warning
 - Enabled by default: yes
 - Cost: O(V+E)

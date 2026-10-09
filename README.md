@@ -89,8 +89,31 @@ layers = ["app.api", "app.services", "app.db"]
 Every option, its default and its cost: `pymapper config --template`
 ([`pymapper.toml.template`](pymapper.toml.template)).
 
+### Choosing a dead-code mode
+
+- `library`: public (non-underscore) names of public modules are API, hence live; only private
+  or unreachable internals are reported.
+- `application`: only what entry points reach is live: `__main__` modules and guards,
+  `[project.scripts]` / entry points, tests, `[entrypoints]` rules and presets.
+- `auto` (default): decided per package. Every directory with a `pyproject.toml` (the root and
+  nested monorepo packages) is a unit, and each file belongs to its nearest unit. A unit with
+  entry points of its own (scripts in its `pyproject.toml`, a `__main__` module or guard) is an
+  application, any other a library. `check --stats` prints `deadcode.units`,
+  `deadcode.library` and `deadcode.application`.
+
+Force one mode for every unit with `--mode application|library` or `mode = "..."`. An
+application-mode unit with no entry point at all gets a warning, since everything in it would
+look unused. Functions a framework loads by name from non-Python configuration (YAML tool
+lists, plugin registries) are invisible to the analysis; declare them:
+
+```toml
+[tool.pymapper.entrypoints]
+names = ["aiml_ais_mcp.elnb.tools:*"]   # every definition of that module is an entry point
+```
+
 Inline suppression: `# pymapper: ignore[PM401]` (or `ignore[PM4]`, or a bare
-`# pymapper: ignore`) on the reported line.
+`# pymapper: ignore`) on the reported line. Ruff's `# noqa` / `# noqa: F401` on an import line
+also suppresses PM405 (unused import); other `noqa` codes are ignored.
 
 ## Rules
 

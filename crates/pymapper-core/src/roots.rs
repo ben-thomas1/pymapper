@@ -38,6 +38,7 @@ mod modules;
 mod project;
 mod pth;
 mod pyvenv;
+mod units;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,7 @@ mod tests;
 pub use dist::{DistId, Distributions, normalize_name};
 pub use modules::{FileStatus, ModuleKind, ModuleMap, ModuleMapBuilder, is_identifier};
 pub use project::{PyprojectInfo, find_project_root, is_src_layout, parse_pyproject, requires_python_floor};
+pub use units::ProjectUnits;
 pub use pyvenv::{PyvenvCfg, Venv, VenvSource, find_site_packages, find_stdlib, parse_pyvenv_cfg, parse_version_prefix};
 
 use std::ffi::{OsStr, OsString};

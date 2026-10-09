@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Context;
-use pymapper_core::analysis::deadcode::{self, DeadCodeOptions};
+use pymapper_core::analysis::deadcode::{self, DeadCode, DeadCodeOptions, DeadCodeStats, unit_flags};
 use pymapper_core::analysis::dupes::{self, DupesParams, Fingerprints};
 use pymapper_core::analysis::{coupling, cycles, hotspot, layers};
 use pymapper_core::config::{Config, RuleSelector};
@@ -29,7 +29,7 @@ use pymapper_core::graph::{CallFilter, call_graph};
 use pymapper_core::index::Index;
 use pymapper_core::output::{self, Baseline, IndexContext, Options, Report, Summary};
 use pymapper_core::resolve::resolve_calls;
-use pymapper_core::roots::Origin;
+use pymapper_core::roots::{Origin, ProjectUnits};
 use pymapper_core::rules::codes::GOD_CLASS;
 use pymapper_core::rules::{self, FileId, Findings, Pass, RuleEngine};
 use pymapper_core::timing;
@@ -88,7 +88,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let mut project = pipeline::load(config, root, DupesParams::from_engine(&engine));
     // Matching consumes the fingerprints.
     let fps = project.fingerprints.take();
-    let mut findings = analyse(config, &engine, &project, fps);
+    let (mut findings, dead) = analyse(config, &engine, &project, fps);
     let ix = &project.index;
     let suppressions = timing::time("suppressions", || pipeline::suppressions(ix));
     let filter = timing::time("filter", || {
@@ -143,6 +143,13 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
             ("read_errors", ix.read_errors().len() as u64),
             ("threads", rayon::current_num_threads() as u64),
         ];
+        if let Some(d) = &dead {
+            counters.extend([
+                ("deadcode.units", u64::from(d.units)),
+                ("deadcode.library", u64::from(d.library_units)),
+                ("deadcode.application", u64::from(d.units - d.library_units)),
+            ]);
+        }
         if let Some(cs) = &project.cache {
             counters.extend([
                 ("cache_hits", cs.hits + cs.verified),
@@ -176,8 +183,9 @@ fn first_party_files(p: &Project) -> u32 {
     (0..ix.file_count()).filter(|&f| ix.file_origin(f) == Origin::FirstParty).count() as u32
 }
 
-/// Runs every analysis with an enabled rule and returns their findings (unfiltered).
-fn analyse(config: &Config, engine: &RuleEngine, p: &Project, fps: Option<Fingerprints>) -> Findings {
+/// Runs every analysis with an enabled rule and returns their findings (unfiltered) and the
+/// dead-code counters (when that pass ran).
+fn analyse(config: &Config, engine: &RuleEngine, p: &Project, fps: Option<Fingerprints>) -> (Findings, Option<DeadCodeStats>) {
     let (ix, imp) = (&p.index, &p.imports);
     let mut out = Findings::new();
     if engine.should_run(Pass::Hotspot) {
@@ -196,6 +204,7 @@ fn analyse(config: &Config, engine: &RuleEngine, p: &Project, fps: Option<Finger
     }
     let god_class = engine.should_run(Pass::Coupling) && engine.is_enabled(GOD_CLASS);
     let dead_code = engine.should_run(Pass::DeadCode);
+    let mut dead = None;
     // Call resolution is the most expensive semantic pass: only when a rule needs it.
     let calls = (god_class || dead_code).then(|| resolve_calls(ix, imp));
     if engine.should_run(Pass::Coupling) {
@@ -207,18 +216,39 @@ fn analyse(config: &Config, engine: &RuleEngine, p: &Project, fps: Option<Finger
     }
     if let (true, Some(calls)) = (dead_code, &calls) {
         let matcher = config.entrypoint_matcher();
-        let scripts: Vec<&[u8]> = match &p.roots.pyproject {
-            Some(info) => info.scripts.iter().map(|s| s.as_bytes()).collect(),
-            None => Vec::new(),
-        };
-        let opts = DeadCodeOptions::from_config(config, &matcher, &scripts);
-        timing::time("deadcode", || deadcode::analyse(ix, imp, calls, &opts, engine, &mut out));
+        let scripts: Vec<&[u8]> = p.units.all_scripts().iter().map(|s| s.as_bytes()).collect();
+        let opts = DeadCodeOptions::from_config(config, &matcher, Some(&p.units), &scripts);
+        let dc = timing::time("deadcode", || deadcode::analyse(ix, imp, calls, &opts, engine, &mut out));
+        warn_no_entry_points(&dc, &p.units);
+        dead = Some(*dc.stats());
     }
     drop(calls);
     if let (Some(params), Some(fps)) = (DupesParams::from_engine(engine), fps) {
         timing::time("dupes", || dupes::analyse(ix, fps, &params, &mut out));
     }
-    out
+    (out, dead)
+}
+
+/// Warns once per application-mode unit without any entry point (every definition in it looks
+/// unused), or once for the project when the mode is forced and no unit has one.
+fn warn_no_entry_points(dc: &DeadCode, units: &ProjectUnits) {
+    let modes = dc.modes();
+    let affected = dc.units_without_entry_points().count();
+    let with_files = (0..modes.units()).filter(|&u| dc.unit_flags(u) & unit_flags::FILES != 0).count();
+    let warn_unit = |dir: &Path| {
+        warn(format_args!(
+            "no entry points found in {} (no __main__ guard, [project.scripts], entrypoint rules or tests); \
+             every definition will look unused. Consider --mode library or [entrypoints]",
+            dir.display()
+        ))
+    };
+    if modes.forced() && affected > 0 && affected == with_files {
+        warn_unit(units.dir(0));
+        return;
+    }
+    for u in dc.units_without_entry_points() {
+        warn_unit(units.dir(u));
+    }
 }
 
 /// Warns about rules selected by code or category that do not run because their gate is

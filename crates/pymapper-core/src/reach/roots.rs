@@ -1,11 +1,13 @@
 //! Root sets: the nodes that are live without being called.
 
+use std::os::unix::ffi::OsStrExt;
+
 use crate::config::{EntrypointMatcher, Mode};
 use crate::extract::facts::{DefKind, FileView, def_flags, file_flags, import_flags};
 use crate::index::{FileId, Index, NodeId, NodeKind};
 use crate::intern::Sym;
 use crate::resolve::{Global, Imports, ResolvedCalls, res_flags};
-use crate::roots::Origin;
+use crate::roots::{Origin, ProjectUnits};
 
 /// Why a node is a root (bit flags; a node can have several).
 pub mod root_kind {
@@ -49,8 +51,12 @@ pub struct RootOptions<'a> {
     /// a package named `test` / `tests` at any level above the module makes a test file (the
     /// distribution, depth 0, is not checked).
     pub tests: bool,
-    /// Library mode: the public API is live (see [`roots`]).
+    /// Library mode: the public API is live (see [`roots`]); with `modes`, only in the files
+    /// of library-mode units.
     pub public_api: bool,
+    /// Per-file mode ([`FileModes`]): restricts `public_api` to library-mode files. `None`:
+    /// every file.
+    pub modes: Option<&'a FileModes>,
     /// Declarative entrypoint rules (decorator, base class and name globs, presets included).
     pub entrypoints: Option<&'a EntrypointMatcher>,
     /// Script targets, `pkg.mod:attr.path` or `pkg.mod` (extras such as `[cli]` and spaces are
@@ -67,6 +73,7 @@ impl RootOptions<'_> {
             main: true,
             tests: true,
             public_api: false,
+            modes: None,
             entrypoints: None,
             scripts: &[],
         }
@@ -94,12 +101,113 @@ pub fn is_library(ix: &Index, mode: Mode, has_scripts: bool) -> bool {
             if has_scripts {
                 return false;
             }
-            let main = (0..ix.file_count()).any(|f| {
-                ix.file_origin(f) == Origin::FirstParty
-                    && (ix.file_facts(f).has(file_flags::MAIN_GUARD) || ix.name(ix.file_node(f)) == b"__main__")
-            });
-            !main
+            !(0..ix.file_count()).any(|f| is_main_file(ix, f))
         }
+    }
+}
+
+/// Whether first-party file `f` makes `mode = "auto"` pick application mode: it has a
+/// `__main__` guard or is a `__main__` module.
+#[inline]
+fn is_main_file(ix: &Index, f: FileId) -> bool {
+    ix.file_origin(f) == Origin::FirstParty
+        && (ix.file_facts(f).has(file_flags::MAIN_GUARD) || ix.name(ix.file_node(f)) == b"__main__")
+}
+
+/// Library or application mode of each file (dead code (e)), decided per project unit
+/// ([`ProjectUnits`]): a unit id per file plus one flag per unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileModes {
+    /// Unit of each file (0 for files that are not first-party).
+    unit: Vec<u32>,
+    /// Library mode, per unit.
+    library: Vec<bool>,
+    /// Whether the mode was forced (`application` / `library`) rather than resolved per unit.
+    forced: bool,
+}
+
+impl FileModes {
+    /// The same mode for every file (one unit); `forced`: see [`FileModes::forced`].
+    pub fn uniform(library: bool, forced: bool) -> FileModes {
+        FileModes { unit: Vec::new(), library: vec![library], forced }
+    }
+
+    /// Resolves `mode` for each unit of `units`. A forced mode applies to every unit. `Auto`
+    /// applies the rules of [`is_library`] to each unit on its own: application when its
+    /// `pyproject.toml` declares script targets (only if `use_scripts`, i.e.
+    /// `entrypoints.project-scripts`) or one of its first-party files has a `__main__` guard or
+    /// is a `__main__` module; library otherwise. O(files) plus one directory lookup per run
+    /// of first-party files in the same directory.
+    pub fn resolve(ix: &Index, mode: Mode, units: &ProjectUnits, use_scripts: bool) -> FileModes {
+        let n = units.len() as usize;
+        let mut unit = Vec::with_capacity(ix.file_count() as usize);
+        let mut last: Option<(&[u8], u32)> = None;
+        for f in 0..ix.file_count() {
+            if ix.file_origin(f) != Origin::FirstParty {
+                unit.push(0);
+                continue;
+            }
+            let b = ix.file_path(f).as_os_str().as_bytes();
+            let dir = &b[..b.iter().rposition(|&c| c == b'/').unwrap_or(0)];
+            let u = match last {
+                Some((d, u)) if d == dir => u,
+                _ => units.unit_of_dir(dir),
+            };
+            last = Some((dir, u));
+            unit.push(u);
+        }
+        let library = match mode {
+            Mode::Application => vec![false; n],
+            Mode::Library => vec![true; n],
+            Mode::Auto => {
+                let mut lib: Vec<bool> = (0..n as u32).map(|u| !(use_scripts && !units.scripts(u).is_empty())).collect();
+                for f in 0..ix.file_count() {
+                    let u = unit[f as usize] as usize;
+                    if lib[u] && is_main_file(ix, f) {
+                        lib[u] = false;
+                    }
+                }
+                lib
+            }
+        };
+        FileModes { unit, library, forced: mode != Mode::Auto }
+    }
+
+    /// Whether file `f` is analysed in library mode.
+    #[inline]
+    pub fn library(&self, f: FileId) -> bool {
+        self.library[self.unit(f) as usize]
+    }
+
+    /// Unit of file `f`.
+    #[inline]
+    pub fn unit(&self, f: FileId) -> u32 {
+        self.unit.get(f as usize).copied().unwrap_or(0)
+    }
+
+    /// Number of units.
+    pub fn units(&self) -> u32 {
+        self.library.len() as u32
+    }
+
+    /// Whether unit `u` is in library mode.
+    pub fn unit_is_library(&self, u: u32) -> bool {
+        self.library[u as usize]
+    }
+
+    /// Number of units in library mode.
+    pub fn library_units(&self) -> u32 {
+        self.library.iter().filter(|&&l| l).count() as u32
+    }
+
+    /// The mode was forced for every unit (not `auto`).
+    pub fn forced(&self) -> bool {
+        self.forced
+    }
+
+    /// Heap bytes (capacity).
+    pub fn heap_bytes(&self) -> usize {
+        self.unit.capacity() * 4 + self.library.capacity()
     }
 }
 
@@ -366,7 +474,7 @@ fn file_roots(
         // The test runner imports test modules.
         set.add(m, root_kind::TEST);
     }
-    let lib = opts.public_api && module_is_public(ix, m);
+    let lib = opts.public_api && opts.modes.is_none_or(|md| md.library(f)) && module_is_public(ix, m);
     let restrict = lib && ff.has(file_flags::ALL_DEFINED) && !ff.has(file_flags::ALL_DYNAMIC);
     if lib {
         set.add(m, root_kind::PUBLIC);

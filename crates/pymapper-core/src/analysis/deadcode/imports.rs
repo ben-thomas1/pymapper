@@ -5,7 +5,7 @@ use super::seeds::FileInfo;
 use crate::extract::facts::{evidence_hash, import_flags};
 use crate::index::{FileId, Index, NONE, NodeKind};
 use crate::intern::Sym;
-use crate::reach::BitSet;
+use crate::reach::{BitSet, FileModes};
 use crate::resolve::{Imports, res_flags};
 
 /// An import that its own file does not use (yet to be checked against other files).
@@ -36,7 +36,7 @@ pub(super) mod penalty {
 
 /// The import rows of included files that their file does not use and no other import
 /// resolves through. O(import rows + evidence lookups).
-pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, library: bool) -> Vec<ImportCand> {
+pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, modes: &FileModes) -> Vec<ImportCand> {
     let st = &ix.facts().imports;
     let rows = st.len();
     let files = ix.file_count();
@@ -65,6 +65,7 @@ pub(super) fn candidates(ix: &Index, imp: &Imports, info: &FileInfo, library: bo
         let view = ix.file_view(f);
         let ev = view.evidence();
         let init = ix.kind(ix.file_node(f)) == NodeKind::Package;
+        let library = modes.library(f);
         for row in ix.file_facts(f).imports.range() {
             let flags = st.flags[row];
             let rflags = imp.flags(row);

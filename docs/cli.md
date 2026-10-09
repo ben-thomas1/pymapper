@@ -66,7 +66,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--venv DIR` | `venv` | default `$VIRTUAL_ENV`, then `.venv` / `venv` |
 | `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root (see below) |
 | `--threads N` / `-j N` | `threads` | 0 = one per logical CPU |
-| `--mode` | `mode` | dead code: `auto`, `application`, `library` |
+| `--mode` | `mode` | dead code: `auto` (per `pyproject.toml` unit), `application`, `library` (every unit) |
 | `--preset` | `presets` | flask, fastapi, django, click, pytest, pydantic |
 | `--exclude GLOB` | `extend-exclude` | gitignore syntax, relative to the project root |
 | `--set 'KEY = VALUE'` | any | TOML fragment, e.g. `--set 'analysis.dupes = true'` |
@@ -77,7 +77,10 @@ subcommands (`pymapper check --help` lists them all):
 
 Selecting a gated rule by code or category (`--select PM501`) without its toggle prints a
 warning naming the toggle (`analysis.dupes`). A selector that matches no known rule
-(`--select PM999`) prints a warning.
+(`--select PM999`) prints a warning. An application-mode unit (a directory with a
+`pyproject.toml`, see "Choosing a dead-code mode" in the README) without any entry point
+(`__main__` guard, scripts, entrypoint rules, tests) prints one warning per unit, or one for
+the project when `--mode application` is forced and no unit has one.
 
 The default cache directory is `.pymapper_cache` in the project root: the config file's
 directory, else the nearest ancestor of the first path with a `pyproject.toml`, else the first
@@ -100,7 +103,9 @@ own; a cache that cannot be written is only a warning.
 ## Suppressions, per-file ignores, baselines
 
 - Inline: `# pymapper: ignore[PM401]` (or `ignore[PM4]`, or bare `# pymapper: ignore`) on the
-  line a finding is reported at.
+  line a finding is reported at. A bare `# noqa` or `# noqa: F401` (ruff's unused import)
+  suppresses PM405 on its line, or on every name of a multi-line import from the statement's
+  first line; other `noqa` codes suppress nothing.
 - Per file: `[rules.per-file-ignores]` maps gitignore-style globs (relative to the project
   root) to selectors: `"tests/" = ["PM4"]`. A pattern matching a parent directory covers every
   file below it.
@@ -125,6 +130,9 @@ pymapper: stats
   first_party_files           630
   loc                      304805
   ...
+  deadcode.units                1
+  deadcode.library              1
+  deadcode.application          0
   cache_hits                    0
   cache_misses                630
   peak_rss                   24.0 MB
@@ -132,5 +140,6 @@ pymapper: stats
 
 Phases are wall time on the coordinating thread, in first-recorded order, with sub-phases
 recorded by the core library (`load.*`, `resolve.*`, `deadcode.*`, `dupes.*`). `peak_rss` is
-`getrusage` `ru_maxrss` of the whole process. Measured numbers are in
+`getrusage` `ru_maxrss` of the whole process. `deadcode.units` counts the project units with
+analysed files, split into the library / application modes they resolved to. Measured numbers are in
 [`benchmarks.md`](benchmarks.md#check-s45).

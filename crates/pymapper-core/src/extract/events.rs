@@ -242,6 +242,8 @@ pub struct Import<'a> {
     pub from: bool,
     /// The `import` / `from` keyword.
     pub keyword: Token,
+    /// Line of `keyword` (differs from `pos.line` for names on continuation lines).
+    pub stmt_line: u32,
     pub pos: Pos,
 }
 

@@ -4,6 +4,7 @@ use super::Why;
 use super::prop::DefGraph;
 use crate::extract::facts::{DefKind, def_flags, evidence_hash, file_flags, import_flags};
 use crate::index::{FileId, Index, NONE, NodeId};
+use crate::reach::FileModes;
 use crate::intern::Sym;
 use crate::resolve::{Imports, class_flags, res_flags};
 
@@ -90,9 +91,10 @@ const PUBLIC: u8 = 4;
 const DYNAMIC_BASE: u8 = 8;
 
 /// Fills the child seeds and sibling rings of `g` for the files `include` selects, and returns
-/// the per-file facts. `library`: library-mode public seeds; otherwise application-mode
-/// exported seeds. O(defs + decorators of decorated defs + bases of classes + import rows).
-pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, library: bool, include: impl Fn(FileId) -> bool) -> FileInfo {
+/// the per-file facts. Files in library mode (`modes`) get library-mode public seeds, the
+/// others application-mode exported seeds. O(defs + decorators of decorated defs + bases of
+/// classes + import rows).
+pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, modes: &FileModes, include: impl Fn(FileId) -> bool) -> FileInfo {
     let names = Names::new(ix);
     let files = ix.file_count();
     let mut info = FileInfo { included: Vec::with_capacity(files as usize), dynamic: Vec::with_capacity(files as usize) };
@@ -104,16 +106,17 @@ pub(super) fn fill(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, library: boo
     }
     for f in 0..files {
         if info.included[f as usize] {
-            file_seeds(ix, imp, g, f, library, &info.dynamic, &names, &mut sc);
+            file_seeds(ix, imp, g, f, modes.library(f), &info.dynamic, &names, &mut sc);
         }
     }
-    if library {
-        star_exports(ix, imp, g, &info.included);
-    } else {
-        // Re-export targets, wherever they are defined.
+    if modes.library_units() > 0 {
+        star_exports(ix, imp, g, &info.included, modes);
+    }
+    if modes.library_units() < modes.units() {
+        // Application mode: re-export targets, wherever they are defined.
         let st = ix.facts();
         for f in 0..files {
-            if !info.included[f as usize] {
+            if !info.included[f as usize] || modes.library(f) {
                 continue;
             }
             for row in ix.file_facts(f).imports.range() {
@@ -139,12 +142,13 @@ fn module_is_public(ix: &Index, m: NodeId) -> bool {
     })
 }
 
-/// Library mode: the module-level defs that a public module re-exports through a module-level
-/// `from m import *` of a loaded module (its `__all__` when static, else its public names).
-fn star_exports(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, included: &[bool]) {
+/// Library mode: the module-level defs that a public module of a library-mode file re-exports
+/// through a module-level `from m import *` of a loaded module (its `__all__` when static, else
+/// its public names).
+fn star_exports(ix: &Index, imp: &Imports, g: &mut DefGraph<'_>, included: &[bool], modes: &FileModes) {
     let st = ix.facts();
     for f in 0..ix.file_count() {
-        if !included[f as usize] || !module_is_public(ix, ix.file_node(f)) {
+        if !included[f as usize] || !modes.library(f) || !module_is_public(ix, ix.file_node(f)) {
             continue;
         }
         for row in ix.file_facts(f).imports.range() {

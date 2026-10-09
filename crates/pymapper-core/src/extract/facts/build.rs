@@ -49,6 +49,10 @@ pub(super) struct Scratch {
     blocks: Vec<Frame>,
     evidence: EvidenceFilter,
     exports: Vec<Sym>,
+    /// `(statement line, name line)` of imported names not on their statement's first line
+    /// (`from x import (\n a,\n b)`), in source order: a `# noqa` on the first line covers
+    /// them too.
+    split_imports: Vec<(u32, u32)>,
 }
 
 /// Slots of the evidence dedup filter (power of two).
@@ -135,6 +139,7 @@ pub(super) fn extract<S: StrSink, V: Visitor>(src: &[u8], st: &mut FactStore, st
     sc.blocks.clear();
     sc.evidence.begin_file();
     sc.exports.clear();
+    sc.split_imports.clear();
     let base = st.bases();
     let module = st.defs.push(
         DefKind::Module as u8,
@@ -236,6 +241,29 @@ impl<S: StrSink> Builder<'_, S> {
         DefKind::from_u8(self.st.defs.kind[(self.base.defs + d) as usize])
     }
 
+    /// Records a `# noqa` on `line` if it covers F401 (bare, or listing it in any case): on
+    /// that line, and on the name lines of a multi-line import statement starting there.
+    fn noqa(&mut self, src: &[u8], s: &Suppression, line: u32) {
+        if !s.all && !s.codes(src).any(|c| c.eq_ignore_ascii_case(b"F401")) {
+            return;
+        }
+        let none = Run { start: 0, len: 0 };
+        self.st.suppressions.push(line, none, sup_kind::NOQA_F401);
+        let split = &self.sc.split_imports;
+        let first = split.partition_point(|&(stmt, _)| stmt < line);
+        let mut prev = line;
+        for &(stmt, name) in &split[first..] {
+            if stmt != line {
+                break;
+            }
+            // Several names on one continuation line: record the line once.
+            if name != prev {
+                self.st.suppressions.push(name, none, sup_kind::NOQA_F401);
+                prev = name;
+            }
+        }
+    }
+
     /// Finalises the file: suppressions, line count, `__all__`, evidence, header.
     fn finish(&mut self, sups: &[Suppression], lines: u32) -> FileFacts {
         // Decorators / bases never followed by their def (malformed input) are dropped.
@@ -244,6 +272,10 @@ impl<S: StrSink> Builder<'_, S> {
         let mut lc = LineCounter::default();
         for s in sups {
             let line = lc.line_at(src, s.start);
+            if s.noqa {
+                self.noqa(src, s, line);
+                continue;
+            }
             let start = len32(self.st.names.len()) - self.base.names;
             for code in s.codes(src) {
                 // `code` is a subslice of `src`: recover its offset.
@@ -252,7 +284,8 @@ impl<S: StrSink> Builder<'_, S> {
                 self.st.names.push(sym);
             }
             let len = len32(self.st.names.len()) - self.base.names - start;
-            self.st.suppressions.push(line, Run { start, len }, s.all as u8);
+            let kind = if s.all { sup_kind::ALL } else { sup_kind::CODES };
+            self.st.suppressions.push(line, Run { start, len }, kind);
         }
         let m = self.base.defs as usize;
         self.st.defs.end_line[m] = lines.max(1);
@@ -529,6 +562,9 @@ impl<S: StrSink> Visitor for Builder<'_, S> {
         let level = i.level.min(255) as u8;
         let scope = self.scope();
         self.st.imports.push(scope, module.c, module.len, name, alias, level, flags, i.pos.line, i.pos.col);
+        if i.stmt_line != i.pos.line {
+            self.sc.split_imports.push((i.stmt_line, i.pos.line));
+        }
     }
 
     fn assign(&mut self, a: &Assign<'_>) {
