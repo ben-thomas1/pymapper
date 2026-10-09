@@ -384,18 +384,9 @@ pub(super) struct Names {
 
 impl Names {
     pub(super) fn new(ix: &Index) -> Names {
-        let g = |s: &[u8]| ix.strings().get(s);
-        Names {
-            self_: g(b"self"),
-            init: g(b"__init__"),
-            new: g(b"__new__"),
-            call: g(b"__call__"),
-            getattr: g(b"__getattr__"),
-            class_: g(b"__class__"),
-            metaclass: g(b"metaclass"),
-            object: g(b"object"),
-            markers: [g(b"Generic"), g(b"Protocol"), g(b"ABC")],
-        }
+        let [self_, init, new, call, getattr, class_, metaclass, object, generic, protocol, abc] =
+            super::builtins::texts::CALLS.map(|s| ix.strings().get(s));
+        Names { self_, init, new, call, getattr, class_, metaclass, object, markers: [generic, protocol, abc] }
     }
 }
 

@@ -274,6 +274,9 @@ impl Index {
         &self.read_errors
     }
 
+    /// Load statistics. After [`Index::patch`] (an incremental update), `files` and `lines`
+    /// still describe the whole program, but `bytes` and `extract` describe only the files
+    /// re-extracted by that update, and `merge` / `build` its patch phases.
     pub fn stats(&self) -> &LoadStats {
         &self.stats
     }

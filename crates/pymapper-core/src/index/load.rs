@@ -29,11 +29,12 @@ pub struct ReadError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub files: u64,
-    /// Source bytes (read, or the cached size of files loaded from the cache).
+    /// Source bytes (read, or the cached size of files loaded from the cache). After an
+    /// incremental update: of the re-extracted files only (see [`super::Index::stats`]).
     pub bytes: u64,
     /// Lines of all files.
     pub lines: u64,
-    /// Read + extract, wall time.
+    /// Read + extract, wall time (after an incremental update: of the re-extracted files).
     pub extract: Duration,
     /// Interner merge + remap + concatenation, wall time.
     pub merge: Duration,

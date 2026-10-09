@@ -111,7 +111,7 @@ pub(super) struct Namespaces {
 
 impl Namespaces {
     pub fn build(ix: &Index) -> Namespaces {
-        let dynamic = [ix.strings().get(b"globals"), ix.strings().get(b"exec")];
+        let dynamic = super::builtins::texts::DYNAMIC.map(|s| ix.strings().get(s));
         let (entries, start) = par_concat(ix.file_count() as usize, |f, out| file_entries(ix, f, dynamic, out));
         Namespaces { entries, start }
     }
@@ -133,7 +133,7 @@ impl Namespaces {
                 }
             }
         });
-        let dynamic = [ix.strings().get(b"globals"), ix.strings().get(b"exec")];
+        let dynamic = super::builtins::texts::DYNAMIC.map(|s| ix.strings().get(s));
         let mut rows = Vec::new();
         let mut lens = Vec::with_capacity(fresh.len());
         for &f in fresh {

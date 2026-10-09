@@ -4,9 +4,11 @@
 //! [`MAX_COPY_BYTES`] are not copied and their files are re-extracted unchanged instead, counter
 //! `inplace`), loaded and resolved with calls (phases `load.*`, `resolve.*`), then a set of
 //! files is edited one at a time: a function is appended, the program updated, the file
-//! restored and the program updated again. The files are spread over the size distribution
-//! plus the stdlib's most imported modules when present. Phase `incremental.update` is the sum
-//! of all updates; counters give per-update medians.
+//! restored and the program updated again; the same with a method added to the first class
+//! (the method-index scan) and with a module-level import appended (readers re-resolved).
+//! The files are spread over the size distribution plus the stdlib's most imported modules
+//! when present. Phase `incremental.update` is the sum of all updates; counters give
+//! per-update medians, overall and per kind of edit.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,52 @@ struct Copy(PathBuf);
 impl Drop for Copy {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One kind of edit; every edit is followed by an update, a restore and another update.
+#[derive(Clone, Copy)]
+enum Edit {
+    /// Append a top-level function.
+    Append,
+    /// Add a method to the first top-level class (new method name: the method index changes,
+    /// so every call row of the program is scanned for it). Files without a class are skipped.
+    Method,
+    /// Append a module-level import (the file's namespace and imports change: its readers are
+    /// re-resolved).
+    Import,
+}
+
+impl Edit {
+    fn apply(self, text: &[u8], round: usize) -> Option<Vec<u8>> {
+        match self {
+            Edit::Append => {
+                let mut t = text.to_vec();
+                t.extend_from_slice(format!("\n\ndef _pymapper_bench_{round}():\n    return {round}\n").as_bytes());
+                Some(t)
+            }
+            Edit::Import => {
+                let mut t = text.to_vec();
+                t.extend_from_slice(format!("\n\nimport os as _pymapper_bench_os_{round}\n").as_bytes());
+                Some(t)
+            }
+            Edit::Method => {
+                // After a one-line `class X...:` header at column 0, indented like the next
+                // non-blank line.
+                let lines: Vec<&[u8]> = text.split_inclusive(|&c| c == b'\n').collect();
+                let at = lines.iter().position(|l| l.starts_with(b"class ") && l.trim_ascii_end().ends_with(b":"))?;
+                let body = lines[at + 1..].iter().find(|l| !l.trim_ascii().is_empty())?;
+                let ind = &body[..body.len() - body.trim_ascii_start().len()];
+                if ind.is_empty() {
+                    return None;
+                }
+                let ind = String::from_utf8_lossy(ind);
+                let mut t: Vec<u8> = lines[..=at].concat();
+                t.extend_from_slice(format!("{ind}def _pymapper_bench_m{round}(self):\n{ind}    return {round}\n").as_bytes());
+                t.extend_from_slice(&lines[at + 1..].concat());
+                Some(t)
+            }
+        }
     }
 }
 
@@ -107,24 +155,31 @@ pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Coun
     let was = timing::is_enabled();
     timing::enable(false);
     let mut all: Vec<UpdateStats> = Vec::new();
+    let mut by_kind: [Vec<Duration>; 3] = Default::default();
     let mut hot_totals = Vec::new();
     for round in 0..ROUNDS {
         for &i in &picks {
             let p = paths.get(i).to_path_buf();
             let original = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-            for edit in [true, false] {
-                if !inplace {
-                    let mut text = original.clone();
-                    if edit {
-                        text.extend_from_slice(format!("\n\ndef _pymapper_bench_{round}():\n    return {round}\n").as_bytes());
+            for (k, kind) in [Edit::Append, Edit::Method, Edit::Import].into_iter().enumerate() {
+                // In place: one unchanged re-extraction per file and round (no edit kinds).
+                let edited = match (inplace, k) {
+                    (true, 0) => Some(original.clone()),
+                    (true, _) => None,
+                    (false, _) => kind.apply(&original, round),
+                };
+                let Some(edited) = edited else { continue };
+                for text in [&edited, &original] {
+                    if !inplace {
+                        fs::write(&p, text)?;
                     }
-                    fs::write(&p, &text)?;
+                    let (_, st) = prog.update(inputs(&paths), &[&p]);
+                    if hot.contains(&i) {
+                        hot_totals.push(st.total);
+                    }
+                    by_kind[k].push(st.total);
+                    all.push(st);
                 }
-                let (_, st) = prog.update(inputs(&paths), &[&p]);
-                if hot.contains(&i) {
-                    hot_totals.push(st.total);
-                }
-                all.push(st);
             }
         }
     }
@@ -143,6 +198,9 @@ pub(super) fn incremental_target(root: &Path) -> anyhow::Result<(ReadStats, Coun
         ("update_best_us".to_owned(), best),
         ("update_worst_us".to_owned(), worst),
         ("hot_median_us".to_owned(), median(&mut hot_totals)),
+        ("append_median_us".to_owned(), median(&mut by_kind[0])),
+        ("method_median_us".to_owned(), median(&mut by_kind[1])),
+        ("import_median_us".to_owned(), median(&mut by_kind[2])),
         ("plan_us".to_owned(), median(&mut col(|s| s.plan))),
         ("extract_us".to_owned(), median(&mut col(|s| s.extract))),
         ("patch_us".to_owned(), median(&mut col(|s| s.patch))),

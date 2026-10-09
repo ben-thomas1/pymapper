@@ -350,7 +350,7 @@ pub(crate) fn resolve_imports_tracked(ix: &Index, attr: &Attribution) -> (Import
     let t0 = Instant::now();
     let (modules, ns) = import_tables(ix);
     let t1 = Instant::now();
-    let getattr = ix.strings().get(b"__getattr__");
+    let getattr = ix.strings().get(super::builtins::texts::GETATTR);
     let cx = Ctx { ix, mods: &modules, ns: &ns, getattr };
     let all: Vec<FileId> = (0..ix.file_count()).collect();
     let (p1, p2, files, lens) = timing::time("resolve.imports", || {
@@ -730,14 +730,15 @@ pub(crate) fn reresolve_calls(
     }
     if !names.is_empty() {
         let hit = |c: &[Sym]| c.last().is_some_and(|s| names.contains(s)) || (c.len() >= 2 && names.contains(&c[1]));
-        for (f, a) in affected.iter_mut().enumerate() {
-            if *a {
-                continue;
+        // Every call and decorator row of the program: parallel, like the safety net.
+        affected.par_iter_mut().enumerate().with_min_len(256).for_each(|(f, a)| {
+            if !*a {
+                let fv = ix.file_view(f as FileId);
+                let ff = ix.file_facts(f as FileId);
+                *a = ff.calls.range().any(|row| hit(fv.call_chain(row)))
+                    || ff.decorators.range().any(|row| hit(fv.decorator_chain(row)));
             }
-            let fv = ix.file_view(f as FileId);
-            let ff = ix.file_facts(f as FileId);
-            *a = ff.calls.range().any(|row| hit(fv.call_chain(row))) || ff.decorators.range().any(|row| hit(fv.decorator_chain(row)));
-        }
+        });
     }
     // Safety net: carried edges must not point at nodes that are gone.
     if carry.dead {
@@ -825,12 +826,8 @@ pub(crate) fn empty_imports() -> Imports {
 /// The interned ids of every name the resolvers look up by text (builtins, dunders, marker
 /// bases). Results can only be carried over while it is unchanged.
 pub(crate) fn names_key(ix: &Index) -> Vec<Option<Sym>> {
-    const NAMES: &[&[u8]] = &[
-        b"__getattr__", b"globals", b"exec", b"self", b"__init__", b"__new__", b"__call__", b"__class__", b"metaclass",
-        b"object", b"Generic", b"Protocol", b"ABC",
-    ];
     let s = ix.strings();
-    let mut out: Vec<Option<Sym>> = NAMES.iter().map(|n| s.get(n)).collect();
+    let mut out: Vec<Option<Sym>> = super::builtins::texts::all().map(|n| s.get(n)).collect();
     out.extend(super::BUILTINS.iter().map(|n| s.get(n.as_bytes())));
     out.extend(super::BUILTIN_METHODS.iter().map(|n| s.get(n.as_bytes())));
     out

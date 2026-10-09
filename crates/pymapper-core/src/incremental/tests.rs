@@ -295,7 +295,7 @@ impl Editor {
     fn edit_text(&mut self, text: &[u8], modules: &[String]) -> Vec<u8> {
         let mut lines: Vec<Vec<u8>> = text.split_inclusive(|&c| c == b'\n').map(<[u8]>::to_vec).collect();
         let at = self.rng.below(lines.len() + 1);
-        match self.rng.below(6) {
+        match self.rng.below(7) {
             0 | 1 => {
                 let s = self.snippet(modules);
                 lines.insert(at, s.into_bytes());
@@ -323,6 +323,30 @@ impl Editor {
                     ind.push('\n');
                 }
                 lines.insert(at, ind.into_bytes());
+            }
+            5 => {
+                // Swap a name in a header, keeping the counts: a decorator, the first base or
+                // the first parameter.
+                let heads: Vec<usize> = (0..lines.len())
+                    .filter(|&i| {
+                        let t = lines[i].trim_ascii_start();
+                        t.starts_with(b"@") || (t.starts_with(b"def ") || t.starts_with(b"class ")) && t.contains(&b'(')
+                    })
+                    .collect();
+                if !heads.is_empty() {
+                    let i = heads[self.rng.below(heads.len())];
+                    let name = self.name();
+                    let l = &lines[i];
+                    let at = l.iter().position(|&c| c == b'@' || c == b'(').map_or(l.len(), |p| p + 1);
+                    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+                    let end = at + l[at..].iter().take_while(|&&c| is_id(c)).count();
+                    if end > at && !l[at].is_ascii_digit() {
+                        let mut s = l[..at].to_vec();
+                        s.extend_from_slice(name.as_bytes());
+                        s.extend_from_slice(&l[end..]);
+                        lines[i] = s;
+                    }
+                }
             }
             _ => {
                 // Rename one `def` / `class`.
@@ -436,6 +460,7 @@ fn property_with(src: &Path, steps: usize, seed: u64, tag: &str, content_only: b
         assert_same(&dump(&prog), &dump(&reference), &format!("{tag} step {step} (seed {seed}, changed {changed:?})"));
         check_diff(&diff, &prog);
         before.check(&diff, &prog);
+        before.check_changes(&diff, &prog);
     }
 }
 
@@ -444,6 +469,59 @@ struct Oracle {
     qids: Vec<Vec<u8>>,
     keys: Vec<NodeKey>,
     edges: EdgeMap,
+    facts: Vec<NodeFacts>,
+}
+
+/// What `changed` / `moved` compare of one node, strings resolved.
+#[derive(PartialEq, Eq)]
+struct NodeFacts {
+    /// Kind, def flags, decorators, bases, parameters and metrics.
+    what: String,
+    /// Lines, byte span and name position (defs only).
+    at: String,
+    dup: u16,
+    parent: NodeId,
+    path: Option<PathBuf>,
+}
+
+/// [`NodeFacts`] of every node of `ix`.
+fn node_facts(ix: &Index) -> Vec<NodeFacts> {
+    let st = ix.facts();
+    let chain = |c: &[crate::intern::Sym]| c.iter().map(|&s| lossy(ix.str(s)).into_owned()).collect::<Vec<_>>().join(".");
+    let mut out = Vec::with_capacity(ix.node_count() as usize);
+    for v in 0..ix.node_count() {
+        let mut what = format!("{:?}", ix.kind(v));
+        let mut at = String::new();
+        if let (Some(f), Some(row)) = (ix.file(v), ix.def_row(v)) {
+            let (fv, rel, d) = (ix.file_view(f), v - ix.file_node(f), &st.defs);
+            let _ = write!(what, " k={} fl={}", d.kind[row], d.flags[row]);
+            for r in fv.decorators(rel) {
+                let _ = write!(what, " @{}/{}", chain(fv.decorator_chain(r)), st.decorators.flags[r]);
+            }
+            for r in fv.bases(rel) {
+                let kw = st.bases.keyword[r].map(|k| lossy(ix.str(k)).into_owned());
+                let _ = write!(what, " base {}/{kw:?}/{}", chain(fv.base_chain(r)), st.bases.flags[r]);
+            }
+            for r in fv.params(rel) {
+                let _ = write!(what, " p {}/{}", lossy(ix.str(st.params.name[r])), st.params.flags[r]);
+            }
+            if let Some(m) = ix.metrics_row(v) {
+                let _ = write!(what, " {:?}", ix.metrics().row(m));
+                at = format!(
+                    "{} {} {} {} {} {}",
+                    d.start_line[row], d.end_line[row], d.name_line[row], d.name_col[row], d.start[row], d.end[row]
+                );
+            }
+        }
+        out.push(NodeFacts {
+            what,
+            at,
+            dup: ix.dup(v),
+            parent: ix.parent(v).unwrap_or(NONE),
+            path: ix.file(v).map(|f| ix.file_path(f).to_path_buf()),
+        });
+    }
+    out
 }
 
 type EdgeMap = std::collections::BTreeMap<(u8, NodeId, NodeId), EdgeLabel>;
@@ -495,7 +573,50 @@ impl Oracle {
     fn take(p: &Program) -> Oracle {
         let (qids, keys) = node_keys(p.index());
         let edges = edges_by_node(p);
-        Oracle { qids, keys, edges }
+        Oracle { qids, keys, edges, facts: node_facts(p.index()) }
+    }
+
+    /// `changed` and `moved` of a diff whose node map was checked: matched nodes whose facts,
+    /// duplicate ordinal, (translated) parent or file changed, plus the package/module node
+    /// of every re-extracted file; defs of re-extracted files that only moved.
+    fn check_changes(&self, d: &IndexDiff, p: &Program) {
+        let ix = p.index();
+        let now = node_facts(ix);
+        let mut fresh = vec![false; ix.file_count() as usize];
+        for &f in &d.reextracted {
+            fresh[f as usize] = true;
+        }
+        let (mut changed, mut moved) = (Vec::new(), Vec::new());
+        for (v, &w) in d.node_map.iter().enumerate() {
+            if w == NONE {
+                continue;
+            }
+            let (a, b) = (&self.facts[v], &now[w as usize]);
+            let parent = if a.parent == NONE { NONE } else { d.node_map[a.parent as usize] };
+            let file = ix.file(w);
+            if file.is_some_and(|f| fresh[f as usize] && ix.file_node(f) == w)
+                || a.what != b.what
+                || a.dup != b.dup
+                || parent != b.parent
+                || a.path != b.path
+            {
+                changed.push(w);
+            } else if a.at != b.at {
+                assert!(file.is_some_and(|f| fresh[f as usize]), "only defs of re-extracted files move: {}", lossy(&self.qids[v]));
+                moved.push(w);
+            }
+        }
+        changed.sort_unstable();
+        moved.sort_unstable();
+        let names = |l: &[NodeId]| {
+            l.iter().map(|&w| {
+                let mut q = Vec::new();
+                ix.qid(w, &mut q);
+                lossy(&q).into_owned()
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&d.changed), names(&changed), "changed nodes");
+        assert_eq!(names(&d.moved), names(&moved), "moved nodes");
     }
 
     /// Node correspondence (file identity, then qualified id) and edge deltas by qualified ids.
@@ -689,6 +810,36 @@ fn diff_reports_nodes_and_edges() {
     assert!(d.is_empty());
     assert_eq!(st.reextracted, 0);
     assert!(d.node_map.iter().enumerate().all(|(v, &w)| w == v as NodeId));
+}
+
+#[test]
+fn header_edits_with_the_same_counts_are_changes() {
+    let t = TempDir::new("header");
+    t.write("a.py", "class A:\n    pass\n\nclass B:\n    pass\n\ndef deco(f):\n    return f\n\nmark = deco\n");
+    let b = t.write("b.py", "from a import A, B, deco, mark\n\nclass C(A):\n    pass\n\n@deco\ndef f(x):\n    pass\n\ndef g(x, y=1):\n    pass\n\ndef h(x):\n    pass\n");
+    let mut p = full(t.path());
+    let (c, f, g, h) = (node(&p, "b:C"), node(&p, "b:f"), node(&p, "b:g"), node(&p, "b:h"));
+    t.write("b.py", "from a import A, B, deco, mark\n\nclass C(B):\n    pass\n\n@mark\ndef f(x):\n    pass\n\ndef g(x, z=1):\n    pass\n\ndef h(x):\n    pass\n");
+    let before = Oracle::take(&p);
+    let (d, _) = p.update(inputs(t.path()), &[&b]);
+    let new = |v: NodeId| d.node_map[v as usize];
+    assert!(d.changed.contains(&new(c)), "base A -> B: {:?}", d.changed);
+    assert!(d.changed.contains(&new(f)), "decorator deco -> mark: {:?}", d.changed);
+    assert!(d.changed.contains(&new(g)), "parameter y -> z: {:?}", d.changed);
+    assert!(!d.changed.contains(&new(h)) && !d.moved.contains(&new(h)), "h is untouched: {d:?}");
+    before.check(&d, &p);
+    before.check_changes(&d, &p);
+
+    // Parameter kind and default: `x` -> `*x`, `x` -> `x=0`.
+    t.write("b.py", "from a import A, B, deco, mark\n\nclass C(B):\n    pass\n\n@mark\ndef f(*x):\n    pass\n\ndef g(x, z=1):\n    pass\n\ndef h(x=0):\n    pass\n");
+    let before = Oracle::take(&p);
+    let (f, g, h) = (node(&p, "b:f"), node(&p, "b:g"), node(&p, "b:h"));
+    let (d, _) = p.update(inputs(t.path()), &[&b]);
+    let new = |v: NodeId| d.node_map[v as usize];
+    assert!(d.changed.contains(&new(f)) && d.changed.contains(&new(h)), "{:?}", d.changed);
+    assert!(!d.changed.contains(&new(g)), "{:?}", d.changed);
+    before.check_changes(&d, &p);
+    assert_same(&dump(&p), &dump(&full(t.path())), "header edits");
 }
 
 #[test]

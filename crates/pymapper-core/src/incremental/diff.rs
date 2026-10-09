@@ -33,7 +33,7 @@ pub struct IndexDiff {
     pub removed: Vec<NodeId>,
     /// Matched nodes whose facts changed: kind, flags, decorators, bases, parameters,
     /// metrics, duplicate ordinal, parent or file; the package/module node of every
-    /// re-extracted file (new ids, ascending).
+    /// re-extracted file that has an old node (new ids, ascending; disjoint from `added`).
     pub changed: Vec<NodeId>,
     /// Matched defs of re-extracted files that only moved: same facts, other lines or byte
     /// span (new ids, ascending; disjoint from `changed`).
@@ -157,9 +157,29 @@ fn signature(ix: &Index, v: NodeId) -> (u64, u64) {
     for x in [d.start_line[row], d.end_line[row], d.name_line[row], d.name_col[row], d.start[row], d.end[row]] {
         at.write_u32(x);
     }
+    // Decorator and base chains, parameters: by content (`Sym`s of the old and the patched
+    // index agree here: the diff is taken before the interner is compacted).
+    let f = ix.file(v).expect("def_row implies a file");
+    let fv = ix.file_view(f);
+    let rel = v - ix.file_node(f);
+    let st = ix.facts();
+    let opt = |s: Option<Sym>| s.map_or(0, |s| s.index() as u32 + 1);
     h.write_u8(d.decorators_len[row]);
+    for r in fv.decorators(rel) {
+        hash_chain(&mut h, fv.decorator_chain(r));
+        h.write_u8(st.decorators.flags[r]);
+    }
     h.write_u8(d.bases_len[row]);
+    for r in fv.bases(rel) {
+        hash_chain(&mut h, fv.base_chain(r));
+        h.write_u32(opt(st.bases.keyword[r]));
+        h.write_u8(st.bases.flags[r]);
+    }
     h.write_u16(d.params_len[row]);
+    for r in fv.params(rel) {
+        h.write_u32(st.params.name[r].index() as u32);
+        h.write_u8(st.params.flags[r]);
+    }
     if let Some(m) = ix.metrics_row(v) {
         let t = ix.metrics();
         h.write_u16(t.cyclomatic[m]);
@@ -172,6 +192,14 @@ fn signature(ix: &Index, v: NodeId) -> (u64, u64) {
         }
     }
     (h.finish(), at.finish())
+}
+
+/// Hashes a name chain: its length, then its names.
+fn hash_chain(h: &mut FxHasher, chain: &[Sym]) {
+    h.write_u8(chain.len() as u8);
+    for s in chain {
+        h.write_u32(s.index() as u32);
+    }
 }
 
 impl OldSnap {
@@ -292,12 +320,12 @@ impl OldSnap {
                 }
                 Src::Fresh(_) => {
                     reextracted.push(i);
-                    changed.push(nf);
                     let f = old_of[i as usize];
                     if f == u32::MAX {
                         added_files.push(i);
                         continue;
                     }
+                    changed.push(nf);
                     let of = self.file_node[f as usize];
                     map[of as usize] = nf;
                     let n_new = ix.file_facts(i).defs.len;

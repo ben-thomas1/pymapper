@@ -30,6 +30,15 @@
 //!                      edge deltas (see [`IndexDiff`])
 //! ```
 //!
+//! # Limitations
+//!
+//! [`Program::load`] and [`Program::update`] go through [`index::load`], which takes no
+//! [`index::LoadOptions`]: there is no load cache and no duplication fingerprints
+//! (`analysis.dupes`). [`Program::from_parts`] accepts an index from [`index::load_with`] or
+//! [`crate::cache::load`], but updates re-extract without the cache and without fingerprints,
+//! so watch-mode callers that need either must run those passes themselves. After an update, [`Index::stats`] describes
+//! the re-extraction of that update for `bytes` and `extract` (see its docs).
+//!
 //! When files are added, removed, renamed or reordered, or module names or statuses change
 //! (a new stub, a new `__init__.py` elsewhere), the module set may change under every import:
 //! the update then resolves the whole program again (still re-extracting only what changed).

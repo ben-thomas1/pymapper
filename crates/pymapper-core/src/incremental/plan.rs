@@ -70,8 +70,9 @@ pub(super) fn plan<P: AsRef<Path>>(old: &Index, new: &Inputs, changed: &[P]) -> 
             src.push(Src::Old(f));
             continue;
         }
-        // A full path list cannot happen: the paths come from a valid `Inputs`.
-        let j = fresh.push(bytes, g, new.module(i as FileId), new.status(i as FileId)).unwrap_or(u32::MAX);
+        let j = fresh
+            .push(bytes, g, new.module(i as FileId), new.status(i as FileId))
+            .expect("a subset of the paths of a valid `Inputs` fits a path list");
         src.push(Src::Fresh(j));
     }
     let same_meta = same_meta && old.groups() == new.groups();

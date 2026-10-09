@@ -233,7 +233,22 @@ impl Index {
     pub(crate) fn patch(self, inputs: Inputs, src: &[Src], mut fresh: Index, same_meta: bool) -> (Index, Option<NodeShift>) {
         assert_eq!(src.len(), inputs.len(), "one source per input file");
         let t0 = Instant::now();
-        let Index { mut strings, facts: mut store, mut metrics, files, read_errors, stats, nodes, group_node, groups_by_node, modules, .. } = self;
+        // Every field named (no `..`): a new field must be handled on this path too.
+        let Index {
+            mut strings,
+            facts: mut store,
+            mut metrics,
+            files,
+            read_errors,
+            stats,
+            nodes,
+            group_node,
+            groups_by_node,
+            modules,
+            paths: _,
+            groups: _,
+            chain: _,
+        } = self;
         let old_ff = files.facts;
         let old_n = old_ff.len();
 
@@ -412,7 +427,22 @@ impl Index {
             }
         }
         drop(live);
-        let Index { strings, facts, files, nodes, modules, .. } = self;
+        // Every field named (no `..`): a new field holding `Sym`s must be remapped here.
+        let Index {
+            strings,
+            facts,
+            files,
+            nodes,
+            modules,
+            paths: _,
+            groups: _,
+            metrics: _,
+            chain: _,
+            group_node: _,
+            groups_by_node: _,
+            read_errors: _,
+            stats: _,
+        } = self;
         *strings = next;
         for ff in &files.facts {
             facts.map_syms(ff, |s| map[s.index()]);
