@@ -23,3 +23,4 @@ pub mod rollup;
 pub mod rules;
 pub mod timing;
 pub mod walk;
+pub mod watch;

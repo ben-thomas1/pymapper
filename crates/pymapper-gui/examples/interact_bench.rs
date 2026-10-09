@@ -70,11 +70,11 @@ fn main() -> Result<()> {
     lp.path = path.context("usage: interact_bench PATH [options]")?;
     let t = Instant::now();
     let a = Arc::new(load(&lp, &|_| {})?);
-    println!("load {:.0} ms, {} nodes, {} files", ms(t.elapsed()), a.index.node_count(), a.index.file_count());
+    println!("load {:.0} ms, {} nodes, {} files", ms(t.elapsed()), a.index().node_count(), a.index().file_count());
     let map = CodeMap::build(Arc::clone(&a), MapParams::default());
     let (scene, _, drawn) = map.scene(&SceneParams::default());
     let t = Instant::now();
-    let sx = SceneIndex::build(&scene, a.index.node_count(), &map.edges, &drawn);
+    let sx = SceneIndex::build(&scene, a.index().node_count(), &map.edges, &drawn);
     println!(
         "scene index {:.1} ms, {:.1} MiB ({} rects, {} drawn edges, {} segments)",
         ms(t.elapsed()),
@@ -83,9 +83,9 @@ fn main() -> Result<()> {
         drawn.len(),
         scene.curves.len()
     );
-    let ix = &a.index;
+    let ix = a.index();
     let t = Instant::now();
-    let q = Query::new(&a.index, &a.imports, &a.calls);
+    let q = Query::new(a.index(), a.imports(), a.calls());
     let si = SearchIndex::build(&q);
     println!(
         "query state {:.1} ms (call graph + {} distinct names), {:.1} MiB",

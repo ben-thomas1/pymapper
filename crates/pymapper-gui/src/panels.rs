@@ -59,6 +59,8 @@ pub struct UiState {
     pub interact: Interaction,
     /// egui caches of the interaction panels.
     pub panel: PanelState,
+    /// Watch mode: the last update (details panel).
+    pub watch_info: String,
     /// The secondary views' tabs, options and texts.
     pub views: ViewsUi,
 }
@@ -85,6 +87,7 @@ impl UiState {
             map_status: String::new(),
             interact: Interaction::default(),
             panel: PanelState::default(),
+            watch_info: String::new(),
             views: ViewsUi::default(),
         }
     }
@@ -219,6 +222,11 @@ fn right(ui: &mut egui::Ui, state: &mut UiState) {
         panel::details(ui, &mut state.interact, &mut state.panel, &state.hover_text);
     });
     ui.separator();
+    if !state.watch_info.is_empty() {
+        ui.strong("Watching");
+        ui.label(&state.watch_info);
+        ui.separator();
+    }
     if !state.map_info.is_empty() {
         ui.collapsing("Map", |ui| {
             ui.monospace(&state.map_info);

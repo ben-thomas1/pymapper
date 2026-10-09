@@ -44,7 +44,7 @@ impl TempProject {
     }
 
     fn analysis(&self) -> Arc<Analysis> {
-        let p = LoadParams { path: self.0.clone(), isolated: false, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true };
+        let p = LoadParams { path: self.0.clone(), isolated: false, deps: Some(false), stdlib: Some(false), cache_dir: None, no_cache: true, watch: false };
         Arc::new(load(&p, &|_| {}).expect("load"))
     }
 }
@@ -96,7 +96,7 @@ fn fixture() -> (TempProject, Arc<CodeMap>, Arc<Scene>, Arc<SceneIndex>) {
     let a = p.analysis();
     let m = Arc::new(CodeMap::build(a, MapParams::default()));
     let (scene, _, drawn) = m.scene(&SceneParams::default());
-    let sx = SceneIndex::build(&scene, m.analysis.index.node_count(), &m.edges, &drawn);
+    let sx = SceneIndex::build(&scene, m.analysis.index().node_count(), &m.edges, &drawn);
     (p, m, Arc::new(scene), Arc::new(sx))
 }
 
@@ -105,13 +105,13 @@ fn node(ix: &Index, qid: &str) -> NodeId {
 }
 
 fn base<'a>(m: &'a CodeMap, scene: &'a Scene, sx: &'a SceneIndex) -> Base<'a> {
-    Base { scene, sx, edges: &m.edges, ix: &m.analysis.index }
+    Base { scene, sx, edges: &m.edges, ix: m.analysis.index() }
 }
 
 #[test]
 fn scene_index_matches_the_scene() {
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     assert!(!sx.drawn().is_empty(), "fixture draws edges");
     // Cells: id is the node, visibly filled, the first such instance.
     let mut cells = 0;
@@ -164,7 +164,7 @@ fn scene_index_matches_the_scene() {
 #[test]
 fn highlight_neighbourhood_redraws_touching_edges_in_their_bands() {
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     let b = base(&m, &scene, &sx);
     // Nothing focused: empty overlay.
     let (s, st) = highlight::build(&b, &HighlightSpec::default());
@@ -205,7 +205,7 @@ fn highlight_neighbourhood_redraws_touching_edges_in_their_bands() {
 #[test]
 fn selection_markers_keep_a_constant_screen_size() {
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     let b = base(&m, &scene, &sx);
     // The smallest cell needs markers at the coarsest bands.
     let v = (0..ix.node_count())
@@ -234,9 +234,9 @@ fn selection_markers_keep_a_constant_screen_size() {
 #[test]
 fn path_overlay_joins_consecutive_cells() {
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     let b = base(&m, &scene, &sx);
-    let q = Query::new(&m.analysis.index, &m.analysis.imports, &m.analysis.calls);
+    let q = Query::new(m.analysis.index(), m.analysis.imports(), m.analysis.calls());
     let mut scratch = Default::default();
     let from = node(ix, "app.main:run");
     let to = node(ix, "app.a:helper");
@@ -250,8 +250,8 @@ fn path_overlay_joins_consecutive_cells() {
 #[test]
 fn search_ranks_exact_fuzzy_and_qualified() {
     let (_p, m, _, _) = fixture();
-    let ix = &m.analysis.index;
-    let q = Query::new(&m.analysis.index, &m.analysis.imports, &m.analysis.calls);
+    let ix = m.analysis.index();
+    let q = Query::new(m.analysis.index(), m.analysis.imports(), m.analysis.calls());
     let si = SearchIndex::build(&q);
     assert!(si.distinct_names() > 5);
     assert!(si.search(&q, "", 10).is_empty());
@@ -281,8 +281,8 @@ fn search_ranks_exact_fuzzy_and_qualified() {
 fn findings_map_to_nodes_with_badges() {
     let (_p, m, _, _) = fixture();
     let a = &m.analysis;
-    let ix = &a.index;
-    let q = Query::new(&a.index, &a.imports, &a.calls);
+    let ix = a.index();
+    let q = Query::new(a.index(), a.imports(), a.calls());
     let ins = findings::analyse(a, &q);
     assert!(!ins.findings.is_empty());
     assert_eq!(ins.nodes.len(), ins.findings.len());
@@ -321,7 +321,7 @@ fn findings_map_to_nodes_with_badges() {
     }
     assert!(ins.on_node(u32::MAX).next().is_none() && ins.on_node(NO_NODE).next().is_none());
     // Coupling reuses the query's call graph: the same edges as check's call graph.
-    let cg = pymapper_core::graph::call_graph(ix, &a.calls, pymapper_core::graph::CallFilter::default());
+    let cg = pymapper_core::graph::call_graph(ix, a.calls(), pymapper_core::graph::CallFilter::default());
     for v in 0..ix.node_count() {
         assert_eq!(cg.succ(v), q.call_graph().succ(v));
     }
@@ -334,7 +334,7 @@ fn findings_map_to_nodes_with_badges() {
 fn marks_draw_cycles_violations_and_badges() {
     let (_p, m, scene, sx) = fixture();
     let a = &m.analysis;
-    let q = Query::new(&a.index, &a.imports, &a.calls);
+    let q = Query::new(a.index(), a.imports(), a.calls());
     let ins = findings::analyse(a, &q);
     let b = base(&m, &scene, &sx);
     let (s, st) = marks::build(&b, &m, &ins, &ins.badges, &MarksSpec::default());
@@ -358,9 +358,9 @@ fn marks_draw_cycles_violations_and_badges() {
 fn worker_answers_jobs() {
     let p = TempProject::new(PROJ);
     let a = p.analysis();
-    let ix_nodes = a.index.node_count();
+    let ix_nodes = a.index().node_count();
     let w = InsightWorker::spawn(Arc::clone(&a), true, Arc::new(|| {})).expect("spawn");
-    let ix = &a.index;
+    let ix = a.index();
     let mut acc = Results::default();
     let tangled = node(ix, "app.low:tangled");
     w.search("tangled");
@@ -405,7 +405,7 @@ fn pump(it: &mut Interaction, done: impl Fn(&Interaction) -> bool) {
 #[test]
 fn interaction_state_end_to_end() {
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     let mut map = MapState::new(Arc::clone(&scene));
     let mut it = Interaction::default();
     it.set_scene(SceneCtx { map: Arc::clone(&m), scene: Arc::clone(&scene), index: Arc::clone(&sx) }, true, Arc::new(|| {}));
@@ -494,7 +494,7 @@ fn panels_render_every_interaction_view_and_settle() {
     use crate::panels::{self, UiState};
     use egui::{RawInput, Rect, ViewportId, pos2, vec2};
     let (_p, m, scene, sx) = fixture();
-    let ix = &m.analysis.index;
+    let ix = m.analysis.index();
     let mut state = UiState::new("proj".to_owned(), "test".to_owned());
     state.interact.set_scene(SceneCtx { map: Arc::clone(&m), scene, index: sx }, true, Arc::new(|| {}));
     state.interact.search_text = "tangled".to_owned();
@@ -542,7 +542,7 @@ fn default_min_confidence_drives_slider_findings_and_badges() {
     let m = Arc::new(CodeMap::build(p.analysis(), MapParams::default()));
     assert_eq!(m.analysis.config.min_confidence, DEFAULT_MIN_CONFIDENCE);
     let (scene, _, drawn) = m.scene(&SceneParams::default());
-    let sx = Arc::new(SceneIndex::build(&scene, m.analysis.index.node_count(), &m.edges, &drawn));
+    let sx = Arc::new(SceneIndex::build(&scene, m.analysis.index().node_count(), &m.edges, &drawn));
     let mut state = UiState::new("proj".to_owned(), "test".to_owned());
     let it = &mut state.interact;
     it.set_scene(SceneCtx { map: Arc::clone(&m), scene: Arc::new(scene), index: sx }, true, Arc::new(|| {}));

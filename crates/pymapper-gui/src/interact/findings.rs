@@ -133,7 +133,7 @@ impl Badges {
 pub fn analyse(a: &Analysis, q: &Query<'_>) -> Insights {
     let t = Instant::now();
     let config = &a.config;
-    let (ix, imp) = (&a.index, &a.imports);
+    let (ix, imp) = (a.index(), a.imports());
     let engine = RuleEngine::new(config);
     let mut out = Findings::new();
     let mut passes = Vec::new();
@@ -160,7 +160,7 @@ pub fn analyse(a: &Analysis, q: &Query<'_>) -> Insights {
         let matcher = config.entrypoint_matcher();
         let scripts: Vec<&[u8]> = a.units.all_scripts().iter().map(|s| s.as_bytes()).collect();
         let opts = DeadCodeOptions::from_config(config, &matcher, Some(&a.units), &scripts).with_config_evidence(a.config_evidence.as_ref());
-        deadcode::analyse(ix, imp, &a.calls, &opts, &engine, &mut out);
+        deadcode::analyse(ix, imp, a.calls(), &opts, &engine, &mut out);
         passes.push("dead code");
     }
     let sup = suppressions(ix);

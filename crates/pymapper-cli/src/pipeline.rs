@@ -88,11 +88,33 @@ pub struct Project {
     pub roots: Roots,
 }
 
+/// A [`Project`] before import resolution (watch mode resolves through
+/// `incremental::Program`, which tracks dependencies).
+pub struct Unresolved {
+    pub units: ProjectUnits,
+    pub index: Index,
+    pub fingerprints: Option<Fingerprints>,
+    pub cache: Option<CacheStats>,
+    pub walk_errors: usize,
+    pub config_evidence: Option<ConfigEvidence>,
+    pub roots: Roots,
+    /// Config files of the first-party walks (the config-evidence inputs).
+    pub configs: PathList,
+}
+
 /// Loads the project described by `config` (rooted at `project_root`).
 ///
 /// `dupes`: take duplication fingerprints during extraction (see
 /// [`DupesParams::from_engine`]).
 pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) -> Project {
+    let u = load_unresolved(config, project_root, dupes);
+    let imports = resolve_imports(&u.index, &Attribution::from_roots(&u.roots));
+    let Unresolved { units, index, fingerprints, cache, walk_errors, config_evidence, roots, configs: _ } = u;
+    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
+}
+
+/// [`load`] without the import resolution.
+pub fn load_unresolved(config: &Config, project_root: &Path, dupes: Option<DupesParams>) -> Unresolved {
     let mut roots = timing::time("roots", || roots::discover(project_root, &RootOptions::from_config(config)));
     for d in &roots.diagnostics {
         warn(format_args!("{d}"));
@@ -133,10 +155,25 @@ pub fn load(config: &Config, project_root: &Path, dupes: Option<DupesParams>) ->
             io::Error::from(e.kind)
         ));
     }
-    let imports = resolve_imports(&index, &Attribution::from_roots(&roots));
-    let config_evidence = (config.analysis.config_evidence && config.analysis.name_fallback)
-        .then(|| timing::time("config-evidence", || cache::config_evidence(&configs, Cache::from_config(config).as_ref())));
-    Project { units, index, imports, fingerprints, cache, walk_errors, config_evidence, roots }
+    let config_evidence = load_config_evidence(config, &configs);
+    Unresolved { units, index, fingerprints, cache, walk_errors, config_evidence, roots, configs }
+}
+
+/// Dead-code evidence from the config files `configs`, when enabled.
+pub fn load_config_evidence(config: &Config, configs: &PathList) -> Option<ConfigEvidence> {
+    (config.analysis.config_evidence && config.analysis.name_fallback)
+        .then(|| timing::time("config-evidence", || cache::config_evidence(configs, Cache::from_config(config).as_ref())))
+}
+
+/// Walks again with the roots and project units of a load: the inputs of an incremental
+/// update after files were added or removed, the config files of the first-party walks, and
+/// the number of walk diagnostics (each printed).
+pub fn rewalk(roots: &Roots, config: &Config, project_root: &Path) -> (Inputs, PathList, usize) {
+    let (files, _, mut configs, errors) = timing::time("walk", || collect_files(roots, config, project_root));
+    if let Some(report) = &config.analysis.coverage {
+        exclude_file(&mut configs, report);
+    }
+    (Inputs::from_roots(roots, &files), configs, errors)
 }
 
 /// Removes `file` from `paths`: the same path, or another path to the same file (symlinks,

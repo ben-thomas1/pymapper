@@ -19,6 +19,7 @@
 //! resolution only when an enabled rule needs it (dead code, god classes).
 
 pub(crate) mod plan;
+mod watch;
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -27,24 +28,26 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Context;
-use pymapper_core::analysis::deadcode::coverage::Coverage;
+use pymapper_core::analysis::deadcode::coverage::{Coverage, CoverageStats};
 use pymapper_core::analysis::deadcode::{self, DeadCode, DeadCodeOptions, DeadCodeStats, unit_flags};
 use pymapper_core::analysis::dupes::{self, DupesParams, Fingerprints};
 use pymapper_core::analysis::{coupling, cycles, hotspot, layers};
-use pymapper_core::config::{Config, EntrypointMatcher, OutputFormat, RuleSelector};
+use pymapper_core::cache::CacheStats;
+use pymapper_core::config::{Config, EntrypointMatcher, Loaded, OutputFormat, RuleSelector};
+use pymapper_core::extract::config::ConfigEvidence;
 use pymapper_core::graph::{CallFilter, call_graph};
 use pymapper_core::index::Index;
 use pymapper_core::output::{self, Baseline, IndexContext, Options, Outcome, Report, Summary};
-use pymapper_core::resolve::resolve_calls;
+use pymapper_core::resolve::{Imports, ResolvedCalls, resolve_calls};
 use pymapper_core::roots::{Origin, ProjectUnits};
 use pymapper_core::rules::codes::GOD_CLASS;
-use pymapper_core::rules::{BadCodeKind, FileId, Findings, Pass, RuleEngine};
+use pymapper_core::rules::{BadCodeKind, FileId, FilterStats, Findings, Pass, RuleEngine};
 use pymapper_core::timing;
 use pymapper_core::walk::{Gitignore, Match};
 
 use self::plan::{CodeList, Footnote, RulePlan, check_selectors};
 use super::config::ConfigArgs;
-use crate::pipeline::{self, Project, warn};
+use crate::pipeline::{self, warn};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -62,192 +65,295 @@ pub struct Args {
     /// Print phase timings, counters and peak RSS to stderr.
     #[arg(long)]
     stats: bool,
+    /// Keep running: check again whenever a file of the project changes (incremental update
+    /// of the loaded program). Stop with Ctrl-C.
+    #[arg(long, conflicts_with = "save_baseline")]
+    watch: bool,
 }
 
 /// Runs `check`. Configuration, baseline and output errors, paths that do not exist, unknown
 /// rule selectors and selections of which no rule can run are fatal (exit 2); unreadable files
-/// and directories are warnings.
+/// and directories are warnings. With `--watch`, see [`watch`].
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
+    if args.watch {
+        return watch::run(args);
+    }
     let t0 = Instant::now();
     if args.stats {
         timing::enable(true);
     }
     let cwd = std::env::current_dir().context("cannot determine the working directory")?;
     let explicit = !args.paths.is_empty();
-    let mut loaded = timing::time("config", || args.config.load(args.paths))?;
-    let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
-    pipeline::require_paths(&loaded.scope, true, None)?;
-    pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
-    if let Some(b) = args.baseline {
-        loaded.config.baseline = Some(cwd.join(b));
-    }
-    let config = &loaded.config;
-    let root = &loaded.project.root;
-    let scope = &loaded.scope;
-    for p in scope.iter().filter(|p| !p.starts_with(root)) {
-        warn(format_args!(
-            "{} is outside the project root {} and is not checked (run pymapper on it separately)",
-            p.display(),
-            root.display()
-        ));
-    }
-    // A path covering the whole project (`check .` at the root) filters nothing.
-    let scope: &[PathBuf] = if scope.iter().any(|s| root.starts_with(s)) { &[] } else { scope };
-    pipeline::configure_threads(config.threads)?;
-    check_selectors(config)?;
-    let engine = RuleEngine::new(config);
-    let plan = RulePlan::new(config, &engine);
-    plan.check()?;
-    plan.warn_skipped();
-    let per_file = compile_per_file_ignores(config)?;
-    // Read the baseline before the expensive work, so a bad file fails fast. Saving a new
-    // baseline ignores the old one.
-    let baseline = match (&args.save_baseline, &config.baseline) {
-        (None, Some(path)) => Some(read_baseline(path)?),
-        _ => None,
-    };
-    // Likewise a missing coverage report (read after the index is built).
-    let coverage_path = config.analysis.coverage.as_deref().filter(|_| engine.should_run(Pass::DeadCode));
-    if let Some(path) = coverage_path {
-        std::fs::File::open(path)
-            .with_context(|| format!("cannot read coverage report {} (create it with `coverage json`)", path.display()))?;
-    }
-
-    let mut project = pipeline::load(config, root, DupesParams::from_engine(&engine));
+    let loaded = timing::time("config", || args.config.load(args.paths))?;
+    let setup = Setup::new(loaded, &cwd, explicit, args.baseline.as_deref(), args.save_baseline.is_some())?;
+    pipeline::configure_threads(setup.config().threads)?;
+    let mut project = pipeline::load(setup.config(), setup.root(), DupesParams::from_engine(&setup.engine));
     // Matching consumes the fingerprints.
     let fps = project.fingerprints.take();
-    let matcher = config.entrypoint_matcher();
-    let coverage = match coverage_path {
-        Some(path) => Some(timing::time("coverage", || load_coverage(&project.index, path, root))?),
-        None => None,
+    let input = Input {
+        ix: &project.index,
+        imp: &project.imports,
+        calls: None,
+        units: &project.units,
+        config_evidence: project.config_evidence.as_ref(),
     };
-    let (mut findings, dead, modes) = analyse(config, &engine, &project, &matcher, coverage.as_ref(), scope, fps, args.stats);
-    if dead.is_some() {
-        for (key, pattern) in matcher.unmatched() {
+    let save = args.save_baseline.as_deref().map(|p| cwd.join(p));
+    let done = setup.check(&input, fps, save.as_deref(), args.stats)?;
+    if args.stats {
+        let extra = Extra { cache: project.cache.as_ref(), walk_errors: project.walk_errors, config_evidence: project.config_evidence.as_ref() };
+        print_stats(t0, &setup, &input, &done, &extra);
+    }
+    Ok(ExitCode::from(done.status.code()))
+}
+
+/// Everything `check` derives from the configuration before loading the project.
+pub(crate) struct Setup {
+    pub loaded: Loaded,
+    /// Positional paths to report on (empty: everything).
+    pub scope: Vec<PathBuf>,
+    pub engine: RuleEngine,
+    pub plan: RulePlan,
+    per_file: Vec<Gitignore>,
+    pub baseline: Option<Baseline>,
+    /// Coverage report to read once the index is built (dead code runs and one is set).
+    pub coverage_path: Option<PathBuf>,
+}
+
+/// The loaded program `check` analyses.
+pub(crate) struct Input<'a> {
+    pub ix: &'a Index,
+    pub imp: &'a Imports,
+    /// Call resolution done by the caller (`None`: resolved here when a rule needs it).
+    pub calls: Option<&'a ResolvedCalls>,
+    pub units: &'a ProjectUnits,
+    pub config_evidence: Option<&'a ConfigEvidence>,
+}
+
+/// What one check produced, for the exit code and `--stats`.
+pub(crate) struct Done {
+    pub status: output::ExitStatus,
+    pub files_checked: u32,
+    pub files_total: u32,
+    pub findings: usize,
+    pub baselined: u32,
+    pub filter: FilterStats,
+    pub dead: Option<DeadCodeStats>,
+    pub coverage: Option<CoverageStats>,
+    pub modes: Vec<String>,
+    /// Output went to a closed pipe.
+    pub closed: bool,
+}
+
+/// Load counters for `--stats` that the [`Input`] does not carry.
+pub(crate) struct Extra<'a> {
+    pub cache: Option<&'a CacheStats>,
+    pub walk_errors: usize,
+    pub config_evidence: Option<&'a ConfigEvidence>,
+}
+
+impl Setup {
+    /// Validates paths, selectors, rule plan, per-file ignores and the baseline (fatal errors
+    /// before the expensive work). `baseline`: the `--baseline` flag; `saving`: a new
+    /// baseline is saved (the old one is ignored).
+    pub fn new(mut loaded: Loaded, cwd: &Path, explicit: bool, baseline: Option<&Path>, saving: bool) -> anyhow::Result<Setup> {
+        let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
+        pipeline::require_paths(&loaded.scope, true, None)?;
+        pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
+        if let Some(b) = baseline {
+            loaded.config.baseline = Some(cwd.join(b));
+        }
+        let config = &loaded.config;
+        let root = &loaded.project.root;
+        for p in loaded.scope.iter().filter(|p| !p.starts_with(root)) {
             warn(format_args!(
-                "entrypoint pattern `{pattern}` (`entrypoints.{key}`) matches nothing in the project{}",
-                if key == "names" { "; name patterns match a bare name (`main`), a qualified id (`pkg.mod:func`) or a module (`pkg.mod`)" } else { "" }
+                "{} is outside the project root {} and is not checked (run pymapper on it separately)",
+                p.display(),
+                root.display()
             ));
         }
+        // A path covering the whole project (`check .` at the root) filters nothing.
+        let scope = if loaded.scope.iter().any(|s| root.starts_with(s)) { Vec::new() } else { loaded.scope.clone() };
+        check_selectors(config)?;
+        let engine = RuleEngine::new(config);
+        let plan = RulePlan::new(config, &engine);
+        plan.check()?;
+        plan.warn_skipped();
+        let per_file = compile_per_file_ignores(config)?;
+        // Read the baseline before the expensive work, so a bad file fails fast. Saving a new
+        // baseline ignores the old one.
+        let baseline = match (saving, &config.baseline) {
+            (false, Some(path)) => Some(read_baseline(path)?),
+            _ => None,
+        };
+        // Likewise a missing coverage report (read after the index is built).
+        let coverage_path = config.analysis.coverage.clone().filter(|_| engine.should_run(Pass::DeadCode));
+        if let Some(path) = &coverage_path {
+            std::fs::File::open(path)
+                .with_context(|| format!("cannot read coverage report {} (create it with `coverage json`)", path.display()))?;
+        }
+        Ok(Setup { loaded, scope, engine, plan, per_file, baseline, coverage_path })
     }
-    let ix = &project.index;
-    // The whole project was analysed; report only what lies under the positional paths.
-    let in_scope = file_scope(ix, scope);
-    let (files_checked, files_total) = first_party_files(ix, in_scope.as_deref());
-    if let Some(sc) = &in_scope {
-        findings.retain(|f, _| f.loc.file.0 < ix.file_count() && sc[f.loc.file.0 as usize]);
+
+    #[inline]
+    pub fn config(&self) -> &Config {
+        &self.loaded.config
     }
-    let suppressions = timing::time("suppressions", || {
-        pipeline::suppressions(ix, |f, line, code, kind| {
-            if ix.file_origin(f) == Origin::FirstParty && in_scope.as_ref().is_none_or(|sc| sc[f as usize]) {
-                warn_bad_suppression(ix, root, f, line, code, kind);
+
+    #[inline]
+    pub fn root(&self) -> &Path {
+        &self.loaded.project.root
+    }
+
+    /// Whether an enabled rule needs call resolution (dead code, god classes).
+    pub fn needs_calls(&self) -> bool {
+        (self.engine.should_run(Pass::Coupling) && self.engine.is_enabled(GOD_CLASS)) || self.engine.should_run(Pass::DeadCode)
+    }
+
+    /// Analyses `input`, filters and reports the findings (or saves them to the baseline
+    /// `save`), and returns the outcome. `describe_modes`: collect the dead-code mode lines
+    /// for `--stats`.
+    pub fn check(&self, input: &Input<'_>, fps: Option<Fingerprints>, save: Option<&Path>, describe_modes: bool) -> anyhow::Result<Done> {
+        let (config, engine, root) = (self.config(), &self.engine, self.root());
+        let scope = &self.scope[..];
+        let ix = input.ix;
+        let matcher = config.entrypoint_matcher();
+        let coverage = match &self.coverage_path {
+            Some(path) => Some(timing::time("coverage", || load_coverage(ix, path, root))?),
+            None => None,
+        };
+        let (mut findings, dead, modes) = analyse(config, engine, input, &matcher, coverage.as_ref(), scope, fps, describe_modes);
+        if dead.is_some() {
+            for (key, pattern) in matcher.unmatched() {
+                warn(format_args!(
+                    "entrypoint pattern `{pattern}` (`entrypoints.{key}`) matches nothing in the project{}",
+                    if key == "names" { "; name patterns match a bare name (`main`), a qualified id (`pkg.mod:func`) or a module (`pkg.mod`)" } else { "" }
+                ));
             }
+        }
+        // The whole project was analysed; report only what lies under the positional paths.
+        let in_scope = file_scope(ix, scope);
+        let (files_checked, files_total) = first_party_files(ix, in_scope.as_deref());
+        if let Some(sc) = &in_scope {
+            findings.retain(|f, _| f.loc.file.0 < ix.file_count() && sc[f.loc.file.0 as usize]);
+        }
+        let suppressions = timing::time("suppressions", || {
+            pipeline::suppressions(ix, |f, line, code, kind| {
+                if ix.file_origin(f) == Origin::FirstParty && in_scope.as_ref().is_none_or(|sc| sc[f as usize]) {
+                    warn_bad_suppression(ix, root, f, line, code, kind);
+                }
+            })
+        });
+        let per_file = &self.per_file;
+        let filter = timing::time("filter", || {
+            engine.filter(&mut findings, &suppressions, false, |f, i| per_file_matches(ix, root, &per_file[i], f))
+        });
+
+        let ctx = IndexContext::new(ix, root, &config.contracts);
+        let mut report = timing::time("report", || Report::new(&findings, &ctx));
+        if files_checked == 0 {
+            let under = if scope.is_empty() { &config.paths } else { scope };
+            warn(format_args!(
+                "no first-party Python files found under {} (check `paths`, `src`, `exclude` and .gitignore files)",
+                DisplayPaths(under)
+            ));
+        }
+        let mut closed = false;
+        let status = if let Some(path) = save {
+            save_baseline(&report, path)?;
+            let _ = writeln!(io::stderr().lock(), "pymapper: saved {} finding(s) to baseline {}", report.len(), path.display());
+            output::ExitStatus::Clean
+        } else {
+            if let Some(b) = &self.baseline {
+                report.apply_baseline(b);
+            }
+            let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
+            let summary = Summary { files_checked, filter };
+            // A closed pipe (`pymapper check | head`) is not an error (`Outcome::Closed`); the
+            // exit status still reflects the findings.
+            let mut out = io::stdout().lock();
+            let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
+            closed = outcome == Outcome::Closed;
+            if outcome == Outcome::Written && matches!(config.output_format, OutputFormat::Concise | OutputFormat::Github) {
+                let note = Footnote { scope, root, files_checked, files_total, plan: &self.plan };
+                match write!(out, "{note}").and_then(|()| out.flush()) {
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => closed = true,
+                    Err(e) => return Err(e).context("cannot write to stdout"),
+                    Ok(()) => {}
+                }
+            }
+            report.exit_status(opts.min_confidence)
+        };
+        Ok(Done {
+            status,
+            files_checked,
+            files_total,
+            findings: report.len(),
+            baselined: report.baselined(),
+            filter,
+            dead,
+            coverage: coverage.map(|c| *c.stats()),
+            modes,
+            closed,
         })
-    });
-    let filter = timing::time("filter", || {
-        engine.filter(&mut findings, &suppressions, false, |f, i| per_file_matches(ix, root, &per_file[i], f))
-    });
-
-    let ctx = IndexContext::new(ix, root, &config.contracts);
-    let mut report = timing::time("report", || Report::new(&findings, &ctx));
-    if files_checked == 0 {
-        let under = if scope.is_empty() { &config.paths } else { scope };
-        warn(format_args!(
-            "no first-party Python files found under {} (check `paths`, `src`, `exclude` and .gitignore files)",
-            DisplayPaths(under)
-        ));
     }
-    let status = if let Some(path) = &args.save_baseline {
-        let path = cwd.join(path);
-        save_baseline(&report, &path)?;
-        let _ = writeln!(
-            io::stderr().lock(),
-            "pymapper: saved {} finding(s) to baseline {}",
-            report.len(),
-            path.display()
-        );
-        output::ExitStatus::Clean
-    } else {
-        if let Some(b) = &baseline {
-            report.apply_baseline(b);
-        }
-        let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
-        let summary = Summary { files_checked, filter };
-        // A closed pipe (`pymapper check | head`) is not an error (`Outcome::Closed`); the
-        // exit status still reflects the findings.
-        let mut out = io::stdout().lock();
-        let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
-        if outcome == Outcome::Written && matches!(config.output_format, OutputFormat::Concise | OutputFormat::Github) {
-            let note = Footnote { scope, root, files_checked, files_total, plan: &plan };
-            match write!(out, "{note}").and_then(|()| out.flush()) {
-                Err(e) if e.kind() != io::ErrorKind::BrokenPipe => return Err(e).context("cannot write to stdout"),
-                _ => {}
-            }
-        }
-        report.exit_status(opts.min_confidence)
-    };
+}
 
-    if args.stats {
-        let s = ix.stats();
-        let mut counters = vec![
-            ("files", s.files),
-            ("first_party_files", u64::from(files_total)),
-            ("files_checked", u64::from(files_checked)),
-            ("loc", s.lines),
-            ("bytes", s.bytes),
-            ("nodes", u64::from(ix.node_count())),
-            ("rules_run", u64::from(plan.ran)),
-            ("rules_skipped", plan.skipped.len() as u64),
-            ("findings", report.len() as u64),
-            ("suppressed", u64::from(filter.suppressed)),
-            ("below_confidence", u64::from(filter.below_confidence)),
-            ("baselined", u64::from(report.baselined())),
-            ("walk_errors", project.walk_errors as u64),
-            ("read_errors", ix.read_errors().len() as u64),
-            ("threads", rayon::current_num_threads() as u64),
-        ];
-        if let Some(d) = &dead {
-            counters.extend([
-                ("deadcode.units", u64::from(d.units)),
-                ("deadcode.library", u64::from(d.library_units)),
-                ("deadcode.application", u64::from(d.units - d.library_units)),
-            ]);
-        }
-        if let Some(cs) = &project.cache {
-            counters.extend([
-                ("cache_hits", cs.hits + cs.verified),
-                ("cache_misses", cs.misses),
-                ("cache_written_kb", cs.written_bytes / 1000),
-            ]);
-        }
-        if let Some(c) = &coverage {
-            let s = c.stats();
-            counters.extend([
-                ("coverage_files", u64::from(s.report_files)),
-                ("coverage_matched", u64::from(s.matched)),
-                ("coverage_executed", u64::from(s.executed)),
-                ("coverage_not_executed", u64::from(s.not_executed)),
-            ]);
-        }
-        if let Some(d) = &dead
-            && coverage.is_some()
-        {
-            counters.extend([("deadcode.executed", d.executed), ("deadcode.lowered", d.not_executed)]);
-        }
-        if let Some(ce) = &project.config_evidence {
-            counters.extend([("config_files", u64::from(ce.stats.files)), ("config_files_cached", u64::from(ce.stats.cached))]);
-        }
-        crate::stats::report(t0.elapsed(), &counters);
-        let mut err = io::stderr().lock();
-        for group in plan.groups() {
-            let _ = writeln!(err, "  skipped {}: {}", CodeList(&group.codes), group.reason.why());
-        }
-        // One line per project unit: its dead-code mode and the deciding evidence.
-        for line in &modes {
-            let _ = writeln!(err, "  deadcode.mode {line}");
-        }
+/// Prints the `--stats` report of one check.
+pub(crate) fn print_stats(t0: Instant, setup: &Setup, input: &Input<'_>, done: &Done, extra: &Extra<'_>) {
+    let ix = input.ix;
+    let s = ix.stats();
+    let mut counters = vec![
+        ("files", s.files),
+        ("first_party_files", u64::from(done.files_total)),
+        ("files_checked", u64::from(done.files_checked)),
+        ("loc", s.lines),
+        ("bytes", s.bytes),
+        ("nodes", u64::from(ix.node_count())),
+        ("rules_run", u64::from(setup.plan.ran)),
+        ("rules_skipped", setup.plan.skipped.len() as u64),
+        ("findings", done.findings as u64),
+        ("suppressed", u64::from(done.filter.suppressed)),
+        ("below_confidence", u64::from(done.filter.below_confidence)),
+        ("baselined", u64::from(done.baselined)),
+        ("walk_errors", extra.walk_errors as u64),
+        ("read_errors", ix.read_errors().len() as u64),
+        ("threads", rayon::current_num_threads() as u64),
+    ];
+    if let Some(d) = &done.dead {
+        counters.extend([
+            ("deadcode.units", u64::from(d.units)),
+            ("deadcode.library", u64::from(d.library_units)),
+            ("deadcode.application", u64::from(d.units - d.library_units)),
+        ]);
     }
-    Ok(ExitCode::from(status.code()))
+    if let Some(cs) = extra.cache {
+        counters.extend([("cache_hits", cs.hits + cs.verified), ("cache_misses", cs.misses), ("cache_written_kb", cs.written_bytes / 1000)]);
+    }
+    if let Some(s) = &done.coverage {
+        counters.extend([
+            ("coverage_files", u64::from(s.report_files)),
+            ("coverage_matched", u64::from(s.matched)),
+            ("coverage_executed", u64::from(s.executed)),
+            ("coverage_not_executed", u64::from(s.not_executed)),
+        ]);
+    }
+    if let Some(d) = &done.dead
+        && done.coverage.is_some()
+    {
+        counters.extend([("deadcode.executed", d.executed), ("deadcode.lowered", d.not_executed)]);
+    }
+    if let Some(ce) = extra.config_evidence {
+        counters.extend([("config_files", u64::from(ce.stats.files)), ("config_files_cached", u64::from(ce.stats.cached))]);
+    }
+    crate::stats::report(t0.elapsed(), &counters);
+    let mut err = io::stderr().lock();
+    for group in setup.plan.groups() {
+        let _ = writeln!(err, "  skipped {}: {}", CodeList(&group.codes), group.reason.why());
+    }
+    // One line per project unit: its dead-code mode and the deciding evidence.
+    for line in &done.modes {
+        let _ = writeln!(err, "  deadcode.mode {line}");
+    }
 }
 
 /// Paths joined by `, ` for messages.
@@ -361,14 +467,14 @@ fn load_coverage(ix: &Index, path: &Path, root: &Path) -> anyhow::Result<Coverag
 fn analyse(
     config: &Config,
     engine: &RuleEngine,
-    p: &Project,
+    p: &Input<'_>,
     matcher: &EntrypointMatcher,
     coverage: Option<&Coverage>,
     scope: &[PathBuf],
     fps: Option<Fingerprints>,
     describe_modes: bool,
 ) -> (Findings, Option<DeadCodeStats>, Vec<String>) {
-    let (ix, imp) = (&p.index, &p.imports);
+    let (ix, imp) = (p.ix, p.imp);
     let mut out = Findings::new();
     if engine.should_run(Pass::Hotspot) {
         timing::time("hotspot", || hotspot::analyse(ix, engine, &mut out));
@@ -388,8 +494,10 @@ fn analyse(
     let dead_code = engine.should_run(Pass::DeadCode);
     let mut dead = None;
     let mut modes = Vec::new();
-    // Call resolution is the most expensive semantic pass: only when a rule needs it.
-    let calls = (god_class || dead_code).then(|| resolve_calls(ix, imp));
+    // Call resolution is the most expensive semantic pass: only when a rule needs it (and
+    // the caller did not resolve already).
+    let owned = (p.calls.is_none() && (god_class || dead_code)).then(|| resolve_calls(ix, imp));
+    let calls = if god_class || dead_code { p.calls.or(owned.as_ref()) } else { None };
     if engine.should_run(Pass::Coupling) {
         let cg = match &calls {
             Some(c) if god_class => Some(timing::time("graph.build", || call_graph(ix, c, CallFilter::default()))),
@@ -399,23 +507,23 @@ fn analyse(
     }
     if let (true, Some(calls)) = (dead_code, &calls) {
         let scripts: Vec<&[u8]> = p.units.all_scripts().iter().map(|s| s.as_bytes()).collect();
-        let opts = DeadCodeOptions::from_config(config, matcher, Some(&p.units), &scripts)
-            .with_config_evidence(p.config_evidence.as_ref())
+        let opts = DeadCodeOptions::from_config(config, matcher, Some(p.units), &scripts)
+            .with_config_evidence(p.config_evidence)
             .with_coverage(coverage);
         let dc = timing::time("deadcode", || deadcode::analyse(ix, imp, calls, &opts, engine, &mut out));
-        warn_no_entry_points(&dc, &p.units, scope);
+        warn_no_entry_points(&dc, p.units, scope);
         if describe_modes {
             let m = dc.modes();
             for u in (0..m.units()).filter(|&u| dc.unit_flags(u) & unit_flags::FILES != 0) {
                 let dir = p.units.dir(u).strip_prefix(p.units.dir(0)).unwrap_or(p.units.dir(u));
                 let mut line = if dir.as_os_str().is_empty() { String::from(".: ") } else { format!("{}: ", dir.display()) };
-                m.describe(ix, &p.units, p.units.dir(0), u, &mut line);
+                m.describe(ix, p.units, p.units.dir(0), u, &mut line);
                 modes.push(line);
             }
         }
         dead = Some(*dc.stats());
     }
-    drop(calls);
+    drop(owned);
     if let (Some(params), Some(fps)) = (DupesParams::from_engine(engine), fps) {
         timing::time("dupes", || dupes::analyse(ix, fps, &params, &mut out));
     }

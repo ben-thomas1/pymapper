@@ -258,8 +258,8 @@ pub fn codemap_report(out: &mut String, cm: &CodeMap) {
     let _ = writeln!(
         out,
         "code map: {} files, {} nodes, {} call pairs, {} edges in {} zoom bands; code map heap {:.1} MiB",
-        a.index.file_count(),
-        a.index.node_count(),
+        a.index().file_count(),
+        a.index().node_count(),
         a.rollup.stats().call_pairs,
         cm.edges.len(),
         cm.reveal.change_bands().len(),

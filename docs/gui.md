@@ -18,7 +18,8 @@ cargo test -p pymapper-gui
 
 `PATH` is analysed like `pymapper check PATH` (same config discovery, project root, cache).
 Load options: `--deps` / `--no-deps`, `--stdlib` / `--no-stdlib`, `--isolated` (ignore
-config files), `--no-cache`, `--cache-dir DIR`.
+config files), `--no-cache`, `--cache-dir DIR`. `--watch` keeps the map up to date while files
+change (see [Watch mode](#watch-mode)).
 
 ## Layout
 
@@ -203,7 +204,9 @@ codemap/
   edges.rs    cut edges of every band with all edge metrics, pruned per source
   bundle.rs   hierarchical edge bundling: control polygon -> B-spline -> Bezier segments
   scene.rs    CodeMap -> map::Scene (rect / curve LODs, label carriers) + Legend
-  worker.rs   background thread: load -> layout -> edges -> scene per request
+  worker.rs   background thread: load -> layout -> edges -> scene per request; watch-mode
+              updates (see "Watch mode")
+  transition.rs  watch-mode transitions: overlay rects animating an update
 ```
 
 ```
@@ -648,6 +651,72 @@ view is the canvas centred on the map.
 Not measured: frame times of the secondary views. Their scenes go through the same renderer
 and are far smaller than the code map's (at most about 650k rects for the full-venv matrix,
 30k lines for the graph), so the code map numbers above bound them.
+
+## Watch mode
+
+`pymapper-gui --watch PATH` applies file changes to the open map as they happen, through the
+same watcher and incremental update as `pymapper check --watch` (`pymapper_core::watch`,
+`incremental::Program`).
+
+```
+  pymapper-watch thread       pymapper-map thread                      UI thread
+  Watcher::wait ── batch ──>  classify against the index (shared read)
+                              release wanted ─────────────────────────> about_to_wait: drop the
+                              wait until the CodeMap is unique   <───── CodeMap, stop the views
+                              keep the old layout (its level Arcs)      thread, released
+                              Analysis::update: rewalk?, Program::update,
+                                Rollup::build, Aggregates::build
+                              CodeMap::build (pre-order layout), Transition::build, scene
+                              Published { update } ──────────────────> replace_scene (camera
+                                                                        kept), remap selection,
+                                                                        animate the overlays
+```
+
+- **Exclusive update, no copy.** The incremental update patches the index in place, so the
+  map thread asks the UI to let go of the code map first (handled in `about_to_wait`, so an
+  occluded window does not hold an update back). The scene does not reference the analysis
+  and stays on screen; only hover details pause for the update. The secondary views drop
+  their state and rebuild for the new map.
+- **Stable geography.** Watch mode lays the treemap out in pre-order (`Order::Preorder`):
+  siblings keep their order when sizes change, so an edit grows or shrinks cells in place
+  instead of re-sorting them. The camera is kept.
+- **Transitions.** `Transition::build` compares the old and new layouts through the index
+  diff's node map: cells that moved by more than 2% of their size get a white outline that
+  morphs from the old to the new rect (350 ms, ease-out); changed cells (and the module of
+  every re-extracted file) flash amber, added ones green, removed ones shrink away in red
+  (1.2 s fade). They are overlay rects drawn with the selection marks (`MapState::set_overlay`):
+  no scene rebuild or re-upload per frame, at most 4 096 per update (largest cells first).
+  The loop redraws continuously only while a transition runs.
+- **Selection** carries over through the node map (cleared when its node is gone).
+- A changed `pyproject.toml` / `pymapper.toml` reloads from scratch (no transition; the old
+  analysis is freed first). A failed reload shows the error and retries on the next change.
+- Not watched: third-party and stdlib files. The details panel shows the last update: files
+  re-extracted / added / removed and the edit-to-map latency with its parts.
+
+### Results (S7.7)
+
+`cargo run --release -p pymapper-gui --example watch_bench -- PATH [--deps] --edits 12`
+(Apple M4 Pro, 14 cores): the project's Python files are copied to `$TMPDIR` (with `--deps`
+its `.venv` is linked in), loaded in watch mode without cache, then 6 files across the size
+distribution get a function appended and are restored, 12 writes, each timed from the write
+to the published scene (GPU upload on the next frame not included). Medians (p90 / worst):
+
+| input                                    | nodes     | write -> scene | incremental update | rebuild (layout / edges / scene) | overlays | peak RSS |
+|------------------------------------------|-----------|----------------|--------------------|----------------------------------|----------|----------|
+| aiml-lectio first party (1 803 files)    | 24 866    | 83 ms (85 / 88) | 4.5 ms            | 32.5 ms (2.2 / 9.9 / 17.2)       | <= 67    | 252 MB   |
+| aiml-lectio with its venv (63 290 files) | 1 032 041 | 347 ms (351 / 354) | 74 ms          | 223 ms (28 / 44 / 86)            | <= 192   | 1.26 GB  |
+
+- The write-to-scene time is the OS delivery (about 11 ms with FSEvents) plus the 30 ms
+  debounce window plus the work. On the first-party map the work is 37 ms, two thirds of it
+  the scene and edge table rebuilt from scratch.
+- With the venv the rebuild dominates: rollup + aggregates (about 52 ms), layout 28 ms,
+  edges 44 ms and the scene 86 ms are full rebuilds. Making them incremental (only the
+  changed subtree's cells and edges) is the obvious next step for million-node maps.
+- The release handshake costs nothing measurable here (no UI holds the map in the bench);
+  in the app it is one pass through the event loop: 2.9 ms in a windowed run
+  (`pymapper-gui --watch --measure`, 120 Hz, three edits of a 3-file project while the
+  scripted frames ran: edit to map 39 ms; `--measure` reports the last update on a `watch:`
+  line).
 
 ## Render on demand
 

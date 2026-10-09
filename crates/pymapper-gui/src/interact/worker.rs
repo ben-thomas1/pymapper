@@ -235,7 +235,7 @@ fn publish(s: &Shared, notify: &Notify, f: impl FnOnce(&mut State)) {
 fn run(s: &Shared, analysis: &Analysis, with_findings: bool, notify: &Notify) {
     let t = Instant::now();
     let a = analysis;
-    let q = Query::new(&a.index, &a.imports, &a.calls);
+    let q = Query::new(a.index(), a.imports(), a.calls());
     let si = SearchIndex::build(&q);
     let ready = t.elapsed();
     publish(s, notify, |st| st.results.ready = Some(ready));
@@ -300,7 +300,7 @@ fn serve(s: &Shared, a: &Analysis, q: &Query<'_>, si: &SearchIndex, notify: &Not
             Job::Badges(min_conf) => {
                 let ins = s.lock().insights.clone();
                 if let Some(ins) = ins {
-                    let b = Arc::new(ins.badges_at(&a.index, min_conf));
+                    let b = Arc::new(ins.badges_at(a.index(), min_conf));
                     publish(s, notify, |st| st.results.badges = Some(b));
                 }
             }
@@ -310,7 +310,7 @@ fn serve(s: &Shared, a: &Analysis, q: &Query<'_>, si: &SearchIndex, notify: &Not
 
 /// The source of node `v`: its def span (a module: the whole file, capped), highlighted.
 fn read_source(a: &Analysis, v: NodeId, t: Instant) -> SourceResult {
-    let ix = &a.index;
+    let ix = a.index();
     let (Some(f), Some(r)) = (ix.file(v), ix.def_row(v)) else {
         return SourceResult { node: v, path: PathBuf::new(), source: Err("no source file (distribution or namespace package)".to_owned()), elapsed: t.elapsed() };
     };

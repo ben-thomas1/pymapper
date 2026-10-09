@@ -10,7 +10,8 @@
 //!   edges.rs    cut edges of every band with all edge metrics, pruned per source
 //!   bundle.rs   hierarchical edge bundling: control polygon -> B-spline -> Bezier segments
 //!   scene.rs    CodeMap -> map::Scene (rect and curve LODs from the reveal bands) + Legend
-//!   worker.rs   background thread: load -> layout -> edges -> scenes on request
+//!   worker.rs   background thread: load -> layout -> edges -> scenes on request; watch mode
+//!   transition.rs  overlay animation of a watch-mode update (moved / changed / added / removed)
 //! ```
 //!
 //! Data flow: [`load::load`] once, then [`CodeMap::build`] per size metric (layout, reveal
@@ -22,11 +23,14 @@ pub mod edges;
 pub mod load;
 pub mod metrics;
 pub mod scene;
+pub mod transition;
 pub mod worker;
 pub mod zoom;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod watch_tests;
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -97,7 +101,7 @@ impl CodeMap {
     pub fn build(analysis: Arc<Analysis>, params: MapParams) -> CodeMap {
         let mut phases = Vec::new();
         let t = Instant::now();
-        let ix = &analysis.index;
+        let ix = analysis.index();
         let tree = Arc::new(LayoutTree::from_index(ix, &analysis.agg, TreeOptions { metric: params.size, min_weight: 1 }));
         let path = analysis.cache_dir.as_deref().map(cache_path);
         let cached = path.as_deref().and_then(|p| load_levels(p, &tree, &params.layout).ok()).unwrap_or_default();
@@ -123,7 +127,7 @@ impl CodeMap {
 
     /// The renderer scene for `p`, its legend, and the drawn edges (curve id = edge index).
     pub fn scene(&self, p: &SceneParams) -> (Scene, Legend, Vec<u32>) {
-        let input = SceneInput { ix: &self.analysis.index, agg: &self.analysis.agg, layout: &self.layout, reveal: &self.reveal, edges: &self.edges };
+        let input = SceneInput { ix: self.analysis.index(), agg: &self.analysis.agg, layout: &self.layout, reveal: &self.reveal, edges: &self.edges };
         let mut ids = Vec::new();
         let (scene, legend) = scene::build(&input, self.params.size, p, &mut ids);
         (scene, legend, ids)
@@ -137,7 +141,7 @@ impl CodeMap {
     /// Details of node `v` into `out` (cleared): qualified id, kind, metrics.
     pub fn describe_node(&self, v: NodeId, out: &mut String) {
         out.clear();
-        let ix = &self.analysis.index;
+        let ix = self.analysis.index();
         if v >= ix.node_count() {
             return;
         }
@@ -156,7 +160,7 @@ impl CodeMap {
     pub fn describe_edge(&self, e: u32, out: &mut String) {
         out.clear();
         let Some(me) = self.edges.get(e as usize) else { return };
-        let ix = &self.analysis.index;
+        let ix = self.analysis.index();
         let _ = write!(out, "{}\n-> {}", ix.qid_string(me.src), ix.qid_string(me.dst));
         for m in EdgeMetric::ALL {
             let _ = write!(out, "\n{}: {}", m.label(), me.weight(m));

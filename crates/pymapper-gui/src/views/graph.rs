@@ -124,7 +124,7 @@ fn induced(nodes: &[NodeId], rows: &[RollupEdge], out: &mut Vec<ViewEdge>) {
 /// largest by lines of code win). Cost: O(visible part of the hierarchy) to collect cells,
 /// O(n + m) for the rollup under the cut.
 pub fn level_graph(cm: &CodeMap, band: Band, view: &WorldRect, max_nodes: usize) -> ViewGraph {
-    let ix = &cm.analysis.index;
+    let ix = cm.analysis.index();
     let (reveal, layout) = (&cm.reveal, &cm.layout);
     let n = ix.node_count();
     let mut leaves: Vec<NodeId> = Vec::new();

@@ -21,7 +21,7 @@ impl Views {
         let Some(i) = self.active.slot() else { return false };
         let slot = &self.slots[i];
         let (Some(content), Some(cm)) = (slot.content.as_ref(), slot.map.as_ref()) else { return true };
-        let ix = &cm.analysis.index;
+        let ix = cm.analysis.index();
         match content {
             Content::NodeLink { graph, weight, calls, .. } => match h.kind {
                 HitKind::Rect => {
@@ -87,7 +87,7 @@ impl Views {
         };
         let slot = &self.slots[i];
         let (Some(content), Some(cm)) = (slot.content.as_ref(), slot.map.as_ref()) else { return };
-        let ix = &cm.analysis.index;
+        let ix = cm.analysis.index();
         match content {
             Content::NodeLink { graph, nl, .. } => out.extend(graph.representative(ix, v).and_then(|l| nl.mark(l))),
             Content::Matrix { rows, geom, .. } => {
@@ -116,9 +116,9 @@ impl Views {
         ui.status.clear();
         ui.info.clear();
         if let (Some(v), Some(cm)) = (self.selection, codemap)
-            && v < cm.analysis.index.node_count()
+            && v < cm.analysis.index().node_count()
         {
-            ui.selection.push_str(&cm.analysis.index.qid_string(v));
+            ui.selection.push_str(&cm.analysis.index().qid_string(v));
         }
         let Some(i) = self.active.slot() else { return };
         if let Some(e) = &self.error {
@@ -146,7 +146,7 @@ impl Views {
                 match focus {
                     Some(f) => {
                         let what = if *calls { "call graph" } else { "module graph" };
-                        let name = String::from_utf8_lossy(cm.analysis.index.name(graph.nodes[*f as usize]));
+                        let name = String::from_utf8_lossy(cm.analysis.index().name(graph.nodes[*f as usize]));
                         let _ = write!(ui.info, "\naround {name} ({what}), {ms:.1} ms");
                     }
                     None => {

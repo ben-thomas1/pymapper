@@ -148,6 +148,14 @@ impl Interaction {
         self.marks_dirty = true;
     }
 
+    /// Drops every reference to the analysis (watch mode: the map thread updates it in
+    /// place): the scene context and the worker. The next [`Self::set_scene`] starts over.
+    pub fn release(&mut self) {
+        self.ctx = None;
+        self.worker = None;
+        self.path_pending = false;
+    }
+
     fn reset_results(&mut self) {
         self.selected = None;
         self.selected_qid.clear();
@@ -270,7 +278,7 @@ impl Interaction {
             return;
         };
         if let Some(c) = &self.ctx {
-            let ix = &c.map.analysis.index;
+            let ix = c.map.analysis.index();
             if v < ix.node_count() {
                 let mut q = Vec::new();
                 ix.qid(v, &mut q);
@@ -292,7 +300,7 @@ impl Interaction {
     /// World rect of `v`'s cell or its nearest drawn ancestor's.
     pub fn cell_rect(&self, v: NodeId) -> Option<WorldRect> {
         let c = self.ctx.as_ref()?;
-        let base = Base { scene: &c.scene, sx: &c.index, edges: &c.map.edges, ix: &c.map.analysis.index };
+        let base = Base { scene: &c.scene, sx: &c.index, edges: &c.map.edges, ix: c.map.analysis.index() };
         if v >= base.ix.node_count() {
             return None;
         }
@@ -368,7 +376,7 @@ impl Interaction {
             self.highlight_dirty = true;
             self.marks_dirty = true;
         }
-        let base = Base { scene: &c.scene, sx: &c.index, edges: &c.map.edges, ix: &c.map.analysis.index };
+        let base = Base { scene: &c.scene, sx: &c.index, edges: &c.map.edges, ix: c.map.analysis.index() };
         let mut changed = false;
         if self.highlight_dirty {
             self.highlight_dirty = false;

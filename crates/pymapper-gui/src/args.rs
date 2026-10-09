@@ -24,6 +24,8 @@ Options:
       --isolated     Ignore configuration files
       --no-cache     Do not read or write the analysis cache
       --cache-dir <DIR>  Cache directory [default: from the configuration]
+      --watch        Update the map when project files change (stable layout,
+                     animated changes)
   -h, --help         Print help
   -V, --version      Print version
 
@@ -56,6 +58,8 @@ pub struct Options {
     pub isolated: bool,
     pub no_cache: bool,
     pub cache_dir: Option<PathBuf>,
+    /// Watch the project and apply changes incrementally.
+    pub watch: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -73,6 +77,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
     let mut idle: Option<u32> = None;
     let mut stress: Option<u32> = None;
     let (mut deps, mut stdlib, mut isolated, mut no_cache, mut cache_dir) = (None, None, false, false, None);
+    let mut watch = false;
     let mut it = args.into_iter();
     let mut positional_only = false;
     while let Some(arg) = it.next() {
@@ -112,6 +117,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
                     no_cache = true;
                     continue;
                 }
+                "--watch" => {
+                    watch = true;
+                    continue;
+                }
                 "--cache-dir" => {
                     cache_dir = Some(PathBuf::from(it.next().ok_or_else(|| "--cache-dir requires a value".to_owned())?));
                     continue;
@@ -129,6 +138,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
         }
         path = Some(PathBuf::from(arg));
     }
+    if watch && stress.is_some() {
+        return Err("--watch needs a project (not --stress)".to_owned());
+    }
     if !measure && (frames.is_some() || idle.is_some()) {
         return Err("--frames and --idle require --measure".to_owned());
     }
@@ -136,7 +148,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Parsed, String
         frames: frames.unwrap_or(DEFAULT_FRAMES),
         idle_secs: idle.unwrap_or(DEFAULT_IDLE_SECS),
     });
-    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure, stress, deps, stdlib, isolated, no_cache, cache_dir }))
+    Ok(Parsed::Run(Options { path: path.unwrap_or_else(|| PathBuf::from(".")), measure, stress, deps, stdlib, isolated, no_cache, cache_dir, watch }))
 }
 
 fn number(flag: &str, value: Option<OsString>) -> Result<u32, String> {
@@ -217,6 +229,15 @@ mod tests {
         assert_eq!(opts(&["--deps", "--no-deps"]).deps, Some(false));
         assert_eq!(opts(&["--no-stdlib", "--stdlib"]).stdlib, Some(true));
         assert!(run(&["--cache-dir"]).unwrap_err().contains("requires a value"));
+    }
+
+    #[test]
+    fn watch_flag() {
+        assert!(!opts(&[]).watch);
+        let o = opts(&["--watch", "p"]);
+        assert!(o.watch);
+        assert_eq!(o.path, PathBuf::from("p"));
+        assert!(run(&["--watch", "--stress", "10"]).unwrap_err().contains("--watch"));
     }
 
     #[test]

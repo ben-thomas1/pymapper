@@ -80,7 +80,7 @@ pub fn radii(cm: &CodeMap, g: &ViewGraph) -> Vec<f32> {
 /// Builds the node-link scene of `g` laid out at `layout` (layout units; scaled into
 /// [`WORLD`]), with radii `r` (layout units).
 pub fn node_link(cm: &CodeMap, g: &ViewGraph, layout: &[[f32; 2]], r: &[f32], s: &NodeLinkStyle) -> (Scene, NodeLink) {
-    let ix = &cm.analysis.index;
+    let ix = cm.analysis.index();
     let agg = &cm.analysis.agg;
     let n = g.nodes.len();
     debug_assert!(layout.len() == n && r.len() == n);
@@ -223,7 +223,7 @@ pub const ABOVE_COLOR: Rgba = Rgba::rgb(255, 90, 70);
 
 /// Builds the matrix scene of `d`.
 pub fn matrix(cm: &CodeMap, d: &Dsm) -> (Scene, MatrixGeom) {
-    let ix = &cm.analysis.index;
+    let ix = cm.analysis.index();
     let n = d.nodes.len() as u32;
     let g = MatrixGeom::new(n);
     let c = g.cell;

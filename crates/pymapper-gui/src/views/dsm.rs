@@ -103,7 +103,7 @@ impl Dsm {
 
 /// Builds and orders the matrix of `cm` (see the module docs).
 pub fn build(cm: &CodeMap, p: DsmParams) -> Dsm {
-    let ix = &cm.analysis.index;
+    let ix = cm.analysis.index();
     let n = ix.node_count();
     // Rows: packages and modules (distributions with external code), in scope.
     let (lo, hi) = p.scope.filter(|&s| s < n).map_or((0, n), |s| (s, ix.subtree(s).end));

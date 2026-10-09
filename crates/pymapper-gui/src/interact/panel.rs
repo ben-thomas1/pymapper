@@ -108,7 +108,7 @@ pub fn search(ui: &mut egui::Ui, it: &mut Interaction, ps: &mut PanelState) {
     if it.search_text.trim().is_empty() {
         return;
     }
-    let ix = &analysis.index;
+    let ix = analysis.index();
     ui.weak(format!("{} matches ({:.1} ms)", res.hits.len(), res.elapsed.as_secs_f64() * 1000.0));
     let mut clicked = enter.then(|| res.hits.first().map(|h| h.node)).flatten();
     let n = res.hits.len();
@@ -184,7 +184,7 @@ pub fn details(ui: &mut egui::Ui, it: &mut Interaction, ps: &mut PanelState, hov
         return;
     };
     let a = &*ctx.map.analysis;
-    let ix = &a.index;
+    let ix = a.index();
     if v >= ix.node_count() {
         return;
     }
@@ -228,7 +228,7 @@ pub fn details(ui: &mut egui::Ui, it: &mut Interaction, ps: &mut PanelState, hov
 
 /// Metrics of node `v`.
 fn metrics(ui: &mut egui::Ui, a: &Analysis, v: NodeId, buf: &mut String) {
-    let ix = &a.index;
+    let ix = a.index();
     let agg = a.agg.get(v);
     let kind = ix.kind(v);
     egui::Grid::new("pm_details_metrics").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
@@ -398,7 +398,7 @@ fn findings_list(ui: &mut egui::Ui, it: &mut Interaction, ps: &mut PanelState) {
         return;
     }
     let a = &*ctx.map.analysis;
-    let ix = &a.index;
+    let ix = a.index();
     let ctxi = IndexContext::new(ix, &a.root, &a.config.contracts);
     let mut clicked = None;
     let view = std::mem::take(&mut ps.view);
