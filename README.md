@@ -169,7 +169,7 @@ Each rule's explanation, thresholds, cost class and confidence model:
 [`docs/rules.md`](docs/rules.md).
 
 Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`tests/`, `test/`,
-`testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
+`testing/`, `_tests/`, `_testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
 `analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
 tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
 structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a

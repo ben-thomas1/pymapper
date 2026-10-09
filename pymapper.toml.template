@@ -345,8 +345,9 @@
 
 # Report complexity / size (PM1xx), coupling (PM2xx) and duplication (PM5xx) findings in test
 # code too. Test code is a file whose dotted module name has a `tests`, `test` or `testing`
-# component (a directory so named below its import root), or whose name is `test_*.py`,
-# `*_test.py` or `conftest.py`. Dead code (PM4xx) and cycles / contracts (PM3xx) always apply
+# component (a directory so named below its import root) or a private `_tests` / `_testing`
+# one (test helpers shipped in a library, such as `pandas/_testing`), or whose name is
+# `test_*.py`, `*_test.py` or `conftest.py`. Dead code (PM4xx) and cycles / contracts (PM3xx) always apply
 # to tests.
 # include-tests-in-metrics = false
 # cost: none (one name check per file; excluding tests makes duplication cheaper, as their

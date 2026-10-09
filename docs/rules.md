@@ -32,7 +32,9 @@ Metric rules read a limit from `[thresholds]` and report values strictly above a
 
 By default the complexity (PM1xx), coupling (PM2xx) and duplication (PM5xx) rules skip test code:
 files whose dotted module name has a `tests`, `test` or `testing` component (a directory so named
-below the import root, at any depth), or whose name is `test_*.py`, `*_test.py` or `conftest.py`.
+below the import root, at any depth) or a private `_tests` / `_testing` one (test-support packages
+shipped inside a library, such as `pandas/_testing`), or whose name is `test_*.py`, `*_test.py` or
+`conftest.py`.
 Long test functions, large test classes and repeated test setup are normal and would drown the
 findings about the code under test. Set `analysis.include-tests-in-metrics = true` to report them
 too. Dead code (PM4xx) and import cycles / contracts (PM3xx) always cover tests.
