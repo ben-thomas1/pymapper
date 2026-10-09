@@ -1,18 +1,12 @@
-//! `pymapper callees` subcommand.
+//! `pymapper callees` subcommand: what a symbol calls (and, with `--depth`, what those call).
+//! The arguments and the implementation are `callers`'s, walking forward edges.
 
 use std::process::ExitCode;
 
-/// Not implemented yet: accepts any operands and the shared configuration flags so that
-/// scripts get the "not implemented" message (exit 2) rather than a usage error.
-#[derive(clap::Args)]
-pub struct Args {
-    /// Operands (symbols, paths).
-    #[arg(hide = true)]
-    _operands: Vec<String>,
-    #[command(flatten)]
-    _config: super::config::ConfigArgs,
-}
+use super::query::hops::Side;
 
-pub fn run(_args: &Args) -> anyhow::Result<ExitCode> {
-    super::not_implemented("callees")
+pub use super::callers::Args;
+
+pub fn run(args: Args) -> anyhow::Result<ExitCode> {
+    super::callers::run_walk(args, Side::Callees)
 }

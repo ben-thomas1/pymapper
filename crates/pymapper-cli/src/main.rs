@@ -27,18 +27,14 @@ struct Cli {
 enum Command {
     /// Run rule checks and report findings.
     Check(Box<cmd::check::Args>),
-    /// List callers of a symbol.
-    #[command(hide = true)]
-    Callers(cmd::callers::Args),
-    /// List callees of a symbol.
-    #[command(hide = true)]
-    Callees(cmd::callees::Args),
-    /// Show everything transitively affected by changing a symbol.
-    #[command(hide = true)]
-    Impact(cmd::impact::Args),
-    /// Find a call/import path between two symbols.
-    #[command(hide = true)]
-    Path(cmd::path::Args),
+    /// List the callers of a symbol, at their call sites.
+    Callers(Box<cmd::callers::Args>),
+    /// List the callees of a symbol, at their call sites.
+    Callees(Box<cmd::callees::Args>),
+    /// Show everything that transitively calls or imports a symbol: what a change can break.
+    Impact(Box<cmd::impact::Args>),
+    /// Find a shortest call (or import) chain from one symbol to another.
+    Path(Box<cmd::path::Args>),
     /// List third-party distributions, how much first-party code uses each, and (--score)
     /// their scorecards.
     Deps(Box<cmd::deps::Args>),
@@ -56,10 +52,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Check(args) => cmd::check::run(*args),
-        Command::Callers(args) => cmd::callers::run(&args),
-        Command::Callees(args) => cmd::callees::run(&args),
-        Command::Impact(args) => cmd::impact::run(&args),
-        Command::Path(args) => cmd::path::run(&args),
+        Command::Callers(args) => cmd::callers::run(*args),
+        Command::Callees(args) => cmd::callees::run(*args),
+        Command::Impact(args) => cmd::impact::run(*args),
+        Command::Path(args) => cmd::path::run(*args),
         Command::Deps(args) => cmd::deps::run(*args),
         Command::Cycles(args) => cmd::cycles::run(&args),
         Command::Summary(args) => cmd::summary::run(&args),

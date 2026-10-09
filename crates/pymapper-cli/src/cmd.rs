@@ -8,6 +8,7 @@ pub mod cycles;
 pub mod deps;
 pub mod impact;
 pub mod path;
+pub mod query;
 pub mod summary;
 
 use std::io::Write;
