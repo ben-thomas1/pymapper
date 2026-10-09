@@ -50,8 +50,9 @@
 //! | `cycles` (calls)           | O(forward reach of the target) per query                    |
 //! | `summary`                  | O(V + E) (one pass over nodes and call rows, Tarjan)        |
 //!
-//! None is quadratic. Memory beyond the index: the call graph (`16 (V + 1) + 10 E` bytes), the
-//! name index (`4 V`) and the scratch (`8 V` per side used).
+//! None is quadratic. Memory beyond the index: the call graph (`8 (V + 1) + 10 E` bytes,
+//! forward and reverse CSR with labels), the name index (`4 V`), the module graphs when used
+//! and the scratch (`8 V` per side used).
 
 mod cycles;
 mod deps;
@@ -185,6 +186,15 @@ impl<'a> Query<'a> {
             let scc = Scc::of(mg.graph());
             (mg, scc)
         })
+    }
+
+    /// Heap bytes (capacity) of the query state: the call graph plus the lazy tables built so
+    /// far (the index and resolutions are borrowed, not counted).
+    pub fn heap_bytes(&self) -> usize {
+        self.graph.heap_bytes()
+            + self.names.get().map_or(0, NameIndex::heap_bytes)
+            + self.imports.get().map_or(0, ModuleGraph::heap_bytes)
+            + self.cycle.get().map_or(0, |(mg, scc)| mg.heap_bytes() + scc.heap_bytes())
     }
 
     /// A view of node `v` with borrowed accessors.

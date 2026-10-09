@@ -122,6 +122,14 @@ pub enum Target {
     /// entrypoints (the fewest roots: the most candidates); `XTASK_DEADCODE_MODE=library` for
     /// library mode. Peak RSS includes the index, the import resolution and the resolved calls.
     Deadcode,
+    /// `calls`, then the query API (`pymapper_core::query`): the query state (`query.build`:
+    /// call graph; `query.names`: name index; `query.imports`: import graph;
+    /// `query.cycle_graph`: cycle import graph + SCCs), then batches of
+    /// queries over up to 1000 evenly spaced defs and 200 packages/modules with one reused
+    /// scratch, one phase per batch (`query.<kind>`). Counters per kind: queries, mean and
+    /// worst latency (`<kind>_avg_ns`, `<kind>_max_us`) and mean result size. Peak RSS
+    /// includes the index, the resolutions and the query state.
+    Query,
     /// `load` through the facts cache (`pymapper_core::cache::load`) after deleting the cache:
     /// extraction plus encoding and writing every segment. Inputs come from import roots when
     /// the corpus is a venv's site-packages (one trusted segment per distribution) or a stdlib
@@ -160,6 +168,7 @@ impl Target {
             Target::Hotspot => "hotspot",
             Target::Coupling => "coupling",
             Target::Deadcode => "deadcode",
+            Target::Query => "query",
             Target::LoadCold => "load-cold",
             Target::LoadWarm => "load-warm",
         }
@@ -495,6 +504,7 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
         Target::Hotspot => hotspot_target(root)?,
         Target::Coupling => coupling_target(root)?,
         Target::Deadcode => deadcode_target(root)?,
+        Target::Query => super::query::query_target(root)?,
         Target::LoadCold | Target::LoadWarm => cache_target(root, target == Target::LoadCold)?,
         Target::Read
         | Target::ParseOnly
@@ -533,18 +543,18 @@ pub fn run(target: Target, root: &Path) -> anyhow::Result<RunRecord> {
 }
 
 /// Named counters of a run, in a fixed order.
-type Counters = Vec<(String, u64)>;
+pub(super) type Counters = Vec<(String, u64)>;
 
 /// Walk options for the benchmark corpora: every Python file outside `__pycache__` and `.git`,
 /// hidden directories included, no gitignore (the same file set as the sequential reference
 /// walker, so `walk` and `walk-seq` are comparable).
-fn corpus_options() -> WalkOptions {
+pub(super) fn corpus_options() -> WalkOptions {
     WalkOptions::everything()
 }
 
 /// Runs the core walker as phase `walk`: files, non-fatal error count and walk counters. An
 /// unreadable root is an error.
-fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64, Counters)> {
+pub(super) fn walk_corpus(root: &Path, opts: &WalkOptions) -> anyhow::Result<(PathList, u64, Counters)> {
     let w = timing::time("walk", || core_walk::walk(&[root], opts));
     if let Some(d) = w.diagnostics.iter().find(|d| d.kind == DiagnosticKind::Root || d.path == root) {
         anyhow::bail!("walking {}: {d}", root.display());
@@ -1407,6 +1417,7 @@ mod tests {
             Target::Hotspot,
             Target::Coupling,
             Target::Deadcode,
+            Target::Query,
             Target::LoadCold,
             Target::LoadWarm,
         ] {
@@ -1488,6 +1499,14 @@ mod tests {
                     "deadcode.graph", "deadcode.propagate", "deadcode.evidence", "deadcode.referenced",
                     "deadcode.findings",
                 ],
+                Target::Query => &[
+                    "walk", "load.extract", "load.merge", "load.build", "resolve.modules", "resolve.imports",
+                    "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "query.build", "query.names",
+                    "query.imports", "query.cycle_graph", "query.lookup_exact", "query.lookup_name",
+                    "query.lookup_suffix2", "query.lookup_fuzzy", "query.callers1", "query.callees3",
+                    "query.callers_all", "query.impact", "query.path", "query.deps_out", "query.deps_in",
+                    "query.import_cycles", "query.call_cycle", "query.summary",
+                ],
                 Target::LoadCold | Target::LoadWarm => {
                     &["walk", "load.extract", "load.merge", "load.build", "cache.write"]
                 }
@@ -1520,6 +1539,14 @@ mod tests {
                 assert!(counter("defs").unwrap() > 0 && counter("calls").unwrap() > 0);
                 assert!(counter("facts_B_per_kLOC").unwrap() > 1000);
                 assert!(counter("metrics_B_per_kLOC").unwrap() > 0);
+            } else if target == Target::Query {
+                assert!(counter("nodes").unwrap() > 0 && counter("loc").unwrap() > rec.files);
+                // Every sampled def is found by its own qualified id, and only it.
+                assert!(counter("lookup_exact_queries").unwrap() > 0);
+                assert_eq!(counter("lookup_exact_avg_items"), Some(1));
+                for kind in ["callers1", "impact", "path", "deps_in", "import_cycles", "summary"] {
+                    assert!(counter(&format!("{kind}_avg_ns")).is_some(), "{kind}");
+                }
             } else if target == Target::Load {
                 let names: Vec<&str> = rec.counters.iter().map(|(n, _)| n.as_str()).collect();
                 assert_eq!(names, [

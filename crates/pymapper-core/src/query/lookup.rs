@@ -17,7 +17,11 @@
 //! Matches are ranked by form, fuzzy score, origin (first-party, third-party, stdlib), then
 //! node order.
 
+use std::collections::BinaryHeap;
+use std::ops::Range;
 use std::path::Path;
+
+use rayon::prelude::*;
 
 use super::Query;
 use crate::index::qid::split_dup;
@@ -137,10 +141,17 @@ impl NameIndex {
 
     /// Distinct names with their nodes, by `Sym` index (`ix`: the index it was built from).
     pub fn runs<'s>(&'s self, ix: &'s Index) -> impl Iterator<Item = (Sym, &'s [NodeId])> + 's {
-        let mut i = 0;
+        self.runs_in(ix, 0..self.nodes.len())
+    }
+
+    /// The runs starting in `range` of the sorted nodes (`range.start` must start a run).
+    fn runs_in<'s>(&'s self, ix: &'s Index, range: Range<usize>) -> impl Iterator<Item = (Sym, &'s [NodeId])> + 's {
+        let mut i = range.start;
         std::iter::from_fn(move || {
-            let &first = self.nodes.get(i)?;
-            let sym = ix.name_sym(first);
+            if i >= range.end {
+                return None;
+            }
+            let sym = ix.name_sym(self.nodes[i]);
             let mut j = i + 1;
             while j < self.nodes.len() && ix.name_sym(self.nodes[j]) == sym {
                 j += 1;
@@ -149,6 +160,23 @@ impl NameIndex {
             i = j;
             Some((sym, run))
         })
+    }
+
+    /// About `k` ranges of the sorted nodes covering them, each starting a run.
+    fn chunks(&self, ix: &Index, k: usize) -> Vec<Range<usize>> {
+        let n = self.nodes.len();
+        let step = n.div_ceil(k.max(1)).max(1);
+        let mut out = Vec::with_capacity(k);
+        let mut start = 0;
+        while start < n {
+            let mut end = (start + step).min(n);
+            while end < n && ix.name_sym(self.nodes[end]) == ix.name_sym(self.nodes[end - 1]) {
+                end += 1;
+            }
+            out.push(start..end);
+            start = end;
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -307,22 +335,34 @@ impl Query<'_> {
             return Vec::new();
         }
         let lower: Vec<u8> = last.to_ascii_lowercase();
-        let max_d = (lower.len() / 3).max(1);
-        let mut rows = Vec::new();
-        // (score, origin rank, node).
-        let mut hits: Vec<(u32, u8, NodeId)> = Vec::new();
-        for (sym, run) in self.names().runs(ix) {
-            let Some(score) = fuzzy_score(&lower, ix.str(sym), max_d, &mut rows) else { continue };
-            for &v in run {
-                hits.push((score, origin_rank(self.symbol(v).origin()), v));
-            }
-        }
-        if hits.len() > limit && limit > 0 {
-            hits.select_nth_unstable(limit - 1);
-        }
-        hits.truncate(limit);
-        hits.sort_unstable();
-        hits.into_iter().map(|(score, _, node)| Match { node, kind: MatchKind::Fuzzy, score }).collect()
+        let fq = Fuzzy { mask: char_mask(&lower), max_d: (lower.len() / 3).max(1), lower };
+        // In parallel over run-aligned chunks of the name index, each keeping its best `limit`
+        // (score, origin rank, node) in a bounded heap (root: the weakest kept); then merged.
+        let names = self.names();
+        let chunks = names.chunks(ix, 4 * rayon::current_num_threads());
+        let heap = chunks
+            .into_par_iter()
+            .map(|range| {
+                let mut rows = Vec::new();
+                let mut heap: BinaryHeap<(u32, u8, NodeId)> = BinaryHeap::with_capacity(limit + 1);
+                for (sym, run) in names.runs_in(ix, range) {
+                    let Some(score) = fuzzy_score(&fq, ix.str(sym), &mut rows) else { continue };
+                    if heap.len() == limit && heap.peek().is_some_and(|w| w.0 < score) {
+                        continue;
+                    }
+                    for &v in run {
+                        push_bounded(&mut heap, limit, (score, origin_rank(self.symbol(v).origin()), v));
+                    }
+                }
+                heap
+            })
+            .reduce(BinaryHeap::new, |mut a, b| {
+                for item in b {
+                    push_bounded(&mut a, limit, item);
+                }
+                a
+            });
+        heap.into_sorted_vec().into_iter().map(|(score, _, node)| Match { node, kind: MatchKind::Fuzzy, score }).collect()
     }
 
     /// The innermost def of file `f` whose line span contains `line`, else the file's
@@ -363,54 +403,233 @@ impl Query<'_> {
     }
 }
 
+/// Keeps the `limit` smallest items in a max-heap.
+#[inline]
+fn push_bounded<T: Ord>(heap: &mut BinaryHeap<T>, limit: usize, item: T) {
+    if heap.len() < limit {
+        heap.push(item);
+    } else if let Some(mut weakest) = heap.peek_mut()
+        && item < *weakest
+    {
+        *weakest = item;
+    }
+}
+
 /// Fuzzy score of `name` against the lower-case query (see [`Match::score`]); `None` when
 /// too far.
-fn fuzzy_score(q: &[u8], name: &[u8], max_d: usize, rows: &mut Vec<usize>) -> Option<u32> {
-    let eq = |a: u8, b: u8| a == b.to_ascii_lowercase();
-    if name.len() == q.len() && q.iter().zip(name).all(|(&a, &b)| eq(a, b)) {
-        return Some(0);
+fn fuzzy_score(q: &Fuzzy, name: &[u8], rows: &mut Vec<u32>) -> Option<u32> {
+    let (ql, nl) = (q.lower.len(), name.len());
+    // No tier applies to a name shorter than the query by more than the edit budget.
+    if nl + q.max_d < ql {
+        return None;
     }
-    if name.len() > q.len() {
-        if q.iter().zip(name).all(|(&a, &b)| eq(a, b)) {
-            return Some((1 << 16) | (name.len() - q.len()).min(0xffff) as u32);
+    // Every distinct query byte missing from the name costs at least one edit, and the exact
+    // tiers need none missing: most names stop here, after one pass over their bytes.
+    let missing = (q.mask & !char_mask(name)).count_ones() as usize;
+    if missing > q.max_d {
+        return None;
+    }
+    let eq = |a: u8, b: u8| a == b.to_ascii_lowercase();
+    if missing == 0 && nl >= ql {
+        if q.lower.iter().zip(name).all(|(&a, &b)| eq(a, b)) {
+            return Some(if nl == ql { 0 } else { (1 << 16) | (nl - ql).min(0xffff) as u32 });
         }
-        if let Some(pos) = name.windows(q.len()).position(|w| q.iter().zip(w).all(|(&a, &b)| eq(a, b))) {
+        if let Some(pos) = name.windows(ql).position(|w| q.lower.iter().zip(w).all(|(&a, &b)| eq(a, b))) {
             return Some((2 << 16) | pos.min(0xffff) as u32);
         }
     }
-    if name.len().abs_diff(q.len()) > max_d {
+    if nl.abs_diff(ql) > q.max_d {
         return None;
     }
-    let d = osa_distance(q, name, rows);
-    (d <= max_d).then_some((3 << 16) | d as u32)
+    let d = osa_bounded(&q.lower, name, q.max_d, rows);
+    (d <= q.max_d).then_some((3 << 16) | d as u32)
 }
 
-/// Optimal string alignment distance between the lower-case `a` and `b` (compared lower-case),
-/// with three reused rolling rows.
-fn osa_distance(a: &[u8], b: &[u8], rows: &mut Vec<usize>) -> usize {
-    if a.is_empty() || b.is_empty() {
-        return a.len().max(b.len());
+/// A fuzzy query: the lower-case last segment, its byte set and the edit budget.
+struct Fuzzy {
+    lower: Vec<u8>,
+    mask: u64,
+    max_d: usize,
+}
+
+/// Set of the (lower-cased) bytes of `s` folded into 64 bits: letters, digits and `_` get a
+/// bit each (37 bits), other bytes share the remaining 27 by value. A superset test on these
+/// masks is a necessary condition for "contains every byte" (shared bits only weaken it).
+#[inline]
+fn char_mask(s: &[u8]) -> u64 {
+    let mut m = 0u64;
+    for &c in s {
+        let bit = match c.to_ascii_lowercase() {
+            c @ b'a'..=b'z' => c - b'a',
+            c @ b'0'..=b'9' => 26 + c - b'0',
+            b'_' => 36,
+            c => 37 + c % 27,
+        };
+        m |= 1 << bit;
     }
-    let w = b.len() + 1;
+    m
+}
+
+/// Optimal string alignment distance between the lower-case `a` and `b` (compared
+/// lower-case), capped: `max_d + 1` when it is larger. Only the band `|i - j| <= max_d` of the
+/// table is computed (cells outside it are above the cap), and the search stops at the first
+/// row whose minimum is above the cap (row minima never decrease, transpositions included).
+/// O(len * max_d); `rows` is reused scratch (three rolling rows plus the lower-cased `b`).
+fn osa_bounded(a: &[u8], b: &[u8], max_d: usize, rows: &mut Vec<u32>) -> usize {
+    let (n, m) = (a.len(), b.len());
+    if n.abs_diff(m) > max_d {
+        return max_d + 1;
+    }
+    if n == 0 || m == 0 {
+        return n.max(m);
+    }
+    let inf = (max_d + 1) as u32;
+    let w = m + 1;
     rows.clear();
-    rows.resize(3 * w, 0);
-    for (j, cell) in rows[w..2 * w].iter_mut().enumerate() {
-        *cell = j;
+    rows.resize(3 * w + m, inf);
+    let (dp, lb) = rows.split_at_mut(3 * w);
+    for (d, &c) in lb.iter_mut().zip(b) {
+        *d = u32::from(c.to_ascii_lowercase());
     }
-    let lb = |j: usize| b[j].to_ascii_lowercase();
-    for i in 1..=a.len() {
-        let (prev2, rest) = rows.split_at_mut(w);
-        let (prev, cur) = rest.split_at_mut(w);
-        cur[0] = i;
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != lb(j - 1));
-            let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == lb(j - 2) && a[i - 2] == lb(j - 1) {
-                v = v.min(prev2[j - 2] + 1);
-            }
-            cur[j] = v;
+    for j in 0..=m.min(max_d) {
+        dp[w + j] = j as u32;
+    }
+    // Offsets of rows i - 2, i - 1 and i.
+    let (mut p2, mut p1, mut cu) = (0, w, 2 * w);
+    for i in 1..=n {
+        let lo = i.saturating_sub(max_d).max(1);
+        let hi = (i + max_d).min(m);
+        dp[cu..cu + w].fill(inf);
+        if i <= max_d {
+            dp[cu] = i as u32;
         }
-        rows.copy_within(w..3 * w, 0);
+        let mut row_min = dp[cu];
+        let ai = u32::from(a[i - 1]);
+        for j in lo..=hi {
+            let cost = u32::from(ai != lb[j - 1]);
+            let mut v = (dp[p1 + j] + 1).min(dp[cu + j - 1] + 1).min(dp[p1 + j - 1] + cost);
+            if i > 1 && j > 1 && ai == lb[j - 2] && u32::from(a[i - 2]) == lb[j - 1] {
+                v = v.min(dp[p2 + j - 2] + 1);
+            }
+            let v = v.min(inf);
+            dp[cu + j] = v;
+            row_min = row_min.min(v);
+        }
+        if row_min >= inf {
+            return max_d + 1;
+        }
+        (p2, p1, cu) = (p1, cu, p2);
     }
-    rows[2 * w - 1]
+    dp[p1 + m] as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic xorshift.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn string(&mut self, alphabet: &[u8], max_len: usize, lower: bool) -> Vec<u8> {
+            let n = self.below(max_len + 1);
+            (0..n)
+                .map(|_| {
+                    let c = alphabet[self.below(alphabet.len())];
+                    if lower { c.to_ascii_lowercase() } else { c }
+                })
+                .collect()
+        }
+    }
+
+    const ALPHABET: &[u8] = b"abcdeABCDE_019p\xc3";
+
+    /// Full-table optimal string alignment distance (the reference of [`osa_bounded`]).
+    fn osa_distance(a: &[u8], b: &[u8]) -> usize {
+        let w = b.len() + 1;
+        let mut rows = vec![0usize; 3 * w];
+        for (j, cell) in rows[w..2 * w].iter_mut().enumerate() {
+            *cell = j;
+        }
+        let lb = |j: usize| b[j].to_ascii_lowercase();
+        for i in 1..=a.len() {
+            let (prev2, rest) = rows.split_at_mut(w);
+            let (prev, cur) = rest.split_at_mut(w);
+            cur[0] = i;
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != lb(j - 1));
+                let mut v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == lb(j - 2) && a[i - 2] == lb(j - 1) {
+                    v = v.min(prev2[j - 2] + 1);
+                }
+                cur[j] = v;
+            }
+            rows.copy_within(w..3 * w, 0);
+        }
+        rows[2 * w - 1]
+    }
+
+    /// The scoring without the byte-set prefilter and the band (the reference).
+    fn reference(q: &[u8], name: &[u8], max_d: usize) -> Option<u32> {
+        let eq = |a: u8, b: u8| a == b.to_ascii_lowercase();
+        let (ql, nl) = (q.len(), name.len());
+        if nl == ql && q.iter().zip(name).all(|(&a, &b)| eq(a, b)) {
+            return Some(0);
+        }
+        if nl > ql {
+            if q.iter().zip(name).all(|(&a, &b)| eq(a, b)) {
+                return Some((1 << 16) | (nl - ql) as u32);
+            }
+            if let Some(pos) = name.windows(ql).position(|w| q.iter().zip(w).all(|(&a, &b)| eq(a, b))) {
+                return Some((2 << 16) | pos as u32);
+            }
+        }
+        let d = osa_distance(q, name);
+        (d <= max_d).then_some((3 << 16) | d as u32)
+    }
+
+    #[test]
+    fn prefilter_and_band_never_change_a_score() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut rows = Vec::new();
+        let mut hits = [0usize; 4];
+        for _ in 0..200_000 {
+            let q = rng.string(ALPHABET, 7, true);
+            if q.is_empty() {
+                continue;
+            }
+            let name = rng.string(ALPHABET, 10, false);
+            let fq = Fuzzy { mask: char_mask(&q), max_d: (q.len() / 3).max(1), lower: q.clone() };
+            let want = reference(&q, &name, fq.max_d);
+            assert_eq!(fuzzy_score(&fq, &name, &mut rows), want, "{q:?} {name:?}");
+            if let Some(s) = want {
+                hits[(s >> 16) as usize] += 1;
+            }
+        }
+        assert!(hits.iter().all(|&h| h > 100), "{hits:?}");
+    }
+
+    #[test]
+    fn banded_distance_matches_the_full_table() {
+        let mut rng = Rng(0x0dd_ba11);
+        let mut rows = Vec::new();
+        for _ in 0..100_000 {
+            let a = rng.string(ALPHABET, 12, true);
+            let b = rng.string(ALPHABET, 12, false);
+            let max_d = rng.below(6);
+            let full = osa_distance(&a, &b);
+            assert_eq!(osa_bounded(&a, &b, max_d, &mut rows), full.min(max_d + 1), "{a:?} {b:?} {max_d}");
+        }
+        for (a, b, d) in [("", "", 0), ("abc", "", 3), ("abc", "abc", 0), ("abc", "ABC", 0), ("ab", "ba", 1), ("helper", "helpr", 1), ("kitten", "sitting", 3)] {
+            assert_eq!(osa_distance(a.as_bytes(), b.as_bytes()), d, "{a} {b}");
+            assert_eq!(osa_bounded(a.as_bytes(), b.as_bytes(), 3, &mut rows), d, "{a} {b}");
+        }
+    }
 }
