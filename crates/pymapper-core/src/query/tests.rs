@@ -852,6 +852,29 @@ fn representative_ref(ix: &Index, x: NodeId, m: NodeId, w: NodeId) -> NodeId {
 }
 
 #[test]
+fn query_is_shareable_between_threads() {
+    fn sync<T: Sync>(_: &T) {}
+    let f = fx(PROJECT);
+    let q = f.q();
+    sync(&q);
+    // Lazy tables initialised from several threads at once give the same answers.
+    let leaf = f.node("pkg.util:leaf");
+    let results: Vec<(usize, usize)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut s = Scratch::default();
+                    (q.lookup(b"leaf", &LookupOptions::default()).len(), q.impact(leaf, &WalkOptions::transitive(), &mut s).importers.len())
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("thread")).collect()
+    });
+    assert!(results.windows(2).all(|w| w[0] == w[1]));
+    assert_eq!(results[0], (2, 3));
+}
+
+#[test]
 fn scratch_reuse_and_generation_wrap() {
     let f = fx(PROJECT);
     let q = f.q();

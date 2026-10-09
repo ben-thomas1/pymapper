@@ -117,9 +117,14 @@ fn run_batches(ix: &Index, q: &Query<'_>, defs: &[NodeId], mods: &[NodeId], c: &
     batch("query.callees3", "callees3", defs, c, |&v| q.callees(v, &WalkOptions { depth: 3, ..d1 }, &mut s).hops.len());
     batch("query.callers_all", "callers_all", defs, c, |&v| q.callers(v, &all, &mut s).hops.len());
     batch("query.impact", "impact", defs, c, |&v| q.impact(v, &all, &mut s).walk.hops.len());
-    let ends: Vec<(NodeId, NodeId)> = defs.iter().zip(defs.iter().rev()).map(|(&a, &b)| (a, b)).collect();
     let po = PathOptions::default();
-    batch("query.path", "path", &ends, c, |&(a, b)| q.path(a, b, &po, &mut s).map_or(0, |p| p.nodes.len()));
+    // Reachable pairs: the deepest transitive caller of each def (with callers) to the def.
+    let reachable: Vec<(NodeId, NodeId)> =
+        defs.iter().filter_map(|&v| q.callers(v, &all, &mut s).hops.last().map(|h| (h.node, v))).collect();
+    batch("query.path", "path", &reachable, c, |&(a, b)| q.path(a, b, &po, &mut s).map_or(0, |p| p.nodes.len()));
+    // Mostly unreachable pairs: def `i` to def `n - 1 - i`.
+    let ends: Vec<(NodeId, NodeId)> = defs.iter().zip(defs.iter().rev()).map(|(&a, &b)| (a, b)).collect();
+    batch("query.path_random", "path_random", &ends, c, |&(a, b)| q.path(a, b, &po, &mut s).map_or(0, |p| p.nodes.len()));
     let dop = DepOptions::default();
     batch("query.deps_out", "deps_out", mods, c, |&v| q.deps(v, Direction::Out, &dop, &mut s).deps.len());
     batch("query.deps_in", "deps_in", mods, c, |&v| q.deps(v, Direction::In, &dop, &mut s).deps.len());

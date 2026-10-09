@@ -193,13 +193,20 @@ impl Query<'_> {
             }
             if let Some(f) = ix.file(h.node) {
                 files.push(f);
-                out.tests += u32::from(testfiles::is_test_file(ix, f));
             }
             mods.push(Level::Module.apply(ix, h.node));
         }
+        // Per distinct file: one test check, counting every hop in it.
         files.sort_unstable();
-        files.dedup();
-        out.files = files.len() as u32;
+        let mut i = 0;
+        while i < files.len() {
+            let j = i + files[i..].partition_point(|&f| f == files[i]);
+            out.files += 1;
+            if testfiles::is_test_file(ix, files[i]) {
+                out.tests += (j - i) as u32;
+            }
+            i = j;
+        }
         mods.sort_unstable();
         let mut i = 0;
         while i < mods.len() {

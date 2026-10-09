@@ -1504,7 +1504,8 @@ mod tests {
                     "resolve.edges", "resolve.classes", "resolve.mro", "resolve.calls", "query.build", "query.names",
                     "query.imports", "query.cycle_graph", "query.lookup_exact", "query.lookup_name",
                     "query.lookup_suffix2", "query.lookup_fuzzy", "query.callers1", "query.callees3",
-                    "query.callers_all", "query.impact", "query.path", "query.deps_out", "query.deps_in",
+                    "query.callers_all", "query.impact", "query.path", "query.path_random", "query.deps_out",
+                    "query.deps_in",
                     "query.import_cycles", "query.call_cycle", "query.summary",
                 ],
                 Target::LoadCold | Target::LoadWarm => {
