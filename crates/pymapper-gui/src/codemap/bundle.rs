@@ -16,6 +16,9 @@
 //!
 //! A collapsed endpoint is anchored at its rect's centre; an open one (it stands for its own
 //! code while its children are shown) at the centre of its header band, where its label is.
+//! Distributions have no common ancestor: the layout regions (main, third-party, stdlib) act
+//! as the roots of the forest, so edges between distributions bundle through the centre of
+//! their region, and edges into external code through both region centres.
 
 use pymapper_core::index::{Index, NodeId};
 use pymapper_core::layout::{Layout, Rect};

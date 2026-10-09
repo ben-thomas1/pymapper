@@ -11,9 +11,14 @@ but not a default member, so build it explicitly:
 ```
 cargo build --release -p pymapper-gui      # target/release/pymapper-gui
 cargo run -p pymapper-gui -- [PATH]        # debug build; wgpu validation on
+cargo run --release -p pymapper-gui -- --deps PATH        # code map incl. the venv (muted)
 cargo run --release -p pymapper-gui -- --stress 1000000   # synthetic 1M rects + 1M edges
 cargo test -p pymapper-gui
 ```
+
+`PATH` is analysed like `pymapper check PATH` (same config discovery, project root, cache).
+Load options: `--deps` / `--no-deps`, `--stdlib` / `--no-stdlib`, `--isolated` (ignore
+config files), `--no-cache`, `--cache-dir DIR`.
 
 ## Layout
 
@@ -42,6 +47,9 @@ crates/pymapper-gui/src/
   render.rs     one frame: clear + canvas + egui in a single render pass
   canvas.rs     canvas: background clear + map renderer, logical -> physical pixel rects
   map/          instanced code-map renderer (see "Canvas renderer")
+  codemap/      the code map: in-process analysis, semantic zoom, bundled edges, scenes
+                (see "Code map")
+  mapui.rs      code map controls (details panel) and legend (canvas overlay)
   panels.rs     egui panel layout (left search/tree, right details, bottom findings),
                 canvas input (pan / zoom / hover)
   schedule.rs   render-on-demand scheduler (pure, unit-tested)
@@ -172,6 +180,168 @@ let mut map = MapState::new(Arc::new(b.build()));   // or map.set_scene(...)
 
 World coordinates should stay within about +-2^14. The camera caps zoom at `2^21 / max|coord|`
 so f32 error stays under 1/8 px.
+
+## Code map
+
+`src/codemap/` turns an analysed project into scenes for the renderer. No GPU code: all of
+it is unit-tested.
+
+```
+codemap/
+  load.rs     in-process analysis through core (same pipeline as `pymapper check`):
+              config, roots, walks, Index (cache), imports, calls, Rollup, Aggregates
+  metrics.rs  size / colour / edge metrics, colour ramps, legend data
+  zoom.rs     reveal bands per node: which hierarchy cut is shown at each LOD band
+  edges.rs    cut edges of every band with all edge metrics, pruned per source
+  bundle.rs   hierarchical edge bundling: control polygon -> B-spline -> Bezier segments
+  scene.rs    CodeMap -> map::Scene (rect / curve LODs, label carriers) + Legend
+  worker.rs   background thread: load -> layout -> edges -> scene per request
+```
+
+```
+  pymapper-gui PATH
+     │ MapWorker thread ─ load (once) ─ CodeMap::build (per size metric) ─ CodeMap::scene
+     │                                  layout, reveal bands, edge table   (per colour / edge
+     │                                                                     metric, bundling)
+     ▼ Published { scene, legend, map } ──> UI thread: MapState::replace_scene (camera kept)
+```
+
+The UI thread never waits: it polls the worker once per frame (one uncontended lock), and
+the worker wakes it through egui's repaint callback. While loading, the canvas shows the
+phase. Requests coalesce (only the newest pending one is built). A size metric change
+rebuilds the layout and edge table; colour, edge metric, bundling strength and the edge
+toggles only rebuild the scene.
+
+### Treemap
+
+Cells are the core squarified layout (S7.3) of every node, sized by the selected metric
+(lines of code by default, also symbols, cyclomatic / cognitive sums, uniform), with
+third-party and stdlib code in the muted region on the right. Layer = depth, so children
+draw over their parent. The map uses the core layout config with a taller header band (160
+world units, still capped at 8% of a cell's height) so top-level names fit at the fit zoom.
+
+Colour metrics: kind (categorical), max cyclomatic / cognitive complexity (absolute scale,
+top of the ramp at 30 / 45), cyclomatic per 100 lines (top at 25), lines of code and
+symbols (log scale relative to the largest node at the same depth). External cells are
+blended 65% toward grey.
+
+### Semantic zoom
+
+The rollup level follows the on-screen size of each subtree, not one global depth. A node's
+children appear once the node is `REVEAL_PX` = 160 physical pixels big (square root of its
+area). Per node, `zoom.rs` computes two bands:
+
+- `rev[v]`: from here `v` is shown (0 for distributions, else its parent's `open`);
+- `open[v]`: from here `v`'s children are shown (never for leaves).
+
+The *cut* at band `b` maps every node to its deepest shown ancestor-or-self. Children are
+shown all at once, so a cut is monotone in pre-order and the core rollup can aggregate under
+it in one pass (`Rollup::map_with`). A shown node is an edge endpoint in one of two states:
+collapsed (it stands for its whole subtree) or open (its children stand for themselves, it
+keeps only its own code, e.g. module-level statements). An edge `A -> B` aggregates the same
+base pairs in every band where both endpoints keep their state, so it is emitted once, with
+the intersection of the two state intervals as its LOD. The renderer then switches rollup
+levels per band with its usual band filter; navigation does no other CPU work.
+
+Rects get `LOD.min = max(rev, auto size LOD)`. A cell that opens moves its label: a
+transparent *label carrier* covers the cell while it is collapsed, and another covers its
+header band once it is open, so parent and child labels never overlap. Fully transparent
+rects are culled in the vertex shader (`RectStyle::label_only`), and the shader's label LOD
+hides a header label until the band is tall enough.
+
+### Edges and metrics
+
+For every band where the cut changes (16 on the venv), `edges.rs` fills the cut map, runs
+`Rollup::map_with` (call sites, distinct pairs, imports, confidence), then one pass over the
+base call pairs adds the distinct-callee metrics with a per-source stamp array:
+
+| metric              | per edge `A -> B`                                                      |
+|---------------------|------------------------------------------------------------------------|
+| call sites          | distinct call sites in `A` with an edge into `B` (core rollup)         |
+| distinct pairs      | distinct (caller, callee) symbol pairs (core rollup)                   |
+| LOC reached         | lines of the distinct callees in `B`, each at its full span            |
+| API surface used    | distinct callees in `B`                                                |
+| complexity-weighted | `sum over pairs of sites x max(1, cc_sum(callee))`                     |
+| imports             | module import rows (draws the import graph instead of the call graph)  |
+
+Only rows new at the band are kept, pruned to the union of each source's 8 heaviest edges
+under every metric (`EdgeParams::per_source`). Third-party and stdlib nodes never open for
+edges below depth 1 (`EXTERNAL_EDGE_DEPTH`): edges into a venv stop at its packages. Edges
+between two external nodes are hidden unless "Edges inside third-party / stdlib" is on. A
+scene draws at most 40 000 edges first shown in any one band (the heaviest under the
+selected metric).
+
+Cost: per band O(n) for the cut plus O(m log d) for `m` base pairs; bands run on 4 workers
+with 16 bytes per node of scratch each. The edge table is 36 bytes per edge.
+
+### Bundling
+
+`bundle.rs` routes `A -> B` through the hierarchy (Holten's hierarchical edge bundling): the
+control polygon is `A`'s anchor, the centres of `A`'s ancestors up to the lowest common
+ancestor, the LCA, `B`'s ancestors down from it, and `B`'s anchor. Distributions have no
+common ancestor, so the region centres act as roots (edges into the venv bundle through the
+main and the external region's centres). The polygon is straightened by the bundling
+strength (default 0.85; slider in the panel), thinned to at most 8 points and drawn as a
+clamped uniform cubic B-spline: one curve instance per segment (2-3 points: one cubic). A
+collapsed endpoint is anchored at its cell's centre, an open one at its header band. Edge
+width (0.75-5 pt) and alpha follow the log of the selected weight relative to the heaviest
+edge in the scene; colour runs from the caller side (yellow) to the callee side (pink), or
+blue to violet for imports. Edges whose calls are all only possible / unresolved are drawn
+at 60% alpha.
+
+### Panels, legend, hover
+
+The details panel has the code map controls (size, colour, edge metric, bundling, edge
+toggles). The legend sits at the canvas's bottom-left: size metric, colour swatches or ramp
+with its scale, the muted swatch when external code is shown, and the edge metric with a
+width scale from 1 to the heaviest weight drawn. Hovering a cell shows its qualified id,
+kind, lines, symbols and complexity; hovering an edge shows both endpoints and every edge
+metric.
+
+### Results (S7.4)
+
+Release build, Apple M4 Pro (Metal), offscreen 2880x1800 px at 2x, frame = CPU + GPU
+(`cargo run --release -p pymapper-gui --example codemap_bench -- PATH [--deps] [--isolated]
+[--cache-dir DIR]`), warm index cache. aiml-lectio with its venv (`--deps`): 62 331 files,
+1 023 762 nodes, 1.43M call pairs.
+
+| phase                                  | time      |
+|----------------------------------------|-----------|
+| load (walk, index from cache, resolve, rollup, aggregates) | 679 ms |
+| code map build (layout 35 ms from the layout cache, reveal bands 9 ms, edges 44 ms) | 88 ms |
+| rebuild for another size metric (fresh layout) | 102 ms |
+| scene build (1.02M cells + carriers, 70k edges / 380k segments) | 92-107 ms |
+
+| scenario (240 frames)          | frame p50 | p95      | max      | CPU p50  | instances |
+|--------------------------------|-----------|----------|----------|----------|-----------|
+| fit view                       | 1.51 ms   | 1.58 ms  | 2.20 ms  | 0.038 ms | 26 620    |
+| pan at fit zoom                | 1.61 ms   | 1.73 ms  | 4.44 ms  | 0.105 ms | 26 620    |
+| pan at 8x (functions revealed) | 1.68 ms   | 2.39 ms  | 3.61 ms  | 0.079 ms | 63 065    |
+| pan at 64x                     | 1.29 ms   | 1.40 ms  | 1.88 ms  | 0.066 ms | 41 270    |
+| zoom sweep 1x -> 512x -> 1x    | 1.60 ms   | 5.49 ms  | 10.8 ms  | 0.079 ms | up to ~65k |
+
+- The zoom sweep crosses all 16 semantic-zoom bands both ways: 22 band rebuilds (mean 1.5,
+  max 2.4 ms) and uploads (mean 2.5, max 5.6 ms); its max frame is a band change.
+- Hover hit tests: mean 21 us at fit, 87 us at 8x, 79 us at 64x (max 0.7 ms).
+- Memory: scene 100 MiB CPU (cells, carriers, curves, grids, labels), code map 38 MiB
+  (layout, reveal bands, edge table), GPU buffers 28 MiB. Peak RSS 1.1 GiB, of which
+  about 660 MiB is the loaded index of the venv.
+
+Smaller inputs (same bench, cold layout):
+
+| input                                   | nodes  | load   | code map build | edges / segments | scene build | frame p50 / max (zoom sweep) | peak RSS |
+|-----------------------------------------|--------|--------|----------------|------------------|-------------|------------------------------|----------|
+| aiml-lectio first party (1 803 files)   | 24 866 | 191 ms | 7.7 ms         | 59.7k / 307k     | 13.7 ms     | 1.31 / 5.7 ms                | 180 MiB  |
+| stdlib 3.13 as a project (630 files)    | 18 755 | 73 ms  | 8.0 ms         | 37.4k / 124k     | 5.6 ms      | 0.96 / 7.3 ms                | 81 MiB   |
+
+Hover hit tests on the first-party map took 155 us on average at 8x and 64x, with single
+outliers of 20-29 ms in 20 000 samples (dense long bundled segments; see the hit-test notes
+above).
+
+Windowed (`pymapper-gui --measure --frames 600 --isolated --deps PATH`, same project, 120 Hz):
+120.0 fps vsync-bound, CPU work p50 0.38 ms, p99 4.4 ms, max 6.7 ms; idle 5 s: 0.4 ms CPU,
+0 frames; launch to the first frame with the map: 1.15 s; peak RSS 1.05 GiB. With a
+project, `--measure` starts timing once the map is shown.
 
 ## Render on demand
 

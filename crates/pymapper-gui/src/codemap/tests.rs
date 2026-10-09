@@ -558,6 +558,21 @@ fn worker_builds_scenes_and_reuses_the_map() {
 }
 
 #[test]
+fn empty_and_tiny_projects_build_empty_or_small_scenes() {
+    let p = TempProject::new(&[]);
+    let m = CodeMap::build(p.analysis(), MapParams::default());
+    assert!(m.edges.is_empty());
+    let (s, l, drawn) = m.scene(&SceneParams::default());
+    assert!(drawn.is_empty() && l.edges == 0 && l.edge_max == 0);
+    assert_eq!(s.curves.len(), 0);
+    let p = TempProject::new(&[("one.py", "x = 1\n")]);
+    let m = CodeMap::build(p.analysis(), MapParams::default());
+    let (s, l, _) = m.scene(&SceneParams::default());
+    assert!(l.rects >= 1 && s.bounds.is_positive());
+    assert!(m.edges.is_empty());
+}
+
+#[test]
 fn worker_reports_configuration_errors() {
     let p = TempProject::new(&[("m.py", "x = 1\n"), ("pymapper.toml", "no-such-option = 1\n")]);
     let w = MapWorker::spawn(LoadParams { isolated: false, ..params(&p.0) }, MapParams::default(), Request::default(), Arc::new(|| {})).expect("spawn");

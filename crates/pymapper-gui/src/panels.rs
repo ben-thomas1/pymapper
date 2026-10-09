@@ -286,6 +286,39 @@ mod tests {
     }
 
     #[test]
+    fn code_map_controls_and_legend_stay_idle() {
+        use crate::codemap::metrics::{ColorLegend, ColorMetric, EdgeMetric};
+        let ctx = egui::Context::default();
+        let mut s = state();
+        s.map_request = Some(Request::default());
+        for color_legend in [ColorLegend::Kinds, ColorLegend::Ramp { lo: "0", hi: "30+".to_owned() }] {
+            s.legend = Some(Legend {
+                size: pymapper_core::layout::SizeMetric::Loc,
+                color: ColorMetric::Kind,
+                color_legend,
+                edge: EdgeMetric::Sites,
+                edge_max: 12,
+                edges: 3,
+                segments: 9,
+                rects: 10,
+                has_muted: true,
+            });
+            let mut last = None;
+            for _ in 0..4 {
+                let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))), ..RawInput::default() };
+                let mut out = ctx.run_ui(raw, |ui| show(ui, &mut s));
+                out.textures_delta.clear();
+                last = Some(out.viewport_output[&ViewportId::ROOT].repaint_delay);
+                assert!(!s.map_request_changed, "no input, no change");
+            }
+            assert_eq!(last, Some(std::time::Duration::MAX));
+        }
+        // A tiny canvas skips the legend instead of drawing outside it.
+        s.map_status = "loading project: index".to_owned();
+        layout(&ctx, &mut s, 300.0, 200.0, 1.0, 2);
+    }
+
+    #[test]
     fn idle_ui_requests_no_repaint() {
         // Render on demand relies on egui settling: after the first frames, an idle UI
         // must not ask for another frame.

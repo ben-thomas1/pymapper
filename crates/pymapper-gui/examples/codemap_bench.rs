@@ -4,7 +4,7 @@
 //! the semantic-zoom bands.
 //!
 //! ```text
-//! cargo run --release -p pymapper-gui --example codemap_bench -- PATH [--deps] [--stdlib]
+//! cargo run --release -p pymapper-gui --example codemap_bench -- PATH [--[no-]deps] [--[no-]stdlib]
 //!     [--isolated] [--cache-dir DIR] [--no-cache] [--frames N] [--dump DIR]
 //! ```
 //!
@@ -119,8 +119,8 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--deps" => lp.deps = Some(true),
-            "--stdlib" => lp.stdlib = Some(true),
+            "--deps" | "--no-deps" => lp.deps = Some(a == "--deps"),
+            "--stdlib" | "--no-stdlib" => lp.stdlib = Some(a == "--stdlib"),
             "--isolated" => lp.isolated = true,
             "--no-cache" => lp.no_cache = true,
             "--cache-dir" => lp.cache_dir = Some(PathBuf::from(args.next().context("--cache-dir DIR")?)),
