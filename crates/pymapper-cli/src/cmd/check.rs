@@ -1,7 +1,7 @@
 //! `pymapper check` subcommand: load the project, run the enabled analyses, report findings.
 //!
 //! ```text
-//!   config ──> roots ──> files ──> index (cache) ──> imports ──┬─> hotspot      (PM1xx)
+//!   config ──> roots ──> walk ───> index (cache) ──> imports ──┬─> hotspot      (PM1xx)
 //!                                                             ├─> cycles       (PM301)
 //!                                                             ├─> layers       (PM302-304, contracts)
 //!                                                             ├─> coupling     (PM201-204; call graph for PM204)
@@ -31,7 +31,7 @@ use pymapper_core::output::{self, Baseline, IndexContext, Options, Report, Summa
 use pymapper_core::resolve::resolve_calls;
 use pymapper_core::roots::Origin;
 use pymapper_core::rules::codes::GOD_CLASS;
-use pymapper_core::rules::{FileId, Findings, Pass, RuleEngine};
+use pymapper_core::rules::{self, FileId, Findings, Pass, RuleEngine};
 use pymapper_core::timing;
 use pymapper_core::walk::{Gitignore, Match};
 
@@ -56,15 +56,18 @@ pub struct Args {
     stats: bool,
 }
 
-/// Runs `check`. Configuration, baseline and output errors are fatal (exit 2); unreadable files
-/// and directories are warnings.
+/// Runs `check`. Configuration, baseline and output errors and paths that do not exist are fatal
+/// (exit 2); unreadable files and directories are warnings.
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let t0 = Instant::now();
     if args.stats {
         timing::enable(true);
     }
     let cwd = std::env::current_dir().context("cannot determine the working directory")?;
+    let explicit = !args.paths.is_empty();
     let mut loaded = timing::time("config", || args.config.load(args.paths))?;
+    let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
+    pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
     if let Some(b) = args.baseline {
         loaded.config.baseline = Some(cwd.join(b));
     }
@@ -73,6 +76,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     pipeline::configure_threads(config.threads)?;
     let engine = RuleEngine::new(config);
     warn_gated(config, &engine);
+    warn_unknown_selectors(config);
     let per_file = compile_per_file_ignores(config)?;
     // Read the baseline before the expensive work, so a bad file fails fast. Saving a new
     // baseline ignores the old one.
@@ -235,6 +239,21 @@ fn warn_gated(config: &Config, engine: &RuleEngine) {
     }
 }
 
+/// Warns about each selector that matches no registered rule (`--select PM999`): it would
+/// silently select or ignore nothing.
+fn warn_unknown_selectors(config: &Config) {
+    let r = &config.rules;
+    let mut seen: Vec<RuleSelector> = Vec::new();
+    let pfi = r.per_file_ignores.iter().flat_map(|e| &e.rules);
+    for &sel in r.select.iter().flatten().chain(&r.extend_select).chain(&r.ignore).chain(pfi) {
+        if seen.contains(&sel) || rules::all().any(|d| sel.matches(d.code)) {
+            continue;
+        }
+        seen.push(sel);
+        warn(format_args!("selector `{sel}` matches no known rule"));
+    }
+}
+
 /// `per-file-ignores` patterns compiled once each (gitignore syntax, relative to the project
 /// root). An invalid pattern is a configuration error.
 fn compile_per_file_ignores(config: &Config) -> anyhow::Result<Vec<Gitignore>> {
@@ -277,8 +296,9 @@ fn read_baseline(path: &Path) -> anyhow::Result<Baseline> {
 
 /// Writes the baseline of `report` to `path` atomically (temporary file + rename).
 fn save_baseline(report: &Report<'_>, path: &Path) -> anyhow::Result<()> {
+    // Per-process temp name: concurrent saves to the same baseline must not share it.
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
     let res = (|| -> anyhow::Result<()> {
         let mut file = io::BufWriter::new(std::fs::File::create(&tmp)?);

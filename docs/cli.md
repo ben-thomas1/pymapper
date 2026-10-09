@@ -11,7 +11,7 @@ pymapper check [paths]
   │
   ├─ config        pyproject.toml [tool.pymapper] / pymapper.toml, --set, flags     phase config
   ├─ roots         import roots: src layout, venv, stdlib, .pth, dist-info          phase roots
-  ├─ files         first-party walk (gitignore + exclude), stdlib walk,             phase walk
+  ├─ walk          first-party walk (gitignore + exclude), stdlib walk,             phase walk
   │                third-party RECORD file lists (no walk of distributions)
   ├─ index         read -> lex -> parse -> facts -> drop source, through the cache  load.*, cache.write
   ├─ imports       absolute/relative, re-exports, __all__, star, TYPE_CHECKING      resolve.modules/imports/edges
@@ -41,10 +41,13 @@ The PM6xx dependency-hygiene rules belong to the `deps` step; `check` does not r
 |------|---------|
 | 0 | no finding at or above the confidence gate (or `--save-baseline` succeeded) |
 | 1 | at least one finding at or above the gate |
-| 2 | usage error, invalid configuration, unreadable or invalid baseline, cannot write output |
+| 2 | usage error (including a path to check that does not exist), invalid configuration, unreadable or invalid baseline, cannot write output |
 
-Unreadable files and directories, a missing stdlib or venv, and a cache that cannot be written
-are warnings on stderr, never fatal. A closed stdout (`pymapper check | head`) stops output
+A path that does not exist, whether given on the command line or listed in the configured
+`paths`, is a usage error (`pymapper: error: path `X` does not exist`, exit 2): a mistyped or
+stale path never passes as a clean run. Files and directories that exist but cannot be read,
+a missing stdlib or venv, and a cache that cannot be written are warnings on stderr, never
+fatal. A closed stdout (`pymapper check | head`) stops output
 quietly; the exit code still reflects the findings.
 
 ## Flags
@@ -61,7 +64,7 @@ subcommands (`pymapper check --help` lists them all):
 | `--deps` / `--no-deps` | `include-deps` | load the venv's third-party packages |
 | `--stdlib` / `--no-stdlib` | `include-stdlib` | load the interpreter's standard library |
 | `--venv DIR` | `venv` | default `$VIRTUAL_ENV`, then `.venv` / `venv` |
-| `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root |
+| `--no-cache`, `--cache-dir DIR` | `cache`, `cache-dir` | default `.pymapper_cache` in the project root (see below) |
 | `--threads N` / `-j N` | `threads` | 0 = one per logical CPU |
 | `--mode` | `mode` | dead code: `auto`, `application`, `library` |
 | `--preset` | `presets` | flask, fastapi, django, click, pytest, pydantic |
@@ -73,7 +76,15 @@ subcommands (`pymapper check --help` lists them all):
 | `--stats` | | phase timings, counters and peak RSS on stderr |
 
 Selecting a gated rule by code or category (`--select PM501`) without its toggle prints a
-warning naming the toggle (`analysis.dupes`).
+warning naming the toggle (`analysis.dupes`). A selector that matches no known rule
+(`--select PM999`) prints a warning.
+
+The default cache directory is `.pymapper_cache` in the project root: the config file's
+directory, else the nearest ancestor of the first path with a `pyproject.toml`, else the first
+path itself (its directory, for a file). So `pymapper check /some/dir` with no config writes `/some/dir/.pymapper_cache`,
+even from another working directory (pointing it at an interpreter's stdlib would write into
+the Python installation). Use `--cache-dir DIR` or `--no-cache` for directories you do not
+own; a cache that cannot be written is only a warning.
 
 ## Output formats
 

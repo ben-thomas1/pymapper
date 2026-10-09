@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!   Config ──> import roots (discover)      phase `roots`
-//!          ──> files: first-party walk,     phase `files`
+//!          ──> walk: first-party walk,      phase `walk`
 //!              stdlib walk, third-party RECORDs (+ walk of unclaimed site-packages entries)
 //!          ──> Inputs (module names, groups)
 //!          ──> Index, through the cache     phases `load.*`, `cache.write`
@@ -41,6 +41,29 @@ pub fn configure_threads(threads: u32) -> anyhow::Result<()> {
 /// nowhere else to report.
 pub fn warn(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(io::stderr().lock(), "pymapper: warning: {msg}");
+}
+
+/// Fails when a path to analyse does not exist: a mistyped or stale path must not pass as a
+/// clean run. `explicit`: the paths came from the command line (else from the config file
+/// `config_file`, or the default). Paths that exist but cannot be read are left to the walk,
+/// which reports them as warnings.
+pub fn require_paths(paths: &[PathBuf], explicit: bool, config_file: Option<&Path>) -> anyhow::Result<()> {
+    for p in paths {
+        let missing = match std::fs::symlink_metadata(p) {
+            Ok(_) => false,
+            Err(e) => matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory),
+        };
+        if !missing {
+            continue;
+        }
+        match config_file {
+            Some(file) if !explicit => {
+                anyhow::bail!("path `{}` (from `paths` in {}) does not exist", p.display(), file.display())
+            }
+            _ => anyhow::bail!("path `{}` does not exist", p.display()),
+        }
+    }
+    Ok(())
 }
 
 /// The loaded project.

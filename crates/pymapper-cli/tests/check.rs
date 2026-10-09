@@ -242,7 +242,9 @@ fn baselines_report_only_new_findings() {
     assert!(r.stderr.contains("saved"), "{}", r.stderr);
     let text = std::fs::read_to_string(p.path("baseline.json")).expect("baseline written");
     assert!(text.contains("\"PM301\""), "{text}");
-    assert!(!p.path("baseline.json.tmp").exists());
+    let leftovers = std::fs::read_dir(&p.dir).expect("list project").flatten();
+    let tmp: Vec<_> = leftovers.filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+    assert!(tmp.is_empty(), "temporary files left: {tmp:?}");
 
     p.check(&["--baseline", "baseline.json"]).expect_code(0);
     // From the config file, relative to it.
@@ -285,6 +287,41 @@ fn usage_and_config_errors_exit_two() {
     let r = p.check(&[]);
     r.expect_code(2);
     assert!(r.stderr.contains("per-file-ignores"), "{}", r.stderr);
+}
+
+#[test]
+fn missing_paths_exit_two() {
+    let p = simple_project("missing");
+    // A mistyped explicit path is a usage error, even next to a valid one.
+    for args in [&["missing_dir"][..], &["app", "missing_dir"], &["app/main.py/x"]] {
+        let r = p.check(args);
+        r.expect_code(2);
+        assert!(r.stderr.contains("pymapper: error: path `"), "{args:?}: {}", r.stderr);
+        assert!(r.stderr.contains("does not exist"), "{args:?}: {}", r.stderr);
+        assert!(!r.stdout.contains("All checks passed"), "{args:?}: {}", r.stdout);
+    }
+    let r = p.check(&["missing_dir"]);
+    assert!(r.stderr.contains(&format!("`{}`", p.path("missing_dir").display())), "{}", r.stderr);
+    // A stale configured path too, naming the config file.
+    p.file("pymapper.toml", "paths = [\"app\", \"gone\"]\n");
+    let r = p.check(&[]);
+    r.expect_code(2);
+    assert!(r.stderr.contains("(from `paths` in "), "{}", r.stderr);
+    assert!(r.stderr.contains("pymapper.toml"), "{}", r.stderr);
+    // Explicit paths replace the configured ones.
+    p.check(&["app"]).expect_code(0);
+}
+
+#[test]
+fn unknown_selectors_warn() {
+    let p = simple_project("unknown-sel");
+    let r = p.check(&["--select", "PM999,PM1", "--ignore", "PM9"]);
+    r.expect_code(0);
+    assert!(r.stderr.contains("selector `PM999` matches no known rule"), "{}", r.stderr);
+    assert!(r.stderr.contains("selector `PM9` matches no known rule"), "{}", r.stderr);
+    assert!(!r.stderr.contains("`PM1`"), "{}", r.stderr);
+    let r = p.check(&["--select", "PM1"]);
+    assert!(!r.stderr.contains("matches no known rule"), "{}", r.stderr);
 }
 
 #[test]

@@ -12,7 +12,7 @@ See [`docs/design.md`](docs/design.md) for the design.
 
 ## Install
 
-pymapper is a single static binary with no Python dependency. With a Rust toolchain (the
+pymapper is a single self-contained binary with no Python dependency. With a Rust toolchain (the
 version is pinned in `rust-toolchain.toml`):
 
 ```
@@ -46,8 +46,9 @@ app/legacy.py:10:5: PM401 function `app.legacy:old_export` is never used
 Found 3 findings in 3 files (128 files checked).
 ```
 
-Exit codes: **0** clean, **1** findings at or above the confidence gate, **2** usage error,
-invalid configuration or baseline, or a fatal I/O error. Unreadable files are warnings.
+Exit codes: **0** clean, **1** findings at or above the confidence gate, **2** usage error
+(including a path to check that does not exist), invalid configuration or baseline, or a fatal
+I/O error. Files and directories that exist but cannot be read are warnings.
 Output to a closed pipe (`| head`) stops quietly.
 
 Full reference (pipeline, every flag, output formats, baselines, `--stats`):
