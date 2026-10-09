@@ -1001,3 +1001,27 @@ Observations:
   cache benchmarks); warm 1.36 s / 0.66 s / 0.52 s.
 - **dupes** is the only gated analysis: +20-30 ms on 305k LOC, +3.1 s matching and +0.2 s of
   fingerprinting on 17M LOC (peak 0.70 -> 1.0 GB), which is why it is off by default.
+
+### Test-code evidence (S4.6)
+
+`deadcode` target, 14-core M4 Pro, release, warm, best of 3-5 (RSS worst), before (rewrite
+`394d5b6`) and after. The evidence scan now reads every first-party `.py` file (not only the
+importable ones) and keeps test-code occurrences in a second slot per name group.
+
+| corpus | candidates | findings (>= 10) | `deadcode.evidence` | peak RSS MB |
+|--------|------------|------------------|---------------------|-------------|
+| stdlib, before | 12,883 | 6,877 | 4.55ms | 32.0 |
+| stdlib, after  | 18,004 | 10,141 | 6.68ms | 35.7 |
+| venv, before   | 572,011 | 313,846 | 277.1ms | 751.9 |
+| venv, after    | 572,124 | 313,917 | 273.1ms | 754.7 |
+
+- The stdlib corpus contains `site-packages/pip` (411 files, not importable below the stdlib
+  root, so not analysed before): those files account for the extra candidates and findings.
+  In `check`, `site-packages` is third-party and never analysed.
+- A first version filtered each group's explained-file events by slot while scanning them and
+  took 311 ms on the venv; sorting the events by (group, slot, file) so each slot scans only
+  its own run, and skipping the test slot once production code links a def, brought it back
+  to the baseline.
+- `check --select PM4` on aiml-lectio (1,803 first-party files, 741 of them not importable,
+  warm): dead code 5.2-5.7 ms -> 6.7-7.4 ms (evidence 2.2-2.5 -> 3.1-3.4 ms) for 40% more
+  analysed files; peak RSS +1.5 MB.
