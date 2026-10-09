@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pymapper_core::cache::{self, Cache};
+use pymapper_core::extract::config::ConfigEvidence;
 use pymapper_core::config::{self, Config, Overrides};
 use pymapper_core::graph::CallFilter;
 use pymapper_core::index::{self, Index, Inputs, LoadOptions};
@@ -53,6 +54,12 @@ pub struct Analysis {
     pub warnings: Vec<String>,
     /// Directory for the layout cache (`None`: cache disabled).
     pub cache_dir: Option<PathBuf>,
+    /// The configuration loaded (rules, contracts, entrypoints: the findings overlay).
+    pub config: Config,
+    /// Project units (dead-code modes, scripts).
+    pub units: ProjectUnits,
+    /// Dead-code evidence from config files (as `pymapper check`; `None` when disabled).
+    pub config_evidence: Option<ConfigEvidence>,
 }
 
 impl std::fmt::Debug for Analysis {
@@ -91,7 +98,7 @@ pub fn load(p: &LoadParams, progress: &dyn Fn(&'static str)) -> anyhow::Result<A
     progress("walk");
     let mut roots = roots::discover(&root, &RootOptions::from_config(&config));
     warnings.extend(roots.diagnostics.iter().map(ToString::to_string));
-    let (files, pyprojects) = collect_files(&roots, &config, &root, &mut warnings);
+    let (files, pyprojects, configs) = collect_files(&roots, &config, &root, &mut warnings);
     let (units, diags) = ProjectUnits::discover(&roots.project_root, roots.pyproject.as_ref(), &pyprojects);
     drop(pyprojects);
     warnings.extend(diags.iter().map(ToString::to_string));
@@ -133,8 +140,11 @@ pub fn load(p: &LoadParams, progress: &dyn Fn(&'static str)) -> anyhow::Result<A
     let rollup = Rollup::build(&index, &imports, &calls, CallFilter::default(), 0);
     let agg = Aggregates::build(&index);
     lap("rollup + aggregates", &mut phases);
+    let config_evidence =
+        (config.analysis.config_evidence && config.analysis.name_fallback).then(|| cache::config_evidence(&configs, cache.as_ref()));
+    drop(configs);
     let cache_dir = cache.map(|c| c.dir().to_path_buf());
-    Ok(Analysis { root, index, imports, calls, rollup, agg, phases, warnings, cache_dir })
+    Ok(Analysis { root, index, imports, calls, rollup, agg, phases, warnings, cache_dir, config, units, config_evidence })
 }
 
 /// Walk options equal for grouping purposes (as the CLI pipeline).
@@ -149,12 +159,13 @@ fn same_opts(a: &WalkOptions, b: &WalkOptions) -> bool {
         && a.configs == b.configs
 }
 
-/// Every file to load and the first-party `pyproject.toml` files, as the CLI pipeline's
-/// `collect_files`.
-fn collect_files(roots: &Roots, config: &Config, project_root: &Path, warnings: &mut Vec<String>) -> (PathList, PathList) {
+/// Every file to load, the first-party `pyproject.toml` files and the config files read for
+/// dead-code evidence, as the CLI pipeline's `collect_files`.
+fn collect_files(roots: &Roots, config: &Config, project_root: &Path, warnings: &mut Vec<String>) -> (PathList, PathList, PathList) {
     let first_party = WalkOptions::first_party(config, project_root);
     let mut files = PathList::default();
     let mut projects = PathList::default();
+    let mut configs = PathList::default();
     let mut full = false;
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut pending_opts: Option<WalkOptions> = None;
@@ -163,13 +174,13 @@ fn collect_files(roots: &Roots, config: &Config, project_root: &Path, warnings: 
         match src {
             Source::Walk { path, opts, .. } => {
                 if !pending_opts.as_ref().is_some_and(|p| same_opts(p, &opts)) {
-                    flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, warnings, &mut full);
+                    flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, warnings, &mut full);
                     pending_opts = Some(opts);
                 }
                 pending.push(path);
             }
             Source::Record { dist } => {
-                flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, warnings, &mut full);
+                flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, warnings, &mut full);
                 let site = roots.dists.site_path(dist).as_os_str().as_encoded_bytes();
                 for rel in roots.dists.owned_files(dist) {
                     buf.clear();
@@ -184,14 +195,22 @@ fn collect_files(roots: &Roots, config: &Config, project_root: &Path, warnings: 
             }
         }
     }
-    flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, warnings, &mut full);
+    flush(&mut pending, pending_opts.as_ref(), &mut files, &mut projects, &mut configs, warnings, &mut full);
     if full {
         warnings.push("more than 4 GiB of file paths: the remaining files were dropped".to_owned());
     }
-    (files, projects)
+    (files, projects, configs)
 }
 
-fn flush(pending: &mut Vec<PathBuf>, opts: Option<&WalkOptions>, files: &mut PathList, projects: &mut PathList, warnings: &mut Vec<String>, full: &mut bool) {
+fn flush(
+    pending: &mut Vec<PathBuf>,
+    opts: Option<&WalkOptions>,
+    files: &mut PathList,
+    projects: &mut PathList,
+    configs: &mut PathList,
+    warnings: &mut Vec<String>,
+    full: &mut bool,
+) {
     let Some(opts) = opts else { return };
     if pending.is_empty() {
         return;
@@ -206,6 +225,11 @@ fn flush(pending: &mut Vec<PathBuf>, opts: Option<&WalkOptions>, files: &mut Pat
     }
     for i in 0..w.projects.len() {
         if projects.push(w.projects.get_bytes(i)).is_err() {
+            break;
+        }
+    }
+    for i in 0..w.configs.len() {
+        if configs.push(w.configs.get_bytes(i)).is_err() {
             break;
         }
     }

@@ -3,7 +3,8 @@
 //! interval), and the legend of what is drawn.
 
 use pymapper_core::index::{Index, NodeId};
-use pymapper_core::layout::{Layout, SizeMetric};
+use pymapper_core::layout::{Layout, Region, SizeMetric};
+use pymapper_core::resolve::Confidence;
 use pymapper_core::rollup::Aggregates;
 
 use super::bundle::{Bundler, Cubic, DEFAULT_BETA};
@@ -29,11 +30,26 @@ pub struct SceneParams {
     pub external_edges: bool,
     /// Most edges first shown in one band (the heaviest win); bounds memory and fill.
     pub max_edges_per_band: usize,
+    /// Confidence filter: call edges are drawn only if at least one call behind them is this
+    /// sure or surer (`Confidence as u8`; `Unresolved` = no filter). Import edges are kept.
+    pub min_conf: u8,
+    /// Origin filter: bit `Region as u8` set = cells and edges of that origin are drawn
+    /// ([`ORIGINS_ALL`] = no filter).
+    pub origins: u8,
+}
+
+/// Every origin (first-party, third-party, stdlib) in [`SceneParams::origins`].
+pub const ORIGINS_ALL: u8 = 0b111;
+
+/// Whether a node in `region` passes the origin mask.
+#[inline]
+pub fn origin_shown(origins: u8, region: Region) -> bool {
+    origins & (1 << region as u8) != 0
 }
 
 impl Default for SceneParams {
     fn default() -> SceneParams {
-        SceneParams { color: ColorMetric::Kind, edge: EdgeMetric::Sites, beta: DEFAULT_BETA, show_edges: true, external_edges: false, max_edges_per_band: 40_000 }
+        SceneParams { color: ColorMetric::Kind, edge: EdgeMetric::Sites, beta: DEFAULT_BETA, show_edges: true, external_edges: false, max_edges_per_band: 40_000, min_conf: Confidence::Unresolved as u8, origins: ORIGINS_ALL }
     }
 }
 
@@ -86,7 +102,18 @@ pub fn build(input: &SceneInput<'_>, size: SizeMetric, p: &SceneParams, edge_ids
     edge_ids.clear();
     if p.show_edges {
         let ext = p.external_edges;
-        select_edges(edges, p.edge, p.max_edges_per_band, |e| ext || !(layout.muted(e.src) && layout.muted(e.dst)), edge_ids);
+        let conf_filter = p.min_conf < Confidence::Unresolved as u8 && p.edge != EdgeMetric::Imports;
+        let origins = p.origins;
+        let keep = |e: &MapEdge| {
+            if !ext && layout.muted(e.src) && layout.muted(e.dst) {
+                return false;
+            }
+            if conf_filter && e.best() > p.min_conf {
+                return false; // import-only edges (NO_CALLS) are not call edges either
+            }
+            origins == ORIGINS_ALL || (origin_shown(origins, layout.region_of(e.src)) && origin_shown(origins, layout.region_of(e.dst)))
+        };
+        select_edges(edges, p.edge, p.max_edges_per_band, keep, edge_ids);
     }
     // Cells plus up to two label carriers per opening node.
     let mut b = SceneBuilder::with_capacity(rects + rects / 4, edge_ids.len() * 4);
@@ -97,6 +124,9 @@ pub fn build(input: &SceneInput<'_>, size: SizeMetric, p: &SceneParams, edge_ids
         for (slot, &v) in tree.level(d).iter().enumerate() {
             let r = level[slot];
             if !(r.w() > 0.0 && r.h() > 0.0) {
+                continue;
+            }
+            if p.origins != ORIGINS_ALL && !origin_shown(p.origins, layout.region_of(v)) {
                 continue;
             }
             cells += 1;

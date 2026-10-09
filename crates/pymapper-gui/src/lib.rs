@@ -17,6 +17,7 @@
 //! canvas.rs   canvas: background + map renderer, logical -> physical pixel rects
 //! map/        instanced code-map renderer: scene, grid, LOD bands, camera, text, GPU
 //! codemap/    the code map: in-process analysis, semantic zoom, bundled edges, scenes
+//! interact/   hover neighbourhood, selection, search, path, overlays, details, source pane
 //! mapui.rs    code map controls and legend (egui)
 //! panels.rs   egui panel layout (left search/tree, right details, bottom findings)
 //! schedule.rs render-on-demand scheduler (pure)
@@ -29,6 +30,7 @@ pub mod args;
 pub mod canvas;
 pub mod codemap;
 pub mod gpu;
+pub mod interact;
 pub mod map;
 pub mod mapui;
 pub mod measure;

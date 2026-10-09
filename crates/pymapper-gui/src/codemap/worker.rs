@@ -14,6 +14,7 @@ use pymapper_core::layout::SizeMetric;
 use super::load::{self, LoadParams};
 use super::scene::{Legend, SceneParams};
 use super::{CodeMap, MapParams};
+use crate::interact::sceneindex::SceneIndex;
 use crate::map::scene::Scene;
 
 /// What the UI wants shown.
@@ -47,10 +48,14 @@ pub struct Published {
     pub map: Arc<CodeMap>,
     pub scene: Arc<Scene>,
     pub legend: Legend,
+    /// Interaction lookup tables of `scene`.
+    pub index: Arc<SceneIndex>,
     pub request: Request,
     /// Time to build the code map (when this request rebuilt it) and the scene.
     pub map_build: Option<Duration>,
     pub scene_build: Duration,
+    /// Time to build `index`.
+    pub index_build: Duration,
 }
 
 #[derive(Default)]
@@ -176,11 +181,15 @@ fn run(s: &Shared, load: &LoadParams, params: MapParams, notify: &Notify) {
             }
         };
         let t = Instant::now();
-        let (scene, legend, _) = m.scene(&req.scene);
+        let (scene, legend, drawn) = m.scene(&req.scene);
         let scene_build = t.elapsed();
+        let t = Instant::now();
+        let index = Arc::new(SceneIndex::build(&scene, m.analysis.index.node_count(), &m.edges, &drawn));
+        drop(drawn);
+        let index_build = t.elapsed();
         {
             let mut st = s.lock();
-            st.published = Some(Published { map: m, scene: Arc::new(scene), legend, request: req, map_build, scene_build });
+            st.published = Some(Published { map: m, scene: Arc::new(scene), legend, index, request: req, map_build, scene_build, index_build });
             if st.pending.is_none() {
                 st.status = Some(Status::Ready);
             }

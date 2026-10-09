@@ -44,6 +44,8 @@ enum Buf {
     Glyphs,
     OverlayRect,
     OverlayEdge,
+    /// Overlay scene buffers: `slot * 3 + {0: rects, 1: lines, 2: curves}`.
+    Extra(u8),
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +140,10 @@ pub struct MapRenderer {
     overlay_edge: GpuBuf,
     overlay_rects: Vec<RectInstance>,
     overlay_edges: Vec<EdgeInstance>,
+    /// Buffers of the overlay scenes ([`super::OVERLAYS`] x rects, lines, curves).
+    extra: Vec<GpuBuf>,
+    /// (overlay generation, band generation) uploaded per overlay buffer.
+    uploaded_extra: Vec<Option<(u64, u64)>>,
     srgb_target: bool,
     last_uniform: [f32; UNIFORM_FLOATS],
     /// (scene generation, band generation) uploaded per batch: rects, lines, curves.
@@ -294,6 +300,8 @@ impl MapRenderer {
             overlay_edge: GpuBuf::new(device, "map_overlay_edges"),
             overlay_rects: Vec::new(),
             overlay_edges: Vec::new(),
+            extra: (0..super::OVERLAYS * 3).map(|_| GpuBuf::new(device, "map_overlay_scene")).collect(),
+            uploaded_extra: vec![None; super::OVERLAYS * 3],
             srgb_target: format.is_srgb(),
             last_uniform: [f32::NAN; UNIFORM_FLOATS],
             uploaded_band: [None; 3],
@@ -307,7 +315,8 @@ impl MapRenderer {
     }
 
     pub fn memory(&self) -> GpuMemory {
-        let buffers = [&self.rects, &self.lines, &self.curves, &self.glyphs, &self.overlay_rect, &self.overlay_edge].iter().map(|b| b.cap).sum();
+        let buffers = [&self.rects, &self.lines, &self.curves, &self.glyphs, &self.overlay_rect, &self.overlay_edge].iter().map(|b| b.cap).sum::<u64>()
+            + self.extra.iter().map(|b| b.cap).sum::<u64>();
         GpuMemory { buffers, atlas: u64::from(self.atlas_size) * u64::from(self.atlas_size) }
     }
 
@@ -342,6 +351,7 @@ impl MapRenderer {
             state.stats.band_upload_bytes = bytes;
         }
         self.uploaded_band = gens;
+        self.sync_overlays(device, queue, state);
         self.sync_labels(device, queue, state);
         if self.uploaded_hover != Some(state.hover) || band_changed {
             self.sync_hover(device, queue, state);
@@ -390,6 +400,26 @@ impl MapRenderer {
         upload_slice(device, queue, &mut self.glyphs, &state.labels.glyphs);
         self.glyph_count = state.labels.glyphs.len() as u32;
         self.uploaded_labels = Some((state.scene_generation, state.labels.generation));
+    }
+
+    /// Uploads the band views of the overlay scenes that changed.
+    fn sync_overlays(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &MapState) {
+        for (slot, o) in state.overlays.iter().enumerate() {
+            let sc = &*o.scene;
+            let b = &o.bands;
+            let k = slot * 3;
+            let gens = [b.rects.generation, b.lines.generation, b.curves.generation].map(|g| Some((o.generation, g)));
+            if self.uploaded_extra[k] != gens[0] {
+                upload_band(device, queue, &mut self.extra[k], &sc.rects, &b.rects);
+            }
+            if self.uploaded_extra[k + 1] != gens[1] {
+                upload_band(device, queue, &mut self.extra[k + 1], &sc.lines, &b.lines);
+            }
+            if self.uploaded_extra[k + 2] != gens[2] {
+                upload_band(device, queue, &mut self.extra[k + 2], &sc.curves, &b.curves);
+            }
+            self.uploaded_extra[k..k + 3].copy_from_slice(&gens);
+        }
     }
 
     fn sync_hover(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &MapState) {
@@ -467,6 +497,15 @@ impl MapRenderer {
         if self.glyph_count > 0 {
             self.draws.push(DrawCmd { pipe: Pipe::Glyph, buf: Buf::Glyphs, instances: 0..self.glyph_count });
         }
+        for (slot, o) in state.overlays.iter().enumerate() {
+            let sc = &*o.scene;
+            let k = (slot * 3) as u8;
+            self.push_batch(&sc.rects, &o.bands.rects, &view.expand(2.0 / cam.zoom, 2.0 / cam.zoom), Pipe::Rect, Buf::Extra(k));
+            let m = (super::hit::edge_px(sc.max_edge_width, state.pixels_per_point) * 0.5 + 2.0) / cam.zoom;
+            let q = view.expand(m, m);
+            self.push_batch(&sc.lines, &o.bands.lines, &q, Pipe::Line, Buf::Extra(k + 1));
+            self.push_batch(&sc.curves, &o.bands.curves, &q, Pipe::Curve, Buf::Extra(k + 2));
+        }
         if !self.overlay_rects.is_empty() {
             self.draws.push(DrawCmd { pipe: Pipe::Rect, buf: Buf::OverlayRect, instances: 0..self.overlay_rects.len() as u32 });
         }
@@ -505,6 +544,7 @@ impl MapRenderer {
                     Buf::Glyphs => &self.glyphs,
                     Buf::OverlayRect => &self.overlay_rect,
                     Buf::OverlayEdge => &self.overlay_edge,
+                    Buf::Extra(k) => &self.extra[k as usize],
                 };
                 pass.set_vertex_buffer(0, b.buffer.slice(..));
                 buf = Some(d.buf);
