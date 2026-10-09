@@ -1303,6 +1303,30 @@ Observations:
   `(unit, top-level name)` pairs, the interned names of findings and, with PM604, the parsed
   requirements of the distributions read; all far below the load's peak.
 
+Review fixes (same machine and setup, load average not controlled): PM601-PM604 are now
+reported once per import statement, at the module token, so each import row carries the module
+token's position (`module_dline` u8 + `module_col` u32: import rows grow from 27 to 32 bytes,
+cache `FACTS_VERSION` 5). The development groups of a uv workspace root count as declared for
+the test code of its members. On `lectio` the findings drop from 535 to 490 (one parenthesised
+`from pydantic import (...)` of six names was six PM601s, now one).
+
+| run | total | deps.hygiene | metadata reads | findings | peak RSS |
+|-----|-------|--------------|----------------|----------|----------|
+| default rules, cold | 315 ms (load.extract 110 ms) | 0.9 ms | 2 | 490 | 43.5 MB |
+| default rules, warm | 104-141 ms | 0.7-0.8 ms | 2 | 490 | 48.2-49.5 MB |
+| `+PM604`, warm | 110-135 ms | 15.0-15.2 ms | 394 | 490 | 45.3-47.3 MB |
+
+`load` target (`cargo xtask bench -t load`, best of 3), before -> after the facts column:
+
+| corpus | load.extract | total | facts_kb | peak RSS MB |
+|--------|--------------|-------|----------|-------------|
+| stdlib | 45.5 -> 40.3 ms | 53.1 -> 48.4 ms | 5,531 -> 5,582 | 27.8 -> 27.8 |
+| venv   | 3.59 -> 2.02 s  | 5.41 -> 2.94 s  | 227,038 -> 231,543 | 496.8 -> 505.3 |
+
+The venv times are dominated by machine load (the walk alone went from 1.73 s to 0.79 s
+between the runs); the memory cost is the 4.5 MB of the new columns (+2% of the facts) for
+901k import rows.
+
 ### Test-code evidence (S4.6)
 
 `deadcode` target, 14-core M4 Pro, release, warm, best of 3-5 (RSS worst), before (rewrite
