@@ -5,7 +5,7 @@
 //! A finding's key is its rule plus:
 //!
 //! - `id`: the stable qualified id of its symbol (`pkg.mod:Class.method`), else its file's
-//!   display path, else empty (project-level findings);
+//!   path relative to the project root, else empty (project-level findings);
 //! - `detail`: its stable message arguments in order: symbols (qualified ids; except the
 //!   finding's own symbol, already the id), names, files (paths) and contracts (names). Numbers (metric values, limits, line numbers) are left out,
 //!   so a function whose complexity goes from 12 to 13 stays baselined, and nothing depends on
@@ -105,7 +105,8 @@ impl KeyBuf {
             ctx.write_symbol_id(f.symbol, &mut self.part);
             lossy_tail(&mut self.part, 0);
         } else if f.loc.file != FileId::NONE {
-            self.part.extend_from_slice(r.path(f));
+            ctx.write_root_path(f.loc.file, &mut self.part);
+            lossy_tail(&mut self.part, 0);
         }
         push_part(&mut self.key, &self.part);
         for &a in r.findings().args(f) {
@@ -123,7 +124,14 @@ impl KeyBuf {
                     continue;
                 }
                 Arg::Name(n) => ctx.write_name(n, &mut self.text),
-                Arg::File(file) => ctx.write_file(file, &mut self.text),
+                // Root-relative, so keys do not depend on the working directory.
+                Arg::File(file) => {
+                    self.part.clear();
+                    ctx.write_root_path(file, &mut self.part);
+                    lossy_tail(&mut self.part, 0);
+                    push_part(&mut self.key, &self.part);
+                    continue;
+                }
                 Arg::Contract(c) => ctx.write_contract(c, &mut self.text),
             };
             if res.is_err() {

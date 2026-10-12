@@ -97,7 +97,7 @@ fn template_documents_every_option() {
     for &p in Preset::ALL {
         assert!(TEMPLATE.contains(&format!("\"{p}\"")), "preset {p} not documented");
     }
-    for name in OutputFormat::NAMES.iter().chain(Mode::NAMES).chain(ContractKindName::NAMES) {
+    for name in OutputFormat::NAMES.iter().chain(Mode::NAMES).chain(ContractKindName::NAMES).chain(GroupBy::NAMES).chain(ColorChoice::NAMES) {
         assert!(TEMPLATE.contains(&format!("\"{name}\"")), "value {name} not documented");
     }
     // Every option carries a cost note in its section.
@@ -134,6 +134,9 @@ cache-dir = "/tmp/c"
 threads = 8
 mode = "library"
 output-format = "sarif"
+group-by = "file"
+color = "never"
+limit = 0
 min-confidence = 60
 baseline = "base.json"
 presets = ["flask", "pytest", "flask"]
@@ -180,6 +183,7 @@ coverage = "cov.json"
     assert_eq!(cfg.threads, 8);
     assert_eq!(cfg.mode, Mode::Library);
     assert_eq!(cfg.output_format, OutputFormat::Sarif);
+    assert_eq!((cfg.group_by, cfg.color, cfg.limit), (GroupBy::File, ColorChoice::Never, 0));
     assert_eq!(cfg.min_confidence, 60);
     assert_eq!(cfg.baseline, Some(PathBuf::from("/proj/base.json")));
     assert_eq!(cfg.presets, vec![Preset::Flask, Preset::Pytest]);
@@ -273,7 +277,7 @@ fn type_and_range_errors() {
 #[test]
 fn enum_values_suggest() {
     let d = one_err("output-format = \"jsn\"");
-    assert_eq!(d.message, "`output-format`: unknown output format `jsn` (expected one of: concise, json, sarif, github)");
+    assert_eq!(d.message, "`output-format`: unknown output format `jsn` (expected one of: human, llm, concise, json, sarif, github)");
     assert_eq!(d.help.as_deref(), Some("did you mean `json`?"));
     let d = one_err("presets = [\"flask\", \"djang\"]");
     assert_eq!(d.help.as_deref(), Some("did you mean `django`?"));
@@ -832,4 +836,27 @@ fn set_fragment_errors_name_their_source() {
     assert_eq!(diagnostics[1].origin, "--set #2 `thresholds.max-mccab = 3`");
     assert_eq!((diagnostics[1].line, diagnostics[1].col), (1, 12));
     assert_eq!(diagnostics[1].help.as_deref(), Some("did you mean `thresholds.max-mccabe`?"));
+}
+
+#[test]
+fn output_defaults_and_errors() {
+    let cfg = ok("");
+    assert_eq!(cfg.output_format, OutputFormat::Human);
+    assert_eq!((cfg.group_by, cfg.color, cfg.limit), (GroupBy::Category, ColorChoice::Auto, DEFAULT_LIMIT));
+    assert_eq!(ok("output-format = \"llm\"").output_format, OutputFormat::Llm);
+    let d = one_err("group-by = \"files\"");
+    assert!(d.message.contains("unknown grouping `files`") && d.message.contains("category, file"), "{}", d.message);
+    let d = one_err("color = \"yes\"");
+    assert!(d.message.contains("unknown color choice `yes`"), "{}", d.message);
+    assert!(!one_err("limit = -1").message.is_empty());
+}
+
+#[test]
+fn color_choice_resolution() {
+    assert!(ColorChoice::Always.resolve(false));
+    assert!(!ColorChoice::Never.resolve(true));
+    assert!(!ColorChoice::Auto.resolve(false));
+    // `auto` on a terminal depends on NO_COLOR, which other tests do not touch.
+    let expect = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    assert_eq!(ColorChoice::Auto.resolve(true), expect);
 }

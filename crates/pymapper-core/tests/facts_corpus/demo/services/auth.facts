@@ -1,0 +1,32 @@
+file lines=51 evidence=33
+module 0:<module> L1-51 b0-1547
+def 1:require_auth in=0 L1-8 b0-267 @1:4 (func)
+def 2:wrapper in=1 L2-7 b28-248 @2:8 (*args, **kwargs) [nested]
+def 3:make_validator in=0 L11-18 b270-458 @11:4 (low, high)
+def 4:check in=3 L12-17 b305-441 @12:8 (value) [nested]
+def 5:validate_token in=0 L21-26 b461-622 @21:4 (token)
+def 6:classify_token in=0 L29-31 b625-753 @29:4 (token)
+def 7:create_authenticator in=0 L34-51 b756-1546 @34:4 (secret, algorithm, expiry)
+def 8:authenticate in=7 L37-50 b945-1522 @37:8 (request) [nested]
+call 2:wrapper L4:21 validate_token()
+call 2:wrapper L5:19 func()
+call 2:wrapper L7:18 PermissionError()
+call 5:validate_token L22:7 token.startswith() dotted
+call 5:validate_token L24:11 len()
+call 6:classify_token L31:11 classify()
+call 8:authenticate L38:16 request.get() dotted
+call 8:authenticate L40:18 ValueError()
+call 8:authenticate L41:18 decode_token()
+call 8:authenticate L42:11 decoded.get() dotted
+call 8:authenticate L43:18 ValueError()
+call 8:authenticate L44:18 decoded.get() dotted
+call 8:authenticate L46:18 ValueError()
+call 8:authenticate L47:15 decoded.get() dotted
+call 8:authenticate L49:18 ValueError()
+bind 2:wrapper L3 token = <expr>
+bind 5:validate_token L23 payload = <expr> [conditional]
+bind 6:classify_token L30 classify = <expr>
+bind 8:authenticate L38 token = request.get()
+bind 8:authenticate L41 decoded = decode_token()
+bind 8:authenticate L44 user_id = decoded.get()
+bind 8:authenticate L47 role = decoded.get()

@@ -26,6 +26,9 @@ pub(super) fn to_toml(c: &Config) -> String {
     w.raw("threads", c.threads);
     w.str("mode", c.mode.as_str());
     w.str("output-format", c.output_format.as_str());
+    w.str("group-by", c.group_by.as_str());
+    w.str("color", c.color.as_str());
+    w.raw("limit", c.limit);
     w.raw("min-confidence", c.min_confidence);
     if let Some(v) = &c.baseline {
         w.path("baseline", v);

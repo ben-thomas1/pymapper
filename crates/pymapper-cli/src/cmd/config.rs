@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Context;
-use pymapper_core::config::{self, Loaded, Mode, OutputFormat, Overrides, Preset, RuleSelector};
+use pymapper_core::config::{self, ColorChoice, GroupBy, Loaded, Mode, OutputFormat, Overrides, Preset, RuleSelector};
 
 /// Configuration flags. They override the discovered config file; see `pymapper config
 /// --template` for every option.
@@ -38,9 +38,22 @@ pub struct ConfigArgs {
     /// Enable framework presets (flask, fastapi, django, click, pytest, pydantic).
     #[arg(long, value_delimiter = ',', value_name = "PRESETS", help_heading = "Configuration")]
     pub preset: Vec<Preset>,
-    /// Output format: concise, json, sarif, github.
-    #[arg(long, visible_alias = "format", value_name = "FORMAT", help_heading = "Configuration")]
+    /// Output format: human (default), llm, concise, json, sarif, github.
+    #[arg(long, visible_alias = "format", value_name = "FORMAT", help_heading = "Output")]
     pub output_format: Option<OutputFormat>,
+    /// Agent mode: a compact, prioritised report with ids, evidence and next steps (short for
+    /// --output-format llm).
+    #[arg(long, conflicts_with = "output_format", help_heading = "Output")]
+    pub llm: bool,
+    /// Group human output by category (default) or by file.
+    #[arg(long, value_name = "BY", help_heading = "Output")]
+    pub group_by: Option<GroupBy>,
+    /// Colour human output: auto (default; only on a terminal, honours NO_COLOR), always, never.
+    #[arg(long, value_name = "WHEN", help_heading = "Output")]
+    pub color: Option<ColorChoice>,
+    /// Maximum items printed: llm output (default 50) and query rows (default 200); 0 = no cap.
+    #[arg(long, value_name = "N", help_heading = "Output")]
+    pub limit: Option<u32>,
     /// Minimum finding confidence (0-100) to report.
     #[arg(long, visible_alias = "confidence", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=100), help_heading = "Configuration")]
     pub min_confidence: Option<u8>,
@@ -105,7 +118,10 @@ impl ConfigArgs {
             ignore: self.ignore,
             extend_exclude: self.exclude,
             presets: self.preset,
-            output_format: self.output_format,
+            output_format: if self.llm { Some(OutputFormat::Llm) } else { self.output_format },
+            group_by: self.group_by,
+            color: self.color,
+            limit: self.limit,
             min_confidence: self.min_confidence,
             cache_dir: self.cache_dir,
             cache: self.no_cache.then_some(false),

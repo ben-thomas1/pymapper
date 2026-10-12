@@ -1,0 +1,10 @@
+file lines=14 evidence=5
+module 0:<module> L1-14 b0-244
+def 1:next_order_id in=0 L6-9 b85-163 @6:4 ()
+def 2:save_order in=0 L12-14 b166-243 @12:4 (order:)
+import 0:<module> L1:25 from models.order import Order
+call 2:save_order L13:4 order.validate() dotted
+call 2:save_order L14:11 order.to_dict() dotted
+bind 0:<module> L3 _counter = <expr>
+bind 1:next_order_id L8 _counter op= <expr>
+decl 1:next_order_id global _counter

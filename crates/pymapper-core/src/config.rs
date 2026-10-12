@@ -72,6 +72,8 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 pub const DEFAULT_MIN_CONFIDENCE: u8 = 80;
 /// Largest accepted `threads` value.
 pub const MAX_THREADS: u32 = 4096;
+/// Default cap on the items of `llm` output (0 = no cap).
+pub const DEFAULT_LIMIT: u32 = 50;
 
 /// Generates a closed string-valued enum: `ALL`, `as_str`, `Display` and a `FromStr` whose
 /// error suggests the closest valid name.
@@ -134,6 +136,10 @@ name_enum!(
 name_enum!(
     /// Finding output format (design: Output).
     OutputFormat, "output format", {
+        /// For people: grouped by category (or file), merged per symbol, coloured on a terminal.
+        Human = "human",
+        /// For agents: a compact, prioritised, capped report with ids, fix hints and next steps.
+        Llm = "llm",
         /// `path:line:col: CODE message`, one finding per line.
         Concise = "concise",
         /// One JSON document.
@@ -144,6 +150,40 @@ name_enum!(
         Github = "github",
     }
 );
+
+name_enum!(
+    /// How the human output groups findings.
+    GroupBy, "grouping", {
+        /// Sections per category (architecture, complexity, ... dead code), files inside.
+        Category = "category",
+        /// One section per file.
+        File = "file",
+    }
+);
+
+name_enum!(
+    /// When human output uses ANSI colour.
+    ColorChoice, "color choice", {
+        /// Only when stdout is a terminal and `NO_COLOR` is unset.
+        Auto = "auto",
+        /// Always (even when piped).
+        Always = "always",
+        /// Never.
+        Never = "never",
+    }
+);
+
+impl ColorChoice {
+    /// Whether to colour output, given whether stdout is a terminal. `NO_COLOR` (set and
+    /// non-empty) turns `auto` off; `always` wins over it.
+    pub fn resolve(self, is_terminal: bool) -> bool {
+        match self {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => is_terminal && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        }
+    }
+}
 
 name_enum!(
     /// Kind of an import contract (design: layering contracts).
@@ -609,6 +649,12 @@ pub struct Config {
     pub mode: Mode,
     /// Finding output format.
     pub output_format: OutputFormat,
+    /// Grouping of the human output.
+    pub group_by: GroupBy,
+    /// When to colour the human output.
+    pub color: ColorChoice,
+    /// Cap on the items of `llm` output (0 = no cap).
+    pub limit: u32,
     /// Minimum confidence (0-100) for `check` to report a finding.
     pub min_confidence: u8,
     /// Baseline file: findings recorded in it are not reported.
@@ -644,7 +690,10 @@ impl Config {
             cache_dir: root.join(DEFAULT_CACHE_DIR),
             threads: 0,
             mode: Mode::Auto,
-            output_format: OutputFormat::Concise,
+            output_format: OutputFormat::Human,
+            group_by: GroupBy::Category,
+            color: ColorChoice::Auto,
+            limit: DEFAULT_LIMIT,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             baseline: None,
             presets: Vec::new(),
@@ -962,6 +1011,12 @@ pub struct Overrides {
     pub presets: Vec<Preset>,
     /// Replaces `output-format`.
     pub output_format: Option<OutputFormat>,
+    /// Replaces `group-by`.
+    pub group_by: Option<GroupBy>,
+    /// Replaces `color`.
+    pub color: Option<ColorChoice>,
+    /// Replaces `limit`.
+    pub limit: Option<u32>,
     /// Replaces `min-confidence` (0-100; larger values are rejected by [`load`]).
     pub min_confidence: Option<u8>,
     /// Replaces `cache-dir`.
@@ -1167,6 +1222,15 @@ fn apply_typed(config: &mut Config, root: &Path, cwd: &Path, o: &Overrides) {
     }
     if let Some(v) = o.output_format {
         config.output_format = v;
+    }
+    if let Some(v) = o.group_by {
+        config.group_by = v;
+    }
+    if let Some(v) = o.color {
+        config.color = v;
+    }
+    if let Some(v) = o.limit {
+        config.limit = v;
     }
     if let Some(v) = o.min_confidence {
         config.min_confidence = v;

@@ -39,11 +39,10 @@ pub struct WalkFlags {
     /// node (the node only) or subtree.
     #[arg(long, value_name = "SCOPE", default_value = "auto", value_parser = parse_scope)]
     pub scope: Scope,
-    /// Rows printed (closest first; `impact`: call rows and importers together); 0 prints
-    /// every row.
-    #[arg(long, value_name = "N", default_value_t = 200)]
-    pub limit: usize,
 }
+
+/// Rows a query prints without `--limit` (text formats; llm output uses the `limit` option).
+pub const DEFAULT_ROWS: usize = 200;
 
 impl WalkFlags {
     /// Walk options for `depth` hops (no node limit: `--limit` bounds the rows printed).
@@ -51,10 +50,6 @@ impl WalkFlags {
         WalkOptions { depth, min_conf: self.edges, overrides: !self.no_overrides, scope: self.scope, limit: usize::MAX }
     }
 
-    /// The row limit (`usize::MAX` for 0).
-    pub fn row_limit(&self) -> usize {
-        if self.limit == 0 { usize::MAX } else { self.limit }
-    }
 }
 
 /// Parses a call edge confidence (`certain`, `likely`, `possible`).
@@ -85,6 +80,10 @@ pub struct Session {
     pub project: Project,
     pub calls: ResolvedCalls,
     pub json: bool,
+    /// Rows printed (closest / heaviest first; `impact`: call rows and importers together):
+    /// `--limit` (0 = every row), else the `limit` option in llm output, else
+    /// [`DEFAULT_ROWS`].
+    pub row_limit: usize,
     /// Per file: under the positional paths (`None`: no filter).
     in_scope: Option<Vec<bool>>,
     /// Bit set over nodes (with a filter): the package/module nodes with a file in scope at
@@ -134,15 +133,23 @@ impl Session {
             timing::enable(true);
         }
         let explicit = !paths.is_empty();
+        let explicit_limit = flags.config.limit;
         let loaded = timing::time("config", || flags.config.load(paths))?;
         let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
         pipeline::require_paths(&loaded.scope, true, None)?;
         pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
         let json = match loaded.config.output_format {
-            OutputFormat::Concise => false,
+            // Text renderings; the human and llm layouts for queries are not built yet.
+            OutputFormat::Human | OutputFormat::Llm | OutputFormat::Concise => false,
             OutputFormat::Json => true,
-            other => anyhow::bail!("`pymapper {name}` writes the concise and json formats, not `{}`", other.as_str()),
+            other => anyhow::bail!("`pymapper {name}` writes the human, llm, concise and json formats, not `{}`", other.as_str()),
         };
+        let rows = match explicit_limit {
+            Some(n) => n as usize,
+            None if loaded.config.output_format == OutputFormat::Llm => loaded.config.limit as usize,
+            None => DEFAULT_ROWS,
+        };
+        let row_limit = if rows == 0 { usize::MAX } else { rows };
         let root = loaded.project.root;
         let mut scope = loaded.scope;
         for p in scope.iter().filter(|p| !p.starts_with(&root)) {
@@ -175,7 +182,7 @@ impl Session {
             warn(format_args!("no loaded Python files under {list}: every row is filtered out"));
         }
         let nodes_in_scope = in_scope.as_deref().map_or_else(Vec::new, |s| scope_bits(&project.index, s));
-        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, in_scope, nodes_in_scope })
+        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, row_limit, in_scope, nodes_in_scope })
     }
 
     /// The query state (call graph built here, O(V + E)).

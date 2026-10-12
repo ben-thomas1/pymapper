@@ -1,0 +1,7 @@
+file lines=10 evidence=5
+module 0:<module> L1-10 b0-179
+def 1:format_name in=0 L1-2 b0-54 @1:4 (name)
+def 2:format_currency in=0 L5-6 b57-113 @5:4 (amount)
+def 3:format_percentage in=0 L9-10 b116-178 @9:4 (value)
+call 1:format_name L2:11 name.strip() dotted
+call 1:format_name L2:24 title() unknown

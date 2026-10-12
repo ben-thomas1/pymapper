@@ -761,3 +761,120 @@ fn dead_code_reasons_are_rendered() {
     // Findings without reasons have no `reasons` key.
     assert_eq!(json.matches("\"reasons\"").count(), 2, "{json}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Finding ids, display paths, plain messages
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn stable_hash_is_fnv1a() {
+    // Published FNV-1a 64 test vectors: ids must never change.
+    assert_eq!(ids::stable_hash(b""), 0xcbf2_9ce4_8422_2325);
+    assert_eq!(ids::stable_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+    assert_eq!(ids::stable_hash(b"foobar"), 0x8594_4171_f739_67e8);
+}
+
+#[test]
+fn ids_are_deterministic_and_unique_per_rule() {
+    let f = sample();
+    let c = ctx();
+    let r = Report::new(&f, &c);
+    let a = r.ids();
+    let b = Report::new(&f, &c).ids();
+    assert_eq!(a.len(), r.len());
+    let mut seen = std::collections::HashSet::new();
+    for (pos, finding) in r.iter().enumerate() {
+        let id = a.get(pos);
+        assert_eq!(id, b.get(pos));
+        assert_eq!(id.code, finding.rule.code());
+        assert!(id.digits >= ids::MIN_ID_DIGITS);
+        let text = id.to_string();
+        assert!(text.starts_with(&format!("{}-", finding.rule)), "{text}");
+        assert!(seen.insert(text.clone()), "duplicate id {text}");
+        assert_eq!(a.find(&text), Ok(pos));
+    }
+}
+
+#[test]
+fn ids_ignore_lines_and_numbers() {
+    let s = SymbolId;
+    let mut one = Findings::new();
+    one.push(COMPLEX_FUNCTION, loc(0, 12, 5), s(0), 100, &[Arg::Symbol(s(0)), Arg::U32(14), Arg::U32(10)]);
+    let mut moved = Findings::new();
+    moved.push(COMPLEX_FUNCTION, loc(0, 40, 1), s(0), 100, &[Arg::Symbol(s(0)), Arg::U32(19), Arg::U32(10)]);
+    let c = ctx();
+    let a = Report::new(&one, &c).ids().get(0);
+    let b = Report::new(&moved, &c).ids().get(0);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn equal_keys_get_distinct_ids_and_the_first_keeps_the_plain_one() {
+    let s = SymbolId;
+    let mut f = Findings::new();
+    f.push(UNUSED_IMPORT, loc(1, 3, 1), s(1), 100, &[Arg::Name(0)]);
+    let c = ctx();
+    let single = Report::new(&f, &c).ids().get(0);
+    f.push(UNUSED_IMPORT, loc(1, 4, 1), s(1), 100, &[Arg::Name(0)]);
+    let r = Report::new(&f, &c);
+    let both = r.ids();
+    assert_eq!(both.get(0).hash, single.hash);
+    assert_ne!(both.get(0).hash, both.get(1).hash);
+}
+
+#[test]
+fn colliding_ids_are_extended() {
+    // Fabricate the collision check directly: two hashes sharing 5 hex digits need 6.
+    let a = FindingId { code: 401, hash: 0x3fa2_1000_0000_0000, digits: 6 };
+    let mut out = Vec::new();
+    a.push(&mut out);
+    assert_eq!(out, b"PM401-3fa210");
+    let ids = FindingIds::from_hashes(&[(401, 0x3fa2_1000_0000_0000), (401, 0x3fa2_1fff_0000_0000), (401, 0x1234_0000_0000_0000), (402, 0x3fa2_1000_0000_0000)]);
+    assert_eq!(ids.get(0).to_string(), "PM401-3fa210");
+    assert_eq!(ids.get(1).to_string(), "PM401-3fa21f");
+    assert_eq!(ids.get(2).to_string(), "PM401-1234");
+    assert_eq!(ids.get(3).to_string(), "PM402-3fa2");
+    assert_eq!(ids.find("PM401-1234"), Ok(2));
+    assert_eq!(ids.find("pm401-3FA21F"), Ok(1));
+    assert_eq!(ids.find("PM401-3fa2"), Err(FindError::Ambiguous));
+    assert_eq!(ids.find("PM401-9999"), Err(FindError::NotFound));
+    for bad in ["PM401", "PM41-3fa2", "PM401-3fa", "PM401-xyzw", "X401-3fa2", "PM401-0123456789abcdef0"] {
+        assert_eq!(ids.find(bad), Err(FindError::Malformed), "{bad}");
+    }
+}
+
+#[test]
+fn relative_paths() {
+    let rel = |p: &str, base: &str| {
+        let mut out = Vec::new();
+        push_relative(p.as_bytes(), base.as_bytes(), &mut out);
+        String::from_utf8(out).expect("utf-8")
+    };
+    assert_eq!(rel("/r/proj/pkg/a.py", "/r/proj"), "pkg/a.py");
+    assert_eq!(rel("/r/proj/pkg/a.py", "/r"), "proj/pkg/a.py");
+    assert_eq!(rel("/r/proj/pkg/a.py", "/r/proj/pkg/sub"), "../a.py");
+    assert_eq!(rel("/r/proj/a.py", "/r/other/x"), "../../proj/a.py");
+    assert_eq!(rel("/r/proj", "/r/proj"), ".");
+    assert_eq!(rel("/r/projx/a.py", "/r/proj"), "../projx/a.py");
+    assert_eq!(rel("/opt/a.py", "/r/proj"), "/opt/a.py");
+    assert_eq!(rel("/r/a.py", "/"), "/r/a.py");
+}
+
+#[test]
+fn plain_messages_and_short_symbols() {
+    let f = sample();
+    let c = ctx();
+    let r = Report::new(&f, &c);
+    let (mut msg, mut scratch, mut sym) = (String::new(), Vec::new(), Vec::new());
+    let complex = r.iter().find(|x| x.rule == COMPLEX_FUNCTION).expect("PM101");
+    r.message_plain(complex, &mut msg, &mut scratch);
+    assert_eq!(msg, "handle is too complex (McCabe 14 > 10)");
+    r.short_symbol(complex, &mut sym);
+    assert_eq!(sym, b"handle");
+    let method = r.iter().find(|x| x.rule == LOW_MAINTAINABILITY).expect("PM106");
+    r.short_symbol(method, &mut sym);
+    assert_eq!(sym, b"Big.run");
+    let module = r.iter().find(|x| x.rule == LONG_MODULE).expect("PM107");
+    r.short_symbol(module, &mut sym);
+    assert_eq!(sym, b"pkg");
+}

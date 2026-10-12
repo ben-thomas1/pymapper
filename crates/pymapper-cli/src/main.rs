@@ -40,6 +40,9 @@ enum Command {
     /// List third-party distributions, how much first-party code uses each, and (--score)
     /// their scorecards.
     Deps(Box<cmd::deps::Args>),
+    /// Explain one finding (by id, e.g. PM401-3fa2) or every finding on a symbol: evidence,
+    /// source, what else is affected, how to verify and fix it.
+    Explain(Box<cmd::explain::Args>),
     /// List import cycles (or, with --calls, the recursion through a symbol).
     Cycles(Box<cmd::cycles::Args>),
     /// Summarise the codebase: size per origin, resolution rates, cycles, top hotspots.
@@ -58,6 +61,7 @@ fn main() -> ExitCode {
         Command::Path(args) => cmd::path::run(*args),
         Command::Imports(args) => cmd::imports::run(*args),
         Command::Deps(args) => cmd::deps::run(*args),
+        Command::Explain(args) => cmd::explain::run(*args),
         Command::Cycles(args) => cmd::cycles::run(*args),
         Command::Summary(args) => cmd::summary::run(*args),
         Command::Config(args) => cmd::config::run(*args),

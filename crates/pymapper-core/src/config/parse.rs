@@ -14,7 +14,7 @@ use toml::de::{DeString, DeTable, DeValue};
 
 use super::suggest::closest;
 use super::{
-    Config, Contract, ContractKind, ContractKindName, Diagnostic, Glob, ImportPattern, Mode, OutputFormat,
+    ColorChoice, Config, Contract, ContractKind, ContractKindName, Diagnostic, GroupBy, Glob, ImportPattern, Mode, OutputFormat,
     PerFileIgnore, Preset, PythonVersion, RuleConfig, RuleSelector, normalize,
 };
 
@@ -36,6 +36,9 @@ pub(super) const ROOT_KEYS: &[&str] = &[
     "threads",
     "mode",
     "output-format",
+    "group-by",
+    "color",
+    "limit",
     "min-confidence",
     "baseline",
     "presets",
@@ -448,6 +451,9 @@ fn apply_root(cx: &mut Ctx<'_, '_>, t: &DeTable<'_>, cfg: &mut Config) {
             "threads" => set(&mut cfg.threads, cx.u32(key, v, 0, super::MAX_THREADS)),
             "mode" => set(&mut cfg.mode, cx.name::<Mode>(key, v)),
             "output-format" => set(&mut cfg.output_format, cx.name::<OutputFormat>(key, v)),
+            "group-by" => set(&mut cfg.group_by, cx.name::<GroupBy>(key, v)),
+            "color" => set(&mut cfg.color, cx.name::<ColorChoice>(key, v)),
+            "limit" => set(&mut cfg.limit, cx.u32(key, v, 0, u32::MAX)),
             "min-confidence" => set(&mut cfg.min_confidence, cx.u32(key, v, 0, 100).map(|n| n as u8)),
             "baseline" => set(&mut cfg.baseline, cx.path(key, v).map(Some)),
             "presets" => {

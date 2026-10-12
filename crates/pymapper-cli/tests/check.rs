@@ -4,6 +4,15 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// `args`, preceded by `--output-format concise` unless they choose a format: these tests
+/// read concise lines, and the default format is `human`.
+fn concise<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let chooses = args.iter().any(|a| *a == "--llm" || *a == "--format" || a.starts_with("--output-format") || a.starts_with("--format="));
+    let mut v = if chooses { Vec::new() } else { vec!["--output-format", "concise"] };
+    v.extend_from_slice(args);
+    v
+}
+
 /// A throwaway project directory, removed on drop.
 struct Project {
     dir: PathBuf,
@@ -40,6 +49,11 @@ impl Project {
 
     /// Runs `pymapper check <args>` in the directory `rel` of the project.
     fn check_in(&self, rel: &str, args: &[&str]) -> Run {
+        self.check_exact(rel, &concise(args))
+    }
+
+    /// As [`Project::check_in`], without choosing the concise format.
+    fn check_exact(&self, rel: &str, args: &[&str]) -> Run {
         let out = Command::new(env!("CARGO_BIN_EXE_pymapper"))
             .arg("check")
             .args(args)
@@ -238,7 +252,7 @@ fn import_cycle_in_every_format() {
 
     // The format can come from the config file too.
     p.file("pymapper.toml", "output-format = \"json\"\n");
-    let r = p.check(&["--select", "PM301"]);
+    let r = p.check_exact("", &["--select", "PM301"]);
     assert!(r.expect_code(1).stdout.starts_with('{'), "{}", r.stdout);
 }
 
@@ -482,7 +496,7 @@ fn closed_stdout_is_not_an_error() {
     let many: String = (0..3000).map(|i| format!("from os import path as p{i}\n")).collect();
     p.file("app/__init__.py", "from app import many\n").file("app/many.py", &many);
     let mut child = Command::new(env!("CARGO_BIN_EXE_pymapper"))
-        .args(["check", "--no-cache"])
+        .args(["check", "--no-cache", "--output-format", "concise"])
         .current_dir(&p.dir)
         .env_remove("VIRTUAL_ENV")
         .stdout(std::process::Stdio::piped())
@@ -748,6 +762,34 @@ fn restricted<'a>(whole: &'a Run, prefixes: &[&str]) -> Vec<&'a str> {
     whole.findings().into_iter().filter(|l| prefixes.iter().any(|p| l.starts_with(p))).collect()
 }
 
+/// Finding lines whose paths are relative to the project root, as shown from its
+/// subdirectory `dir` (paths are relative to the working directory). Order is kept: callers
+/// compare sets of lines from runs in the same directory.
+fn rebased(lines: &[&str], dir: &str) -> Vec<String> {
+    let depth = dir.split('/').count();
+    let mut out: Vec<String> = lines
+        .iter()
+        .map(|l| match l.strip_prefix(&format!("{dir}/")) {
+            Some(rest) => rest.to_owned(),
+            None => {
+                // Up to the shared directory, then down.
+                let base: Vec<&str> = dir.split('/').collect();
+                let parts: Vec<&str> = l.split('/').collect();
+                let shared = base.iter().zip(&parts).take_while(|(a, b)| a == b).count();
+                format!("{}{}", "../".repeat(depth - shared), parts[shared..].join("/"))
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn sorted(lines: Vec<&str>) -> Vec<String> {
+    let mut v: Vec<String> = lines.into_iter().map(str::to_owned).collect();
+    v.sort();
+    v
+}
+
 #[test]
 fn positional_paths_filter_the_whole_program_findings() {
     let p = namespace_workspace("scope-ns");
@@ -785,14 +827,15 @@ fn positional_paths_filter_the_whole_program_findings() {
     let r = p.check(&[&args[..], &["libs/core/ns/core/clean.py"]].concat());
     r.expect_code(0);
     assert!(r.stdout.contains("All checks passed! (1 file checked)"), "{}", r.stdout);
-    // From inside a member, with relative paths, warm cache: the same answers.
+    // From inside a member, with relative paths, warm cache: the same answers (paths shown
+    // relative to the working directory).
     let r = p.check_in("libs/app", &[&args[..], &["."]].concat());
-    assert_eq!(r.findings(), restricted(&whole, &["libs/app"]), "{}{}", r.stdout, r.stderr);
+    assert_eq!(sorted(r.findings()), rebased(&restricted(&whole, &["libs/app"]), "libs/app"), "{}{}", r.stdout, r.stderr);
     let r = p.check_in("libs/app/ns/app", &[&args[..], &["main.py"]].concat());
-    assert_eq!(r.findings(), restricted(&whole, &["libs/app/ns/app/main.py"]), "{}{}", r.stdout, r.stderr);
+    assert_eq!(sorted(r.findings()), rebased(&restricted(&whole, &["libs/app/ns/app/main.py"]), "libs/app/ns/app"), "{}{}", r.stdout, r.stderr);
     // No positional path: the whole project, wherever it runs from.
     let r = p.check_in("libs/app", &args);
-    assert_eq!(r.findings(), whole.findings());
+    assert_eq!(sorted(r.findings()), rebased(&whole.findings(), "libs/app"));
     assert!(!r.stdout.contains("Filtered to"), "{}", r.stdout);
     // A path covering the project root filters nothing.
     let r = p.check(&[&args[..], &["."]].concat());

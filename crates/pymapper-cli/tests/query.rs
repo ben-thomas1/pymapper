@@ -233,7 +233,7 @@ fn json_follows_the_check_conventions() {
     // Formats other than concise and json are usage errors.
     let r = p.run(&["callers", "app.util:helper", "--format", "sarif"]);
     r.expect_code(2);
-    assert!(r.stderr.contains("writes the concise and json formats, not `sarif`"), "{}", r.stderr);
+    assert!(r.stderr.contains("writes the human, llm, concise and json formats, not `sarif`"), "{}", r.stderr);
 }
 
 #[test]

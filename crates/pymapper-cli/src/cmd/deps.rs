@@ -84,9 +84,10 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     loaded.config.include_deps = true;
     let config = &loaded.config;
     let json = match config.output_format {
-        OutputFormat::Concise => false,
+        // Text renderings; the human and llm layouts for deps are not built yet.
+        OutputFormat::Human | OutputFormat::Llm | OutputFormat::Concise => false,
         OutputFormat::Json => true,
-        other => anyhow::bail!("`pymapper deps` writes the concise and json formats, not `{}`", other.as_str()),
+        other => anyhow::bail!("`pymapper deps` writes the human, llm, concise and json formats, not `{}`", other.as_str()),
     };
     let root = &loaded.project.root;
     let scope = &loaded.scope;

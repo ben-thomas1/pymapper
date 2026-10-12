@@ -21,7 +21,7 @@
 pub(crate) mod plan;
 mod watch;
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -117,6 +117,8 @@ pub(crate) struct Setup {
     pub baseline: Option<Baseline>,
     /// Coverage report to read once the index is built (dead code runs and one is set).
     pub coverage_path: Option<PathBuf>,
+    /// Working directory: the base of displayed paths in the text formats.
+    pub cwd: PathBuf,
 }
 
 /// The loaded program `check` analyses.
@@ -191,7 +193,7 @@ impl Setup {
             std::fs::File::open(path)
                 .with_context(|| format!("cannot read coverage report {} (create it with `coverage json`)", path.display()))?;
         }
-        Ok(Setup { loaded, scope, engine, plan, per_file, baseline, coverage_path })
+        Ok(Setup { loaded, scope, engine, plan, per_file, baseline, coverage_path, cwd: cwd.to_path_buf() })
     }
 
     #[inline]
@@ -248,7 +250,13 @@ impl Setup {
             engine.filter(&mut findings, &suppressions, false, |f, i| per_file_matches(ix, root, &per_file[i], f))
         });
 
-        let ctx = IndexContext::new(ix, root, &config.contracts);
+        // Text formats show paths relative to the working directory; json and sarif keep the
+        // project root.
+        let text = !matches!(config.output_format, OutputFormat::Json | OutputFormat::Sarif);
+        let mut ctx = IndexContext::new(ix, root, &config.contracts);
+        if text {
+            ctx = ctx.relative_to(&self.cwd);
+        }
         let mut report = timing::time("report", || Report::new(&findings, &ctx));
         if files_checked == 0 {
             let under = if scope.is_empty() { &config.paths } else { scope };
@@ -266,15 +274,15 @@ impl Setup {
             if let Some(b) = &self.baseline {
                 report.apply_baseline(b);
             }
-            let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
+            let opts = Options::from_config(config, io::stdout().is_terminal());
             let summary = Summary { files_checked, filter };
             // A closed pipe (`pymapper check | head`) is not an error (`Outcome::Closed`); the
             // exit status still reflects the findings.
             let mut out = io::stdout().lock();
             let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
             closed = outcome == Outcome::Closed;
-            if outcome == Outcome::Written && matches!(config.output_format, OutputFormat::Concise | OutputFormat::Github) {
-                let note = Footnote { scope, root, files_checked, files_total, plan: &self.plan };
+            if outcome == Outcome::Written && text {
+                let note = Footnote { scope, base: &self.cwd, files_checked, files_total, plan: &self.plan };
                 match write!(out, "{note}").and_then(|()| out.flush()) {
                     Err(e) if e.kind() == io::ErrorKind::BrokenPipe => closed = true,
                     Err(e) => return Err(e).context("cannot write to stdout"),
@@ -401,6 +409,20 @@ pub(crate) fn first_party_files(ix: &Index, in_scope: Option<&[bool]>) -> (u32, 
         }
     }
     (checked, total)
+}
+
+/// `path` (absolute) relative to `base` (absolute), with `../` steps where needed; as the
+/// paths of the text formats.
+pub(crate) struct RelPath<'a>(pub &'a Path, pub &'a Path);
+
+impl std::fmt::Display for RelPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = self.1.as_os_str().as_bytes();
+        let b = if b == b"/" { b } else { b.strip_suffix(b"/").unwrap_or(b) };
+        let mut out = Vec::new();
+        output::push_relative(self.0.as_os_str().as_bytes(), b, &mut out);
+        f.write_str(&String::from_utf8_lossy(&out))
+    }
 }
 
 /// `path` relative to the project root when below it, else as is.

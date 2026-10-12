@@ -1,0 +1,34 @@
+file lines=40 evidence=31 [main_guard]
+module 0:<module> L1-40 b0-1062
+def 1:list_users in=0 L12-15 b368-488 @13:4 decs=[app.route()] () [other_decorator]
+def 2:health_check in=0 L18-20 b491-562 @19:4 decs=[app.route()] () [other_decorator]
+def 3:main in=0 L23-32 b565-989 @24:4 decs=[log_calls] () [other_decorator]
+def 4:dead_endpoint in=0 L35-36 b992-1021 @35:4 ()
+import 0:<module> L1:26 from services.auth import require_auth
+import 0:<module> L2:34 from services.user_service import create_user
+import 0:<module> L3:32 from middleware.pipeline import run_pipeline
+import 0:<module> L4:29 from utils.decorators import log_calls
+import 0:<module> L5:19 from cycles import ping
+import 0:<module> L6:25 from models.order import Order
+import 0:<module> L7:28 from repo.order_repo import save_order
+import 0:<module> L8:29 from services.pricing import calculate_price
+import 0:<module> L8:46 from services.pricing import receipt_lines
+import 0:<module> L9:29 from services.invoice import invoice_lines
+call 0:<module> L12:1 app.route() dotted
+call 1:list_users L14:12 create_user()
+call 0:<module> L18:1 app.route() dotted
+call 3:main L25:4 require_auth()
+call 3:main L26:4 create_user()
+call 3:main L27:4 run_pipeline()
+call 3:main L28:4 ping()
+call 3:main L29:12 Order()
+call 3:main L30:4 save_order()
+call 3:main L31:4 print()
+call 3:main L31:10 calculate_price()
+call 3:main L32:4 print()
+call 3:main L32:15 join() unknown
+call 3:main L32:20 receipt_lines()
+call 3:main L32:43 invoice_lines()
+call 0:<module> L40:4 main() [main_guard]
+bind 1:list_users L14 users = create_user()
+bind 3:main L29 order = Order()

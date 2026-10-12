@@ -687,24 +687,57 @@ pub struct HygieneContext<'a> {
     names: &'a Interner,
     decls: &'a Declarations,
     root: &'a Path,
+    /// Display base for `pyproject.toml` paths (`None` = the root); see
+    /// [`IndexContext::relative_to`].
+    base: Option<&'a Path>,
+    scratch: std::cell::RefCell<Vec<u8>>,
 }
 
 impl<'a> HygieneContext<'a> {
     pub fn new(inner: IndexContext<'a>, names: &'a Interner, decls: &'a Declarations, root: &'a Path) -> HygieneContext<'a> {
-        HygieneContext { inner, names, decls, root }
+        HygieneContext { inner, names, decls, root, base: None, scratch: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// Shows display paths relative to `base` (see [`IndexContext::relative_to`]).
+    pub fn relative_to(mut self, base: &'a Path) -> HygieneContext<'a> {
+        self.inner = self.inner.relative_to(base);
+        self.base = Some(base);
+        self
     }
 
     fn pyproject(&self, file: FileId) -> Option<&'a [u8]> {
         let u = self.decls.unit_of_file(file)?;
         Some(display_path(&self.decls.unit(u).path, self.root).as_os_str().as_encoded_bytes())
     }
+
+    /// Appends the display path of a `pyproject.toml` file; false if `file` is not one.
+    fn push_pyproject(&self, file: FileId, out: &mut Vec<u8>) -> bool {
+        let Some(u) = self.decls.unit_of_file(file) else {
+            return false;
+        };
+        let path = &self.decls.unit(u).path;
+        match self.base {
+            Some(base) => {
+                let b = base.as_os_str().as_encoded_bytes();
+                crate::output::push_relative(path.as_os_str().as_encoded_bytes(), b.strip_suffix(b"/").unwrap_or(b), out);
+            }
+            None => out.extend_from_slice(display_path(path, self.root).as_os_str().as_encoded_bytes()),
+        }
+        true
+    }
 }
 
 impl Context for HygieneContext<'_> {
     fn write_path(&self, file: FileId, out: &mut Vec<u8>) {
+        if !self.push_pyproject(file, out) {
+            self.inner.write_path(file, out);
+        }
+    }
+
+    fn write_root_path(&self, file: FileId, out: &mut Vec<u8>) {
         match self.pyproject(file) {
             Some(p) => out.extend_from_slice(p),
-            None => self.inner.write_path(file, out),
+            None => self.inner.write_root_path(file, out),
         }
     }
 
@@ -730,10 +763,9 @@ impl ArgResolver for HygieneContext<'_> {
     }
 
     fn write_file(&self, id: FileId, out: &mut dyn fmt::Write) -> fmt::Result {
-        match self.pyproject(id) {
-            Some(p) => crate::output::write_lossy(p, out),
-            None => self.inner.write_file(id, out),
-        }
+        let mut buf = self.scratch.borrow_mut();
+        buf.clear();
+        if self.push_pyproject(id, &mut buf) { crate::output::write_lossy(&buf, out) } else { self.inner.write_file(id, out) }
     }
 
     fn write_contract(&self, index: u32, out: &mut dyn fmt::Write) -> fmt::Result {

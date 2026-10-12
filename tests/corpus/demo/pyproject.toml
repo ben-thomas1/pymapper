@@ -1,0 +1,13 @@
+[project]
+name = "shop"
+version = "0.1.0"
+
+[project.scripts]
+shop = "app:main"
+
+# Architecture rule: the domain models must not depend on the persistence layer.
+[[tool.pymapper.contracts]]
+name = "models are independent of repo"
+kind = "forbidden"
+source = ["models"]
+forbidden = ["repo"]

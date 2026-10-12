@@ -1,0 +1,28 @@
+app.py:35:5: PM401 function `app:dead_endpoint` is never used
+middleware/pipeline.py:6:25: PM405 `User` is imported but never used
+middleware/pipeline.py:21:5: PM401 function `middleware.pipeline:format_receipt` is never used
+models/base.py:12:9: PM403 method `models.base:BaseModel.save` is never used
+models/order.py:2:29: PM303 `models.order` imports forbidden module `repo.order_repo` (contract `models are independent of repo`)
+models/order.py:15:9: PM403 method `models.order:Order.archive` is never used
+models/product.py:10:9: PM403 method `models.product:Product.display_price` is never used
+models/user.py:10:9: PM403 method `models.user:User.display_name` is never used
+repo/order_repo.py:1:26: PM301 import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
+repo/product_repo.py:1:1: PM404 module `repo.product_repo` is never imported
+repo/user_repo.py:9:5: PM401 function `repo.user_repo:delete_user` is never used
+services/auth.py:11:5: PM401 function `services.auth:make_validator` is never used
+services/auth.py:29:5: PM401 function `services.auth:classify_token` is never used
+services/auth.py:34:5: PM401 function `services.auth:create_authenticator` is never used
+services/pricing.py:1:8: PM405 `json` is imported but never used
+services/pricing.py:6:5: PM101 `services.pricing:calculate_price` is too complex (McCabe 14 > 10)
+services/pricing.py:6:5: PM102 `services.pricing:calculate_price` is hard to understand (cognitive complexity 32 > 15)
+services/pricing.py:6:5: PM103 `services.pricing:calculate_price` nests blocks 5 levels deep (> 4)
+services/pricing.py:6:5: PM105 `services.pricing:calculate_price` takes 8 parameters (> 7)
+services/pricing.py:53:5: PM401 function `services.pricing:legacy_discount` is never used
+services/pricing.py:57:7: PM402 class `services.pricing:PromoEngine` is never used
+services/user_service.py:22:5: PM401 function `services.user_service:get_user_display` is never used
+utils/formatting.py:5:5: PM401 function `utils.formatting:format_currency` is only used by unused code
+utils/formatting.py:9:5: PM401 function `utils.formatting:format_percentage` is never used
+utils/legacy_helpers.py:1:1: PM404 module `utils.legacy_helpers` is never imported
+utils/validation.py:15:5: PM401 function `utils.validation:validate_range` is never used
+Found 26 findings in 15 files (23 files checked).
+Not shown: 10 below min-confidence.

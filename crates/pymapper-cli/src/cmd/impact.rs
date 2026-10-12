@@ -52,7 +52,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let opts = args.walk.walk(depth);
     let mut scratch = Scratch::default();
     let imp = timing::time("query", || q.impact(target, &opts, &mut scratch));
-    let limit = args.walk.row_limit();
+    let limit = s.row_limit;
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
     let counts = timing::time("output", || {

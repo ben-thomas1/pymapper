@@ -1,0 +1,10 @@
+file lines=11 evidence=6
+module 0:<module> L1-11 b0-261
+class 1:User in=0 L4-11 b36-260 @4:6 bases=[BaseModel]
+def 2:__init__ in=1 L5-8 b63-198 @5:8 (self, name, email) [dunder,method]
+def 3:display_name in=1 L10-11 b204-260 @10:8 (self) [method]
+import 0:<module> L1:24 from models.base import BaseModel
+call 3:display_name L11:15 self.name.title() self
+bind 2:__init__ L6 self.name = name
+bind 2:__init__ L7 self.email = email
+bind 2:__init__ L8 self.data = <expr>

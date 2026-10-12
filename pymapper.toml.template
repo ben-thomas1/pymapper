@@ -125,9 +125,34 @@
 # mode = "auto"
 # cost: O(files) to assign files to units; one pyproject.toml parse per unit.
 
-# Finding output format: "concise" (path:line:col: CODE message), "json", "sarif", "github"
-# (GitHub Actions annotations). (CLI: `--output-format`.)
-# output-format = "concise"
+# Finding output format:
+#   "human"   - for people: findings grouped by category (or file, see `group-by`), metric
+#               findings merged per function, cross-file findings shown once, colour on a
+#               terminal.
+#   "llm"     - for agents: a compact, prioritised report capped at `limit` items, with stable
+#               ids, evidence, fix hints and verification commands (`pymapper explain <id>`).
+#   "concise" - one `path:line:col: CODE message` line per finding (for scripts and editors).
+#   "json", "sarif", "github" (GitHub Actions annotations).
+# Paths are relative to the working directory, except in json and sarif (relative to the
+# project root). (CLI: `--output-format`; `--llm` is short for `--output-format llm`.)
+# output-format = "human"
+# cost: none.
+
+# Grouping of the human output: "category" (architecture, dependencies, complexity, coupling,
+# duplication, dead code, unused imports; files inside each) or "file" (one section per file).
+# (CLI: `--group-by`.)
+# group-by = "category"
+# cost: none.
+
+# Colour in the human output: "auto" (only when stdout is a terminal and NO_COLOR is unset),
+# "always" or "never". The llm and machine formats are never coloured. (CLI: `--color`.)
+# color = "auto"
+# cost: none.
+
+# Maximum number of items in llm output (merged findings count as one item); the rest is
+# summarised in a final "N more findings not displayed" line. 0 = no cap. Human and machine
+# formats are not capped. (CLI: `--limit`.)
+# limit = 50
 # cost: none.
 
 # Minimum confidence (0-100) a finding needs for `check` to report it. Dead-code findings are

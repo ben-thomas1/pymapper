@@ -30,7 +30,7 @@ This is the single source of truth for what is wrong with pymapper **0.3.0** (ta
 | [O4](#o4---llm-mode-for-every-command) | CLI | `--llm` mode for every command | high | AGREED |
 | [O5](#o5-stable-finding-ids) | output | Stable finding ids (`PM401-3fa2`) | high | AGREED |
 | [O6](#o6-paths-relative-to-the-current-directory) | output | Paths relative to the project root, not the cwd (bug) | high | AGREED |
-| [O7](#o7-json-sarif-and-github-format-improvements) | output | JSON/SARIF/GitHub improvements (root, ids, endLine, related locations, reasons) | medium | AGREED (JSON root + ids), PROPOSED (rest) |
+| [O7](#o7-json-sarif-and-github-format-improvements) | output | JSON/SARIF/GitHub improvements (root, ids, endLine, fix, related locations, reasons) | medium | AGREED (JSON root/id/fix, SARIF+GitHub endLine), deferred (rest) |
 | [O8](#o8-config-docs-and-skill-updates-for-the-new-output) | docs | Config keys, docs and agent skill for the new output | medium | AGREED |
 | [F1](#f1-auto-mode-flips-libraries-to-application-mode) | dead code | Auto mode flips libraries to application on a stray `__main__` guard or script | high | PROPOSED |
 | [F2](#f2-notebooks-are-not-scanned) | dead code | Jupyter notebooks not scanned | high | PROPOSED |
@@ -44,7 +44,7 @@ This is the single source of truth for what is wrong with pymapper **0.3.0** (ta
 | [F10](#f10-deps-defects) | deps | PM601 per site, PM604 never fires, impossible scorecard values | medium | PROPOSED |
 | [F11](#f11-front-end-speed-and-memory-targets) | performance | Front end ~225 MB/s/core against a 400 target; 15.22 B/LOC against 15 | low | PROPOSED |
 | [F12](#f12-internal-names-committed-to-the-repository) | repository | Internal names, findings and local paths committed (blocks pushing) | high | PROPOSED (must be done before any push) |
-| [R1](#r1-repository-and-tooling-housekeeping) | repository | Housekeeping: stale `rewrite` worktree, facts-digest test, demo project | low | OPEN |
+| [R1](#r1-repository-and-tooling-housekeeping) | repository | Housekeeping: stale `rewrite` worktree, `.gitignore`, demo project, build output | low | mostly DONE |
 
 **Release decisions already made by the user:**
 - The next version is **0.4.0**, because the default output changes.
@@ -53,6 +53,29 @@ This is the single source of truth for what is wrong with pymapper **0.3.0** (ta
 - Fix hints and verification commands are included in `--llm` (O2).
 - Every command gets an `--llm` mode (O4).
 - The human default is grouped **category > file** (O1).
+- **Ids are always shown**, in human output too (no `--show-ids` flag) (O1, O5).
+- O7 scope: JSON `root`, `id` and `fix`; SARIF and GitHub `endLine`. The rest of O7 is deferred.
+- 0.4.0 scope is **O1–O8 only**; F1–F12 come later (F12 still before any push).
+- Built by subagents in worktrees (A human, B llm + ids, C explain + queries) on top of a coordinator "Phase 0" commit; success = golden tests + the demo renders as specified + concise/json/sarif/github byte-identical to 0.3.0.
+
+## 0.4.0 Phase 0: shared interfaces (done by the coordinator)
+
+So the agents do not collide, these land first (one commit on `master`):
+
+| Piece | Where | Notes |
+|---|---|---|
+| `OutputFormat::Human` (default) and `OutputFormat::Llm` | `config.rs` | `--llm` is a CLI shorthand for `--output-format llm` and conflicts with `--output-format` (exit 2). Modelling llm as a format keeps one dispatch point. |
+| `GroupBy`, `ColorChoice` (+ `resolve(is_terminal)` honouring `NO_COLOR`), `limit` (default `DEFAULT_LIMIT` = 50) | `config.rs`, `config/parse.rs`, `config/write.rs`, template | config keys `group-by`, `color`, `limit`; flags `--group-by`, `--color`, `--limit` in `ConfigArgs` (help heading "Output") |
+| **One shared `--limit`** | `cmd/config.rs`, `cmd/query/session.rs` | The queries already had a per-command `--limit` (rows, default 200), which clashed. Now: an explicit `--limit N` caps any format (0 = all); without it, `llm` uses the `limit` option (50), query text keeps 200 rows (`DEFAULT_ROWS`, `Session::row_limit`), human `check` is uncapped. |
+| `Options { format, min_confidence, footer, group_by, color, limit }`, `Options::from_config(&config, is_terminal)` | `output.rs` | `color` is already resolved (human only) |
+| `output/human.rs`, `output/llm.rs` | core | **placeholders that write concise**; agents A and B replace the bodies |
+| Paths relative to the cwd (O6) | `output/context.rs` (`IndexContext::relative_to`, `push_relative`, `Context::write_root_path`), `deps/hygiene.rs`, `cmd/check.rs`, `cmd/check/plan.rs` (`Footnote.base`, `RelPath`) | text formats (human, llm, concise, github) use the cwd; json/sarif the root; baseline keys and ids always root-relative |
+| Finding ids (O5) | `output/ids.rs`: `stable_hash` (FNV-1a 64, frozen), `FindingId` (Display `PM401-3fa2`), `FindingIds` (`Report::ids()`, `get(pos)`, `find(text)` accepting any unique ≥4-digit prefix), `FindError` | equal keys disambiguated by occurrence; per-finding extension on collision |
+| Short symbols / plain messages | `Report::short_symbol`, `Report::message_plain` | for the human and llm writers |
+| `pymapper explain <target> [path]` | `cmd/explain.rs` (stub, bails), `main.rs` | arguments final; agent C implements |
+| Tracked demo | `tests/corpus/demo/` (copy of the seeded root `sample_python/`, without `expected.json`) + facts goldens | the untracked root `sample_python/` stays the user's playground |
+| Goldens | `crates/pymapper-cli/tests/golden.rs`, `tests/golden/demo/{concise.txt, concise-dupes-all.txt, json.json, sarif.json, github.txt}` | produced by the **0.3.0 binary**; current build is byte-identical; also O6 path tests (repo root, project root, subdirectory, filter note, json, baselines) |
+| E2E test helpers | `crates/pymapper-cli/tests/{check,coverage,deps_check,watch}.rs` | inject `--output-format concise` unless the test picks a format (`concise()` helper; `check_exact` bypasses it) |
 
 ---
 
@@ -160,7 +183,7 @@ Unused imports  2
    - a contract break goes under the importing file.
 6. **Short symbols** (the file is already the heading): `calculate_price`, `Order.archive`. No backticks in human messages. Dead code shows a kind column (function/class/method/module) and a short verdict ("never used", "only used by unused code", "has no resolved callers (name appears elsewhere)", ...).
 7. **Low confidence:** findings below 100 end with `(confidence 40: unknown-decorator)`, dimmed on a TTY.
-8. **Codes:** right-aligned when the terminal width allows; otherwise two spaces after the message. **Never truncate.**
+8. **Ids** (AGREED: always shown): every item ends with its finding id (`PM401-3fa2`) instead of the bare code, right-aligned when the terminal width allows, otherwise two spaces after the message. **Never truncate.** A merged metric line shows the first finding's id and the other codes (`PM101-0b2e +PM102,PM103,PM105`); `explain` on that id covers every metric of the symbol. A duplicate pair or cycle shows its one id. (The target layout below predates this decision and shows bare codes.)
 9. **Footer:** a per-category tally, plus the existing notes (below confidence, suppressed, baselined, per-file-ignored, "Filtered to <paths> … the whole project was analysed", the rules-ran/skipped line).
 10. **Colour** (AGREED: "yes, when a terminal"):
     - category headers coloured by family: architecture/cycles red, dependencies cyan, complexity magenta, coupling magenta-dim, duplication blue, dead code yellow, unused imports yellow-dim;
@@ -345,7 +368,7 @@ The cap counts **items** (merged groups), not raw findings.
 
 - **Format:** `PM401-3fa2`, i.e. the rule code, `-`, then 4 hex characters, automatically extended to 5–6 when two findings in the same run would collide.
 - **Derivation:** from the **baseline key** (`output/baseline.rs`: rule + stable id (the symbol's qualified id, else the file path) + stable message arguments, never numbers). Use a fixed, toolchain-independent hasher. The std `DefaultHasher` is not stable across Rust releases, so use Fx/FNV/xxhash-style code written in-house.
-- **Shown in:** human output only on request (`--show-ids`, PROPOSED); `--llm` always; JSON as a new `"id"` field; SARIF in `partialFingerprints` (already present as `pymapperKey/v1`; keep it consistent).
+- **Shown in:** human output always (AGREED: no `--show-ids` flag); `--llm` always; JSON as a new `"id"` field; SARIF in `partialFingerprints` (already present as `pymapperKey/v1`; keep it consistent).
 - **Used by:** `explain`, and later possibly `--ignore-id`.
 
 **Acceptance:**
@@ -374,7 +397,8 @@ The cap counts **items** (merged groups), not raw findings.
   - PROPOSED: `url` per finding, linking to the rule's documentation anchor;
   - PROPOSED: `fix` (the same template as `--llm`);
   - PROPOSED: per-rule counts in `summary`.
-- **SARIF (PROPOSED):**
+- **AGREED for 0.4.0:** JSON `fix` per finding; SARIF `region.endLine`; GitHub `endLine`. The rest of this section is deferred.
+- **SARIF (deferred except `endLine`):**
   - `region.endLine` (JSON already has `end_line`);
   - the second PM501 copy and cycle members as `relatedLocations`;
   - dead-code `reasons` in `properties`;
@@ -391,7 +415,7 @@ The cap counts **items** (merged groups), not raw findings.
   - `color = "auto" | "always" | "never"`;
   - `limit = 50`, applying to `--llm` only by default.
   - Document every key in the template with its default and cost note.
-- **CLI flags:** `--llm`, `--group-by`, `--color`, `--limit`, and `--show-ids` (PROPOSED), on every command where they apply. Shared flags live in `crates/pymapper-cli/src/cmd/config.rs` (`ConfigArgs`).
+- **CLI flags:** `--llm`, `--group-by`, `--color`, `--limit` (done in Phase 0, on every command through `ConfigArgs`; `--limit` also replaces the queries' old row limit). Shared flags live in `crates/pymapper-cli/src/cmd/config.rs` (`ConfigArgs`).
 - **Docs:**
   - `README.md` (usage, formats);
   - `docs/cli.md` (output formats section, exit codes, `explain`);
@@ -692,10 +716,10 @@ Precision snapshot for 0.3.0 (verified samples; full tables in `reports/0.3.0/SU
 
 ## R1 Repository and tooling housekeeping
 
-**Status:** OPEN · **Severity:** low
+**Status:** mostly DONE · **Severity:** low
 
-- **Stale `rewrite` worktree:** the `rewrite` branch (`964a723`) is registered to `../pymapper-integration`, which **no longer exists** (`git worktree list` shows it as prunable; the user asked what was in it: about 13 GB of build output). `master` is one commit ahead (`0b54c1a`, the usage guide). Options: `git worktree prune` plus delete `rewrite`, or prune and recreate the worktree when the workflow is used again.
+- **Stale `rewrite` worktree:** DONE (2026-10-13): pruned and the `rewrite` branch deleted (it was fully contained in `master`).
 - **Build output in worktrees:** each worktree builds its own `target/`, which reached about 13 GB. Future multi-worktree runs should run `cargo clean` at the end or share `CARGO_TARGET_DIR` (with care: a shared target dir serialises builds).
-- **Demo project:** the seeded demo is the **untracked** root `sample_python/` (gitignored by the allow-list). It holds deliberate problems for every rule family (see HANDOFF). Do **not** seed the tracked `tests/corpus/sample_python`: about 12 tests depend on its exact contents (resolve, query, dead code, rollup, coupling, hotspot, GUI offscreen, xtask layout). If the output goldens need a tracked demo, create a new one (e.g. `tests/corpus/demo/` or `examples/demo/`, the latter added to the `.gitignore` allow-list) and update the layout test minimums.
-- **`ISSUES.md` and `HANDOFF.md`** are not tracked (the root allow-list in `.gitignore` ignores new root files), so **fresh git worktrees do not contain them**. Either give agents absolute paths to this checkout, or add `!/ISSUES.md` (safe, no internal names) to `.gitignore`. Keep `HANDOFF.md` untracked if it mentions internal paths.
+- **Demo project:** the seeded demo is the **untracked** root `sample_python/` (ignored). It holds deliberate problems for every rule family (see HANDOFF). Do **not** seed the tracked `tests/corpus/sample_python`: about 12 tests depend on its exact contents (resolve, query, dead code, rollup, coupling, hotspot, GUI offscreen, xtask layout). DONE (Phase 0): the tracked copy for goldens is `tests/corpus/demo/`.
+- **`.gitignore`:** DONE (`68763cb`): the allow-list was replaced by explicit ignores. It had a real bug: the proprietary-fixture rule pointed at `tests/corpus/fixtures/db.py` while the file is `tests/fixtures/db.py`, so it was not ignored. `ISSUES.md` is now tracked; `HANDOFF.md`, `TODO.md`, `.pymapper.toml`, `reports/`, `sample_python/`, `.claude/` and `tests/fixtures/` are ignored, so fresh worktrees lack them (give agents absolute paths to `HANDOFF.md`).
 - **Stray caches:** runs without `--cache-dir` write `.pymapper_cache/` (self-gitignored) into project roots. Agents analysing other repos must always pass `--cache-dir /tmp/...`. Remove stray caches after runs.

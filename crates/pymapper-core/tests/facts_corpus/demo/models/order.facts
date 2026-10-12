@@ -1,0 +1,14 @@
+file lines=17 evidence=12
+module 0:<module> L1-17 b0-540
+class 1:Order in=0 L5-17 b120-539 @5:6 bases=[BaseModel]
+def 2:__init__ in=1 L6-10 b148-337 @6:8 (self, customer, items) [dunder,method]
+def 3:total in=1 L12-13 b343-430 @12:8 (self) [method]
+def 4:archive in=1 L15-17 b436-539 @15:8 (self) [method]
+import 0:<module> L1:24 from models.base import BaseModel
+import 0:<module> L2:28 from repo.order_repo import next_order_id
+call 2:__init__ L7:18 next_order_id()
+call 3:total L13:15 sum()
+bind 2:__init__ L7 self.id = next_order_id()
+bind 2:__init__ L8 self.customer = customer
+bind 2:__init__ L9 self.items = items
+bind 2:__init__ L10 self.data = <expr>

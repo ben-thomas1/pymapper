@@ -2,7 +2,7 @@
 
 use std::process::{Command, Output};
 
-const SUBCOMMANDS: [&str; 10] = ["check", "callers", "callees", "impact", "path", "imports", "deps", "cycles", "summary", "config"];
+const SUBCOMMANDS: [&str; 11] = ["check", "callers", "callees", "impact", "path", "imports", "deps", "explain", "cycles", "summary", "config"];
 
 fn pymapper(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_pymapper"))

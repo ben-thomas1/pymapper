@@ -209,7 +209,8 @@ pub fn check_selectors(config: &Config) -> anyhow::Result<()> {
 /// the user selected rules, how many ran and which were skipped.
 pub struct Footnote<'a> {
     pub scope: &'a [PathBuf],
-    pub root: &'a Path,
+    /// Base of the displayed paths (the working directory).
+    pub base: &'a Path,
     pub files_checked: u32,
     pub files_total: u32,
     pub plan: &'a RulePlan,
@@ -223,7 +224,7 @@ impl fmt::Display for Footnote<'_> {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{}", super::display_rel(p, self.root))?;
+                write!(f, "{}", super::RelPath(p, self.base))?;
             }
             writeln!(
                 f,

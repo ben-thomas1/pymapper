@@ -8,6 +8,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
+/// `args`, preceded by `--output-format concise` unless they choose a format: these tests
+/// read concise lines, and the default format is `human`.
+fn concise<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let chooses = args.iter().any(|a| *a == "--llm" || *a == "--format" || a.starts_with("--output-format") || a.starts_with("--format="));
+    let mut v = if chooses { Vec::new() } else { vec!["--output-format", "concise"] };
+    v.extend_from_slice(args);
+    v
+}
+
 /// A throwaway project directory, removed on drop.
 struct Project {
     dir: PathBuf,
@@ -35,7 +44,7 @@ impl Project {
         let mut child = Command::new(env!("CARGO_BIN_EXE_pymapper"))
             .arg("check")
             .arg("--watch")
-            .args(args)
+            .args(concise(args))
             .current_dir(&self.dir)
             .env_remove("VIRTUAL_ENV")
             .stdout(Stdio::piped())

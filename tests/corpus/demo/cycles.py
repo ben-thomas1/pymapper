@@ -1,0 +1,6 @@
+def ping():
+    pong()
+
+
+def pong():
+    ping()

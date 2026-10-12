@@ -1,0 +1,45 @@
+file lines=59 evidence=35
+module 0:<module> L1-59 b0-1859
+def 1:calculate_price in=0 L6-36 b67-1222 @6:4 (order, customer, coupon, region, currency, tax_rate, shipping, express)
+def 2:receipt_lines in=0 L39-50 b1225-1670 @39:4 (order)
+def 3:legacy_discount in=0 L53-54 b1673-1746 @53:4 (total)
+class 4:PromoEngine in=0 L57-59 b1749-1858 @57:6
+def 5:apply in=4 L58-59 b1793-1858 @58:8 (self, order:) [method]
+import 0:<module> L1:7 import json
+import 0:<module> L3:25 from models.order import Order
+call 1:calculate_price L8:12 order.total() dotted
+call 1:calculate_price L10:11 customer.get() dotted
+call 1:calculate_price L27:13 customer.get() dotted
+call 1:calculate_price L29:18 coupon.startswith() dotted
+call 1:calculate_price L30:17 int()
+call 1:calculate_price L32:11 item.get() dotted
+call 1:calculate_price L32:34 item.get() dotted
+call 1:calculate_price L36:11 round()
+call 2:receipt_lines L43:28 strip() unknown
+call 2:receipt_lines L43:36 title() unknown
+call 2:receipt_lines L44:14 int()
+call 2:receipt_lines L45:16 float()
+call 2:receipt_lines L47:8 lines.append() dotted
+call 2:receipt_lines L48:4 lines.append() dotted
+call 2:receipt_lines L49:4 lines.append() dotted
+call 2:receipt_lines L49:34 order.total() dotted
+call 5:apply L59:15 order.total() dotted
+bind 1:calculate_price L8 total = order.total()
+bind 1:calculate_price L14 total op= <expr> [conditional]
+bind 1:calculate_price L16 total op= <expr> [conditional]
+bind 1:calculate_price L18 total op= <expr> [conditional]
+bind 1:calculate_price L20 total op= <expr> [conditional]
+bind 1:calculate_price L22 total op= <expr> [conditional]
+bind 1:calculate_price L24 total op= <expr> [conditional]
+bind 1:calculate_price L26 total op= <expr> [conditional]
+bind 1:calculate_price L28 total op= <expr> [conditional]
+bind 1:calculate_price L30 total op= int() [conditional]
+bind 1:calculate_price L31 item for
+bind 1:calculate_price L33 shipping op= <expr> [conditional]
+bind 1:calculate_price L35 shipping op= <expr> [conditional]
+bind 2:receipt_lines L41 lines = <strings>
+bind 2:receipt_lines L42 item for
+bind 2:receipt_lines L43 name = <expr> [conditional]
+bind 2:receipt_lines L44 qty = int() [conditional]
+bind 2:receipt_lines L45 price = float() [conditional]
+bind 2:receipt_lines L46 subtotal = <expr> [conditional]

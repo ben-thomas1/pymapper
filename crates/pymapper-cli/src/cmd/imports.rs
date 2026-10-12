@@ -47,9 +47,6 @@ pub struct Args {
     /// Skip imports only type checkers see (`if TYPE_CHECKING:` blocks).
     #[arg(long)]
     runtime: bool,
-    /// Rows printed per direction (heaviest first); 0 prints every row.
-    #[arg(long, value_name = "N", default_value_t = 200)]
-    limit: usize,
     #[command(flatten)]
     flags: QueryFlags,
 }
@@ -93,7 +90,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         imports: true,
         import_exclude: if args.runtime { res_flags::TYPE_ONLY } else { 0 },
     };
-    let limit = if args.limit == 0 { usize::MAX } else { args.limit };
+    let limit = s.row_limit;
     let mut scratch = Scratch::default();
     let mut side = |dir: Direction| -> Option<Side> {
         // Imports name modules: nothing imports a class or function.

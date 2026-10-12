@@ -68,7 +68,7 @@ pub fn run_walk(args: Args, side: Side) -> anyhow::Result<ExitCode> {
             if depth == u32::MAX { w.str("null") } else { w.num(u64::from(depth)) }
             w.open_array("results");
         }
-        let counts = hops::write_rows(&s, &q, &mut w, &walk, side, args.walk.row_limit(), false);
+        let counts = hops::write_rows(&s, &q, &mut w, &walk, side, s.row_limit, false);
         if w.json {
             w.close_array(counts.shown);
             w.key("summary", false);

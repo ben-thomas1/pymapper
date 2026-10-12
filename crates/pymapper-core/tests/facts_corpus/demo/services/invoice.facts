@@ -1,0 +1,17 @@
+file lines=12 evidence=15
+module 0:<module> L1-12 b0-463
+def 1:invoice_lines in=0 L1-12 b0-462 @1:4 (order)
+call 1:invoice_lines L5:28 strip() unknown
+call 1:invoice_lines L5:36 title() unknown
+call 1:invoice_lines L6:14 int()
+call 1:invoice_lines L7:16 float()
+call 1:invoice_lines L9:8 lines.append() dotted
+call 1:invoice_lines L10:4 lines.append() dotted
+call 1:invoice_lines L11:4 lines.append() dotted
+call 1:invoice_lines L11:34 order.total() dotted
+bind 1:invoice_lines L3 lines = <strings>
+bind 1:invoice_lines L4 item for
+bind 1:invoice_lines L5 name = <expr> [conditional]
+bind 1:invoice_lines L6 qty = int() [conditional]
+bind 1:invoice_lines L7 price = float() [conditional]
+bind 1:invoice_lines L8 subtotal = <expr> [conditional]

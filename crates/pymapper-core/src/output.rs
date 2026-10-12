@@ -1,5 +1,6 @@
-//! Finding output (design: Checks / CLI, "Output"): concise, JSON, SARIF 2.1.0 and GitHub
-//! annotations, the summary footer, exit codes and baselines.
+//! Finding output (design: Checks / CLI, "Output"): human (default), llm (agent mode),
+//! concise, JSON, SARIF 2.1.0 and GitHub annotations, the summary footer, exit codes,
+//! baselines and stable finding ids.
 //!
 //! # Pipeline
 //!
@@ -17,8 +18,10 @@
 //!
 //! # Paths and columns
 //!
-//! Paths are shown relative to the project root ([`IndexContext`]); files outside it keep
-//! their absolute path. Columns are 1-based and counted in bytes from the start of the line
+//! Paths are shown relative to the context's display base: the working directory for the
+//! human, llm, concise and github formats, the project root for json and sarif (the CLI sets
+//! it, see [`IndexContext::relative_to`]). Baseline keys and finding ids always use paths
+//! relative to the project root. Columns are 1-based and counted in bytes from the start of the line
 //! (sources are not retained, so they are not converted to characters). They differ from
 //! character columns only when non-ASCII text precedes the finding on its line, which does not
 //! happen for definitions and imports (indentation is ASCII).
@@ -34,13 +37,15 @@
 //! let ctx = IndexContext::new(&index, &root, &config.contracts);
 //! let mut report = Report::new(&findings, &ctx);
 //! if let Some(b) = &baseline { report.apply_baseline(b); }
-//! let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
+//! let opts = Options::from_config(&config, std::io::stdout().is_terminal());
 //! report.write(&opts, &Summary { files_checked, filter: stats }, &mut std::io::stdout().lock())?;
 //! std::process::ExitCode::from(report.exit_status(opts.min_confidence).code())
 //! ```
 //!
 //! # Formats
 //!
+//! - `human`: grouped by category (or file), merged, coloured on a terminal ([`human`]).
+//! - `llm`: compact prioritised agent report, capped at [`Options::limit`] items ([`llm`]).
 //! - `concise`: `path:line:col: CODE message`, confidence appended when below 100, then a
 //!   summary footer.
 //! - `json`: one document, schema version [`JSON_VERSION`] (see [`json`]).
@@ -52,14 +57,21 @@
 //! See [`Baseline`]: findings are keyed by rule + stable id (the symbol's qualified id, else the
 //! file path) + the stable message arguments (names, symbols, files, contracts; never numbers),
 //! with a count per key.
+//!
+//! # Ids
+//!
+//! [`Report::ids`]: `PM401-3fa2`, derived from the baseline key (see [`ids`]).
 
 mod baseline;
 mod buf;
 mod concise;
 mod context;
 mod github;
+mod human;
+pub mod ids;
 pub mod json;
 mod jsonread;
+mod llm;
 mod sarif;
 
 #[cfg(test)]
@@ -70,10 +82,11 @@ use std::io;
 
 pub use baseline::{Baseline, BaselineError};
 pub use buf::{Out, Outcome, is_broken_pipe};
-pub use context::{Context, IndexContext};
+pub use context::{Context, IndexContext, push_relative};
 pub(crate) use context::write_lossy;
 
-pub use crate::config::OutputFormat;
+pub use crate::config::{GroupBy, OutputFormat};
+pub use ids::{FindError, FindingId, FindingIds};
 use crate::rules::codes::UNUSED_IMPORT;
 use crate::rules::{Arg, FileId, FilterStats, Finding, Findings, SymbolId};
 
@@ -121,14 +134,40 @@ pub struct Options {
     /// Confidence gate (0-100): findings at or above it make the exit status 1. Findings below
     /// it are still written if present (JSON consumers filter on `confidence`).
     pub min_confidence: u8,
-    /// Write the summary footer (concise and github formats).
+    /// Write the summary footer (human, llm, concise and github formats).
     pub footer: bool,
+    /// Grouping of the human format.
+    pub group_by: GroupBy,
+    /// ANSI colour in the human format (already resolved from `color` and the terminal).
+    pub color: bool,
+    /// Item cap of the llm format (0 = none).
+    pub limit: u32,
 }
 
 impl Options {
-    /// `format` with the default gate and a footer.
+    /// `format` with the default gate, a footer, category grouping, no colour and the default
+    /// llm cap.
     pub fn new(format: OutputFormat) -> Options {
-        Options { format, min_confidence: crate::config::DEFAULT_MIN_CONFIDENCE, footer: true }
+        Options {
+            format,
+            min_confidence: crate::config::DEFAULT_MIN_CONFIDENCE,
+            footer: true,
+            group_by: GroupBy::Category,
+            color: false,
+            limit: crate::config::DEFAULT_LIMIT,
+        }
+    }
+
+    /// The configured options; `is_terminal`: whether stdout is a terminal (for `color = "auto"`).
+    pub fn from_config(config: &crate::config::Config, is_terminal: bool) -> Options {
+        Options {
+            format: config.output_format,
+            min_confidence: config.min_confidence,
+            footer: true,
+            group_by: config.group_by,
+            color: config.output_format == OutputFormat::Human && config.color.resolve(is_terminal),
+            limit: config.limit,
+        }
     }
 }
 
@@ -313,6 +352,8 @@ impl<'a> Report<'a> {
     pub fn write(&self, opts: &Options, summary: &Summary, w: &mut dyn io::Write) -> io::Result<Outcome> {
         let mut out = Out::new(w);
         match opts.format {
+            OutputFormat::Human => human::write(self, opts, summary, &mut out),
+            OutputFormat::Llm => llm::write(self, opts, summary, &mut out),
             OutputFormat::Concise => concise::write(self, opts, summary, &mut out),
             OutputFormat::Json => json::write_report(self, opts, summary, &mut out),
             OutputFormat::Sarif => sarif::write(self, &mut out),
@@ -328,11 +369,44 @@ impl<'a> Report<'a> {
         out.finish()
     }
 
+    /// Stable ids of the findings, by output position (see [`ids`]). Computed on demand:
+    /// one key rendering and hash per finding, plus a sort.
+    pub fn ids(&self) -> FindingIds {
+        FindingIds::build(self)
+    }
+
     /// Message of a finding rendered into `buf` (cleared first).
     pub(crate) fn message(&self, f: &Finding, buf: &mut String) {
         buf.clear();
         // Writing into a String cannot fail; resolvers only fail if the sink does.
         let _ = self.findings.write_message(f, self.ctx, buf);
+    }
+
+    /// Message of a finding for the human and llm formats, into `buf` (cleared first): no
+    /// backticks, and symbols of the finding's own module without the `pkg.mod:` prefix (the
+    /// file is already shown). `scratch` is reused for the module prefix.
+    #[allow(dead_code)] // for the human and llm writers (being built)
+    pub(crate) fn message_plain(&self, f: &Finding, buf: &mut String, scratch: &mut Vec<u8>) {
+        self.message(f, buf);
+        buf.retain(|c| c != '`');
+        self.symbol_id(f, scratch);
+        if let Some(colon) = scratch.iter().position(|&b| b == b':')
+            && let Ok(prefix) = std::str::from_utf8(&scratch[..=colon])
+            && buf.contains(prefix)
+        {
+            *buf = buf.replace(prefix, "");
+        }
+    }
+
+    /// Short symbol of a finding into `buf` (cleared first; empty without one): its stable id
+    /// without the module part (`Class.method`, or the bound name of an unused import); a
+    /// module's own id is kept whole (`utils.legacy_helpers`).
+    #[allow(dead_code)] // for the human and llm writers (being built)
+    pub(crate) fn short_symbol(&self, f: &Finding, buf: &mut Vec<u8>) {
+        self.symbol_id(f, buf);
+        if let Some(colon) = buf.iter().position(|&b| b == b':') {
+            buf.drain(..=colon);
+        }
     }
 
     /// Stable id of a finding's symbol rendered into `buf` (cleared first; empty without one).

@@ -6,6 +6,7 @@ pub mod check;
 pub mod config;
 pub mod cycles;
 pub mod deps;
+pub mod explain;
 pub mod impact;
 pub mod imports;
 pub mod path;

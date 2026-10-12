@@ -1,0 +1,6 @@
+file lines=9 evidence=4
+module 0:<module> L1-9 b0-150
+def 1:to_cents in=0 L4-5 b44-101 @4:4 (amount)
+def 2:from_cents in=0 L8-9 b104-149 @8:4 (cents)
+call 1:to_cents L5:11 int()
+call 1:to_cents L5:15 round()

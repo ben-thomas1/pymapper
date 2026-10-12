@@ -13,7 +13,7 @@
 //! suppress them with a `# pymapper: ignore[PM602]` comment on its line, or `per-file-ignores`
 //! on `pyproject.toml`.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -120,7 +120,13 @@ pub fn run(mut loaded: Loaded, opts: Opts, t0: Instant) -> anyhow::Result<ExitCo
         })
     });
 
-    let ctx = HygieneContext::new(IndexContext::new(ix, root, &config.contracts), &names, &decls, root);
+    // Text formats show paths relative to the working directory; json and sarif keep the
+    // project root.
+    let text = !matches!(config.output_format, OutputFormat::Json | OutputFormat::Sarif);
+    let mut ctx = HygieneContext::new(IndexContext::new(ix, root, &config.contracts), &names, &decls, root);
+    if text {
+        ctx = ctx.relative_to(&cwd);
+    }
     let mut report = timing::time("report", || Report::new(&findings, &ctx));
     let status = if let Some(path) = &opts.save_baseline {
         let path = cwd.join(path);
@@ -131,12 +137,12 @@ pub fn run(mut loaded: Loaded, opts: Opts, t0: Instant) -> anyhow::Result<ExitCo
         if let Some(b) = &baseline {
             report.apply_baseline(b);
         }
-        let opts = Options { format: config.output_format, min_confidence: config.min_confidence, footer: true };
+        let opts = Options::from_config(config, io::stdout().is_terminal());
         let summary = Summary { files_checked, filter };
         let mut out = io::stdout().lock();
         let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
         if outcome == Outcome::Written
-            && matches!(config.output_format, OutputFormat::Concise | OutputFormat::Github)
+            && text
             && !scope.is_empty()
         {
             let res = writeln!(

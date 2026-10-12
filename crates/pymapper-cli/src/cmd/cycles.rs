@@ -75,7 +75,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         keep
     });
     counts.matched = hits.len();
-    counts.shown = hits.len().min(args.walk.row_limit());
+    counts.shown = hits.len().min(s.row_limit);
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
     timing::time("output", || write(&q, &mut w, &kind, target, &hits, &counts, &walk));
