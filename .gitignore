@@ -1,26 +1,25 @@
-# Publish only the project roots below; keep local working material on disk.
-/*
-!/.gitignore
-!/.cargo/
-!/.github/
-!/Cargo.toml
-!/Cargo.lock
-!/rust-toolchain.toml
-!/LICENSE
-!/README.md
-!/CLAUDE.md
-!/SKILL.md
-!/crates/
-!/xtask/
-!/tests/
-!/docs/
-!/pymapper.toml.template
-
+# Build output
 /target/
-# Proprietary local fixture; never commit.
-/tests/corpus/fixtures/db.py
-**/__pycache__/
+
+# pymapper cache (also ignores itself)
+.pymapper_cache/
+
+# Local working material; may contain internal names, never commit
+/HANDOFF.md
+/TODO.md
+/.pymapper.toml
+/reports/
+/sample_python/
+/.claude/
+
+# Proprietary local fixture; never commit
+/tests/fixtures/
+
+# Python
+__pycache__/
 *.py[cod]
+
+# OS and secrets
 .DS_Store
 .env
 .env.*
