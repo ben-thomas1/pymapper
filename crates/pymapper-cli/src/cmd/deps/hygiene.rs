@@ -23,13 +23,13 @@ use pymapper_core::config::{Loaded, OutputFormat};
 use pymapper_core::deps::{self, DeclStatus, Declarations, HygieneContext, HygieneCtx, HygieneRules};
 use pymapper_core::index::NONE;
 use pymapper_core::intern::Interner;
-use pymapper_core::output::{self, IndexContext, Options, Outcome, Report, Summary};
+use pymapper_core::output::{self, IndexContext, Options, Outcome, Report, RunNotes, Summary};
 use pymapper_core::rules::{Findings, RuleEngine};
 use pymapper_core::timing;
 
 use crate::cmd::check::plan::check_selectors;
 use crate::cmd::check::{
-    compile_per_file_ignores, display_rel, file_scope, first_party_files, per_file_matches, per_file_path_matches,
+    RelPath, compile_per_file_ignores, display_rel, file_scope, first_party_files, per_file_matches, per_file_path_matches,
     read_baseline, save_baseline, warn_bad_code,
 };
 use crate::pipeline::{self, warn};
@@ -138,11 +138,20 @@ pub fn run(mut loaded: Loaded, opts: Opts, t0: Instant) -> anyhow::Result<ExitCo
             report.apply_baseline(b);
         }
         let opts = Options::from_config(config, io::stdout().is_terminal());
-        let summary = Summary { files_checked, filter };
+        let llm = config.output_format == OutputFormat::Llm;
+        let root_rel = if llm { RelPath(root, &cwd).to_string() } else { String::new() };
+        let filter_note = if llm && !scope.is_empty() {
+            format!("{} ({files_checked} of {files_total} first-party files)", DisplayScope(scope, &cwd))
+        } else {
+            String::new()
+        };
+        let notes = RunNotes { command: "deps --check", root: &root_rel, filter: &filter_note, ..RunNotes::default() };
+        let summary = Summary { files_checked, filter, notes };
         let mut out = io::stdout().lock();
         let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
         if outcome == Outcome::Written
             && text
+            && !llm
             && !scope.is_empty()
         {
             let res = writeln!(
@@ -204,5 +213,20 @@ fn warn_declarations(decls: &Declarations, root: &std::path::Path, rules: Hygien
             "no dependency declarations found (`[project] dependencies` or `[tool.poetry.dependencies]` in \
              pyproject.toml); PM601, PM602 and PM604 need them"
         ));
+    }
+}
+
+/// Positional paths relative to the working directory, joined by `, ` (the llm filter note).
+struct DisplayScope<'a>(&'a [PathBuf], &'a std::path::Path);
+
+impl std::fmt::Display for DisplayScope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, p) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", RelPath(p, self.1))?;
+        }
+        Ok(())
     }
 }

@@ -1,0 +1,18 @@
+# pymapper impact services.pricing:calculate_price
+target: services.pricing:calculate_price (function, services/pricing.py:6) · root: .
+Affected: 2 (1 symbol, 1 module level) in 1 file, 0 in tests, 0 only through a possible edge · importing modules: 1 (1 direct, 0 in tests)
+Tags are the least sure edge on the path back to the target.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+Affected symbols, grouped by file (closest first):
+
+## app.py (app)
+main [certain] at 31:11
+(module level) [certain] at 40:5 depth 2 via app:main
+
+## Importing modules (1): import the target's module, so a removed or renamed name breaks them; most do not call it
+app (app.py:8)
+
+Most affected modules: app 2
+
+Next: `pymapper callers services.pricing:calculate_price` for the direct call sites · `pymapper explain services.pricing:calculate_price` for findings on it

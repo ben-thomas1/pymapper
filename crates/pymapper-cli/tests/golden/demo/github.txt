@@ -1,28 +1,28 @@
-::warning file=app.py,line=35,col=5,title=PM401 unused-function::function `app:dead_endpoint` is never used
+::warning file=app.py,line=35,col=5,endLine=36,title=PM401 unused-function::function `app:dead_endpoint` is never used
 ::warning file=middleware/pipeline.py,line=6,col=25,title=PM405 unused-import::`User` is imported but never used
-::warning file=middleware/pipeline.py,line=21,col=5,title=PM401 unused-function::function `middleware.pipeline:format_receipt` is never used
-::warning file=models/base.py,line=12,col=9,title=PM403 unused-method::method `models.base:BaseModel.save` is never used
+::warning file=middleware/pipeline.py,line=21,col=5,endLine=24,title=PM401 unused-function::function `middleware.pipeline:format_receipt` is never used
+::warning file=models/base.py,line=12,col=9,endLine=15,title=PM403 unused-method::method `models.base:BaseModel.save` is never used
 ::error file=models/order.py,line=2,col=29,title=PM303 forbidden-import::`models.order` imports forbidden module `repo.order_repo` (contract `models are independent of repo`)
-::warning file=models/order.py,line=15,col=9,title=PM403 unused-method::method `models.order:Order.archive` is never used
-::warning file=models/product.py,line=10,col=9,title=PM403 unused-method::method `models.product:Product.display_price` is never used
-::warning file=models/user.py,line=10,col=9,title=PM403 unused-method::method `models.user:User.display_name` is never used
+::warning file=models/order.py,line=15,col=9,endLine=17,title=PM403 unused-method::method `models.order:Order.archive` is never used
+::warning file=models/product.py,line=10,col=9,endLine=11,title=PM403 unused-method::method `models.product:Product.display_price` is never used
+::warning file=models/user.py,line=10,col=9,endLine=11,title=PM403 unused-method::method `models.user:User.display_name` is never used
 ::warning file=repo/order_repo.py,line=1,col=26,title=PM301 import-cycle::import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
 ::warning file=repo/product_repo.py,line=1,col=1,title=PM404 unused-module::module `repo.product_repo` is never imported
-::warning file=repo/user_repo.py,line=9,col=5,title=PM401 unused-function::function `repo.user_repo:delete_user` is never used
-::warning file=services/auth.py,line=11,col=5,title=PM401 unused-function::function `services.auth:make_validator` is never used
-::warning file=services/auth.py,line=29,col=5,title=PM401 unused-function::function `services.auth:classify_token` is never used
-::warning file=services/auth.py,line=34,col=5,title=PM401 unused-function::function `services.auth:create_authenticator` is never used
+::warning file=repo/user_repo.py,line=9,col=5,endLine=10,title=PM401 unused-function::function `repo.user_repo:delete_user` is never used
+::warning file=services/auth.py,line=11,col=5,endLine=18,title=PM401 unused-function::function `services.auth:make_validator` is never used
+::warning file=services/auth.py,line=29,col=5,endLine=31,title=PM401 unused-function::function `services.auth:classify_token` is never used
+::warning file=services/auth.py,line=34,col=5,endLine=51,title=PM401 unused-function::function `services.auth:create_authenticator` is never used
 ::warning file=services/pricing.py,line=1,col=8,title=PM405 unused-import::`json` is imported but never used
-::warning file=services/pricing.py,line=6,col=5,title=PM101 complex-function::`services.pricing:calculate_price` is too complex (McCabe 14 > 10)
-::warning file=services/pricing.py,line=6,col=5,title=PM102 cognitive-complexity::`services.pricing:calculate_price` is hard to understand (cognitive complexity 32 > 15)
-::warning file=services/pricing.py,line=6,col=5,title=PM103 deep-nesting::`services.pricing:calculate_price` nests blocks 5 levels deep (> 4)
-::warning file=services/pricing.py,line=6,col=5,title=PM105 too-many-parameters::`services.pricing:calculate_price` takes 8 parameters (> 7)
-::warning file=services/pricing.py,line=53,col=5,title=PM401 unused-function::function `services.pricing:legacy_discount` is never used
-::warning file=services/pricing.py,line=57,col=7,title=PM402 unused-class::class `services.pricing:PromoEngine` is never used
-::warning file=services/user_service.py,line=22,col=5,title=PM401 unused-function::function `services.user_service:get_user_display` is never used
-::warning file=utils/formatting.py,line=5,col=5,title=PM401 unused-function::function `utils.formatting:format_currency` is only used by unused code
-::warning file=utils/formatting.py,line=9,col=5,title=PM401 unused-function::function `utils.formatting:format_percentage` is never used
+::warning file=services/pricing.py,line=6,col=5,endLine=36,title=PM101 complex-function::`services.pricing:calculate_price` is too complex (McCabe 14 > 10)
+::warning file=services/pricing.py,line=6,col=5,endLine=36,title=PM102 cognitive-complexity::`services.pricing:calculate_price` is hard to understand (cognitive complexity 32 > 15)
+::warning file=services/pricing.py,line=6,col=5,endLine=36,title=PM103 deep-nesting::`services.pricing:calculate_price` nests blocks 5 levels deep (> 4)
+::warning file=services/pricing.py,line=6,col=5,endLine=36,title=PM105 too-many-parameters::`services.pricing:calculate_price` takes 8 parameters (> 7)
+::warning file=services/pricing.py,line=53,col=5,endLine=54,title=PM401 unused-function::function `services.pricing:legacy_discount` is never used
+::warning file=services/pricing.py,line=57,col=7,endLine=59,title=PM402 unused-class::class `services.pricing:PromoEngine` is never used
+::warning file=services/user_service.py,line=22,col=5,endLine=24,title=PM401 unused-function::function `services.user_service:get_user_display` is never used
+::warning file=utils/formatting.py,line=5,col=5,endLine=6,title=PM401 unused-function::function `utils.formatting:format_currency` is only used by unused code
+::warning file=utils/formatting.py,line=9,col=5,endLine=10,title=PM401 unused-function::function `utils.formatting:format_percentage` is never used
 ::warning file=utils/legacy_helpers.py,line=1,col=1,title=PM404 unused-module::module `utils.legacy_helpers` is never imported
-::warning file=utils/validation.py,line=15,col=5,title=PM401 unused-function::function `utils.validation:validate_range` is never used
+::warning file=utils/validation.py,line=15,col=5,endLine=20,title=PM401 unused-function::function `utils.validation:validate_range` is never used
 Found 26 findings in 15 files (23 files checked).
 Not shown: 10 below min-confidence.

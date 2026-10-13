@@ -130,6 +130,7 @@ Function with a McCabe cyclomatic complexity above `max-mccabe`.
 - Cost: O(n)
 - Threshold: `thresholds.max-mccabe` (reported above; default 10)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `extract branches of <symbol> into helpers, use a dispatch table or return early, to bring McCabe from <int> to <int> or less`
 
 McCabe complexity counts the independent paths through a function, exactly as ruff's C901 / PyCQA mccabe: 1, plus one per `if`, `elif`, `for`, `while`, `except` handler, `try`-`else`, nested function and `match` case (minus one when the last case is an irrefutable, unguarded pattern). Boolean operators, conditional expressions, comprehensions, `with` and `assert` are not counted. High values mean many paths to test and reason about.
 
@@ -147,6 +148,7 @@ Function with a cognitive complexity above `max-cognitive`.
 - Cost: O(n)
 - Threshold: `thresholds.max-cognitive` (reported above; default 15)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `flatten <symbol> with guard clauses and extract nested blocks, to bring cognitive complexity from <int> to <int> or less`
 
 Cognitive complexity (SonarSource) weights control flow by how deeply it is nested: `if`, conditional expressions, `match`, `for`, `while` and `except` cost one plus the current nesting level; `elif` and `else` cost one; each run of like boolean operators costs one; direct recursion costs one. Nested functions and lambdas count toward their parent.
 
@@ -164,6 +166,7 @@ Function whose blocks nest deeper than `max-nesting`.
 - Cost: O(n)
 - Threshold: `thresholds.max-nesting` (reported above; default 4)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `return or continue early in <symbol> and move inner blocks into helpers, to nest at most <int> levels (now <int>)`
 
 The maximum depth of nested compound statements (`if`, `for`, `while`, `try`, `with`, `match`) inside a function body. Deeply nested code is hard to follow and usually mixes several responsibilities.
 
@@ -181,6 +184,7 @@ Function longer than `max-function-loc` lines, docstrings excluded.
 - Cost: O(n)
 - Threshold: `thresholds.max-function-loc` (reported above; default 100)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `split <symbol> along its steps into functions of at most <int> lines (now <int>)`
 
 Lines of the function's inclusive span, from its first decorator or `def` to its last line, minus the lines of its docstring and of the docstrings of functions and classes nested in it (a long numpydoc docstring is documentation, not code). Blank lines and comments count. A docstring is the first statement of a body when it is a plain string literal (not an f-string or bytes) on its own line(s). Long functions tend to do several things.
 
@@ -198,6 +202,7 @@ Function with more than `max-params` parameters.
 - Cost: O(n)
 - Threshold: `thresholds.max-params` (reported above; default 7)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `group related parameters of <symbol> into a dataclass, or split it, to take at most <int> (now <int>)`
 
 Counts every parameter (positional-only, regular, `*args`, keyword-only, `**kwargs`) except a leading `self` / `cls` of a method. Many parameters make calls hard to read and suggest the function does too much.
 
@@ -215,6 +220,7 @@ Function with a maintainability index below `min-maintainability`.
 - Cost: O(n)
 - Threshold: `thresholds.min-maintainability` (reported below; default 10)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `reduce the size and complexity of <symbol> (index <real>, limit <real>; see PM101 and PM104)`
 
 Maintainability index on a 0-100 scale: `clamp((171 - 5.2 ln V - 0.23 CC - 16.2 ln LOC) * 100 / 171, 0, 100)`, where V is the Halstead volume, CC the McCabe complexity and LOC the line count. It blends size and complexity into one number and is best used to rank code, which is why the rule is off by default.
 
@@ -232,6 +238,7 @@ Module longer than `max-module-loc` lines, docstrings excluded.
 - Cost: O(n)
 - Threshold: `thresholds.max-module-loc` (reported above; default 1000)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `split module <symbol> (<int> lines) into a package of focused modules of at most <int> lines`
 
 Lines of the module file minus the lines of every docstring in it (the module's, and those of its classes and functions, as for PM104). Blank lines and comments count. Very long modules are hard to navigate and usually hold several unrelated concerns.
 
@@ -252,6 +259,7 @@ Module importing more than `max-fan-out` distinct first-party modules.
 - Cost: O(V+E)
 - Threshold: `thresholds.max-fan-out` (reported above; default 30)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `move unrelated responsibilities of <symbol> into separate modules, or depend on a narrower facade, to import at most <int> first-party modules (now <int>)`
 
 Efferent coupling: the number of distinct first-party modules a module imports (at any scope, `if TYPE_CHECKING:` imports excluded). A module that depends on many others breaks whenever any of them changes and is hard to test in isolation.
 
@@ -270,6 +278,7 @@ Coupled module far from the main sequence (distance above `max-distance`).
 - Threshold: `thresholds.max-distance` (reported above; default 0.7)
 - Threshold: `thresholds.distance-min-coupling` (parameter; default 10)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `if <symbol> is concrete and widely used (abstractness <real>, instability <real>), put an abstract interface between it and its dependants; if it is an unused abstraction, remove or merge it`
 
 Robert C. Martin's package metrics, per module. Afferent coupling Ca is the number of distinct first-party modules importing the module, efferent coupling Ce the number it imports (`if TYPE_CHECKING:` imports excluded). Instability is `I = Ce / (Ca + Ce)`; abstractness `A` is the share of its classes that are abstract (an `ABC` / `Protocol` base, an `ABCMeta` metaclass, or an `@abstractmethod`). The distance from the main sequence is `D = |A + I - 1|`. Near `A = 0, I = 0` lies the zone of pain (concrete code many modules depend on: every change ripples); near `A = 1, I = 1` the zone of uselessness (abstractions nobody uses). Only modules with `Ca + Ce` of at least `distance-min-coupling` are judged: for barely coupled modules the ratios mean little. The rule is a ranking aid, which is why it is off by default.
 
@@ -288,6 +297,7 @@ Module that is both large (`max-module-symbols`) and highly coupled (`max-module
 - Threshold: `thresholds.max-module-symbols` (reported above; default 80)
 - Threshold: `thresholds.max-module-coupling` (reported above; default 25)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `split <symbol> along its responsibilities so that each dependant imports only the part it needs`
 
 A module with more classes and functions (methods and nested functions included) than `max-module-symbols` whose total coupling `Ca + Ce` (distinct first-party modules importing it plus distinct first-party modules it imports, `if TYPE_CHECKING:` imports excluded) exceeds `max-module-coupling`. Such a module gathers many responsibilities and sits in the middle of the import graph, so most changes touch it and it touches most of the code base.
 
@@ -306,6 +316,7 @@ Class that is both complex (`max-class-wmc`) and uses many other classes (`max-c
 - Threshold: `thresholds.max-class-wmc` (reported above; default 47)
 - Threshold: `thresholds.max-class-fan-out` (reported above; default 5)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `move behaviour of <symbol> next to the data it uses (into the classes it calls), and split it along groups of methods that share state`
 
 After Lanza and Marinescu's detection strategy. WMC (weighted methods per class) is the sum of the McCabe complexities of the class's methods and class-level statements; the class fan-out is the number of distinct other classes whose constructors or methods the class's methods call (resolved calls of any confidence; calls into the class itself and to plain functions are not counted). A class above both `max-class-wmc` and `max-class-fan-out` centralises behaviour and reaches into many collaborators instead of delegating to them.
 
@@ -325,6 +336,7 @@ Modules that import each other, directly or indirectly.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import`
 
 One finding per strongly connected component of the first-party module import graph, reported at an import that closes a short witness cycle. The message gives the number of modules in the component and the witness, ending at the first module again; JSON output adds a `cycle` object with the component's `size`, every `member` and the `witness`. Cycles make import order matter, cause `ImportError`s on partially initialised modules and prevent splitting code into independent parts. Imports under `if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level imports count, stub files (`.pyi`) do not.
 
@@ -341,6 +353,7 @@ Import from a lower layer into a higher one, breaking a `layers` contract.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `move the code <symbol> needs from <symbol> down a layer, or pass it in from the higher layer (contract <contract>)`
 
 A `kind = "layers"` contract lists layers from highest to lowest: a layer may import lower layers, never higher ones. With `containers`, each container has its own layers and imports between containers are not checked. Reported at each violating import (sibling imports under `independent-siblings` are PM304). With `transitive = true`, an import of a module outside the contract that leads to a higher layer through other such modules counts too; the message names the higher-layer module reached. Stub files (`.pyi`) are not checked.
 
@@ -357,6 +370,7 @@ Import breaking a `forbidden` contract.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `remove the import of <name> from <symbol>, or move the code that needs it out of <symbol> (contract <contract>)`
 
 A `kind = "forbidden"` contract forbids its `source` modules (and their submodules) from importing its `forbidden` modules, which may be first- or third-party. Modules that are not analysed match unresolved imports by dotted prefix. Reported at each violating import; with `transitive = true` also at imports that lead to a forbidden module through modules outside the contract. Stub files (`.pyi`) are not checked.
 
@@ -373,6 +387,7 @@ Import between modules of an `independence` contract.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `move the code <symbol> uses from <symbol> into a separate module both may import (contract <contract>)`
 
 A `kind = "independence"` contract lists modules that may not import one another (submodules included); the same applies to siblings within a layer of a `layers` contract with `independent-siblings`. Reported at each violating import; with `transitive = true` also at imports that lead to another listed module through modules outside the contract. Stub files (`.pyi`) are not checked.
 
@@ -392,6 +407,7 @@ Module-level or nested function that is never used.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
+- Fix hint (`--llm`, JSON `fix`): `delete <symbol> if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__)`
 
 The function is not reachable from any root: nothing live calls it, references it, re-exports it or registers it (decorator entry points, presets).
 
@@ -408,6 +424,7 @@ Class that is never instantiated, subclassed or referenced.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
+- Fix hint (`--llm`, JSON `fix`): `delete <symbol> if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__)`
 
 No live code instantiates, subclasses or references the class, and no entry-point rule (base class, decorator, name) marks it as used. While PM402 is enabled, its methods are not reported separately unless they look less live than the class (higher confidence); suppressing the class finding (inline or `per-file-ignores`) hides them too.
 
@@ -424,6 +441,7 @@ Method of a live class that is never called.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: 100 minus how live the definition looks. 100 when nothing reaches it; 50 when reached only through a `possible` call (e.g. the unique-method fallback); 40 when it carries an unknown decorator that may register it; 50 for a method of a class with a base that is not loaded (it may override a framework method); 70 when the defining module uses dynamic access (`getattr`, `globals()`, `vars()`, `__getattr__`), or for a method when the module of a base class does (name-based dispatch); in application mode 30 when listed in `__all__` or re-exported; in library mode 80 for a public name outside the public API and 50 for a public method of a class that is not part of it (its instances may reach callers). With `analysis.name-fallback`, 10 when the name occurs in its own file or in a file that imports it or its module, 50 when it occurs anywhere else (attribute, identifier, string); every first-party `.py` file counts, importable or not (tests in hyphenated directories). When only test code mentions the name, the same 10 or 50 with the reason `used-only-in-tests` (test-only API is not dead). Callees inherit the confidence of such callers. With a coverage report (`analysis.coverage`, `--coverage`), code that ran is never reported (nor what it calls), and the doubt of code that never ran is divided by 3 (50 becomes 84, 80 becomes 94; reason `never-executed`). `check` reports findings at or above `min-confidence` (default 80).
+- Fix hint (`--llm`, JSON `fix`): `delete <symbol> if nothing calls it by name, or declare how it is used`
 
 The class is live but this method is never called through the class, its instances, `self` / `cls` / `super()`, or as an override of a live method in a base class. Dunder and protocol methods are always live.
 
@@ -440,6 +458,7 @@ First-party module that nothing imports and that is not an entry point.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: 100 when no live module imports it or calls into it; 50 when reached only through `possible` calls or when its name occurs in another file (for instance `importlib.import_module("pkg.plugins.x")`; `used-only-in-tests` when only test code names it); 40 for a module outside any regular package (it may be run as a script) and for modules imported only from such modules. With a coverage report, a module that was imported is never reported and the doubt of one that never was is divided by 3 (40 becomes 80; reason `never-executed`).
+- Fix hint (`--llm`, JSON `fix`): `delete module <symbol> if nothing loads it by name, or declare it as an entry point`
 
 No first-party module imports it, it is not a script or `__main__` module, not an entry point, and (in library mode) not part of the public package. Test modules are usually entry points via the `pytest` preset. Packages (`__init__.py`) are never reported. While PM404 is enabled, the module's defs and imports are reported only when they look less live than the module (higher confidence); suppressing the module finding (`ignore[PM404]` on line 1 or `per-file-ignores`) hides them too.
 
@@ -456,6 +475,7 @@ Import that neither its module nor any importer of that module uses.
 - Enabled by default: yes
 - Cost: O(V+E)
 - Confidence: 100 when no module uses the name, minus: 30 when the importing module uses dynamic access (`globals()`, `vars()`, `getattr`, `__getattr__`), 40 when another module star-imports it (public names), 40 when another file mentions both the name and the module without importing it (string references such as `mock.patch("pkg.mod.name")`), 30 for an application-mode `__init__.py` re-export, 20 in an `__init__.py` (20 more for a submodule import, often made for its side effects), 50 under `if TYPE_CHECKING:` (mostly used in quoted annotations, which name evidence sees only when the whole string is a dotted name), 10 for another conditional import.
+- Fix hint (`--llm`, JSON `fix`): `delete the import of <name>, or add <name> to __all__ if it is part of the module's API`
 
 Unlike per-file linters, this also follows re-exports: an import counts as used when another module imports the name from here or accesses it as `module.name`. Imports listed in `__all__`, the `import x as x` idiom, `__init__.py` re-exports in library mode, star imports, `__future__` imports and `try`/`except ImportError` fallbacks are kept.
 
@@ -477,6 +497,7 @@ Block of code duplicated elsewhere (token-based clone).
 - Threshold: `thresholds.dupes-min-tokens` (parameter; default 50)
 - Threshold: `thresholds.dupes-min-lines` (parameter; default 6)
 - Confidence: Similarity of the two copies: 100 when their tokens are identical, lower when they only match after normalising identifiers and literals.
+- Fix hint (`--llm`, JSON `fix`): `extract the <int> shared lines into one function (or base class) used by both copies`
 
 Token sequences of at least `dupes-min-tokens` tokens spanning at least `dupes-min-lines` lines that occur more than once, after normalising identifiers and literals (so renamed copies match). Reported at each copy, pointing at another copy; JSON output adds the copy's `end_line`, its `symbol` (the innermost class or function containing the whole copy, if any) and an `other` object with the other copy's `path`, `line`, `end_line` and `symbol`. Import statements are ignored, stub files (`.pyi`) are skipped, and a copy never starts or ends on an `@overload` signature or a docstring (it is trimmed to the code in between, and dropped if too little is left), so runs of overloads are not reported. Duplicates must be kept in sync by hand and drift apart.
 
@@ -498,6 +519,7 @@ Import of a third-party distribution not declared in `pyproject.toml`.
 - Enabled by default: yes
 - Cost: O(n)
 - Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
+- Fix hint (`--llm`, JSON `fix`): `add <name> (it provides <name>) to the project's dependencies`
 
 First-party code imports a module whose distribution is not listed in `[project.dependencies]`, `[project.optional-dependencies]`, a `[dependency-groups]` group or the poetry / uv / pdm dependency tables of the `pyproject.toml` that applies to the file (its nearest project unit that declares dependencies). The code works only because the package happens to be installed. What a declared meta-package (installed, no importable name) requires directly counts as declared, and so do the development groups of a uv workspace root for the test code of its members. Units whose `dependencies` are `dynamic` are not checked (unless Poetry lists them in `[tool.poetry.dependencies]`). Reported once per import statement and distribution, at the module (`from yaml import (a, b)` reports `yaml` once, on the statement's first line).
 
@@ -514,6 +536,7 @@ Declared dependency that no first-party module imports.
 - Enabled by default: yes
 - Cost: O(n)
 - Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
+- Fix hint (`--llm`, JSON `fix`): `remove dependency <name>, or move it to the group that needs it`
 
 A distribution in `[project.dependencies]` (or poetry's main dependencies) provides no module that the unit's first-party code imports. Optional and development groups are not checked. A distribution that installs no importable name (a command-line tool, a meta-package) is reported with confidence 50. Plugins, CLI tools and runtime-only extras are legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline suppression on the dependency line.
 
@@ -530,6 +553,7 @@ Import of a private module or name of a third-party package.
 - Enabled by default: yes
 - Cost: O(n)
 - Confidence: always 100
+- Fix hint (`--llm`, JSON `fix`): `use the public API of <name> instead of <name>, or pin the version and isolate the access in one module`
 
 The import path contains a component starting with an underscore (`pkg._internal`, `from pkg import _helper`) of a third-party distribution; dunders (`__version__`) and the lone `_` (the gettext idiom) are not private. A private module is reported once per import statement, at the module; a private name at the name. Private internals change without notice between releases.
 
@@ -546,6 +570,7 @@ Import of a distribution installed only as a dependency of a dependency.
 - Enabled by default: no (enable with `select` / `extend-select`)
 - Cost: O(n)
 - Confidence: 100 when the import name maps to a distribution through installed dist-info metadata (`top_level.txt`, `RECORD`), 90 through the built-in table of import names that differ from their distribution (`yaml` -> `PyYAML`), 60 for a guess from the name alone (below the default gate). An import guarded by `except ImportError` (an optional dependency) gets at most 50.
+- Fix hint (`--llm`, JSON `fix`): `declare <name> (it provides <name>) directly; it is installed only as a dependency of <name>`
 
 A refinement of PM601: the imported distribution is not declared, but a declared dependency requires it, directly or transitively (installed `Requires-Dist` metadata, extras honoured). It may disappear when that dependency changes. When this rule is enabled such imports are reported as PM604 instead of PM601; it is off by default because PM601 already reports them.
 

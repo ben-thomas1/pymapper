@@ -1,0 +1,46 @@
+# pymapper summary
+root: .
+first-party: 23 files, 362 lines, 18 modules, 5 classes, 51 functions
+imports: 34 rows, 0 unresolved · import cycles: 1 (largest 2 modules)
+calls: 106 sites: 34.0% certain, 0.0% likely, 13.2% possible, 52.8% unresolved
+Caller counts are lower bounds: unresolved calls, callbacks passed as values, getattr dispatch and calls from C extensions are not edges.
+
+## Most complex functions (cognitive, cyclomatic)
+services/pricing.py:6 calculate_price: cognitive 32, cyclomatic 14
+services/auth.py:34 create_authenticator: cognitive 8, cyclomatic 6
+services/auth.py:1 require_auth: cognitive 6, cyclomatic 3
+services/auth.py:37 create_authenticator.authenticate: cognitive 4, cyclomatic 5
+services/auth.py:11 make_validator: cognitive 4, cyclomatic 4
+services/auth.py:2 require_auth.wrapper: cognitive 4, cyclomatic 2
+services/auth.py:21 validate_token: cognitive 3, cyclomatic 3
+models/base.py:2 BaseModel.validate: cognitive 2, cyclomatic 3
+services/auth.py:12 make_validator.check: cognitive 2, cyclomatic 3
+utils/validation.py:7 validate_length: cognitive 2, cyclomatic 3
+utils/validation.py:15 validate_range: cognitive 2, cyclomatic 3
+services/auth.py:29 classify_token: cognitive 2, cyclomatic 1
+
+## Most called (distinct certain/likely callers; possible callers not counted)
+utils/formatting.py:1 format_name: 4 callers
+services/user_service.py:9 create_user: 3 callers
+utils/decorators.py:1 log_calls: 3 callers
+cycles.py:1 ping: 2 callers
+models/base.py:2 BaseModel.validate: 2 callers (+3 possible)
+services/auth.py:21 validate_token: 2 callers
+utils/validation.py:1 validate_email: 2 callers
+app.py:24 main: 1 caller
+cycles.py:5 pong: 1 caller
+middleware/pipeline.py:10 run_pipeline: 1 caller
+
+## Most imported (importing modules)
+models.base: 4
+models.order: 3
+models.user: 3
+utils.decorators: 3
+repo.order_repo: 2
+services.auth: 2
+services.user_service: 2
+utils.formatting: 2
+utils.validation: 2
+cycles: 1
+
+Next: `pymapper check --llm` for findings · `pymapper callers <symbol>` / `pymapper impact <symbol>` before changing a hub

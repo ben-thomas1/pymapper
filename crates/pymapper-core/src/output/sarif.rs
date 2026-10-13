@@ -5,7 +5,9 @@
 //! - `level`: error -> `error`, warning -> `warning`, info -> `note`.
 //! - Locations: `artifactLocation.uri` is the percent-encoded relative path with `uriBaseId`
 //!   `%SRCROOT%` (left undefined: consumers resolve it to the checkout root, which the paths
-//!   are relative to); `region.startLine` / `startColumn` when known. The run declares `columnKind`
+//!   are relative to); `region.startLine` / `startColumn` when known, and `endLine` when the
+//!   span (the definition of a function / class finding, a duplicated block) ends on a later
+//!   line. The run declares `columnKind`
 //!   `unicodeCodePoints`; columns are byte columns, which are equal for ASCII line prefixes
 //!   (see the module docs of `output`).
 //! - `logicalLocations[0].fullyQualifiedName`: the symbol's stable qualified id.
@@ -92,6 +94,7 @@ pub(super) fn write(r: &Report<'_>, out: &mut Out<'_>) {
         r.message(f, &mut msg);
         r.symbol_id(f, &mut sym);
         let hash = keybuf.hash(r, f);
+        let end = r.end_line(f);
         let def = f.rule.def();
         let b = out.buf();
         b.extend_from_slice(if i == 0 { b"\n        {" } else { b",\n        {" });
@@ -114,6 +117,9 @@ pub(super) fn write(r: &Report<'_>, out: &mut Out<'_>) {
                 push_u32(b, f.loc.line);
                 if f.loc.col > 0 {
                     key_u32(b, "startColumn", f.loc.col);
+                }
+                if end > f.loc.line {
+                    key_u32(b, "endLine", end);
                 }
                 b.push(b'}');
             }

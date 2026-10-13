@@ -96,10 +96,11 @@ fn sample() -> Findings {
     f
 }
 
-fn summary() -> Summary {
+fn summary() -> Summary<'static> {
     Summary {
         files_checked: 42,
         filter: FilterStats { reported: 9, below_confidence: 2, disabled: 0, file_ignored: 3, suppressed: 1 },
+        notes: RunNotes::default(),
     }
 }
 
@@ -272,13 +273,13 @@ fn footer_counts() {
     f.push(UNUSED_FUNCTION, loc(0, 9, 1), SymbolId(0), 50, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
     f.push(UNUSED_FUNCTION, loc(1, 9, 1), SymbolId(1), 100, &[Arg::Symbol(SymbolId(1)), Arg::Phrase(0)]);
     let c = ctx();
-    let sum = Summary { files_checked: 0, filter: FilterStats { below_confidence: 1, ..FilterStats::default() } };
+    let sum = Summary { files_checked: 0, filter: FilterStats { below_confidence: 1, ..FilterStats::default() }, notes: RunNotes::default() };
     let out = render(&f, &c, &Options::new(OutputFormat::Concise), &sum);
     // The one below-gate finding is shown, so none is hidden.
     assert!(out.ends_with("Found 3 findings in 2 files (1 below min-confidence 80).\n"), "{out}");
     let mut one = Findings::new();
     one.push(UNUSED_FUNCTION, loc(0, 1, 1), SymbolId(0), 100, &[Arg::Symbol(SymbolId(0)), Arg::Phrase(0)]);
-    let sum = Summary { files_checked: 1, filter: FilterStats { below_confidence: 4, ..FilterStats::default() } };
+    let sum = Summary { files_checked: 1, filter: FilterStats { below_confidence: 4, ..FilterStats::default() }, notes: RunNotes::default() };
     let out = render(&one, &c, &Options::new(OutputFormat::Concise), &sum);
     assert!(out.ends_with("Found 1 finding in 1 file (1 file checked).\nNot shown: 4 below min-confidence.\n"), "{out}");
 }
@@ -737,7 +738,7 @@ fn json_end_line_and_unused_import_symbol() {
     assert!(got.contains("\"line\":14,\"col\":9,\"end_line\":21,"), "{got}");
     assert!(got.contains("\"symbol\":\"pkg.alpha:yaml\""), "{got}");
     // Reals are numbers with at most two decimals.
-    assert!(got.contains("\"value\":12.25,\"threshold\":20}"), "{got}");
+    assert!(got.contains("\"value\":12.25,\"threshold\":20,\"fix\":"), "{got}");
 }
 
 #[test]
@@ -756,8 +757,8 @@ fn dead_code_reasons_are_rendered() {
     assert_eq!(lines[1], "pkg/zeta.py:9:5: PM401 function `pkg.zeta:handle` is never used");
     let json = render(&f, &ctx(), &Options::new(OutputFormat::Json), &sum);
     assert_json(&json);
-    assert!(json.contains(r#""reasons":["only-used-by-unused-code","name-elsewhere"]}"#), "{json}");
-    assert!(json.contains(r#""reasons":["no-references"]}"#), "{json}");
+    assert!(json.contains(r#""reasons":["only-used-by-unused-code","name-elsewhere"],"fix":"#), "{json}");
+    assert!(json.contains(r#""reasons":["no-references"],"fix":"#), "{json}");
     // Findings without reasons have no `reasons` key.
     assert_eq!(json.matches("\"reasons\"").count(), 2, "{json}");
 }

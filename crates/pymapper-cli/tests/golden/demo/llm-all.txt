@@ -1,0 +1,74 @@
+# pymapper check · root <root> (reached as .) · paths relative to the working directory
+Dead-code mode: application ([project.scripts] in pyproject.toml)
+38 findings in 17 files, 27 items, all shown · exit 1 = findings, not an error
+Not analysed: notebooks, C extensions, names used only via getattr or strings. Verify dead code before deleting it.
+Rules not run: PM601-PM603: run by `pymapper deps --check`
+
+## Architecture (2)
+PM303-e6ff models/order.py:2 models.order imports forbidden module repo.order_repo (contract "models are independent of repo")
+  fix: remove the import of repo.order_repo from models.order, or move the code that needs it out of models.order (contract "models are independent of repo") · verify: pymapper explain PM303-e6ff
+PM301-e35f repo/order_repo.py:1 import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
+  fix: break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import · verify: pymapper explain PM301-e35f
+
+## Complexity (1 function)
+PM101-312c services/pricing.py:6-36 calculate_price: McCabe 14>10, cognitive 32>15, nesting 5>4, params 8>7 (PM101,PM102,PM103,PM105)
+  fix: flatten calculate_price with guard clauses and extract nested blocks, to bring cognitive complexity from 32 to 15 or less · verify: pymapper callers services.pricing:calculate_price
+
+## Duplication (1 pair)
+PM501-f258 12 duplicated lines: services/invoice.py:1-12 invoice_lines = services/pricing.py:39-50 receipt_lines (conf 98)
+  fix: extract the 12 shared lines into one function (or base class) used by both copies · verify: pymapper explain PM501-f258
+
+## Dead code (21 items, 28 symbols)
+PM401-61ec middleware/pipeline.py:21 format_receipt (function): never used (conf 100)
+  also dead if it goes: utils/formatting.py: format_currency:5
+  fix: delete format_receipt if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnwE --exclude-dir=.venv 'format_receipt|format_currency' .
+PM403-7339 models/base.py:12 BaseModel.save (method): never used (conf 100)
+  also dead if it goes: models/base.py: BaseModel.validate:2 (conf 50)
+  fix: delete BaseModel.save if nothing calls it by name, or declare how it is used · verify: grep -rnwE --exclude-dir=.venv 'save|validate' .
+PM404-d26e repo/product_repo.py: module never imported (conf 100)
+  fix: delete module repo.product_repo if nothing loads it by name, or declare it as an entry point · verify: grep -rnw --exclude-dir=.venv product_repo .
+PM404-c008 utils/legacy_helpers.py: module never imported (conf 100)
+  fix: delete module utils.legacy_helpers if nothing loads it by name, or declare it as an entry point · verify: grep -rnw --exclude-dir=.venv legacy_helpers .
+PM403-565b models/base.py:17 BaseModel.serialize (method): has only possible callers (unique method name, unresolved receiver) (conf 50: possible-call-only)
+  also dead if it goes: models/base.py: BaseModel.to_dict:9 (conf 50)
+  fix: delete BaseModel.serialize if nothing calls it by name, or declare how it is used · verify: grep -rnwE --exclude-dir=.venv 'serialize|to_dict' .
+PM401-5dad services/auth.py: make_validator:11 (function), classify_token:29 (function), create_authenticator:34 (function): never used (conf 100)
+  fix: delete make_validator if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) (likewise for the other 2) · verify: grep -rnwE --exclude-dir=.venv 'make_validator|classify_token|create_authenticator' .
+PM401-145e services/pricing.py: legacy_discount:53 (function), PromoEngine:57 (class): never used (conf 100)
+  fix: delete legacy_discount if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) (likewise for the other) · verify: grep -rnwE --exclude-dir=.venv 'legacy_discount|PromoEngine' .
+PM401-e3b2 app.py:35 dead_endpoint (function): never used (conf 100)
+  fix: delete dead_endpoint if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv dead_endpoint .
+PM403-d26a models/order.py:15 Order.archive (method): never used (conf 100)
+  fix: delete Order.archive if nothing calls it by name, or declare how it is used · verify: grep -rnw --exclude-dir=.venv archive .
+PM403-5d6b models/product.py:10 Product.display_price (method): never used (conf 100)
+  fix: delete Product.display_price if nothing calls it by name, or declare how it is used · verify: grep -rnw --exclude-dir=.venv display_price .
+PM403-0ad5 models/user.py:10 User.display_name (method): never used (conf 100)
+  fix: delete User.display_name if nothing calls it by name, or declare how it is used · verify: grep -rnw --exclude-dir=.venv display_name .
+PM401-5619 repo/user_repo.py:9 delete_user (function): never used (conf 100)
+  fix: delete delete_user if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv delete_user .
+PM401-f4f8 services/user_service.py:22 get_user_display (function): never used (conf 100)
+  fix: delete get_user_display if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv get_user_display .
+PM401-04b6 utils/formatting.py:9 format_percentage (function): never used (conf 100)
+  fix: delete format_percentage if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv format_percentage .
+PM401-c422 utils/validation.py:15 validate_range (function): never used (conf 100)
+  fix: delete validate_range if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv validate_range .
+PM403-bb65 models/base.py:20 BaseModel.is_valid (method): has only possible callers (unique method name, unresolved receiver) (conf 50: possible-call-only)
+  fix: delete BaseModel.is_valid if nothing calls it by name, or declare how it is used · verify: grep -rnw --exclude-dir=.venv is_valid .
+PM403-0917 models/order.py:12 Order.total (method): has only possible callers (unique method name, unresolved receiver) (conf 50: possible-call-only)
+  fix: delete Order.total if nothing calls it by name, or declare how it is used · verify: grep -rnw --exclude-dir=.venv total .
+PM401-e889 app.py: list_users:13 (function), health_check:19 (function): has no resolved callers (an unknown decorator may register it) (conf 40: unknown-decorator)
+  fix: delete list_users if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) (likewise for the other) · verify: grep -rnwE --exclude-dir=.venv 'list_users|health_check' .
+PM402-efd7 models/product.py:4 Product (class): only used by unused code (conf 30: only-used-by-unused-code, exported)
+  fix: delete Product if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv Product .
+PM401-428a services/auth.py:2 require_auth.wrapper (function): has no resolved callers (name appears in its own file) (conf 10: name-in-same-file)
+  fix: delete require_auth.wrapper if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv wrapper .
+PM401-226f utils/decorators.py:3 log_calls.wrapper (function): has no resolved callers (name appears in its own file) (conf 10: name-in-same-file)
+  fix: delete log_calls.wrapper if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__) · verify: grep -rnw --exclude-dir=.venv wrapper .
+
+## Unused imports (2)
+PM405-f95d middleware/pipeline.py:6 User (conf 100)
+  fix: delete the import of User, or add User to __all__ if it is part of the module's API · verify: grep -nw User middleware/pipeline.py
+PM405-4ed8 services/pricing.py:1 json (conf 100)
+  fix: delete the import of json, or add json to __all__ if it is part of the module's API · verify: grep -nw json services/pricing.py
+
+Next: pymapper explain <id> for evidence and source · suppress with # pymapper: ignore[PMxxx] on the reported line

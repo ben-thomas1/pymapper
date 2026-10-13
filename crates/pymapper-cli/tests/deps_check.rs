@@ -434,3 +434,20 @@ fn multi_line_from_imports_report_once_per_statement() {
         r.stdout
     );
 }
+
+#[test]
+fn llm_mode_groups_sites_and_ends_with_next_step() {
+    let p = project("llm");
+    let r = p.run(&["--llm"]);
+    r.expect_code(1);
+    let out = &r.stdout;
+    assert!(out.starts_with("# pymapper deps --check · root "), "{out}");
+    assert!(out.contains("(reached as .)"), "{out}");
+    assert!(out.contains("Not analysed: imports in notebooks and imports by name"), "{out}");
+    assert!(out.contains("exit 1 = findings, not an error"), "{out}");
+    assert!(out.contains("\n## Dependencies ("), "{out}");
+    assert!(out.contains("pyproject.toml:7 dependency idle is declared but never imported"), "{out}");
+    assert!(out.contains("fix: remove dependency idle, or move it to the group that needs it"), "{out}");
+    assert!(out.ends_with("on the reported line\n"), "{out}");
+    assert!(!out.contains("Found "), "{out}");
+}

@@ -1,6 +1,6 @@
 # pymapper issues and agreed work
 
-This is the single source of truth for what is wrong with pymapper **0.3.0** (tag `v0.3.0`, `master` @ `0b54c1a`) and for the work the user has **agreed** for the next release, **0.4.0**.
+This is the single source of truth for what is wrong with pymapper and for the work the user has **agreed**. Part A (the 0.4.0 output redesign) is **done**; the precision backlog (Parts B–D) was measured on **0.3.0** (tag `v0.3.0`) and is still open.
 
 **Read `HANDOFF.md` first** for context: goals, user preferences, process rules, environment gotchas and the history.
 
@@ -24,14 +24,14 @@ This is the single source of truth for what is wrong with pymapper **0.3.0** (ta
 
 | ID | Area | Title | Severity | Status |
 |---|---|---|---|---|
-| [O1](#o1-human-friendly-default-output-category--file) | output | Human-friendly default output, grouped by category then file | high | AGREED |
-| [O2](#o2---llm-mode-for-check-and-deps---check) | output | `--llm` mode for `check` / `deps --check`: compact prioritised report for agents | high | AGREED |
-| [O3](#o3-pymapper-explain-id--symbol) | CLI | New `pymapper explain <id \| symbol>` drill-down | high | AGREED |
-| [O4](#o4---llm-mode-for-every-command) | CLI | `--llm` mode for every command | high | AGREED |
-| [O5](#o5-stable-finding-ids) | output | Stable finding ids (`PM401-3fa2`) | high | AGREED |
-| [O6](#o6-paths-relative-to-the-current-directory) | output | Paths relative to the project root, not the cwd (bug) | high | AGREED |
-| [O7](#o7-json-sarif-and-github-format-improvements) | output | JSON/SARIF/GitHub improvements (root, ids, endLine, fix, related locations, reasons) | medium | AGREED (JSON root/id/fix, SARIF+GitHub endLine), deferred (rest) |
-| [O8](#o8-config-docs-and-skill-updates-for-the-new-output) | docs | Config keys, docs and agent skill for the new output | medium | AGREED |
+| [O1](#o1-human-friendly-default-output-category--file) | output | Human-friendly default output, grouped by category then file | high | DONE (0.4.0) |
+| [O2](#o2---llm-mode-for-check-and-deps---check) | output | `--llm` mode for `check` / `deps --check`: compact prioritised report for agents | high | DONE (0.4.0) |
+| [O3](#o3-pymapper-explain-id--symbol) | CLI | New `pymapper explain <id \| symbol>` drill-down | high | DONE (0.4.0) |
+| [O4](#o4---llm-mode-for-every-command) | CLI | `--llm` mode for every command | high | DONE (0.4.0) |
+| [O5](#o5-stable-finding-ids) | output | Stable finding ids (`PM401-3fa2`) | high | DONE (0.4.0) |
+| [O6](#o6-paths-relative-to-the-current-directory) | output | Paths relative to the project root, not the cwd (bug) | high | DONE (0.4.0) |
+| [O7](#o7-json-sarif-and-github-format-improvements) | output | JSON/SARIF/GitHub improvements (root, ids, endLine, fix, related locations, reasons) | medium | DONE for JSON root/id/fix, SARIF+GitHub endLine (0.4.0); rest deferred |
+| [O8](#o8-config-docs-and-skill-updates-for-the-new-output) | docs | Config keys, docs and agent skill for the new output | medium | DONE (0.4.0) |
 | [F1](#f1-auto-mode-flips-libraries-to-application-mode) | dead code | Auto mode flips libraries to application on a stray `__main__` guard or script | high | PROPOSED |
 | [F2](#f2-notebooks-are-not-scanned) | dead code | Jupyter notebooks not scanned | high | PROPOSED |
 | [F3](#f3-functions-and-classes-used-as-values-are-not-references) | dead code | Functions/classes used as values are not references | high | PROPOSED |
@@ -58,6 +58,18 @@ This is the single source of truth for what is wrong with pymapper **0.3.0** (ta
 - 0.4.0 scope is **O1–O8 only**; F1–F12 come later (F12 still before any push).
 - Built by subagents in worktrees (A human, B llm + ids, C explain + queries) on top of a coordinator "Phase 0" commit; success = golden tests + the demo renders as specified + concise/json/sarif/github byte-identical to 0.3.0.
 
+## 0.4.0 implementation notes (built 2026-10-13)
+
+O1–O8 are implemented. Deviations and decisions made while building (beyond the spec below):
+
+- **Human (O1):** ids right-aligned to `COLUMNS` (capped at 120; default 100; no terminal query, so output is identical on a TTY and in a pipe); PM201–204 on one symbol are merged like PM101–107; a duplicate pair is shown in report order (first copy left); findings without a file go under `(project)`; PM6xx lines are plain messages (no golden: the demo has no dependency findings).
+- **llm (O2):** dead chains use a new extra arg on PM401–403 "only used by unused code" findings (the referrer; `analysis/deadcode.rs` `referenced_defs` now maps def → one referrer); extras are not in baseline keys, so ids and baselines are unchanged. Same-file dead symbols with the same verdict and confidence are merged; unused imports merge per file; PM601/604 merge per distribution. Within Architecture, PM303 (error) sorts before PM301 (warning). The CLI `Footnote` is not printed after llm output (the trailer must be last; the header carries the filter and skipped rules). `Summary` became `Summary<'a>` with `notes: RunNotes` (command, root as reached, modes, skipped rules, filter).
+- **Fix hints:** `RuleDef::fix` templates for every rule (registry test), rendered by `Report::fix`/`fix_plain`, documented in `docs/rules.md`; used by llm, JSON `fix` and `explain`.
+- **Plain text:** `output::strip_backticks` keeps contract names quoted (`(contract "models are independent of repo")`).
+- **explain (O3):** reuses `check` through `Setup::analyse` (+ `Keep`, `Analysed`); ids identical to `check` (gated report first, then below-gate ids as `--min-confidence 0` shows them); baselines not applied. PM6xx ids are not explainable (they come from `deps --check`); explain exits 2 with a hint. Complexity "where it comes from" is an approximate source-text scan (labelled). Config-file evidence locations are not available (stored as hashes).
+- **Queries (O4):** `Session` gained a `Mode { Text, Llm, Json }` and `cwd`; query paths are cwd-relative in text/llm (O6). `deps` llm shows names used and public API separately (avoids F10's `46/2`). `summary --llm` "most called" counts certain/likely callers only (`+N possible`); human summary unchanged.
+- **Performance:** no measurable change on the stdlib (8.7k findings, all formats ≈ 80 ms); allocation tests cover human and llm (bounded, never per finding).
+
 ## 0.4.0 Phase 0: shared interfaces (done by the coordinator)
 
 So the agents do not collide, these land first (one commit on `master`):
@@ -66,7 +78,7 @@ So the agents do not collide, these land first (one commit on `master`):
 |---|---|---|
 | `OutputFormat::Human` (default) and `OutputFormat::Llm` | `config.rs` | `--llm` is a CLI shorthand for `--output-format llm` and conflicts with `--output-format` (exit 2). Modelling llm as a format keeps one dispatch point. |
 | `GroupBy`, `ColorChoice` (+ `resolve(is_terminal)` honouring `NO_COLOR`), `limit` (default `DEFAULT_LIMIT` = 50) | `config.rs`, `config/parse.rs`, `config/write.rs`, template | config keys `group-by`, `color`, `limit`; flags `--group-by`, `--color`, `--limit` in `ConfigArgs` (help heading "Output") |
-| **One shared `--limit`** | `cmd/config.rs`, `cmd/query/session.rs` | The queries already had a per-command `--limit` (rows, default 200), which clashed. Now: an explicit `--limit N` caps any format (0 = all); without it, `llm` uses the `limit` option (50), query text keeps 200 rows (`DEFAULT_ROWS`, `Session::row_limit`), human `check` is uncapped. |
+| **One shared `--limit`** | `cmd/config.rs`, `cmd/query/session.rs` | The queries already had a per-command `--limit` (rows, default 200), which clashed. Now: on `check` and `deps --check`, `--limit` caps only `llm` output (human, concise and machine formats are never capped); on queries, an explicit `--limit N` caps every format; without it, `llm` uses the `limit` option (50) and query text/json keep 200 rows (`DEFAULT_ROWS`, `Session::row_limit`). 0 = no cap. |
 | `Options { format, min_confidence, footer, group_by, color, limit }`, `Options::from_config(&config, is_terminal)` | `output.rs` | `color` is already resolved (human only) |
 | `output/human.rs`, `output/llm.rs` | core | **placeholders that write concise**; agents A and B replace the bodies |
 | Paths relative to the cwd (O6) | `output/context.rs` (`IndexContext::relative_to`, `push_relative`, `Context::write_root_path`), `deps/hygiene.rs`, `cmd/check.rs`, `cmd/check/plan.rs` (`Footnote.base`, `RelPath`) | text formats (human, llm, concise, github) use the cwd; json/sarif the root; baseline keys and ids always root-relative |

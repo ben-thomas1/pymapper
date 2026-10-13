@@ -1,0 +1,55 @@
+[1mapp.py[0m
+    [2m35:5[0m   [1;33mdead code[0m      function dead_endpoint  never used                              [2mPM401-e3b2[0m
+
+[1mmiddleware/pipeline.py[0m
+     [2m6:25[0m  [2;33munused import[0m  User                                                            [2mPM405-f95d[0m
+    [2m21:5[0m   [1;33mdead code[0m      function format_receipt  never used                             [2mPM401-61ec[0m
+
+[1mmodels/base.py[0m
+    [2m12:9[0m   [1;33mdead code[0m      method BaseModel.save  never used                               [2mPM403-7339[0m
+
+[1mmodels/order.py[0m
+     [2m2:29[0m  [1;31marchitecture[0m   imports forbidden repo.order_repo (contract: models are independent of repo)  [2mPM303-e6ff[0m
+    [2m15:9[0m   [1;33mdead code[0m      method Order.archive  never used                                [2mPM403-d26a[0m
+
+[1mmodels/product.py[0m
+    [2m10:9[0m   [1;33mdead code[0m      method Product.display_price  never used                        [2mPM403-5d6b[0m
+
+[1mmodels/user.py[0m
+    [2m10:9[0m   [1;33mdead code[0m      method User.display_name  never used                            [2mPM403-0ad5[0m
+
+[1mrepo/order_repo.py[0m
+     [2m1:26[0m  [1;31marchitecture[0m   import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo  [2mPM301-e35f[0m
+
+[1mrepo/product_repo.py[0m
+     [2m1:1[0m   [1;33mdead code[0m      module repo.product_repo  never imported                        [2mPM404-d26e[0m
+
+[1mrepo/user_repo.py[0m
+     [2m9:5[0m   [1;33mdead code[0m      function delete_user  never used                                [2mPM401-5619[0m
+
+[1mservices/auth.py[0m
+    [2m11:5[0m   [1;33mdead code[0m      function make_validator  never used                             [2mPM401-5dad[0m
+    [2m29:5[0m   [1;33mdead code[0m      function classify_token  never used                             [2mPM401-974d[0m
+    [2m34:5[0m   [1;33mdead code[0m      function create_authenticator  never used                       [2mPM401-f0b1[0m
+
+[1mservices/pricing.py[0m
+     [2m1:8[0m   [2;33munused import[0m  json                                                            [2mPM405-4ed8[0m
+     [2m6:5[0m   [1;35mcomplexity[0m     calculate_price  McCabe 14>10 · cognitive 32>15 · nesting 5>4 · params 8>7  [2mPM101-312c +PM102,PM103,PM105[0m
+    [2m53:5[0m   [1;33mdead code[0m      function legacy_discount  never used                            [2mPM401-145e[0m
+    [2m57:7[0m   [1;33mdead code[0m      class PromoEngine  never used                                   [2mPM402-d424[0m
+
+[1mservices/user_service.py[0m
+    [2m22:5[0m   [1;33mdead code[0m      function get_user_display  never used                           [2mPM401-f4f8[0m
+
+[1mutils/formatting.py[0m
+     [2m5:5[0m   [1;33mdead code[0m      function format_currency  only used by unused code              [2mPM401-5fdd[0m
+     [2m9:5[0m   [1;33mdead code[0m      function format_percentage  never used                          [2mPM401-04b6[0m
+
+[1mutils/legacy_helpers.py[0m
+     [2m1:1[0m   [1;33mdead code[0m      module utils.legacy_helpers  never imported                     [2mPM404-c008[0m
+
+[1mutils/validation.py[0m
+    [2m15:5[0m   [1;33mdead code[0m      function validate_range  never used                             [2mPM401-c422[0m
+
+26 findings in 15 files (23 files checked) · architecture 2 · complexity 1 function · dead code 18 · unused imports 2
+10 more below confidence 80 (use --min-confidence 0 to show them)

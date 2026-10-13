@@ -40,6 +40,7 @@ unguarded pattern). Boolean operators, conditional expressions, comprehensions, 
 `assert` are not counted. High values mean many paths to test and reason about.\n\n\
 Fix: extract branches into well-named helpers, replace `if`/`elif` chains with a dispatch table, \
 or return early.",
+        fix: "extract branches of `{0}` into helpers, use a dispatch table or return early, to bring McCabe from {1} to {2} or less",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -60,6 +61,7 @@ current nesting level; `elif` and `else` cost one; each run of like boolean oper
 direct recursion costs one. Nested functions and lambdas count toward their parent.\n\n\
 Fix: flatten nesting with guard clauses, extract nested blocks into functions, and simplify \
 boolean conditions.",
+        fix: "flatten `{0}` with guard clauses and extract nested blocks, to bring cognitive complexity from {1} to {2} or less",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -78,6 +80,7 @@ boolean conditions.",
 `with`, `match`) inside a function body. Deeply nested code is hard to follow and usually mixes \
 several responsibilities.\n\n\
 Fix: return or `continue` early, and move inner blocks into helper functions.",
+        fix: "return or `continue` early in `{0}` and move inner blocks into helpers, to nest at most {2} levels (now {1})",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -98,6 +101,7 @@ nested in it (a long numpydoc docstring is documentation, not code). Blank lines
 count. A docstring is the first statement of a body when it is a plain string literal (not an \
 f-string or bytes) on its own line(s). Long functions tend to do several things.\n\n\
 Fix: split the function along its steps.",
+        fix: "split `{0}` along its steps into functions of at most {2} lines (now {1})",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -116,6 +120,7 @@ Fix: split the function along its steps.",
 `**kwargs`) except a leading `self` / `cls` of a method. Many parameters make calls hard to \
 read and suggest the function does too much.\n\n\
 Fix: group related parameters into a dataclass, or split the function.",
+        fix: "group related parameters of `{0}` into a dataclass, or split it, to take at most {2} (now {1})",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -135,6 +140,7 @@ Fix: group related parameters into a dataclass, or split the function.",
 volume, CC the McCabe complexity and LOC the line count. It blends size and complexity into one \
 number and is best used to rank code, which is why the rule is off by default.\n\n\
 Fix: reduce the function's size and complexity (see PM101 and PM104).",
+        fix: "reduce the size and complexity of `{0}` (index {1}, limit {2}; see PM101 and PM104)",
         severity: Severity::Info,
         default_enabled: false,
         cost: CostClass::Linear,
@@ -154,6 +160,7 @@ module's, and those of its classes and functions, as for PM104). Blank lines and
 count. Very long modules are hard to navigate and \
 usually hold several unrelated concerns.\n\n\
 Fix: split the module into a package of focused modules.",
+        fix: "split module `{0}` ({1} lines) into a package of focused modules of at most {2} lines",
         severity: Severity::Info,
         default_enabled: true,
         cost: CostClass::Linear,

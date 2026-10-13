@@ -1,0 +1,28 @@
+# pymapper impact models.base
+target: models.base (module, models/base.py) · root: .
+Affected: 8 (7 symbols, 1 module level) in 6 files, 0 in tests, 8 only through a possible edge · importing modules: 9 (4 direct, 0 in tests)
+Tags are the least sure edge on the path back to the target.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+Affected symbols, grouped by file (closest first):
+
+## repo/order_repo.py (repo.order_repo)
+save_order [possible] at 13:5
+
+## repo/product_repo.py (repo.product_repo)
+save_product [possible] at 2:5
+
+## repo/user_repo.py (repo.user_repo)
+save_user [possible] at 2:5
+
+## Importing modules (9; first 3 shown, direct first): import the target's module, so a removed or renamed name breaks them; most do not call it
+models (models/__init__.py:1)
+models.order (models/order.py:1)
+models.product (models/product.py:1)
+6 more importing modules not displayed (use --output-format json for all).
+
+Most affected modules: app 3, middleware.pipeline 1, repo.order_repo 1
+
+5 more affected symbols not displayed. Use --limit 0 to show all.
+
+Next: `pymapper callers models.base` for the direct call sites · `pymapper explain models.base` for findings on it

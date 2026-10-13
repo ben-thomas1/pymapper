@@ -1,0 +1,6 @@
+# pymapper path services.pricing:legacy_discount app:main
+from: services.pricing:legacy_discount (function, services/pricing.py:53) · to: app:main (function, app.py:24) · root: .
+No call path (exit 1)
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+Next: `pymapper path services.pricing:legacy_discount app:main --imports` for an import chain · `pymapper callers app:main` for what does call it

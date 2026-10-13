@@ -172,16 +172,20 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         config::TEMPLATE.to_owned()
     } else {
         let loaded = args.config.load(args.paths)?;
-        let source = match &loaded.project.config_file {
-            Some((path, _)) => path.display().to_string(),
-            None => "none (defaults)".to_owned(),
-        };
-        let mut text = format!(
-            "# Effective pymapper configuration\n# project root: {}\n# config file: {source}\n\n",
-            loaded.project.root.display()
-        );
-        text.push_str(&loaded.config.to_toml());
-        text
+        if loaded.config.output_format == OutputFormat::Llm {
+            llm_text(&loaded)?
+        } else {
+            let source = match &loaded.project.config_file {
+                Some((path, _)) => path.display().to_string(),
+                None => "none (defaults)".to_owned(),
+            };
+            let mut text = format!(
+                "# Effective pymapper configuration\n# project root: {}\n# config file: {source}\n\n",
+                loaded.project.root.display()
+            );
+            text.push_str(&loaded.config.to_toml());
+            text
+        }
     };
     let mut out = io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
@@ -189,4 +193,26 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e).context("cannot write to stdout"),
         _ => Ok(ExitCode::SUCCESS),
     }
+}
+
+/// `config --llm` (ISSUES O4): the effective configuration as TOML under a header naming the
+/// project root and the config file it came from (paths relative to the working directory).
+fn llm_text(loaded: &Loaded) -> anyhow::Result<String> {
+    use crate::cmd::check::RelPath;
+    let cwd = std::env::current_dir().context("cannot determine the working directory")?;
+    let root = &loaded.project.root;
+    let source = match &loaded.project.config_file {
+        Some((path, _)) => RelPath(path, &cwd).to_string(),
+        None => "none (defaults)".to_owned(),
+    };
+    let mut text = format!(
+        "# pymapper config\nroot: {} · config file: {source}\nEffective configuration in pymapper.toml syntax (config file, then --set and flags applied):\n\n",
+        RelPath(root, &cwd)
+    );
+    text.push_str(&loaded.config.to_toml());
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("\nNext: `pymapper config --template` for every option with its default and cost · `pymapper check --llm` to run the checks\n");
+    Ok(text)
 }

@@ -1,0 +1,12 @@
+# pymapper imports services.pricing
+target: services.pricing (module, services/pricing.py) · root: . · 2 out (1 not loaded) · 1 in
+Not import edges: importlib.import_module / __import__ with computed names, imports in notebooks and C extensions.
+
+## Out: what it imports (2)
+models.order (top-level, 1 row) at services/pricing.py:3:26
+json (stdlib, not loaded, 1 row) at services/pricing.py:1:8
+
+## In: what imports it (1)
+app (top-level, 2 rows) at app.py:8:30
+
+Next: `pymapper cycles --symbol services.pricing` for import cycles through it · `pymapper impact services.pricing` for what a change can break

@@ -34,6 +34,7 @@ initialised modules and prevent splitting code into independent parts. Imports u
 `if TYPE_CHECKING:` are ignored unless `analysis.type-checking-cycles` is set; function-level \
 imports count, stub files (`.pyi`) do not.\n\n\
 Fix: move the shared code into a lower-level module both can import, or invert the dependency.",
+        fix: "break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -56,6 +57,7 @@ the contract that leads to a higher layer through other such modules counts too;
 names the higher-layer module reached. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the imported code down a layer, or pass it in from the higher layer (dependency \
 injection, callbacks).",
+        fix: "move the code `{0}` needs from `{1}` down a layer, or pass it in from the higher layer (contract `{2}`)",
         severity: Severity::Error,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -77,6 +79,7 @@ that are not analysed match unresolved imports by dotted prefix. Reported at eac
 import; with `transitive = true` also at imports that lead to a forbidden module through modules \
 outside the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: remove the dependency, or move the code that needs it out of the source modules.",
+        fix: "remove the import of `{1}` from `{0}`, or move the code that needs it out of `{0}` (contract `{2}`)",
         severity: Severity::Error,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -97,6 +100,7 @@ contract with `independent-siblings`. Reported at each violating import; with \
 `transitive = true` also at imports that lead to another listed module through modules outside \
 the contract. Stub files (`.pyi`) are not checked.\n\n\
 Fix: move the shared code into a separate module that both may import.",
+        fix: "move the code `{0}` uses from `{1}` into a separate module both may import (contract `{2}`)",
         severity: Severity::Error,
         default_enabled: true,
         cost: CostClass::Graph,

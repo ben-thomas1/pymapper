@@ -3,18 +3,19 @@
 //!
 //! ```text
 //!   load (as check) ──> calls ──> Query ──> resolve SYMBOL ──> BFS over reverse (forward)
-//!   call edges up to --depth ──> PATHS filter ──> sites of the shown rows ──> concise | json
+//!   call edges up to --depth ──> PATHS filter ──> sites of the shown rows ──> text | llm | json
 //! ```
 
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use pymapper_core::query::Scratch;
+use pymapper_core::index::NodeId;
+use pymapper_core::query::{Query, Scratch, Walk};
 use pymapper_core::timing;
 
-use super::query::hops::{self, Side};
-use super::query::{QueryFlags, Session, WalkFlags, finish};
+use super::query::hops::{self, Side, WalkCounts};
+use super::query::{QueryFlags, Session, WalkFlags, Writer, finish, llm};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -59,6 +60,12 @@ pub fn run_walk(args: Args, side: Side) -> anyhow::Result<ExitCode> {
     });
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
+    if w.llm {
+        let c = timing::time("output", || write_llm(&s, &q, &mut w, &walk, side, target, depth, &args.symbol));
+        finish(w)?;
+        s.report_stats(&q, &[("reached", walk.hops.len() as u64), ("shown", c.rows.shown as u64)]);
+        return Ok(ExitCode::SUCCESS);
+    }
     let counts = timing::time("output", || {
         if w.json {
             w.json_header(name);
@@ -102,4 +109,62 @@ pub fn run_walk(args: Args, side: Side) -> anyhow::Result<ExitCode> {
     finish(w)?;
     s.report_stats(&q, &[("reached", walk.hops.len() as u64), ("shown", counts.shown as u64)]);
     Ok(ExitCode::SUCCESS)
+}
+
+/// The llm rendering of `callers` / `callees` (see `query::llm`).
+#[allow(clippy::too_many_arguments)]
+fn write_llm(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, walk: &Walk, side: Side, target: NodeId, depth: u32, arg: &str) -> WalkCounts {
+    let name = if side == Side::Callers { "callers" } else { "callees" };
+    let c = hops::walk_counts(s, walk, s.row_limit, false);
+    llm::header(w, name, arg);
+    llm::target(w, target);
+    llm::sep(w);
+    llm::root(w, s);
+    llm::sep(w);
+    match side {
+        Side::Callers => llm::count(w, c.rows.matched as u64, "caller", "callers"),
+        Side::Callees => llm::count(w, c.rows.matched as u64, "callee", "callees"),
+    }
+    w.str(" in ");
+    llm::count(w, c.files as u64, "file", "files");
+    w.str(" (");
+    w.num(c.possible as u64);
+    w.str(" possible");
+    if c.dispatch > 0 {
+        w.str(", ");
+        w.num(c.dispatch as u64);
+        w.str(" dispatch only");
+    }
+    w.str(")");
+    if depth == u32::MAX {
+        w.str(" · transitive");
+    } else if depth > 1 {
+        w.str(" · up to depth ");
+        w.num(u64::from(depth));
+    }
+    w.end_line();
+    w.str("Confidence: certain/likely = resolved call; possible = guessed from a unique method name; dispatch = base method to an override.");
+    w.end_line();
+    llm::call_blind_spots(w, s);
+    hops::write_llm_rows(s, q, w, walk, side, s.row_limit, false);
+    llm::trailer(w, c.rows.matched, c.rows.shown, c.rows.outside, name);
+    let id = llm::qid_arg(w, target);
+    let next = match side {
+        Side::Callers if c.rows.matched == 0 => format!(
+            "nothing calls it statically; check dynamic use with `grep -rnw {} {} --include='*.py'` or `pymapper explain {id}`",
+            short_name(w.ix, target),
+            llm::root_arg(s)
+        ),
+        Side::Callers => format!("`pymapper impact {id}` for everything that depends on it transitively · `--depth N` for callers of callers"),
+        Side::Callees => format!("`pymapper callees {id} --depth 2` to go deeper · `pymapper callers <callee>` for other users of a callee"),
+    };
+    llm::next(w, &next);
+    c
+}
+
+/// The bare name of `v` (last segment of its qualified id, without a `#N` suffix).
+pub fn short_name(ix: &pymapper_core::index::Index, v: NodeId) -> String {
+    let id = ix.qid_string(v);
+    let tail = id.rsplit([':', '.']).next().unwrap_or(&id);
+    tail.split('#').next().unwrap_or(tail).to_owned()
 }

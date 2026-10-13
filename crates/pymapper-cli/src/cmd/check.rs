@@ -37,7 +37,7 @@ use pymapper_core::config::{Config, EntrypointMatcher, Loaded, OutputFormat, Rul
 use pymapper_core::extract::config::ConfigEvidence;
 use pymapper_core::graph::{CallFilter, call_graph};
 use pymapper_core::index::Index;
-use pymapper_core::output::{self, Baseline, IndexContext, Options, Outcome, Report, Summary};
+use pymapper_core::output::{self, Baseline, IndexContext, Options, Outcome, Report, RunNotes, Summary};
 use pymapper_core::resolve::{Imports, ResolvedCalls, resolve_calls};
 use pymapper_core::roots::{Origin, ProjectUnits};
 use pymapper_core::rules::codes::GOD_CLASS;
@@ -146,6 +146,28 @@ pub(crate) struct Done {
     pub closed: bool,
 }
 
+/// What [`Setup::analyse`] keeps beyond `check`'s needs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Keep {
+    /// Findings below the confidence gate (counted in the filter stats either way).
+    pub below_confidence: bool,
+    /// The dead-code result ([`Analysed::dead_code`]).
+    pub dead_code: bool,
+}
+
+/// The filtered findings of one analysis and what `check` reports about them.
+pub(crate) struct Analysed {
+    pub findings: Findings,
+    pub filter: FilterStats,
+    pub files_checked: u32,
+    pub files_total: u32,
+    pub dead: Option<DeadCodeStats>,
+    /// The dead-code result, with [`Keep::dead_code`] (and when that pass ran).
+    pub dead_code: Option<DeadCode>,
+    pub coverage: Option<CoverageStats>,
+    pub modes: Vec<String>,
+}
+
 /// Load counters for `--stats` that the [`Input`] does not carry.
 pub(crate) struct Extra<'a> {
     pub cache: Option<&'a CacheStats>,
@@ -211,10 +233,11 @@ impl Setup {
         (self.engine.should_run(Pass::Coupling) && self.engine.is_enabled(GOD_CLASS)) || self.engine.should_run(Pass::DeadCode)
     }
 
-    /// Analyses `input`, filters and reports the findings (or saves them to the baseline
-    /// `save`), and returns the outcome. `describe_modes`: collect the dead-code mode lines
-    /// for `--stats`.
-    pub fn check(&self, input: &Input<'_>, fps: Option<Fingerprints>, save: Option<&Path>, describe_modes: bool) -> anyhow::Result<Done> {
+    /// Analyses `input` and filters the findings as `check` does (positional paths,
+    /// suppressions, per-file ignores, the confidence gate unless `keep_below`), without
+    /// reporting them. `describe_modes`: collect the dead-code mode lines (`--stats`,
+    /// `explain`); `keep`: what to keep beyond `check`'s needs (`explain`).
+    pub fn analyse(&self, input: &Input<'_>, fps: Option<Fingerprints>, describe_modes: bool, keep: Keep) -> anyhow::Result<Analysed> {
         let (config, engine, root) = (self.config(), &self.engine, self.root());
         let scope = &self.scope[..];
         let ix = input.ix;
@@ -223,7 +246,10 @@ impl Setup {
             Some(path) => Some(timing::time("coverage", || load_coverage(ix, path, root))?),
             None => None,
         };
-        let (mut findings, dead, modes) = analyse(config, engine, input, &matcher, coverage.as_ref(), scope, fps, describe_modes);
+        // The llm header states the dead-code mode of every unit, as `--stats` does.
+        let llm = config.output_format == OutputFormat::Llm;
+        let (mut findings, dead, modes) =
+            analyse(config, engine, input, &matcher, coverage.as_ref(), scope, fps, describe_modes || llm);
         if dead.is_some() {
             for (key, pattern) in matcher.unmatched() {
                 warn(format_args!(
@@ -247,12 +273,35 @@ impl Setup {
         });
         let per_file = &self.per_file;
         let filter = timing::time("filter", || {
-            engine.filter(&mut findings, &suppressions, false, |f, i| per_file_matches(ix, root, &per_file[i], f))
+            engine.filter(&mut findings, &suppressions, keep.below_confidence, |f, i| per_file_matches(ix, root, &per_file[i], f))
         });
+        let stats = dead.as_ref().map(|d| *d.stats());
+        Ok(Analysed {
+            findings,
+            filter,
+            files_checked,
+            files_total,
+            dead: stats,
+            dead_code: if keep.dead_code { dead } else { None },
+            coverage: coverage.map(|c| *c.stats()),
+            modes,
+        })
+    }
+
+    /// Analyses `input`, filters and reports the findings (or saves them to the baseline
+    /// `save`), and returns the outcome. `describe_modes`: collect the dead-code mode lines
+    /// for `--stats`.
+    pub fn check(&self, input: &Input<'_>, fps: Option<Fingerprints>, save: Option<&Path>, describe_modes: bool) -> anyhow::Result<Done> {
+        let (config, root) = (self.config(), self.root());
+        let scope = &self.scope[..];
+        let ix = input.ix;
+        let Analysed { findings, filter, files_checked, files_total, dead, coverage, modes, .. } =
+            self.analyse(input, fps, describe_modes, Keep::default())?;
 
         // Text formats show paths relative to the working directory; json and sarif keep the
         // project root.
         let text = !matches!(config.output_format, OutputFormat::Json | OutputFormat::Sarif);
+        let llm = config.output_format == OutputFormat::Llm;
         let mut ctx = IndexContext::new(ix, root, &config.contracts);
         if text {
             ctx = ctx.relative_to(&self.cwd);
@@ -275,13 +324,16 @@ impl Setup {
                 report.apply_baseline(b);
             }
             let opts = Options::from_config(config, io::stdout().is_terminal());
-            let summary = Summary { files_checked, filter };
+            let notes = LlmNotes::new(self, &modes, files_checked, files_total);
+            let summary = Summary { files_checked, filter, notes: notes.as_run_notes() };
             // A closed pipe (`pymapper check | head`) is not an error (`Outcome::Closed`); the
             // exit status still reflects the findings.
             let mut out = io::stdout().lock();
             let outcome = timing::time("output", || report.write(&opts, &summary, &mut out)).context("cannot write to stdout")?;
             closed = outcome == Outcome::Closed;
-            if outcome == Outcome::Written && text {
+            // The llm format states the filter and skipped rules in its header and must end
+            // with its own trailer.
+            if outcome == Outcome::Written && text && !llm {
                 let note = Footnote { scope, base: &self.cwd, files_checked, files_total, plan: &self.plan };
                 match write!(out, "{note}").and_then(|()| out.flush()) {
                     Err(e) if e.kind() == io::ErrorKind::BrokenPipe => closed = true,
@@ -299,10 +351,50 @@ impl Setup {
             baselined: report.baselined(),
             filter,
             dead,
-            coverage: coverage.map(|c| *c.stats()),
+            coverage,
             modes,
             closed,
         })
+    }
+}
+
+/// Owned text behind the [`RunNotes`] of the llm header: the root as reached from the working
+/// directory, the dead-code mode per unit, the skipped rules and the path filter.
+struct LlmNotes {
+    root: String,
+    modes: Vec<String>,
+    skipped: Vec<String>,
+    filter: String,
+}
+
+impl LlmNotes {
+    /// `modes`: the lines of `analyse` (`<unit dir>: <mode> (<why>)`, `.` for the root unit);
+    /// a single unit's line loses its `.: ` prefix.
+    fn new(setup: &Setup, modes: &[String], files_checked: u32, files_total: u32) -> LlmNotes {
+        if setup.config().output_format != OutputFormat::Llm {
+            return LlmNotes { root: String::new(), modes: Vec::new(), skipped: Vec::new(), filter: String::new() };
+        }
+        let root = RelPath(setup.root(), &setup.cwd).to_string();
+        let modes = match modes {
+            [one] => vec![one.strip_prefix(".: ").unwrap_or(one).to_owned()],
+            _ => modes.to_vec(),
+        };
+        let skipped = setup.plan.groups().iter().map(|g| format!("{}: {}", CodeList(&g.codes), g.reason.short())).collect();
+        let mut filter = String::new();
+        if !setup.scope.is_empty() {
+            for (i, p) in setup.scope.iter().enumerate() {
+                if i > 0 {
+                    filter.push_str(", ");
+                }
+                filter.push_str(&RelPath(p, &setup.cwd).to_string());
+            }
+            filter.push_str(&format!(" ({files_checked} of {files_total} first-party files)"));
+        }
+        LlmNotes { root, modes, skipped, filter }
+    }
+
+    fn as_run_notes(&self) -> RunNotes<'_> {
+        RunNotes { command: "check", root: &self.root, modes: &self.modes, skipped: &self.skipped, filter: &self.filter }
     }
 }
 
@@ -482,7 +574,7 @@ fn load_coverage(ix: &Index, path: &Path, root: &Path) -> anyhow::Result<Coverag
 }
 
 /// Runs every analysis with an enabled rule and returns their findings (unfiltered), the
-/// dead-code counters (when that pass ran) and, with `describe_modes`, one line per project
+/// dead-code result (when that pass ran) and, with `describe_modes`, one line per project
 /// unit with files describing its dead-code mode and why. `coverage`: dead-code evidence from
 /// a coverage report.
 #[allow(clippy::too_many_arguments)]
@@ -495,7 +587,7 @@ fn analyse(
     scope: &[PathBuf],
     fps: Option<Fingerprints>,
     describe_modes: bool,
-) -> (Findings, Option<DeadCodeStats>, Vec<String>) {
+) -> (Findings, Option<DeadCode>, Vec<String>) {
     let (ix, imp) = (p.ix, p.imp);
     let mut out = Findings::new();
     if engine.should_run(Pass::Hotspot) {
@@ -543,7 +635,7 @@ fn analyse(
                 modes.push(line);
             }
         }
-        dead = Some(*dc.stats());
+        dead = Some(dc);
     }
     drop(owned);
     if let (Some(params), Some(fps)) = (DupesParams::from_engine(engine), fps) {

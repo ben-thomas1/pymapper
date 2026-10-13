@@ -1,0 +1,11 @@
+# pymapper cycles
+root: . · 1 import cycle
+Graph: first-party imports, TYPE_CHECKING imports excluded, as PM301. Kinds: top-level runs on import; inside a function, try and conditional imports are deferred or guarded, so a cycle closed only by them is usually harmless.
+Not import edges: importlib.import_module / __import__ with computed names, imports in notebooks and C extensions.
+
+## Cycle 1: 2 modules, eager (every edge runs on import)
+repo.order_repo -> models.order -> repo.order_repo
+repo.order_repo -> models.order (top-level) at repo/order_repo.py:1:26
+models.order -> repo.order_repo (top-level) at models/order.py:2:29
+
+Next: break an edge by moving a top-level import into the function that uses it, or move the shared names to a module both can import · `pymapper check --select PM301 --llm` for the finding ids

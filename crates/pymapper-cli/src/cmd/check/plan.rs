@@ -36,6 +36,11 @@ impl Skip {
     pub fn why(self) -> SkipWhy {
         SkipWhy(self)
     }
+
+    /// Short form, for footers and the llm header.
+    pub fn short(self) -> SkipShort {
+        SkipShort(self)
+    }
 }
 
 /// Short form of a [`Skip`] reason, for the footer.

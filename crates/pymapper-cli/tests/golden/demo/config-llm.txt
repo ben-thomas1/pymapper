@@ -1,0 +1,71 @@
+# pymapper config
+root: . · config file: pyproject.toml
+Effective configuration in pymapper.toml syntax (config file, then --set and flags applied):
+
+paths = ["<demo>"]
+src = []
+exclude = [".bzr", ".direnv", ".eggs", ".git", ".hg", ".mypy_cache", ".nox", ".pants.d", ".pymapper_cache", ".pytest_cache", ".pytype", ".ruff_cache", ".svn", ".tox", ".venv", "__pycache__", "__pypackages__", "_build", "buck-out", "build", "dist", "node_modules", "site-packages", "venv"]
+extend-exclude = []
+respect-gitignore = true
+include-deps = false
+include-stdlib = false
+cache = false
+cache-dir = "<demo>/.pymapper_cache"
+threads = 0
+mode = "auto"
+output-format = "llm"
+group-by = "category"
+color = "auto"
+limit = 50
+min-confidence = 80
+presets = []
+
+[rules]
+extend-select = []
+ignore = []
+
+[thresholds]
+max-mccabe = 10
+max-cognitive = 15
+max-nesting = 4
+max-function-loc = 100
+max-params = 7
+min-maintainability = 10.0
+max-module-loc = 1000
+max-fan-out = 30
+max-distance = 0.7
+distance-min-coupling = 10
+max-module-symbols = 80
+max-module-coupling = 25
+max-class-wmc = 47
+max-class-fan-out = 5
+dupes-min-tokens = 50
+dupes-min-lines = 6
+
+[entrypoints]
+decorators = []
+bases = []
+names = []
+members = []
+project-scripts = true
+
+[analysis]
+dupes = false
+exact-reachability = false
+name-fallback = true
+config-evidence = true
+config-evidence-globs = ["*.yaml", "*.yml", "*.toml", "*.json", "*.cfg", "*.ini"]
+unique-method-fallback = true
+type-checking-cycles = false
+include-tests-in-metrics = false
+
+[[contracts]]
+name = "models are independent of repo"
+kind = "forbidden"
+allow-type-checking = true
+transitive = false
+ignore-imports = []
+source = ["models"]
+forbidden = ["repo"]
+
+Next: `pymapper config --template` for every option with its default and cost · `pymapper check --llm` to run the checks

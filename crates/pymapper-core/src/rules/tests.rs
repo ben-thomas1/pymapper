@@ -57,6 +57,32 @@ fn messages_match_declared_args() {
     }
 }
 
+/// Every registered rule has a one-line fix hint whose placeholders name declared arguments
+/// (ISSUES O2: "fix hints present for every rule family").
+#[test]
+fn every_rule_has_a_fix_hint() {
+    for d in all() {
+        assert_eq!(d.check_fix(), Ok(()), "PM{}: {}", d.code, d.fix);
+        assert!(d.fix.len() > 20, "PM{}: fix hint too short", d.code);
+        assert!(!d.fix.ends_with('.'), "PM{}: fix hint ends with a period", d.code);
+        assert!(d.fix.starts_with(|c: char| c.is_ascii_lowercase()), "PM{}: fix hint should start lower case", d.code);
+    }
+    for &cat in Category::ALL {
+        assert!(!in_category(cat).is_empty(), "{cat:?}");
+    }
+}
+
+#[test]
+fn check_fix_rejects_bad_templates() {
+    let base = *codes::COMPLEX_FUNCTION.def();
+    let with = |fix: &'static str| RuleDef { fix, ..base };
+    assert_eq!(with("split {0} down to {2}").check_fix(), Ok(()));
+    assert_eq!(with("split {3}").check_fix(), Err(MessageError::Missing(3)));
+    assert_eq!(with("split {0..,}").check_fix(), Err(MessageError::Rest));
+    assert!(with("").check_fix().is_err());
+    assert!(with("two\nlines").check_fix().is_err());
+}
+
 #[test]
 fn gating_is_consistent() {
     for d in all() {

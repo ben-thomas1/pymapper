@@ -2,8 +2,9 @@
 //!
 //! Everything is appended to the core's [`Out`] buffer (64 KiB chunks, graceful on a closed
 //! pipe); qualified ids are rendered into one reused scratch buffer. Paths are relative to the
-//! project root (absolute outside it); invalid UTF-8 becomes U+FFFD in both formats, as in
-//! `check`.
+//! working directory in the text and llm modes (`../` outside it, as `check`'s text formats)
+//! and to the project root in JSON (absolute outside it); invalid UTF-8 becomes U+FFFD in
+//! every mode, as in `check`.
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -12,18 +13,24 @@ use std::path::Path;
 use anyhow::Context;
 use pymapper_core::index::{FileId, Index, NodeId};
 use pymapper_core::output::json::push_str;
-use pymapper_core::output::{JSON_VERSION, Out};
+use pymapper_core::output::{JSON_VERSION, Out, push_relative};
 use pymapper_core::query::Match;
 use pymapper_core::resolve::{Confidence, ExtKind, res_flags};
 use pymapper_core::query::ExternalDep;
 use pymapper_core::roots::{Origin, Roots};
 
+use super::session::Mode;
+
 /// A writer of query output (see the module docs).
 pub struct Writer<'w> {
     pub ix: &'w Index,
-    root: &'w Path,
+    /// Base of displayed paths (the working directory, or the project root for JSON).
+    base: &'w Path,
     roots: &'w Roots,
+    /// Shorthand for `mode == Mode::Json`.
     pub json: bool,
+    /// Shorthand for `mode == Mode::Llm`.
+    pub llm: bool,
     out: Out<'w>,
     tmp: Vec<u8>,
 }
@@ -70,8 +77,9 @@ const FLAG_NAMES: [(u8, &str); 5] = [
 ];
 
 impl<'w> Writer<'w> {
-    pub fn new(ix: &'w Index, root: &'w Path, roots: &'w Roots, json: bool, sink: &'w mut dyn Write) -> Writer<'w> {
-        Writer { ix, root, roots, json, out: Out::new(sink), tmp: Vec::with_capacity(256) }
+    pub fn new(ix: &'w Index, base: &'w Path, roots: &'w Roots, mode: Mode, sink: &'w mut dyn Write) -> Writer<'w> {
+        let (json, llm) = (mode == Mode::Json, mode == Mode::Llm);
+        Writer { ix, base, roots, json, llm, out: Out::new(sink), tmp: Vec::with_capacity(256) }
     }
 
     #[inline]
@@ -91,17 +99,22 @@ impl<'w> Writer<'w> {
         self.out.maybe_flush();
     }
 
-    /// Path of `p` relative to the project root (as is outside it).
+    /// Path of `p`: JSON relative to the project root (as is outside it), text and llm
+    /// relative to the working directory (`../` steps where needed, as `check`).
     pub fn path(&mut self, p: &Path) {
-        let rel = match p.strip_prefix(self.root) {
-            Ok(r) if !r.as_os_str().is_empty() => r,
-            _ => p,
-        };
         if self.json {
+            let rel = match p.strip_prefix(self.base) {
+                Ok(r) if !r.as_os_str().is_empty() => r,
+                _ => p,
+            };
             push_str(self.out.buf(), rel.as_os_str().as_bytes());
-        } else {
-            push_lossy(self.out.buf(), rel.as_os_str().as_bytes());
+            return;
         }
+        let b = self.base.as_os_str().as_bytes();
+        let b = if b == b"/" { b } else { b.strip_suffix(b"/").unwrap_or(b) };
+        self.tmp.clear();
+        push_relative(p.as_os_str().as_bytes(), b, &mut self.tmp);
+        push_lossy(self.out.buf(), &self.tmp);
     }
 
     /// Path of file `f`.
@@ -122,6 +135,29 @@ impl<'w> Writer<'w> {
         }
     }
 
+    /// Short name of `v` for llm rows under a heading that already names its module: a
+    /// class or function without the `pkg.mod:` part (`Class.method`), a package or module
+    /// whole (`pkg.mod`).
+    pub fn short(&mut self, v: NodeId) {
+        self.tmp.clear();
+        self.ix.qid(v, &mut self.tmp);
+        let start = if self.ix.kind(v).is_def() { self.tmp.iter().position(|&b| b == b':').map_or(0, |i| i + 1) } else { 0 };
+        push_lossy(self.out.buf(), &self.tmp[start..]);
+    }
+
+    /// `path:line` of the definition of `v` (`path` alone for a package or module; nothing
+    /// without a file).
+    pub fn def_at(&mut self, v: NodeId) {
+        let d = SymbolLoc::of(self.ix, v);
+        if let Some(f) = d.file {
+            self.file(f);
+            if d.line > 0 {
+                self.str(":");
+                self.num(u64::from(d.line));
+            }
+        }
+    }
+
     /// Concise location prefix `path:line:col: ` (`col` 0: `path:line: `; `line` 0: `path: `).
     pub fn loc(&mut self, f: FileId, line: u32, col: u32) {
         self.file(f);
@@ -134,6 +170,19 @@ impl<'w> Writer<'w> {
             }
         }
         self.str(": ");
+    }
+
+    /// `path:line:col` (`col` 0: `path:line`; `line` 0: `path`), no trailing separator.
+    pub fn loc_plain(&mut self, f: FileId, line: u32, col: u32) {
+        self.file(f);
+        if line > 0 {
+            self.str(":");
+            self.num(u64::from(line));
+            if col > 0 {
+                self.str(":");
+                self.num(u64::from(col));
+            }
+        }
     }
 
     /// Concise location prefix of the definition of `v` (nothing for a node without a file).
@@ -297,6 +346,33 @@ impl<'w> Writer<'w> {
         for (bit, name) in FLAG_NAMES {
             if flags & bit != 0 {
                 self.str(", ");
+                self.str(name);
+            }
+        }
+    }
+
+    /// The kind of an import edge for llm output (ISSUES O3/O4, F4): `top-level` when it runs
+    /// on import, else the flags that make it deferred or type-only: `inside a function`,
+    /// `TYPE_CHECKING`, `try`, `conditional`, plus `star`.
+    pub fn import_kind(&mut self, flags: u8) {
+        let deferring = res_flags::TYPE_ONLY | res_flags::CONDITIONAL | res_flags::TRY | res_flags::LAZY;
+        let mut first = true;
+        if flags & deferring == 0 {
+            self.str("top-level");
+            first = false;
+        }
+        for (bit, name) in [
+            (res_flags::LAZY, "inside a function"),
+            (res_flags::TYPE_ONLY, "TYPE_CHECKING"),
+            (res_flags::TRY, "try"),
+            (res_flags::CONDITIONAL, "conditional"),
+            (res_flags::STAR, "star"),
+        ] {
+            if flags & bit != 0 {
+                if !first {
+                    self.str(", ");
+                }
+                first = false;
                 self.str(name);
             }
         }

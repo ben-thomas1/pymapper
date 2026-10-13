@@ -1,0 +1,32 @@
+# pymapper callees app:main
+target: app:main (function, app.py:24) · root: . · 10 callees in 8 files (0 possible)
+Confidence: certain/likely = resolved call; possible = guessed from a unique method name; dispatch = base method to an override.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+## cycles.py (cycles)
+ping:1 [certain] at app.py:28:5
+
+## middleware/pipeline.py (middleware.pipeline)
+run_pipeline:10 [certain] at app.py:27:5
+
+## models/order.py (models.order)
+Order:5 [certain] at app.py:29:13
+Order.__init__:6 [certain] at app.py:29:13
+
+## repo/order_repo.py (repo.order_repo)
+save_order:12 [certain] at app.py:30:5
+
+## services/auth.py (services.auth)
+require_auth:1 [certain] at app.py:25:5
+
+## services/invoice.py (services.invoice)
+invoice_lines:1 [certain] at app.py:32:44
+
+## services/pricing.py (services.pricing)
+calculate_price:6 [certain] at app.py:31:11
+receipt_lines:39 [certain] at app.py:32:21
+
+## services/user_service.py (services.user_service)
+create_user:9 [certain] at app.py:26:5
+
+Next: `pymapper callees app:main --depth 2` to go deeper · `pymapper callers <callee>` for other users of a callee

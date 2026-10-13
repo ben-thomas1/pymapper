@@ -88,6 +88,7 @@ fn rule_section(out: &mut String, def: &RuleDef, defaults: &Thresholds) -> std::
         ConfidenceModel::Certain => writeln!(out, "- Confidence: always 100")?,
         ConfidenceModel::Scored(how) => writeln!(out, "- Confidence: {how}")?,
     }
+    writeln!(out, "- Fix hint (`--llm`, JSON `fix`): `{}`", fix_shape(def))?;
     writeln!(out, "\n{}\n", def.explanation)?;
     writeln!(out, "Suppress on a line with `# pymapper: ignore[PM{:03}]`.\n", def.code)?;
     Ok(())
@@ -112,6 +113,19 @@ fn message_shape(def: &RuleDef) -> String {
                 let _ = write!(out, "{k}{sep}{k}{sep}...");
             }
             Err(_) => break,
+        }
+    }
+    out
+}
+
+/// The fix template with placeholders shown as `<kind>` (backticks dropped, as for the message).
+fn fix_shape(def: &RuleDef) -> String {
+    let mut out = String::new();
+    for piece in pieces(def.fix) {
+        match piece {
+            Ok(Piece::Lit(s)) => out.push_str(&s.replace('`', "")),
+            Ok(Piece::Arg(i)) => out.push_str(kind_name(def.args.get(i))),
+            Ok(Piece::Rest(..)) | Err(_) => break,
         }
     }
     out

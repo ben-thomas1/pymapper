@@ -1,5 +1,6 @@
 //! GitHub Actions workflow commands: one `::warning file=...,line=...::message` annotation per
-//! finding, then the summary footer as plain log lines.
+//! finding (with `endLine=` when the span ends on a later line, so the whole function is
+//! highlighted), then the summary footer as plain log lines.
 //!
 //! Severity maps to the command: error -> `error`, warning -> `warning`, info -> `notice`.
 //! Escaping follows the runner: `%`, CR and LF in the message; additionally `:` and `,` in
@@ -27,6 +28,11 @@ pub(super) fn write(r: &Report<'_>, opts: &Options, summary: &Summary, out: &mut
                 if f.loc.col > 0 {
                     out.str(",col=");
                     out.u32(f.loc.col);
+                }
+                let end = r.end_line(f);
+                if end > f.loc.line {
+                    out.str(",endLine=");
+                    out.u32(end);
                 }
             }
             out.byte(b',');

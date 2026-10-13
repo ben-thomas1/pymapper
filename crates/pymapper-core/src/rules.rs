@@ -396,6 +396,11 @@ pub struct RuleDef {
     pub args: &'static [ArgKind],
     /// Longer Markdown explanation: what is detected, why it matters, how to fix it.
     pub explanation: &'static str,
+    /// One-line fix hint: a template like [`message`](Self::message) over the same arguments
+    /// (`{N}` only; not every argument must be used), filled with the finding's facts at
+    /// output time (`--llm`, JSON `fix`; see [`RuleDef::write_fix`]). States what to change, never
+    /// more than the analysis knows.
+    pub fix: &'static str,
     /// Severity of every finding.
     pub severity: Severity,
     /// Enabled when `select` is unset (expensive rules additionally need their gate).

@@ -2,7 +2,8 @@
 //! problem per rule family), compared byte for byte with reviewed files in `tests/golden/demo/`.
 //!
 //! The concise, json, sarif and github goldens were produced by pymapper 0.3.0: those formats
-//! must not change (only additive json fields, with a schema note). `"<version>"` stands for
+//! must not change, except for the agreed 0.4.0 additions (json `root`, `id` and `fix`; sarif
+//! `region.endLine`; github `endLine=`). The absolute demo root is written as `<root>`. `"<version>"` stands for
 //! the crate version. After an intended change, regenerate with
 //! `PYMAPPER_BLESS=1 cargo test -p pymapper-cli --test golden` and review the diff.
 //!
@@ -39,6 +40,8 @@ fn check(cwd: &Path, args: &[&str]) -> (i32, String) {
 fn golden(name: &str, got: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/demo").join(name);
     let got = got.replace(&format!("\"{}\"", env!("CARGO_PKG_VERSION")), "\"<version>\"");
+    // The absolute project root (JSON `root`, the llm header) depends on the checkout.
+    let got = got.replace(&demo().display().to_string(), "<root>");
     if std::env::var_os("PYMAPPER_BLESS").is_some() {
         std::fs::write(&path, &got).expect("write golden");
         return;
@@ -110,4 +113,147 @@ fn baselines_do_not_depend_on_the_working_directory() {
     let (a, b) = (std::fs::read(&a).expect("baseline a"), std::fs::read(&b).expect("baseline b"));
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(a, b);
+}
+
+/// Runs `pymapper <args>` in `cwd`; returns (exit code, stdout, stderr).
+fn pymapper(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_pymapper"))
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("VIRTUAL_ENV")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("run pymapper");
+    let text = |b: Vec<u8>| String::from_utf8(b).expect("utf-8");
+    (out.status.code().expect("exited normally"), text(out.stdout), text(out.stderr))
+}
+
+const NEXT: &str = "Next: pymapper explain <id> for evidence and source · suppress with # pymapper: ignore[PMxxx] on the reported line";
+
+/// Finding ids at the start of llm item lines (`PM401-3fa2 ...`).
+fn llm_ids(out: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in out.lines() {
+        let Some(word) = line.split(' ').next() else { continue };
+        let b = word.as_bytes();
+        if b.len() >= 10 && word.starts_with("PM") && b[2..5].iter().all(u8::is_ascii_digit) && b[5] == b'-' {
+            ids.push(word.to_owned());
+        }
+    }
+    ids
+}
+
+#[test]
+fn llm_golden() {
+    let (code, out) = check(&demo(), &["--llm"]);
+    assert_eq!(code, 1);
+    golden("llm.txt", &out);
+    let (code, out) = check(&demo(), &["--llm", "--limit", "3"]);
+    assert_eq!(code, 1);
+    golden("llm-limit3.txt", &out);
+    let (_, out) = check(&demo(), &["--llm", "--limit", "0", "--set", "analysis.dupes = true", "--min-confidence", "0"]);
+    golden("llm-all.txt", &out);
+}
+
+#[test]
+fn llm_header_states_mode_exit_meaning_and_blind_spots() {
+    let (_, out) = check(&demo(), &["--llm"]);
+    let head: Vec<&str> = out.lines().take(5).collect();
+    assert!(head[0].starts_with("# pymapper check · root /"), "{out}");
+    assert!(head[0].contains("(reached as .)"), "{out}");
+    assert_eq!(head[1], "Dead-code mode: application ([project.scripts] in pyproject.toml)");
+    assert!(head[2].starts_with("26 findings in 15 files, "), "{out}");
+    assert!(head[2].contains("10 below confidence 80 not shown"), "{out}");
+    assert!(head[2].ends_with("exit 1 = findings, not an error"), "{out}");
+    assert!(head[3].starts_with("Not analysed: notebooks, C extensions, names used only via getattr"), "{out}");
+    assert!(head[4].starts_with("Rules not run: PM501: needs `analysis.dupes = true`"), "{out}");
+    // Sections in priority order; no concise footer or footnote after the trailer.
+    let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s} missing:\n{out}"));
+    assert!(at("## Architecture") < at("## Complexity") && at("## Complexity") < at("## Dead code"));
+    assert!(at("## Dead code") < at("## Unused imports"));
+    assert!(out.ends_with(&format!("\n{NEXT}\n")), "{out}");
+    assert!(!out.contains("Found "), "{out}");
+    // From a subdirectory: the root as reached, and paths relative to the working directory.
+    let (_, sub) = check(&demo().join("services"), &["--llm"]);
+    assert!(sub.lines().next().is_some_and(|l| l.contains("(reached as ..)")), "{sub}");
+    assert!(sub.contains("\nPM101-312c pricing.py:6-36 calculate_price: "), "{sub}");
+    assert!(sub.contains("grep -rnw --exclude-dir=.venv dead_endpoint ..\n"), "{sub}");
+}
+
+#[test]
+fn llm_cap_and_trailer() {
+    let (_, out) = check(&demo(), &["--llm", "--limit", "3"]);
+    assert_eq!(llm_ids(&out).len(), 3, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let n = lines.len();
+    assert_eq!(lines[n - 1], NEXT);
+    assert_eq!(
+        lines[n - 2],
+        "20 more findings not displayed (in 14 files). Use --limit 0 to show all, or --select <code> to narrow."
+    );
+    assert!(lines[2].contains(" items, showing 3 "), "{out}");
+    // --limit 0 shows every item, without the trailer.
+    let (_, all) = check(&demo(), &["--llm", "--limit", "0"]);
+    let (_, default) = check(&demo(), &["--llm"]);
+    assert_eq!(all, default, "the demo fits the default cap of 50");
+    assert!(!all.contains("more findings not displayed"), "{all}");
+    assert_eq!(llm_ids(&all).len(), 19, "{all}");
+    // --limit 1: the most important item only (the contract break: severity error).
+    let (_, one) = check(&demo(), &["--llm", "--limit", "1"]);
+    assert_eq!(llm_ids(&one), ["PM303-e6ff"], "{one}");
+    assert!(one.contains("\n25 more findings not displayed (in 15 files)."), "{one}");
+}
+
+#[test]
+fn llm_merges_chains_metrics_and_pairs() {
+    let (_, out) = check(&demo(), &["--llm", "--set", "analysis.dupes = true", "--min-confidence", "0", "--limit", "0"]);
+    // A dead chain is one item: the root, then what only it uses.
+    assert!(out.contains(
+        "middleware/pipeline.py:21 format_receipt (function): never used (conf 100)\n  also dead if it goes: utils/formatting.py: format_currency:5\n"
+    ), "{out}");
+    assert!(!out.contains("\nPM401-") || !out.lines().any(|l| l.contains(" format_currency (function)")), "{out}");
+    assert!(out.contains("verify: grep -rnwE --exclude-dir=.venv 'format_receipt|format_currency' .\n"), "{out}");
+    // Metrics of one function: one line with every value and code.
+    assert!(out.contains("calculate_price: McCabe 14>10, cognitive 32>15, nesting 5>4, params 8>7 (PM101,PM102,PM103,PM105)\n"), "{out}");
+    // The duplicate pair once (PM501 is reported in both directions).
+    assert_eq!(out.matches("duplicated lines: ").count(), 1, "{out}");
+    assert!(out.contains("## Duplication (1 pair)"), "{out}");
+}
+
+#[test]
+fn llm_ids_are_stable_and_match_json() {
+    let (_, a) = check(&demo(), &["--llm", "--min-confidence", "0", "--limit", "0"]);
+    let (_, b) = check(&demo(), &["--llm", "--min-confidence", "0", "--limit", "0"]);
+    assert_eq!(a, b);
+    let (_, json) = check(&demo(), &["--output-format", "json", "--min-confidence", "0"]);
+    let ids = llm_ids(&a);
+    assert!(ids.len() > 10, "{a}");
+    for id in &ids {
+        assert!(json.contains(&format!("\"id\":\"{id}\"")), "{id} not in the JSON output:\n{json}");
+    }
+    // The same ids from a subdirectory (ids use root-relative keys; the order follows the
+    // displayed paths).
+    let (_, sub) = check(&demo().join("services"), &["--llm", "--min-confidence", "0", "--limit", "0"]);
+    let (mut want, mut got) = (ids, llm_ids(&sub));
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn llm_conflicts_with_machine_formats() {
+    for format in ["json", "sarif", "github", "concise"] {
+        let (code, _, err) = pymapper(&demo(), &["check", "--no-cache", "--llm", "--output-format", format]);
+        assert_eq!(code, 2, "{format}: {err}");
+    }
+}
+
+#[test]
+fn json_has_root_ids_and_fixes() {
+    let (_, out) = check(&demo(), &["--output-format", "json"]);
+    assert!(out.contains(&format!("\"root\":\"{}\"", demo().display())), "{out}");
+    let findings = out.lines().filter(|l| l.starts_with("  {\"code\"")).count();
+    assert_eq!(out.matches("\"id\":\"PM").count(), findings);
+    assert_eq!(out.matches("\"fix\":\"").count(), findings);
+    assert!(out.contains("\"fix\":\"extract branches of `services.pricing:calculate_price` into helpers, use a dispatch table or return early, to bring McCabe from 14 to 10 or less\""), "{out}");
 }

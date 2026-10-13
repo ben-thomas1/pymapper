@@ -247,9 +247,14 @@ fn positional_paths_filter_rows_and_never_reroot() {
     let want: Vec<&str> = whole.rows().into_iter().filter(|l| l.starts_with("app/cli.py:") || l.starts_with("tests/")).collect();
     assert_eq!(r.rows(), want);
     assert!(r.summary().ends_with("; 3 outside PATHS not shown"), "{}", r.summary());
-    // From a subdirectory: the same root, module names and relative paths.
+    // From a subdirectory: the same root, module names and rows, with paths relative to the
+    // working directory (ISSUES O6; 0.3.0 showed them relative to the project root).
     let sub = p.run_in("app/core", &["callers", "app.util:helper", "--transitive", "../cli.py", "../../tests"]);
-    assert_eq!(sub.expect_code(0).stdout, r.stdout);
+    let want = r.stdout.replace("app/cli.py", "../cli.py").replace("tests/", "../../tests/").replace("app/util.py", "../util.py");
+    assert_eq!(sub.expect_code(0).stdout, want);
+    // JSON keeps paths relative to the project root.
+    let json = |dir: &str| p.run_in(dir, &["callers", "app.util:helper", "--format", "json"]).stdout;
+    assert_eq!(json("app/core"), json(""));
     // A path covering the project root filters nothing.
     assert_eq!(p.run(&["callers", "app.util:helper", "--transitive", "."]).stdout, whole.stdout);
     // A path that does not exist is a usage error; one without Python files warns.
@@ -337,7 +342,8 @@ fn path_finds_a_shortest_chain_or_exits_1() {
         .file("proj/m.py", "def g():\n    return 1\n\n\ndef f():\n    return g()\n")
         .file("other/notes.txt", "");
     let r = q.run_in("other", &["path", "m:f", "m:g", "--root", "../proj"]);
-    assert_eq!(r.expect_code(0).rows(), ["m.py:6:12: m:f -> m:g [certain]"]);
+    // Paths are relative to the working directory (ISSUES O6).
+    assert_eq!(r.expect_code(0).rows(), ["../proj/m.py:6:12: m:f -> m:g [certain]"]);
     q.run_in("other", &["path", "m:f", "m:g"]).expect_code(2);
 }
 

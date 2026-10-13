@@ -33,7 +33,7 @@ pymapper check [paths]
   ├─ filter        selection, per-file-ignores, # pymapper: ignore[...], confidence gate
   ├─ report        deterministic order (path, line, col, rule, symbol)
   ├─ baseline      drop findings recorded in --baseline / `baseline`
-  └─ output        concise | json | sarif | github, then the exit code
+  └─ output        human | llm | concise | json | sarif | github, then the exit code
 ```
 
 Third-party (`--deps`) and stdlib (`--stdlib`) code is loaded so first-party code links to it
@@ -51,7 +51,8 @@ The PM6xx dependency-hygiene rules are run by `pymapper deps --check`, not `chec
 `pymapper deps` (third-party distributions, their use by first-party code, `--score`
 scorecards and the `--check` dependency-hygiene rules) is described in [`deps.md`](deps.md).
 The query subcommands (`callers`, `callees`, `impact`, `path`, `imports`, `cycles`, `summary`)
-are described in [Query subcommands](#query-subcommands) below.
+are described in [Query subcommands](#query-subcommands) below, and the drill-down into one
+finding in [`pymapper explain`](#pymapper-explain).
 
 ## Project root
 
@@ -86,7 +87,7 @@ checked (warning); run pymapper on that project separately.
 | code | meaning |
 |------|---------|
 | 0 | no finding at or above the confidence gate (or `--save-baseline` succeeded) |
-| 1 | at least one finding at or above the gate |
+| 1 | at least one finding at or above the gate (findings, not an error; the `--llm` header says so) |
 | 2 | usage error (including a path to check that does not exist, an unknown rule selector, or a selection of which no rule can run), invalid configuration, unreadable or invalid baseline, cannot write output |
 
 A path that does not exist, whether given on the command line or listed in the configured
@@ -105,7 +106,11 @@ subcommands (`pymapper check --help` lists them all):
 | flag | config key | notes |
 |------|------------|-------|
 | `--select`, `--extend-select`, `--ignore` | `rules.*` | comma-separated selectors: `ALL`, `PM1`, `PM10`, `PM101` |
-| `--format` / `--output-format` | `output-format` | `concise` (default), `json`, `sarif`, `github` |
+| `--format` / `--output-format` | `output-format` | `human` (default), `llm`, `concise`, `json`, `sarif`, `github` (see [Output formats](#output-formats)) |
+| `--llm` | `output-format = "llm"` | short for `--output-format llm`; conflicts with `--output-format` (exit 2) |
+| `--group-by` | `group-by` | human output: `category` (default) or `file` |
+| `--color` | `color` | human output: `auto` (default: only when stdout is a terminal and `NO_COLOR` is unset), `always`, `never` |
+| `--limit N` | `limit` | items in llm output (default 50; `0` = all); human and machine formats of `check` are never capped. For queries: rows (see [Output](#output)) |
 | `--confidence` / `--min-confidence` | `min-confidence` | 0-100, default 80; lower shows less certain findings |
 | `--deps` / `--no-deps` | `include-deps` | load the venv's third-party packages |
 | `--stdlib` / `--no-stdlib` | `include-stdlib` | load the interpreter's standard library |
@@ -181,38 +186,217 @@ or when it is a contract rule (PM302-PM304) and no `[[contracts]]` are configure
 
 ## Output formats
 
-- `concise`: `path:line:col: CODE message`, confidence appended when below 100, then a footer
-  (`Found N findings in M files (K files checked).`, counts of suppressed / baselined /
-  below-gate findings). With positional paths (other than one covering the project root, such
-  as `check .` at the root), `K` counts the first-party files under them and
-  a line `Filtered to PATHS (K of T first-party files); the whole project was analysed.`
-  follows; with an explicit selection that skipped rules, the rules line above follows. Paths
-  are relative to the project root; columns are 1-based bytes. Below 100 the confidence comes
-  with its reasons for dead-code rules: `(confidence 50: only-used-by-unused-code,
-  name-elsewhere)`. The `github` format prints the same footer lines; `json` and `sarif`
-  contain the filtered findings only (`files_checked` is `K`).
-- `json`: one document (`version` 2, `tool`, `min_confidence`, `findings[]`, `summary`); every
-  finding has `code`, `name`, `severity`, `confidence`, `path`, `line`, `col`, `end_line` (last
-  line of the reported span: the definition, the whole file for module metrics, the copy for
-  PM501, else `line`), `symbol` (the stable qualified id `pkg.mod:Class.method`; for PM405
-  `pkg.mod:<bound name>`) and `message`. Rule-specific fields:
-  - PM1xx, PM2xx: `value` and `threshold` (the measured value and its limit; for PM203 / PM204,
-    which check two limits, the first pair of the message).
-  - PM301: `"cycle": {"size": N, "members": [...], "witness": [...]}`: the number of modules in
-    the strongly connected component, all of them, and the cycle of the message (without
-    repeating its first module).
-  - PM501: `"other": {"path", "line", "end_line", "symbol"}`: the other copy of the pair;
-    `symbol` (of either copy) is the innermost class or function containing the whole copy,
-    else `null`.
-  - Dead-code rules (PM4xx): `reasons`, the machine-readable reasons for the confidence
-    (`["only-used-by-unused-code", "name-elsewhere"]`); absent when the finding has none.
+Six formats, chosen with `--output-format` / `--format` or the `output-format` config key:
 
-  Fields are only ever added within a version; version 2 changed the PM405 `symbol` (was the
-  module), removed the `#N` suffix from overload implementations (see below) and made PM104 /
-  PM107 values exclude docstrings and PM1 / PM2 / PM5 skip test code by default
-  (`analysis.include-tests-in-metrics`).
-- `sarif`: SARIF 2.1.0 with rule metadata, for code-scanning uploads.
-- `github`: GitHub Actions workflow commands (`::warning file=...,line=...::message`).
+| format | for | shape |
+|--------|-----|-------|
+| `human` (default) | people at a terminal | grouped by category, then file; metric findings merged per function; an id on every item; colour on a terminal; never capped |
+| `llm` (`--llm`) | coding agents | header facts, items in priority order with ids, evidence, a fix hint and a verification command; capped at `--limit` items |
+| `concise` | scripts, editors, line tools | one `path:line:col: CODE message` line per finding; byte-identical to 0.3.0 |
+| `json` | programs | one document, schema version 2 |
+| `sarif` | code-scanning uploads | SARIF 2.1.0 |
+| `github` | GitHub Actions | workflow-command annotations |
+
+Conventions shared by every format:
+
+- **Paths.** `human`, `llm`, `concise` and `github` print paths relative to the working
+  directory (like ruff), so they are clickable where you ran the command; files outside it
+  show `../`. `json` and `sarif` print paths relative to the project root (JSON gives the
+  absolute root in `root`; SARIF uses `%SRCROOT%`). Run from the parent of the project,
+  `pymapper check myproject` prints `myproject/app.py:35:5`. Baseline keys and ids are always
+  root-relative. Lines are 1-based, columns 1-based bytes.
+- **Ids.** Every finding has a stable id such as `PM401-e3b2`: the rule code and 4 hex digits
+  of a fixed hash (FNV-1a) of its baseline key (rule, stable symbol id, stable message
+  arguments; never line numbers or metric values), extended to 5-6 digits when two findings of
+  one run would collide. An id does not change across runs, with or without the cache, or when
+  code above it moves; it changes when the symbol is renamed or moved. `human` and `llm` end
+  every item with it, `json` has it as `id`, and `pymapper explain <id>` accepts it (or any
+  unique prefix of at least 4 hex digits).
+- **Footer notes.** The text formats print the same notes: findings below the confidence gate,
+  suppressed, baselined or per-file-ignored; with positional paths (other than one covering
+  the project root, such as `check .` at the root) the files-checked count `K` covers the
+  first-party files under them and a line `Filtered to PATHS (K of T first-party files); the
+  whole project was analysed.` follows; with an explicit selection that skipped rules, the
+  rules line of [Rules that cannot run](#rules-that-cannot-run) follows. `json` and `sarif`
+  contain the filtered findings only (`files_checked` is `K`).
+- **Exit codes** are the same for every format (see [Exit codes](#exit-codes)).
+
+### `human`
+
+```
+$ pymapper check
+Architecture  2
+  models/order.py
+     2:29  imports forbidden repo.order_repo (contract: models are independent of repo)   PM303-e6ff
+  repo/order_repo.py
+     1:26  import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo   PM301-e35f
+
+Complexity  1 function
+  services/pricing.py
+     6:5   calculate_price  McCabe 14>10 · cognitive 32>15 · nesting 5>4 · params 8>7  PM101-312c +PM102,PM103,PM105
+
+Dead code  18
+  app.py
+    35:5   function  dead_endpoint          never used                                    PM401-e3b2
+  ...
+  utils/formatting.py
+     5:5   function  format_currency        only used by unused code                      PM401-5fdd
+
+Unused imports  2
+  middleware/pipeline.py
+     6:25  User                                                                           PM405-f95d
+  ...
+
+26 findings in 15 files (23 files checked) · architecture 2 · complexity 1 function · dead code 18 · unused imports 2
+10 more below confidence 80 (use --min-confidence 0 to show them)
+```
+
+- **Sections** in priority order, each with a count: Architecture (PM301 cycles, PM302-PM304
+  contracts), Dependencies (PM6xx, under `deps --check`), Complexity (PM1xx; counted in
+  functions), Coupling (PM2xx), Duplication (PM5xx; counted in pairs), Dead code (PM401-PM404),
+  Unused imports (PM405). Files alphabetically inside a section, findings by line.
+- **Merging.** The metric findings PM101-PM107 of one symbol are one line
+  (`McCabe 14>10 · cognitive 32>15 · ...`) ending with the first finding's id and the other
+  codes (`PM101-312c +PM102,PM103,PM105`); `explain` on that id covers every metric of the
+  symbol. A cycle is listed once, under the file of the import that closes it; a duplicate pair
+  once, with both locations (`services/invoice.py:1  invoice_lines  ↔  services/pricing.py:39
+  receipt_lines  (12 lines)`); a contract break under the importing file.
+- **Symbols** are short (the file is the heading): `calculate_price`, `Order.archive`. Dead code
+  has a kind column (function, class, method, module) and a verdict (`never used`, `only used by
+  unused code`, `has no resolved callers (name appears in its own file)`, ...).
+- **Confidence** below 100 is appended with its reasons: `(confidence 10: name-in-same-file)`.
+- **Ids** are right-aligned to a fixed width: `COLUMNS` when set (40 to 120), else 100. There
+  is no terminal-size query, so the layout is the same on a terminal and in a pipe. A line too
+  long for the width gets its id two spaces after the text. Nothing is truncated.
+- **Footer:** the totals with a tally per section, then the notes above.
+- **`--group-by file`** (config `group-by = "file"`): one section per file, with a category
+  column, for editing sessions and changed-file CI:
+
+  ```
+  $ pymapper check --group-by file services/pricing.py
+  services/pricing.py
+       1:8   unused import  json                                                            PM405-4ed8
+       6:5   complexity     calculate_price  McCabe 14>10 · cognitive 32>15 · nesting 5>4 · params 8>7  PM101-312c +PM102,PM103,PM105
+      53:5   dead code      function legacy_discount  never used                            PM401-145e
+      57:7   dead code      class PromoEngine  never used                                   PM402-d424
+
+  7 findings in 1 file (1 file checked) · complexity 1 function · dead code 2 · unused imports 1
+  Filtered to services/pricing.py (1 of 23 first-party files); the whole project was analysed.
+  ```
+
+- **Colour** (`--color auto|always|never`, config `color`): `auto` colours only when stdout is
+  a terminal and `NO_COLOR` is unset; `always` colours even when piped or with `NO_COLOR`.
+  Section headers are coloured by family (architecture red, dependencies cyan, complexity
+  magenta, coupling dim magenta, duplication blue, dead code yellow, unused imports dim
+  yellow), paths bold, positions, ids and low-confidence
+  suffixes dim. Plain ANSI escapes; the other formats are never coloured.
+- Not capped: `--limit` does not apply to `human` (people scroll).
+
+### `llm`
+
+`--llm` (or `--output-format llm`) is the mode for coding agents: Markdown-like, no colour, no
+alignment padding, deterministic, paths and symbols once:
+
+```
+$ pymapper check --llm --limit 3
+# pymapper check · root /path/to/sample_python (reached as .) · paths relative to the working directory
+Dead-code mode: application ([project.scripts] in pyproject.toml)
+26 findings in 15 files, 19 items, showing 3 · 10 below confidence 80 not shown (--min-confidence 0 shows them) · exit 1 = findings, not an error
+Not analysed: notebooks, C extensions, names used only via getattr or strings. Verify dead code before deleting it.
+Rules not run: PM501: needs `analysis.dupes = true`; PM601-PM603: run by `pymapper deps --check`
+
+## Architecture (2)
+PM303-e6ff models/order.py:2 models.order imports forbidden module repo.order_repo (contract "models are independent of repo")
+  fix: remove the import of repo.order_repo from models.order, or move the code that needs it out of models.order (contract "models are independent of repo") · verify: pymapper explain PM303-e6ff
+PM301-e35f repo/order_repo.py:1 import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
+  fix: break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import · verify: pymapper explain PM301-e35f
+
+## Complexity (1 function)
+PM101-312c services/pricing.py:6-36 calculate_price: McCabe 14>10, cognitive 32>15, nesting 5>4, params 8>7 (PM101,PM102,PM103,PM105)
+  fix: flatten calculate_price with guard clauses and extract nested blocks, to bring cognitive complexity from 32 to 15 or less · verify: pymapper callers services.pricing:calculate_price
+
+20 more findings not displayed (in 14 files). Use --limit 0 to show all, or --select <code> to narrow.
+Next: pymapper explain <id> for evidence and source · suppress with # pymapper: ignore[PMxxx] on the reported line
+```
+
+- **Header:** the command, the project root (absolute, and as reached from the working
+  directory), the dead-code mode of each unit and why, the counts (findings, items, how many
+  are shown, below the gate, suppressed, baselined), what the exit code means, the blind spots
+  (what pymapper cannot see), and the rules that did not run.
+- **Items** in the section order of `human`; inside a section, higher severity and confidence
+  first, complexity by the worst overshoot, dead-code chains and modules before single
+  symbols. Merged groups are one item: the metrics of a function, a cycle, a contract break, a
+  duplicate pair, the dead symbols of one file with the same verdict, and a dead-code chain
+  (`also dead if it goes: utils/formatting.py: format_currency:5`).
+- **Every item** has its id, location, the evidence (metric values, confidence and reasons as
+  `(conf 100)`), a `fix:` hint filled in from per-rule templates (the same text as the JSON
+  `fix` field and [rules.md](rules.md)), and a `verify:` command (`pymapper explain <id>`,
+  `pymapper callers <symbol>` or a `grep -rnw` line).
+- **Cap:** at most `--limit` items (config `limit`, default 50; `--limit 0` shows every item).
+  When items are cut the output ends with
+  `N more findings not displayed (in M files). Use --limit 0 to show all, or --select <code> to narrow.`
+- **`Next:`** the follow-up command and the suppression syntax, once.
+
+`--llm` conflicts with `--output-format` (usage error, exit 2). Every command has an llm mode
+(see [`pymapper explain`](#pymapper-explain) and [Query subcommands](#query-subcommands));
+`deps --check --llm` uses this layout.
+
+### `concise`
+
+`path:line:col: CODE message`, confidence appended when below 100, then a footer
+(`Found N findings in M files (K files checked).`, then `Not shown: ...` counts of
+suppressed / baselined / below-gate findings and the filter and rules lines). Below 100 the
+confidence comes with its reasons for dead-code rules: `(confidence 50:
+only-used-by-unused-code, name-elsewhere)`. This is the 0.3.0 default, kept byte for byte, so
+use it for anything that parses lines:
+
+```
+$ pymapper check --output-format concise
+app.py:35:5: PM401 function `app:dead_endpoint` is never used
+middleware/pipeline.py:6:25: PM405 `User` is imported but never used
+...
+Found 26 findings in 15 files (23 files checked).
+Not shown: 10 below min-confidence.
+```
+
+### `json`
+
+One document: `version` 2, `tool`, `root` (the absolute project root), `min_confidence`,
+`findings[]`, `summary`. Every finding has `code`, `id` (as above), `name`, `severity`,
+`confidence`, `path`, `line`, `col`, `end_line` (last line of the reported span: the
+definition, the whole file for module metrics, the copy for PM501, else `line`), `symbol` (the
+stable qualified id `pkg.mod:Class.method`; for PM405 `pkg.mod:<bound name>`), `message` and
+`fix` (the fix hint). Rule-specific fields:
+
+- PM1xx, PM2xx: `value` and `threshold` (the measured value and its limit; for PM203 / PM204,
+  which check two limits, the first pair of the message).
+- PM301: `"cycle": {"size": N, "members": [...], "witness": [...]}`: the number of modules in
+  the strongly connected component, all of them, and the cycle of the message (without
+  repeating its first module).
+- PM501: `"other": {"path", "line", "end_line", "symbol"}`: the other copy of the pair;
+  `symbol` (of either copy) is the innermost class or function containing the whole copy,
+  else `null`.
+- Dead-code rules (PM4xx): `reasons`, the machine-readable reasons for the confidence
+  (`["only-used-by-unused-code", "name-elsewhere"]`); absent when the finding has none.
+
+```json
+{"version":2,"tool":{"name":"pymapper","version":"0.4.0"},"root":"/path/to/sample_python","min_confidence":80,"findings":[
+  {"code":"PM101","id":"PM101-312c","name":"complex-function","severity":"warning","confidence":100,"path":"services/pricing.py","line":6,"col":5,"end_line":36,"symbol":"services.pricing:calculate_price","message":"`services.pricing:calculate_price` is too complex (McCabe 14 > 10)","value":14,"threshold":10,"fix":"extract branches of `services.pricing:calculate_price` into helpers, use a dispatch table or return early, to bring McCabe from 14 to 10 or less"}
+],"summary":{"findings":1,"gated":1,"files":1,"files_checked":23,"suppressed":0,"baselined":0,"file_ignored":0,"below_confidence_hidden":0}}
+```
+
+Fields are only ever added within a version (0.4.0 added `root`, `id` and `fix`); version 2
+changed the PM405 `symbol` (was the module), removed the `#N` suffix from overload
+implementations (see below) and made PM104 / PM107 values exclude docstrings and PM1 / PM2 /
+PM5 skip test code by default (`analysis.include-tests-in-metrics`).
+
+### `sarif` and `github`
+
+- `sarif`: SARIF 2.1.0 with rule metadata, for code-scanning uploads; `region.endLine` is the
+  end of the reported span, and `partialFingerprints` carry the baseline key.
+- `github`: GitHub Actions workflow commands with `endLine`, so the whole function is
+  highlighted (`::warning file=services/pricing.py,line=6,col=5,endLine=36,title=PM101
+  complex-function::...`), followed by the concise footer lines.
 
 ## Suppressions, per-file ignores, baselines
 
@@ -281,11 +465,14 @@ report (on a terminal the screen is cleared first) and one status line on stderr
 
 ```
 $ pymapper check --watch
-pkg/a.py:4:5: PM401 function `pkg.a:unused` is never used
-Found 1 finding in 1 file (3 files checked).
-pymapper: watching /path/to/project for changes (Ctrl-C to stop); checked in 96 ms
+Dead code  1
+  pkg/a.py
+     1:1   module    pkg.a  never imported                                                PM404-f12a
+
+1 finding in 1 file (3 files checked) · dead code 1
+pymapper: watching /path/to/project for changes (Ctrl-C to stop); checked in 6 ms
 ...
-pymapper: 1 file(s) changed; updated in 6 ms, reported 58 ms after the first event. Watching for changes
+pymapper: 1 file(s) changed; updated in 1 ms, reported 32 ms after the first event. Watching for changes
 ```
 
 ```
@@ -315,6 +502,87 @@ Cost: memory is that of a `check` run plus the dependency tracking of the increm
 resolution (4 bytes per (file, file read) pair; 3.4 MB on a 17M-line venv). Latency is
 measured by `cargo xtask bench -t watch` ([benchmarks.md](benchmarks.md#watch-mode-s77)).
 
+# `pymapper explain`
+
+```
+pymapper explain TARGET [PATH]   [configuration flags] [--llm]
+```
+
+The drill-down to run **before acting** on a finding: everything pymapper knows about it, so
+it can be verified and fixed without rebuilding the context by hand. `TARGET` is a finding id
+from `check` (`PM401-e3b2`, from `human`, `llm` or JSON output) or a symbol (a qualified id,
+dotted name or last segments, as for the [queries](#symbols)). `PATH` is the project (default:
+the working directory); config and root discovery start there.
+
+`explain` is stateless: it re-runs the `check` analysis (a warm cache makes that cheap), builds
+the same report and looks the id up. Pass the **same analysis options** as the `check` run the
+id came from: an id from `check --set 'analysis.dupes = true'` is found only with that option
+too. The confidence gate does not hide anything: an id below the gate is explained, with a
+note (`below the gate 80: check hides it unless --min-confidence 10`). For a symbol, it shows
+the symbol's connectivity (callers and callees by confidence, importing modules) and then every
+finding on it.
+
+What it shows, by family:
+
+| family | content |
+|--------|---------|
+| dead code (PM401-PM404) | the definition's source lines; the evidence behind the confidence (reasons, liveness level, call sites, where the name appears, decorators, the dead-code mode and the roots checked); the effect of deleting it (what else becomes unused, with ids; import statements naming it); blind spots; verify commands (`grep -rnw ...`, `pymapper callers ...`); fix; suppression |
+| complexity (PM1xx) | every metric against its threshold, with every merged code; where the complexity comes from (branches ranked by nesting cost, the deepest nesting path); split points (largest nested blocks); refactor risk (callers, `impact` size) |
+| import cycle (PM301) | the members; every import statement between them with its kind (top-level, inside a function, try, conditional); whether it is a real runtime cycle; the cheapest edge to break |
+| contract (PM302-PM304) | the contract as configured, the offending import line and its kind, other modules that import the same target |
+| duplication (PM501) | the source of both copies and the lines that differ (names, literals, docstrings) |
+| unused import (PM405) | the import line, re-export / `__all__` status, appearances in strings and annotations |
+
+Dependency findings (PM6xx, from `deps --check`) are not covered by `explain` yet: their ids
+are reported as unknown, with a note saying so.
+
+```
+$ pymapper explain PM401-61ec
+PM401-61ec · Dead code · unused-function: function middleware.pipeline:format_receipt is never used
+  at middleware/pipeline.py:21:5 · middleware.pipeline:format_receipt (function) · confidence 100 (no-references)
+
+  Source middleware/pipeline.py:21-24
+    21 > def format_receipt(user, amount):
+    22 |     name = format_name(user.name)
+    23 |     price = format_currency(amount)
+    24 |     return f"{name}: {price}"
+
+  Evidence
+    no-references: nothing refers to it at all
+    liveness level 0/100 (confidence = 100 - level), from: no path from any root
+    call sites: none (no resolved call, decorator or override edge reaches it)
+    name `format_receipt`: appears nowhere else in the analysed Python files
+    decorators: none
+    mode: .: application ([project.scripts] in pyproject.toml)
+    roots checked: __main__ 1, scripts 2 (e.g. app, app:main)
+
+  Effect of deleting it
+    also unused once it goes (1):
+      utils.formatting:format_currency at utils/formatting.py:5 PM401-5fdd
+    no import statement names it
+
+  Blind spots
+    not scanned in this repository: 0 notebooks (.ipynb), 0 compiled extensions (.so/.pyd); callbacks passed as values, getattr/string dispatch and calls from C are not edges
+
+  Verify
+    grep -rnw format_receipt . --exclude-dir=.venv --exclude-dir=.git --exclude-dir=.pymapper_cache
+    pymapper callers middleware.pipeline:format_receipt
+
+  Fix
+    delete middleware.pipeline:format_receipt if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__)
+
+  Suppress
+    add `# pymapper: ignore[PM401]` at the end of middleware/pipeline.py:21
+
+Next: run the Verify command, then delete it with what Effect lists · `pymapper callers middleware.pipeline:format_receipt` to double-check
+```
+
+`--llm` prints the same content with a `# pymapper explain <target>` header, `## ` section
+headings and no indentation. `explain` writes `human` and `llm` only (other formats are a usage
+error). Exit codes: 0 explained; 2 when no finding has the id (the code changed, or other
+options hide it: re-run `check` with the same options for current ids), when a symbol is
+unknown (similar names on stdout) or ambiguous (candidates on stdout), and for usage errors.
+
 # Query subcommands
 
 Questions about the code for agents and humans: who calls what, what a change can break, how
@@ -325,18 +593,19 @@ import roots, walk, cache and configuration flags: `--deps`, `--stdlib`, `--venv
 calls, and answers from the core query API (the one the GUI uses).
 
 ```
-pymapper callers SYMBOL [PATHS]...   [--depth N | --transitive] [--edges LEVEL] [--no-overrides] [--scope S] [--limit N]
+pymapper callers SYMBOL [PATHS]...   [--depth N | --transitive] [--edges LEVEL] [--no-overrides] [--scope S]
 pymapper callees SYMBOL [PATHS]...   (as callers)
-pymapper impact  SYMBOL [PATHS]...   [--depth N] [--edges LEVEL] [--no-overrides] [--scope S] [--limit N]
+pymapper impact  SYMBOL [PATHS]...   [--depth N] [--edges LEVEL] [--no-overrides] [--scope S]
 pymapper path    FROM TO             [--imports] [--edges LEVEL] [--no-overrides] [--node] [--max-len N] [--root DIR]
-pymapper imports SYMBOL [PATHS]...   [--depth N] [--direction in|out] [--runtime] [--limit N]
-pymapper cycles  [PATHS]...          [--symbol SYMBOL [--calls]] [--edges LEVEL] [--no-overrides] [--limit N]
+pymapper imports SYMBOL [PATHS]...   [--depth N] [--direction in|out] [--runtime]
+pymapper cycles  [PATHS]...          [--symbol SYMBOL [--calls]] [--edges LEVEL] [--no-overrides]
 pymapper summary [PATHS]...          [--top N] [--include-tests] [--all-origins]
 ```
 
-Every query also takes `--format concise|json` (`sarif` and `github` are usage errors) and
-`--stats` (phases `query.build`, `lookup`, `query`, `output`, `output.sites` and peak RSS on
-stderr).
+Every query also takes the shared output flags `--llm`, `--format human|llm|concise|json`
+(`human` and `concise` print the same one-fact-per-line text; `sarif` and `github` are usage
+errors) and `--limit N` (see [Output](#output)), plus `--stats` (phases `query.build`,
+`lookup`, `query`, `output`, `output.sites` and peak RSS on stderr).
 
 ## Symbols
 
@@ -366,8 +635,8 @@ subtree of a function too (its nested functions).
 
 ## Output
 
-Concise output is one fact per line, then one summary line. A line starts with the location it
-is about (`path:line:col: `; paths relative to the project root, 1-based lines, byte columns),
+Text output is one fact per line, then one summary line. A line starts with the location it
+is about (`path:line:col: `; paths relative to the working directory, 1-based lines, byte columns),
 names symbols by their qualified id and tags call edges with their confidence:
 
 - `[certain]` statically determined, `[likely]` from a hint (`x = Foo()`, an alias),
@@ -395,10 +664,54 @@ is (the caller for `callers` / `impact`, the callee for `callees`, the other mod
 path covering the project root filters nothing, a path that does not exist is a usage error,
 and config discovery starts at the first path.
 
-`--limit N` (default 200) caps the rows printed, closest first; `--limit 0` prints every row.
+`--limit N` caps the rows printed, closest first, in every format; `--limit 0` prints every
+row. Without it, text and JSON print up to 200 rows and `--llm` up to the `limit` option (50).
 `impact` applies one cap to its call rows and importers together (call rows first, importers
 with what is left); `imports` caps each direction separately. Summary counts always cover every
-row.
+row, and a capped answer says so (`; first 1 shown (--limit 0 for all)`, or in llm mode
+`2 more callers not displayed. Use --limit 0 to show all.`).
+
+### `--llm`
+
+The llm mode of every query is for agents: a `# pymapper <command> <args>` header with the
+resolved target (qualified id, kind, location), the root and the counts; the blind spots of
+the command (functions passed as values, getattr/string dispatch, calls from C extensions and
+notebooks, and the share of unresolved call sites are not call edges; computed imports are not
+import edges); rows grouped by file or module, with paths and symbols once and confidence
+tags; the cap and trailer; a `Next:` line. Paths are relative to the working directory.
+
+```
+$ pymapper callers services.user_service:create_user --llm
+# pymapper callers services.user_service:create_user
+target: services.user_service:create_user (function, services/user_service.py:9) · root: . · 3 callers in 2 files (0 possible)
+Confidence: certain/likely = resolved call; possible = guessed from a unique method name; dispatch = base method to an override.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+## app.py (app)
+list_users [certain] at 14:13
+main [certain] at 26:5
+
+## middleware/pipeline.py (middleware.pipeline)
+run_pipeline [certain] at 17:12
+
+Next: `pymapper impact services.user_service:create_user` for everything that depends on it transitively · `--depth N` for callers of callers
+```
+
+Per command:
+
+- `callers` / `callees`: grouped by the other symbol's module, with the number of `possible`
+  calls in the header.
+- `impact`: the affected symbols first, grouped by file (closest first), then the importing
+  modules as a count with the top few, then the most affected modules.
+- `path`: the chain as a numbered list of edges.
+- `imports`: `Out` and `In` sections, each import with its kind (top-level, lazy, type-only, ...).
+- `cycles`: one section per cycle, saying whether it is eager (every edge runs on import), with
+  every edge and its kind.
+- `summary`: the counts, then the most complex functions, the most called (distinct
+  certain/likely callers; `possible` callers are not counted, only noted), and the most
+  imported modules.
+- `config --llm`: the effective configuration as TOML with its source file; `deps --llm` and
+  `deps --score --llm`: one line per distribution (see [`deps.md`](deps.md)).
 
 ## Exit codes
 

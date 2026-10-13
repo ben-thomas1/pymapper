@@ -1,13 +1,13 @@
 # pymapper
 
 Whole-program analysis for Python codebases: import cycles, layering contracts,
-cross-module dead code, duplication, coupling and complexity, with ruff-style output, rule
-codes, config, suppressions, baselines and exit codes. ruff and ty check one file at a time;
+cross-module dead code, duplication, coupling and complexity, with readable grouped output, an
+agent mode (`--llm`), rule codes, config, suppressions, baselines and exit codes. ruff and ty check one file at a time;
 pymapper looks at the whole program (and, optionally, the venv and the standard library it
 links to).
 
-**Status:** under rewrite. Every subcommand works end to end: `check`, the queries (`callers`,
-`callees`, `impact`, `path`, `imports`, `cycles`, `summary`), `deps` and `config`.
+**Status:** under rewrite. Every subcommand works end to end: `check`, `explain`, the queries
+(`callers`, `callees`, `impact`, `path`, `imports`, `cycles`, `summary`), `deps` and `config`.
 See [`docs/design.md`](docs/design.md) for the design.
 
 ## Install
@@ -26,9 +26,12 @@ cargo build --release                         # target/release/pymapper
 ```
 pymapper check                       # the whole project around the working directory
 pymapper check src/pkg tests/x.py    # analyse the whole project, report only these paths
+pymapper check --llm                 # compact, prioritised report for coding agents
+pymapper explain PM401-e3b2          # one finding in depth: evidence, source, effect, how to verify and fix
 pymapper check --select PM3,PM4      # only cycles/contracts and dead code
 pymapper check --ignore PM1          # everything but complexity
-pymapper check --format json         # concise | json | sarif | github
+pymapper check --group-by file       # one section per file instead of per category
+pymapper check --format json         # human (default) | llm | concise | json | sarif | github
 pymapper check --confidence 50       # also show less certain findings (default gate: 80)
 pymapper check --deps --stdlib       # link first-party code to the venv and the stdlib
 pymapper check --save-baseline .pymapper-baseline.json   # record today's findings
@@ -41,36 +44,85 @@ pymapper config                      # the effective configuration
 pymapper config --template           # every option, commented, with its default and cost
 ```
 
+The default output is for people: findings grouped by category (architecture, dependencies,
+complexity, coupling, duplication, dead code, unused imports), then by file, with the metric
+findings of one function merged into one line and a stable id at the end of every item
+(coloured on a terminal):
+
 ```
 $ pymapper check
-app/billing.py:1:1: PM301 import cycle (2 modules): app.billing -> app.accounts -> app.billing
-app/report.py:42:5: PM101 `app.report:render` is too complex (McCabe 14 > 10)
-app/legacy.py:10:5: PM401 function `app.legacy:old_export` is never used
-Found 3 findings in 3 files (128 files checked).
+Architecture  2
+  models/order.py
+     2:29  imports forbidden repo.order_repo (contract: models are independent of repo)   PM303-e6ff
+  repo/order_repo.py
+     1:26  import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo   PM301-e35f
+
+Complexity  1 function
+  services/pricing.py
+     6:5   calculate_price  McCabe 14>10 · cognitive 32>15 · nesting 5>4 · params 8>7  PM101-312c +PM102,PM103,PM105
+
+Dead code  18
+  app.py
+    35:5   function  dead_endpoint          never used                                    PM401-e3b2
+  ...
+  utils/formatting.py
+     5:5   function  format_currency        only used by unused code                      PM401-5fdd
+  utils/legacy_helpers.py
+     1:1   module    utils.legacy_helpers   never imported                                PM404-c008
+  ...
+
+Unused imports  2
+  services/pricing.py
+     1:8   json                                                                           PM405-4ed8
+  ...
+
+26 findings in 15 files (23 files checked) · architecture 2 · complexity 1 function · dead code 18 · unused imports 2
+10 more below confidence 80 (use --min-confidence 0 to show them)
 ```
+
+(The seeded demo project in `tests/corpus/demo`.) The formats, and who each is for:
+
+| format | for | notes |
+|--------|-----|-------|
+| `human` (default) | people at a terminal | grouped and merged as above; `--group-by file`; `--color auto\|always\|never` (`NO_COLOR` honoured); never capped |
+| `llm` (`--llm`) | coding agents | header facts (root, dead-code mode and why, counts, what the exit code means, blind spots), items in priority order with ids, evidence, a fix hint and a verification command; capped at `--limit` items (default 50, `0` = all) with a final `N more findings not displayed` line |
+| `concise` | scripts and editors that parse lines | `path:line:col: CODE message`, byte-identical to 0.3.0 |
+| `json` | programs | one document, schema version 2, with `root` and a per-finding `id` and `fix` |
+| `sarif`, `github` | code scanning, GitHub Actions annotations | |
+
+Every command has an `--llm` mode, and `--llm` conflicts with `--output-format` (exit 2).
+Paths are relative to the working directory, except in JSON and SARIF (relative to the project
+root). An id such as `PM401-e3b2` stays the same while the code it points at does not change
+(it is derived from the baseline key, never from line numbers), so an agent can read
+`check --llm`, then run `pymapper explain <id>` before acting on an item. `explain` re-runs the
+analysis, so give it the same options as the `check` run; it also takes a symbol
+(`pymapper explain services.pricing:calculate_price`). The config keys `output-format`, `group-by`, `color` and
+`limit` set the same defaults.
 
 The analysis is always whole-program: positional paths only filter which findings are
 reported (`pymapper check src/pkg` gives exactly the findings of the whole-project run that lie
 under `src/pkg`, with the same module names), and the footer says so (`Filtered to src/pkg (12 of
 340 first-party files); the whole project was analysed.`).
 
-Exit codes: **0** clean, **1** findings at or above the confidence gate, **2** usage error
-(including a path to check that does not exist, an unknown rule selector such as `PM999`, or a
-selection of which no rule can run, e.g. `--select PM6` or `--select PM501` without
+Exit codes (unchanged): **0** clean, **1** findings at or above the confidence gate, **2** usage
+error (including a path to check that does not exist, an unknown rule selector such as `PM999`,
+or a selection of which no rule can run, e.g. `--select PM6` or `--select PM501` without
 `analysis.dupes = true`), invalid configuration or baseline, or a fatal I/O error. Files and
 directories that exist but cannot be read are warnings.
 Output to a closed pipe (`| head`) stops quietly.
 
-Full reference (pipeline, every flag, output formats, baselines, `--stats`):
-[`docs/cli.md`](docs/cli.md).
+Full reference (pipeline, every flag, output formats, `explain`, baselines, `--stats`):
+[`docs/cli.md`](docs/cli.md). A guided tour with real output: [`docs/usage.md`](docs/usage.md).
 
 ### Queries
 
 Questions about the code, answered from the same whole-program load as `check` (same root,
-config, flags and cache). The output is meant for agents: one fact per line, at the
-`path:line:col` it is about (a call site, an import statement), call edges tagged with their
-confidence, then one summary line; `--format json` gives one document with `check`'s
-conventions.
+config, flags and cache). The text output is one fact per line, at the `path:line:col` it is
+about (a call site, an import statement; relative to the working directory), call edges tagged
+with their confidence, then one summary line. `--llm` groups the rows by file with paths and
+symbols once, states the blind spots of the query (callbacks passed as values, getattr dispatch
+and C callers are not call edges) and ends with a next step; `--format json` gives one document
+with `check`'s conventions. `--limit N` caps the rows (default 200, 50 with `--llm`; `0` = all).
 
 ```
 pymapper callers app.util:helper             # who calls it (--depth N, --transitive)
@@ -83,11 +135,11 @@ pymapper summary                             # sizes, resolution rates, cycles, 
 ```
 
 ```
-$ pymapper callers app.util:helper
-app/main.py:6:9: app.main:run [certain] +1 site
-app/util.py:7:16: app.util:Base.run [certain]
-tests/test_util.py:5:12: tests.test_util:test_helper [certain]
-3 callers of app.util:helper (function, app/util.py:1)
+$ pymapper callers services.user_service:create_user
+app.py:14:13: app:list_users [certain]
+app.py:26:5: app:main [certain]
+middleware/pipeline.py:17:12: middleware.pipeline:run_pipeline [certain]
+3 callers of services.user_service:create_user (function, services/user_service.py:9)
 ```
 
 A symbol is a qualified id (`pkg.mod:Class.method`), a dotted name (`pkg.mod.Class.method`) or
@@ -125,6 +177,10 @@ mode = "application"                 # dead code: auto | application | library
 presets = ["pytest", "fastapi"]      # framework entrypoints
 min-confidence = 80
 baseline = ".pymapper-baseline.json"
+output-format = "human"              # human | llm | concise | json | sarif | github
+group-by = "category"                # human output: category | file
+color = "auto"                       # human output: auto | always | never (NO_COLOR honoured)
+limit = 50                           # llm output: items shown (0 = all)
 
 [tool.pymapper.rules]
 ignore = ["PM107"]
@@ -208,8 +264,8 @@ Metric rules (PM1xx, PM2xx) and duplication (PM5xx) skip test code by default (`
 `testing/`, `_tests/`, `_testing/` directories, `test_*.py`, `*_test.py`, `conftest.py`); set
 `analysis.include-tests-in-metrics = true` to include it. Dead code and cycles always cover
 tests. Function and module lengths (PM104, PM107) do not count docstrings. JSON output carries
-structured fields (`end_line`, `value` / `threshold`, the cycle's members, the other copy of a
-duplicate): see [`docs/cli.md`](docs/cli.md#output-formats).
+structured fields (`id`, `fix`, `end_line`, `value` / `threshold`, the cycle's members, the other
+copy of a duplicate): see [`docs/cli.md`](docs/cli.md#output-formats).
 
 Dead-code findings carry a confidence (0-100): 100 means nothing references the symbol by any
 route pymapper knows; lower values mean only weak evidence (a matching attribute name or
@@ -259,7 +315,8 @@ crates/pymapper-gui    the `pymapper-gui` binary (native GUI; see docs/gui.md)
 xtask                  dev tooling: cargo xtask bench | diff-ruff | fuzz
 tests/corpus           Python inputs used by tests and benchmarks
 docs/design.md         design document (source of truth)
-docs/cli.md            `pymapper check` and query subcommand reference
+docs/cli.md            `pymapper check`, `explain` and query subcommand reference
+docs/usage.md          guided tour with real output
 docs/rules.md          rule reference (generated)
 ```
 

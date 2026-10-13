@@ -1,0 +1,53 @@
+# pymapper explain services.pricing:receipt_lines
+
+services.pricing:receipt_lines (function) at services/pricing.py:39
+1 finding at or above confidence 80, 0 below
+
+## Connectivity
+callers: 1 certain/likely, 0 possible, 0 dispatch only
+callees: 0 certain/likely, 1 possible, 0 dispatch only
+modules importing services.pricing: 1 (app)
+
+PM501-a46f · Duplication · duplicate-code: 12 lines duplicated in services/invoice.py:1
+at services/pricing.py:39:1 · services.pricing:receipt_lines (function) · confidence 98
+
+## Copy services/pricing.py:39-50 (services.pricing:receipt_lines)
+39 | def receipt_lines(order):
+40 |     """PM501: duplicated in services/invoice.py."""
+41 |     lines = []
+42 |     for item in order.items:
+43 |         name = item["name"].strip().title()
+44 |         qty = int(item["qty"])
+45 |         price = float(item["price"])
+46 |         subtotal = qty * price
+47 |         lines.append(f"{name:<20} {qty:>3} x {price:>8.2f} = {subtotal:>9.2f}")
+48 |     lines.append("-" * 46)
+49 |     lines.append(f"{'TOTAL':<36} {order.total():>9.2f}")
+50 |     return lines
+
+## Copy services/invoice.py:1-12 (services.invoice:invoice_lines)
+ 1 | def invoice_lines(order):
+ 2 |     """PM501: copy-pasted from services/pricing.py:receipt_lines."""
+ 3 |     lines = []
+ 4 |     for item in order.items:
+ 5 |         name = item["name"].strip().title()
+ 6 |         qty = int(item["qty"])
+ 7 |         price = float(item["price"])
+ 8 |         subtotal = qty * price
+ 9 |         lines.append(f"{name:<20} {qty:>3} x {price:>8.2f} = {subtotal:>9.2f}")
+10 |     lines.append("-" * 46)
+11 |     lines.append(f"{'TOTAL':<36} {order.total():>9.2f}")
+12 |     return lines
+
+## Comparison
+2 of 12 lines differ (the match is token-based; these lines differ in names, literals or docstrings):
+  1: def receipt_lines(order):  |  def invoice_lines(order):
+  2: """PM501: duplicated in services/invoice.py."""  |  """PM501: copy-pasted from services/pricing.py:receipt_lines."""
+
+## Fix
+extract the 12 shared lines into one function (or base class) used by both copies
+
+## Suppress
+add `# pymapper: ignore[PM501]` at the end of services/pricing.py:39
+
+Next: `pymapper explain <id>` for one finding · `pymapper impact services.pricing:receipt_lines` before changing it

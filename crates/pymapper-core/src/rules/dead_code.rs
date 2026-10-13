@@ -213,6 +213,7 @@ pub(super) const RULES: &[RuleDef] = &[
         explanation: "The function is not reachable from any root: nothing live calls it, references \
 it, re-exports it or registers it (decorator entry points, presets).\n\n\
 Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`).",
+        fix: "delete `{0}` if nothing uses it by name, or declare how it is used (`[entrypoints]`, a preset, `__all__`)",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -232,6 +233,7 @@ entry-point rule (base class, decorator, name) marks it as used. While PM402 is 
 methods are not reported separately unless they look less live than the class (higher \
 confidence); suppressing the class finding (inline or `per-file-ignores`) hides them too.\n\n\
 Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`).",
+        fix: "delete `{0}` if nothing uses it by name, or declare how it is used (`[entrypoints]`, a preset, `__all__`)",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -250,6 +252,7 @@ Fix: delete it, or declare how it is used (`[entrypoints]`, a preset, `__all__`)
 instances, `self` / `cls` / `super()`, or as an override of a live method in a base class. \
 Dunder and protocol methods are always live.\n\n\
 Fix: delete it, or declare how it is used.",
+        fix: "delete `{0}` if nothing calls it by name, or declare how it is used",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -271,6 +274,7 @@ While PM404 is enabled, the module's defs and imports are reported only when the
 live than the module (higher confidence); suppressing the module finding (`ignore[PM404]` on \
 line 1 or `per-file-ignores`) hides them too.\n\n\
 Fix: delete the module, or declare it as an entry point.",
+        fix: "delete module `{0}` if nothing loads it by name, or declare it as an entry point",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -290,6 +294,7 @@ when another module imports the name from here or accesses it as `module.name`. 
 in `__all__`, the `import x as x` idiom, `__init__.py` re-exports in library mode, star \
 imports, `__future__` imports and `try`/`except ImportError` fallbacks are kept.\n\n\
 Fix: delete the import, or add the name to `__all__` if it is part of the module's API.",
+        fix: "delete the import of `{0}`, or add `{0}` to `__all__` if it is part of the module's API",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,

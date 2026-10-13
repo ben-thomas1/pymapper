@@ -1,0 +1,49 @@
+services.pricing:calculate_price (function) at services/pricing.py:6
+  4 findings at or above confidence 80, 0 below
+
+  Connectivity
+    callers: 1 certain/likely, 0 possible, 0 dispatch only
+    callees: 0 certain/likely, 1 possible, 0 dispatch only
+    modules importing services.pricing: 1 (app)
+
+PM101-312c · Complexity and size · complex-function: services.pricing:calculate_price is too complex (McCabe 14 > 10)
+  also PM102-0ea0 · cognitive-complexity: services.pricing:calculate_price is hard to understand (cognitive complexity 32 > 15)
+  also PM103-1b4f · deep-nesting: services.pricing:calculate_price nests blocks 5 levels deep (> 4)
+  also PM105-7df2 · too-many-parameters: services.pricing:calculate_price takes 8 parameters (> 7)
+  at services/pricing.py:6:5 · services.pricing:calculate_price (function) · confidence 100
+
+  Metrics (value vs threshold)
+    McCabe: 14 > 10 PM101 over
+    cognitive: 32 > 15 PM102 over
+    nesting: 5 > 4 PM103 over
+    lines (excluding docstrings): 30 <= 100
+    parameters (excluding self/cls): 8 > 7 PM105 over
+    maintainability index: 44.5 >= 10.0
+
+  Where the complexity comes from (services/pricing.py:6-36, approximate, from the source text)
+    line 13: if at nesting 4 (cost ~5): if total > 1000:
+    line 12: if at nesting 3 (cost ~4): if currency == "EUR":
+    line 11: if at nesting 2 (cost ~3): if region == "EU":
+    line 32: if at nesting 1 (cost ~3): if item.get("fragile") or item.get("oversize"):
+    line 10: if at nesting 1 (cost ~2): if customer.get("vip"):
+    line 23: elif at nesting 2 (cost ~2): elif region == "US" and express:
+    line 27: elif at nesting 1 (cost ~2): elif customer.get("new") and coupon:
+    line 29: if at nesting 0 (cost ~2): if coupon and coupon.startswith("SAVE"):
+    ... 8 more branch points (cost ~8)
+    deepest nesting: 5 levels, lines 9 > 10 > 11 > 12 > 13
+
+  Split points (largest nested blocks)
+    lines 9-28 (20 lines): if block at nesting 0
+    lines 10-26 (17 lines): if block at nesting 1
+    lines 11-22 (12 lines): if block at nesting 2
+
+  Refactor risk
+    1 direct caller (0 possible); impact: 2 affected symbols in 1 file, 0 in tests
+
+  Fix
+    extract branches of services.pricing:calculate_price into helpers, use a dispatch table or return early, to bring McCabe from 14 to 10 or less
+
+  Suppress
+    add `# pymapper: ignore[PM101]` at the end of services/pricing.py:6
+
+Next: `pymapper explain <id>` for one finding · `pymapper impact services.pricing:calculate_price` before changing it

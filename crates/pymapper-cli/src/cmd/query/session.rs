@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use anyhow::Context;
+
 use pymapper_core::config::{Config, OutputFormat};
 use pymapper_core::analysis::cycles::CycleOptions;
 use pymapper_core::index::{FileId, Index, NodeId};
@@ -71,6 +73,17 @@ fn parse_scope(s: &str) -> Result<Scope, String> {
     }
 }
 
+/// How a query renders its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// One fact per line (the human and concise formats).
+    Text,
+    /// The agent layout (`--llm`): header, blind spots, grouped rows, trailer, next step.
+    Llm,
+    /// One JSON document.
+    Json,
+}
+
 /// A loaded program, ready for queries.
 pub struct Session {
     t0: Instant,
@@ -79,7 +92,12 @@ pub struct Session {
     pub root: PathBuf,
     pub project: Project,
     pub calls: ResolvedCalls,
+    pub mode: Mode,
+    /// Shorthand for `mode == Mode::Json`.
     pub json: bool,
+    /// Working directory: the base of displayed paths in the text and llm modes (JSON keeps
+    /// the project root).
+    pub cwd: PathBuf,
     /// Rows printed (closest / heaviest first; `impact`: call rows and importers together):
     /// `--limit` (0 = every row), else the `limit` option in llm output, else
     /// [`DEFAULT_ROWS`].
@@ -138,10 +156,11 @@ impl Session {
         let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
         pipeline::require_paths(&loaded.scope, true, None)?;
         pipeline::require_paths(&loaded.config.paths, explicit, config_file)?;
-        let json = match loaded.config.output_format {
-            // Text renderings; the human and llm layouts for queries are not built yet.
-            OutputFormat::Human | OutputFormat::Llm | OutputFormat::Concise => false,
-            OutputFormat::Json => true,
+        let cwd = std::env::current_dir().context("cannot determine the working directory")?;
+        let mode = match loaded.config.output_format {
+            OutputFormat::Human | OutputFormat::Concise => Mode::Text,
+            OutputFormat::Llm => Mode::Llm,
+            OutputFormat::Json => Mode::Json,
             other => anyhow::bail!("`pymapper {name}` writes the human, llm, concise and json formats, not `{}`", other.as_str()),
         };
         let rows = match explicit_limit {
@@ -182,7 +201,8 @@ impl Session {
             warn(format_args!("no loaded Python files under {list}: every row is filtered out"));
         }
         let nodes_in_scope = in_scope.as_deref().map_or_else(Vec::new, |s| scope_bits(&project.index, s));
-        Ok(Session { t0, stats: flags.stats, config, root, project, calls, json, row_limit, in_scope, nodes_in_scope })
+        let json = mode == Mode::Json;
+        Ok(Session { t0, stats: flags.stats, config, root, project, calls, mode, json, cwd, row_limit, in_scope, nodes_in_scope })
     }
 
     /// The query state (call graph built here, O(V + E)).
@@ -216,7 +236,9 @@ impl Session {
 
     /// A writer over stdout for this session's format.
     pub fn writer<'w>(&'w self, sink: &'w mut dyn Write) -> Writer<'w> {
-        Writer::new(&self.project.index, &self.root, &self.project.roots, self.json, sink)
+        // Text and llm paths are relative to the working directory, JSON paths to the root.
+        let base = if self.json { &self.root } else { &self.cwd };
+        Writer::new(&self.project.index, base, &self.project.roots, self.mode, sink)
     }
 
     /// Resolves the symbol argument `text`. On an ambiguous or unknown symbol, writes the

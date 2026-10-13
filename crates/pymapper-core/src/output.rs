@@ -38,7 +38,8 @@
 //! let mut report = Report::new(&findings, &ctx);
 //! if let Some(b) = &baseline { report.apply_baseline(b); }
 //! let opts = Options::from_config(&config, std::io::stdout().is_terminal());
-//! report.write(&opts, &Summary { files_checked, filter: stats }, &mut std::io::stdout().lock())?;
+//! let summary = Summary { files_checked, filter: stats, notes: RunNotes::default() };
+//! report.write(&opts, &summary, &mut std::io::stdout().lock())?;
 //! std::process::ExitCode::from(report.exit_status(opts.min_confidence).code())
 //! ```
 //!
@@ -73,6 +74,7 @@ pub mod json;
 mod jsonread;
 mod llm;
 mod sarif;
+mod style;
 
 #[cfg(test)]
 mod tests;
@@ -119,11 +121,34 @@ impl ExitStatus {
 
 /// Counts for the summary footer and the JSON summary, beyond the findings themselves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Summary {
+pub struct Summary<'a> {
     /// Files analysed (0 = unknown; then the footer does not mention it).
     pub files_checked: u32,
     /// What [`crate::rules::RuleEngine::filter`] dropped or kept.
     pub filter: FilterStats,
+    /// Facts about the run for the llm header (empty by default: nothing stated).
+    pub notes: RunNotes<'a>,
+}
+
+/// Facts about the run that the findings do not carry, stated in the llm header (and available
+/// to other text formats). Every field is optional: empty means "not stated".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunNotes<'a> {
+    /// The command after `pymapper`: `check` (also when empty) or `deps --check` (which selects
+    /// the dependency blind spots).
+    pub command: &'a str,
+    /// The project root as the user reaches it: relative to the working directory (`.`,
+    /// `tests/corpus/demo`, `..`). The absolute root comes from [`Context::write_root_dir`].
+    pub root: &'a str,
+    /// Dead-code mode and why, one line per project unit with files (`application
+    /// ([project.scripts] in pyproject.toml)`, prefixed by `<unit dir>: ` when there are
+    /// several units, `.` for the root unit); empty when dead code did not run.
+    pub modes: &'a [String],
+    /// Selected rules that did not run, one line per reason (`PM501: needs `analysis.dupes =
+    /// true``).
+    pub skipped: &'a [String],
+    /// The path filter (`services (5 of 23 first-party files)`); empty without positional paths.
+    pub filter: &'a str,
 }
 
 /// Rendering options.
@@ -388,14 +413,37 @@ impl<'a> Report<'a> {
     #[allow(dead_code)] // for the human and llm writers (being built)
     pub(crate) fn message_plain(&self, f: &Finding, buf: &mut String, scratch: &mut Vec<u8>) {
         self.message(f, buf);
-        buf.retain(|c| c != '`');
+        self.make_plain(f, buf, scratch);
+    }
+
+    /// Drops backticks and the finding's own `pkg.mod:` prefix from `buf`.
+    fn make_plain(&self, f: &Finding, buf: &mut String, scratch: &mut Vec<u8>) {
+        strip_backticks(buf);
         self.symbol_id(f, scratch);
         if let Some(colon) = scratch.iter().position(|&b| b == b':')
             && let Ok(prefix) = std::str::from_utf8(&scratch[..=colon])
-            && buf.contains(prefix)
         {
-            *buf = buf.replace(prefix, "");
+            // In place (no new string): every occurrence, scanning on after each removal.
+            let mut from = 0;
+            while let Some(k) = buf[from..].find(prefix) {
+                buf.replace_range(from + k..from + k + prefix.len(), "");
+                from += k;
+            }
         }
+    }
+
+    /// Fix hint of a finding ([`crate::rules::RuleDef::fix`] filled with its arguments) into
+    /// `buf` (cleared first), with backticks and qualified ids as in [`Report::message`] (JSON).
+    pub fn fix(&self, f: &Finding, buf: &mut String) {
+        buf.clear();
+        let _ = self.findings.write_fix(f, self.ctx, buf);
+    }
+
+    /// Fix hint for the human and llm formats, like [`Report::message_plain`]: no backticks, and
+    /// symbols of the finding's own module without the `pkg.mod:` prefix.
+    pub fn fix_plain(&self, f: &Finding, buf: &mut String, scratch: &mut Vec<u8>) {
+        self.fix(f, buf);
+        self.make_plain(f, buf, scratch);
     }
 
     /// Short symbol of a finding into `buf` (cleared first; empty without one): its stable id
@@ -469,6 +517,38 @@ impl std::fmt::Write for VecWriter<'_> {
         self.0.extend_from_slice(s.as_bytes());
         Ok(())
     }
+}
+
+/// Removes the backticks of a message or fix hint for plain-text formats. A quoted name right
+/// after `contract ` keeps double quotes instead (contract names are free text: `(contract
+/// "models are independent of repo")` stays readable). In place, no allocation.
+pub fn strip_backticks(buf: &mut String) {
+    if !buf.contains('`') {
+        return;
+    }
+    let mut out = std::mem::take(buf).into_bytes();
+    let mut w = 0;
+    let mut quoting = false;
+    for r in 0..out.len() {
+        let b = out[r];
+        if b == b'`' {
+            if quoting {
+                quoting = false;
+                out[w] = b'"';
+                w += 1;
+            } else if out[..w].ends_with(b"contract ") {
+                quoting = true;
+                out[w] = b'"';
+                w += 1;
+            }
+            continue;
+        }
+        out[w] = b;
+        w += 1;
+    }
+    out.truncate(w);
+    // Only ASCII backticks were removed or replaced by ASCII quotes: still valid UTF-8.
+    *buf = String::from_utf8(out).unwrap_or_default();
 }
 
 /// Replaces invalid UTF-8 in `buf[start..]` with U+FFFD, so every format (and the baseline

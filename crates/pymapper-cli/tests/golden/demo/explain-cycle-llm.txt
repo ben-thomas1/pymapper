@@ -1,0 +1,28 @@
+# pymapper explain PM301-e35f
+
+PM301-e35f · Import cycles and layering · import-cycle: import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
+at repo/order_repo.py:1:26 · repo.order_repo (module) · confidence 100
+
+## Members
+2 modules: models.order, repo.order_repo
+
+## Import statements between members (2)
+models/order.py:2 models.order -> repo.order_repo (top-level): from repo.order_repo import next_order_id  # PM301 cycle + PM303 contract violation
+repo/order_repo.py:1 repo.order_repo -> models.order (top-level): from models.order import Order  # closes the cycle with models.order
+
+## Runtime
+a real runtime cycle: the top-level imports alone close it, so importing any member first runs into a partly initialised module
+
+## Cheapest edge to break (from the source text)
+models/order.py:2: `next_order_id` is used only inside functions or classes (lines 7): move this import into them
+
+## Blind spots
+not scanned in this repository: 0 notebooks (.ipynb), 0 compiled extensions (.so/.pyd); callbacks passed as values, getattr/string dispatch and calls from C are not edges
+
+## Fix
+break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import
+
+## Suppress
+add `# pymapper: ignore[PM301]` at the end of repo/order_repo.py:1
+
+Next: `pymapper cycles --llm` for every cycle · `pymapper imports <module>` for one module's imports

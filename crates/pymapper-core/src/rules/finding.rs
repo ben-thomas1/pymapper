@@ -123,7 +123,8 @@ pub trait ArgResolver {
 
 /// One finding (40 bytes). The message is the rule's template applied to the arguments stored
 /// in the owning [`Findings`]; structured data that is not part of the message (a cycle's
-/// members, the other copy of a duplicate) follows them as *extra* arguments.
+/// members, the other copy of a duplicate, the referrer of dead code only used by unused code)
+/// follows them as *extra* arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Finding {
     /// The rule.
@@ -362,6 +363,11 @@ impl Findings {
     pub fn write_message(&self, f: &Finding, r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Result {
         f.rule.def().write_message(self.args(f), r, out)
     }
+
+    /// Writes the fix hint of a finding of this buffer ([`RuleDef::fix`]).
+    pub fn write_fix(&self, f: &Finding, r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Result {
+        f.rule.def().write_fix(self.args(f), r, out)
+    }
 }
 
 /// A malformed message template (found by the registry tests).
@@ -495,11 +501,37 @@ impl RuleDef {
         }
     }
 
+    /// Checks the fix template ([`RuleDef::fix`]): non-empty, one line, placeholders parse and
+    /// refer to declared arguments (`{N}` only; unused arguments are fine).
+    pub fn check_fix(&self) -> Result<(), MessageError> {
+        if self.fix.is_empty() || self.fix.contains('\n') {
+            return Err(MessageError::Syntax(0));
+        }
+        for piece in pieces(self.fix) {
+            match piece? {
+                Piece::Lit(_) => {}
+                Piece::Arg(i) if i >= self.args.len() => return Err(MessageError::Missing(i)),
+                Piece::Arg(_) => {}
+                Piece::Rest(..) => return Err(MessageError::Rest),
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the message for `args`, which should satisfy [`accepts`](Self::accepts) (missing
     /// arguments render as `?`). No allocation: numbers are formatted directly into `out`, ids
     /// through `r`.
     pub fn write_message(&self, args: &[Arg], r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Result {
-        for piece in pieces(self.message) {
+        self.write_template(self.message, args, r, out)
+    }
+
+    /// Writes the fix hint ([`RuleDef::fix`]) for `args`, like [`write_message`](Self::write_message).
+    pub fn write_fix(&self, args: &[Arg], r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Result {
+        self.write_template(self.fix, args, r, out)
+    }
+
+    fn write_template(&self, template: &str, args: &[Arg], r: &dyn ArgResolver, out: &mut dyn fmt::Write) -> fmt::Result {
+        for piece in pieces(template) {
             match piece {
                 Ok(Piece::Lit(s)) => out.write_str(s)?,
                 Ok(Piece::Arg(i)) => match (args.get(i), self.args.get(i)) {

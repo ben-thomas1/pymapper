@@ -41,6 +41,7 @@ its members. Units whose `dependencies` are `dynamic` are not checked (unless Po
 `[tool.poetry.dependencies]`). Reported once per import statement and distribution, at the \
 module (`from yaml import (a, b)` reports `yaml` once, on the statement's first line).\n\n\
 Fix: add the distribution to the project's dependencies.",
+        fix: "add `{1}` (it provides `{0}`) to the project's dependencies",
         severity: Severity::Error,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -62,6 +63,7 @@ meta-package) is reported with confidence 50. Plugins, CLI tools and runtime-onl
 legitimate exceptions; ignore them with `per-file-ignores` on `pyproject.toml` or an inline \
 suppression on the dependency line.\n\n\
 Fix: remove the dependency, or move it to the group that needs it.",
+        fix: "remove dependency `{0}`, or move it to the group that needs it",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -82,6 +84,7 @@ Fix: remove the dependency, or move it to the group that needs it.",
 reported once per import statement, at the module; a private name at the name. Private internals \
 change without notice between releases.\n\n\
 Fix: use the package's public API, or pin the version and isolate the access in one module.",
+        fix: "use the public API of `{1}` instead of `{0}`, or pin the version and isolate the access in one module",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Linear,
@@ -102,6 +105,7 @@ extras honoured). It may disappear when that dependency changes. When this rule 
 is enabled such imports are reported as PM604 instead of PM601; it is off by default because \
 PM601 already reports them.\n\n\
 Fix: declare the distribution directly.",
+        fix: "declare `{1}` (it provides `{0}`) directly; it is installed only as a dependency of `{2}`",
         severity: Severity::Warning,
         default_enabled: false,
         cost: CostClass::Linear,

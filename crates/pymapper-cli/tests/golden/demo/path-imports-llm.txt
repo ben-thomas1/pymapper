@@ -1,0 +1,9 @@
+# pymapper path --imports app models.base
+from: app (module, app.py) · to: models.base (module, models/base.py) · root: .
+Import path: 2 edges
+Not import edges: importlib.import_module / __import__ with computed names, imports in notebooks and C extensions.
+
+1. app -> models.order [import, top-level] at app.py:6:26
+2. models.order -> models.base [import, top-level] at models/order.py:1:25
+
+Next: `pymapper imports app` for every import of the start · `pymapper cycles --symbol app` for cycles through it

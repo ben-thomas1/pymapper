@@ -233,3 +233,37 @@ fn no_venv_warns_and_exits_0() {
     assert!(r.stderr.contains("no virtualenv found"), "{}", r.stderr);
     assert!(r.stdout.contains("0 of 0 distributions"), "{}", r.stdout);
 }
+
+/// `--llm` (ISSUES O4): header facts, one line per distribution, most used first, the cap
+/// and trailer, and the scorecard line with its grade and public API kept apart from the
+/// names used (never a fraction that can exceed 100%).
+#[test]
+fn llm_listing_and_scorecards() {
+    let p = project("llm");
+    let r = p.run(&["--no-cache", "--llm"]);
+    r.expect_code(0);
+    let want = "\
+# pymapper deps
+root: . · 2 of 3 distributions used by first-party code (3 first-party files) · listed: 2
+Usage counts static imports and resolved calls from first-party code; dynamic imports, CLI tools, plugins and unresolved calls are not seen. Scorecards are information, never findings (exit 0).
+
+foo 1.0: importers 1 · names used 1 · loc reached 8/12 (67%)
+fastlib 3.0: importers 1 · 1 import row · code not loaded
+
+1 unused distribution not listed (--all lists every one).
+
+Next: `pymapper deps --score --llm` for scorecards · `pymapper deps --check --llm` for undeclared and unused dependencies
+";
+    assert_eq!(r.stdout, want);
+    let r = p.run(&["--no-cache", "--llm", "--limit", "1", "--all"]);
+    r.expect_code(0);
+    assert!(r.stdout.contains("\nfoo 1.0: importers 1 ·"), "{}", r.stdout);
+    assert!(!r.stdout.contains("fastlib"), "{}", r.stdout);
+    assert!(r.stdout.contains("\n2 more distributions not displayed. Use --limit 0 to show all.\n"), "{}", r.stdout);
+    let r = p.run(&["--no-cache", "--llm", "--score"]);
+    r.expect_code(0);
+    assert!(r.stdout.starts_with("# pymapper deps --score\n"), "{}", r.stdout);
+    let foo = r.stdout.lines().find(|l| l.starts_with("foo 1.0: grade ")).unwrap_or_else(|| panic!("{}", r.stdout));
+    assert!(foo.contains(" · importers 1 · names used 1 (public api 2) · loc reached 8/12 (67%)"), "{foo}");
+    assert!(r.stdout.contains("\nfastlib 3.0: grade - (code not loaded) · importers 1 ·"), "{}", r.stdout);
+}

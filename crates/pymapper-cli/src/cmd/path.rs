@@ -14,12 +14,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use pymapper_core::index::NodeId;
-use pymapper_core::query::{PathGraph, PathOptions, Scope, Scratch, ShortestPath};
+use pymapper_core::query::{PathGraph, PathOptions, Query, Scope, Scratch, ShortestPath};
 use pymapper_core::resolve::Confidence;
 use pymapper_core::timing;
 
 use super::query::hops;
-use super::query::{EXIT_NOT_FOUND, Pair, QueryFlags, Session, Writer, finish, import_site, locate, parse_conf};
+use super::query::{EXIT_NOT_FOUND, Pair, QueryFlags, Session, Writer, finish, import_site, llm, locate, parse_conf};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -72,7 +72,12 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let found = timing::time("query", || q.path(from, to, &opts, &mut scratch));
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
-    timing::time("output", || write(&q, &mut w, from, to, &opts, found.as_ref()));
+    if w.llm {
+        let arg = format!("{} {}", args.from, args.to);
+        timing::time("output", || write_llm(&s, &q, &mut w, from, to, &opts, found.as_ref(), &arg));
+    } else {
+        timing::time("output", || write(&q, &mut w, from, to, &opts, found.as_ref()));
+    }
     finish(w)?;
     s.report_stats(&q, &[("path_len", found.as_ref().map_or(0, |p| p.len() as u64))]);
     Ok(if found.is_some() { ExitCode::SUCCESS } else { ExitCode::from(EXIT_NOT_FOUND) })
@@ -205,4 +210,79 @@ fn write(q: &pymapper_core::query::Query<'_>, w: &mut Writer<'_>, from: NodeId, 
         }
     }
     w.end_line();
+}
+
+/// The llm rendering: the chain one numbered edge per line at its call site (import line),
+/// with the edge's confidence (import flags).
+#[allow(clippy::too_many_arguments)]
+fn write_llm(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, from: NodeId, to: NodeId, opts: &PathOptions, found: Option<&ShortestPath>, arg: &str) {
+    let imports = opts.graph == PathGraph::Imports;
+    llm::header(w, if imports { "path --imports" } else { "path" }, arg);
+    w.str("from: ");
+    hops::describe_target(w, from);
+    llm::sep(w);
+    w.str("to: ");
+    hops::describe_target(w, to);
+    llm::sep(w);
+    llm::root(w, s);
+    w.end_line();
+    match found {
+        Some(p) => {
+            w.str(if imports { "Import path: " } else { "Call path: " });
+            llm::count(w, p.len() as u64, "edge", "edges");
+            if let Some(c) = p.worst() {
+                w.str(", least sure ");
+                w.str(c.as_str());
+            }
+            if p.is_empty() {
+                w.str(" (the symbols overlap)");
+            }
+        }
+        None => {
+            w.str(if imports { "No import path" } else { "No call path" });
+            if opts.max_len != u32::MAX {
+                w.str(" within ");
+                llm::count(w, u64::from(opts.max_len), "edge", "edges");
+            }
+            w.str(" (exit 1)");
+        }
+    }
+    w.end_line();
+    if imports {
+        llm::import_blind_spots(w);
+    } else {
+        llm::call_blind_spots(w, s);
+    }
+    if let Some(p) = found {
+        let sites = edge_sites(q, p);
+        w.end_line();
+        for (i, &site) in sites.iter().enumerate() {
+            w.num(i as u64 + 1);
+            w.str(". ");
+            w.qid(p.nodes[i]);
+            w.str(" -> ");
+            w.qid(p.nodes[i + 1]);
+            match p.conf(i) {
+                Some(c) => w.conf_tag(c, p.dispatch(i)),
+                None => {
+                    w.str(" [import, ");
+                    w.import_kind(p.import_flags(i));
+                    w.str("]");
+                }
+            }
+            if let Some((f, line, col)) = site {
+                w.str(" at ");
+                w.loc_plain(f, line, col);
+            }
+            w.end_line();
+        }
+    }
+    let (a, b) = (llm::qid_arg(w, from), llm::qid_arg(w, to));
+    let next = match (found.is_some(), imports) {
+        (true, false) => format!("`pymapper callers {b}` for every caller of the end · `--edges likely` to skip guessed edges"),
+        (true, true) => format!("`pymapper imports {a}` for every import of the start · `pymapper cycles --symbol {a}` for cycles through it"),
+        (false, false) => format!("`pymapper path {a} {b} --imports` for an import chain · `pymapper callers {b}` for what does call it"),
+        (false, true) => format!("`pymapper imports {b} --direction in` for what imports the end"),
+    };
+    llm::next(w, &next);
 }

@@ -741,8 +741,16 @@ impl Context for HygieneContext<'_> {
         }
     }
 
+    fn write_root_dir(&self, out: &mut Vec<u8>) {
+        self.inner.write_root_dir(out);
+    }
+
     fn write_symbol_id(&self, sym: SymbolId, out: &mut Vec<u8>) {
         self.inner.write_symbol_id(sym, out);
+    }
+
+    fn parent_symbol(&self, sym: SymbolId) -> SymbolId {
+        self.inner.parent_symbol(sym)
     }
 
     fn def_end_line(&self, sym: SymbolId) -> u32 {

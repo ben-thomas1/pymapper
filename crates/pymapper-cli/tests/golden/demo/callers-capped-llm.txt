@@ -1,0 +1,14 @@
+# pymapper callers models.order:Order
+target: models.order:Order (class, models/order.py:5) · root: . · 5 callers in 3 files (4 possible)
+Confidence: certain/likely = resolved call; possible = guessed from a unique method name; dispatch = base method to an override.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+## app.py (app)
+main [certain] at 29:13
+
+## services/invoice.py (services.invoice)
+invoice_lines [possible] at 11:35
+
+3 more callers not displayed. Use --limit 0 to show all.
+
+Next: `pymapper impact models.order:Order` for everything that depends on it transitively · `--depth N` for callers of callers

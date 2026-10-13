@@ -5,10 +5,11 @@
 //! One document; one finding object per line so the output diffs and streams well:
 //!
 //! ```text
-//! {"version":2,"tool":{"name":"pymapper","version":"0.3.0"},"min_confidence":80,"findings":[
-//!   {"code":"PM101","name":"complex-function","severity":"warning","confidence":100,
-//!    "path":"pkg/mod.py","line":3,"col":5,"end_line":40,"symbol":"pkg.mod:f","message":"...",
-//!    "value":14,"threshold":10},
+//! {"version":2,"tool":{"name":"pymapper","version":"0.4.0"},"root":"/abs/project",
+//!  "min_confidence":80,"findings":[
+//!   {"code":"PM101","id":"PM101-0b2e","name":"complex-function","severity":"warning",
+//!    "confidence":100,"path":"pkg/mod.py","line":3,"col":5,"end_line":40,"symbol":"pkg.mod:f",
+//!    "message":"...","value":14,"threshold":10,"fix":"extract branches of `pkg.mod:f` ..."},
 //!   {"code":"PM301",...,"message":"import cycle (3 modules): a -> b -> a",
 //!    "cycle":{"size":3,"members":["a","b","c"],"witness":["a","b"]}},
 //!   {"code":"PM501",...,"end_line":21,"symbol":"pkg.mod:g","message":"8 lines duplicated in ...",
@@ -20,6 +21,12 @@
 //!
 //! (`findings` entries are written on one line each; wrapped here for width.)
 //!
+//! - `root`: the absolute project root, which `path` values are relative to (`null` when
+//!   unknown).
+//! - `id`: the stable finding id (`PM401-3fa2`, see [`super::ids`]), as shown by the text
+//!   formats and accepted by `pymapper explain`.
+//! - `fix`: a one-line fix hint, the rule's template ([`crate::rules::RuleDef::fix`]) filled with
+//!   the finding's facts (the same text as the `--llm` output, with qualified symbols).
 //! - `path` is relative to the project root (`null` for project-level findings); `line` and
 //!   `col` are 1-based (`null` when unknown; `col` counts bytes); `symbol` is the stable
 //!   qualified id (`null` when the finding is not about a symbol); for PM405 it is
@@ -40,6 +47,7 @@
 //! New fields may be added without a version bump; removals and meaning changes bump
 //! [`JSON_VERSION`]. History:
 //!
+//! - 2 (0.4.0, additive): top-level `root`; per finding `id` and `fix`.
 //! - 2: PM405 `symbol` is `pkg.mod:<name>` (was the module); overload implementations have no
 //!   `#N` suffix (see the index docs); PM104 / PM107 values exclude docstrings and test code is
 //!   skipped by default (`analysis.include-tests-in-metrics`). Added `end_line`, `value`,
@@ -225,17 +233,32 @@ pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, ou
         b.extend_from_slice(b",\"tool\":{\"name\":\"pymapper\",\"version\":");
         push_str(b, env!("CARGO_PKG_VERSION").as_bytes());
         b.push(b'}');
+        key(b, "root", false);
+        sym.clear();
+        r.ctx().write_root_dir(&mut sym);
+        if sym.is_empty() {
+            b.extend_from_slice(b"null");
+        } else {
+            push_str(b, &sym);
+        }
         key_u32(b, "min_confidence", u32::from(opts.min_confidence));
         b.extend_from_slice(b",\"findings\":[");
     }
+    let ids = r.ids();
+    let mut fix = String::with_capacity(super::SCRATCH);
     for (i, f) in r.iter().enumerate() {
         r.message(f, &mut msg);
+        r.fix(f, &mut fix);
         r.symbol_id(f, &mut sym);
         let def = f.rule.def();
         let b = out.buf();
         b.extend_from_slice(if i == 0 { b"\n  {\"code\":\"PM" } else { b",\n  {\"code\":\"PM" });
         let code = f.rule.code();
         b.extend_from_slice(&[b'0' + (code / 100 % 10) as u8, b'0' + (code / 10 % 10) as u8, b'0' + (code % 10) as u8]);
+        b.push(b'"');
+        key(b, "id", false);
+        b.push(b'"');
+        ids.get(i).push(b);
         b.push(b'"');
         key(b, "name", false);
         push_str(b, def.name.as_bytes());
@@ -274,6 +297,8 @@ pub(super) fn write_report(r: &Report<'_>, opts: &Options, summary: &Summary, ou
             }
             b.push(b']');
         }
+        key(b, "fix", false);
+        push_str(b, fix.as_bytes());
         b.push(b'}');
         out.maybe_flush();
     }

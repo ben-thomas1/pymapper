@@ -1,0 +1,8 @@
+# pymapper path app:main services.pricing:calculate_price
+from: app:main (function, app.py:24) · to: services.pricing:calculate_price (function, services/pricing.py:6) · root: .
+Call path: 1 edge, least sure certain
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+1. app:main -> services.pricing:calculate_price [certain] at app.py:31:11
+
+Next: `pymapper callers services.pricing:calculate_price` for every caller of the end · `--edges likely` to skip guessed edges

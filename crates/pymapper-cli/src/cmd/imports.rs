@@ -4,7 +4,7 @@
 //! ```text
 //!   load (as check) ──> Query ──> resolve SYMBOL ──> Query::deps (imports only, both
 //!   directions; other endpoint mapped to its module, or its ancestor at --depth) ──> PATHS
-//!   filter ──> Query::import_sites (shown rows) ──> concise | json
+//!   filter ──> Query::import_sites (shown rows) ──> text | llm | json
 //! ```
 //!
 //! Every row sits at the first import statement behind it (the target's files for `out`, the
@@ -27,7 +27,7 @@ use pymapper_core::rollup::Level;
 use pymapper_core::timing;
 
 use super::query::hops::{self, RowCounts};
-use super::query::{QueryFlags, Session, Writer, finish, origin_str};
+use super::query::{QueryFlags, Session, Writer, finish, llm, origin_str};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -125,7 +125,11 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let inc = side(Direction::In);
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
-    timing::time("output", || write(&q, &mut w, target, args.depth, out.as_ref(), inc.as_ref(), limit));
+    if w.llm {
+        timing::time("output", || write_llm(&s, &q, &mut w, target, args.depth, out.as_ref(), inc.as_ref(), &args.symbol));
+    } else {
+        timing::time("output", || write(&q, &mut w, target, args.depth, out.as_ref(), inc.as_ref(), limit));
+    }
     finish(w)?;
     let n = |x: &Option<Side>| x.as_ref().map_or(0, |x| x.counts.matched as u64);
     s.report_stats(&q, &[("out", n(&out)), ("in", n(&inc))]);
@@ -309,4 +313,81 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, 
     }
     hops::filter_note(w, &merged);
     w.end_line();
+}
+
+/// The llm rendering: one section per direction, one row per module at its first import
+/// statement with the edge kind (top-level / inside a function / TYPE_CHECKING / try /
+/// conditional) and its rows; imports of code that is not loaded after the modules.
+#[allow(clippy::too_many_arguments)]
+fn write_llm(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, depth: Option<u32>, out: Option<&Side>, inc: Option<&Side>, arg: &str) {
+    let ix = q.index();
+    llm::header(w, "imports", arg);
+    llm::target(w, target);
+    llm::sep(w);
+    llm::root(w, s);
+    if let Some(d) = depth {
+        w.str(" · rolled up to depth ");
+        w.num(u64::from(d));
+    }
+    if let Some(o) = out {
+        llm::sep(w);
+        w.num(o.counts.matched as u64);
+        w.str(" out");
+        if !o.deps.external.is_empty() {
+            w.str(" (");
+            w.num(o.deps.external.len() as u64);
+            w.str(" not loaded)");
+        }
+    }
+    if let Some(i) = inc {
+        llm::sep(w);
+        w.num(i.counts.matched as u64);
+        w.str(" in");
+    }
+    w.end_line();
+    llm::import_blind_spots(w);
+    for (dir, side) in [("out", out), ("in", inc)] {
+        let Some(side) = side else { continue };
+        w.end_line();
+        w.str(if dir == "out" { "## Out: what it imports (" } else { "## In: what imports it (" });
+        w.num(side.counts.matched as u64);
+        w.str(")");
+        w.end_line();
+        let n = side.sites.len();
+        for (d, site) in side.deps.deps[..n].iter().zip(&side.sites) {
+            w.qid(d.node);
+            w.str(" (");
+            let o = origin_str(ix, d.node);
+            if o != "first-party" {
+                w.str(o);
+                w.str(", ");
+            }
+            w.import_kind(d.import_flags);
+            w.str(", ");
+            llm::count(w, u64::from(d.imports), "row", "rows");
+            w.str(")");
+            if let Some(st) = site {
+                w.str(" at ");
+                w.loc_plain(st.file, st.line, st.col);
+            }
+            w.end_line();
+        }
+        for (e, site) in side.deps.external[..side.ext_sites.len()].iter().zip(&side.ext_sites) {
+            w.external_name(e);
+            w.str(" (");
+            w.str(ext_origin(e));
+            w.str(", not loaded, ");
+            llm::count(w, u64::from(e.rows), "row", "rows");
+            w.str(")");
+            if let Some(st) = site {
+                w.str(" at ");
+                w.loc_plain(st.file, st.line, st.col);
+            }
+            w.end_line();
+        }
+        let what = if dir == "out" { "imported modules" } else { "importing modules" };
+        llm::trailer(w, side.counts.matched, side.counts.shown, side.counts.outside, what);
+    }
+    let id = llm::qid_arg(w, target);
+    llm::next(w, &format!("`pymapper cycles --symbol {id}` for import cycles through it · `pymapper impact {id}` for what a change can break"));
 }

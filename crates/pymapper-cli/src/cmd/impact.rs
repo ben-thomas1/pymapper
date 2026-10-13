@@ -3,7 +3,7 @@
 //!
 //! ```text
 //!   load (as check) ──> calls ──> Query ──> resolve SYMBOL ──> Query::impact (reverse BFS,
-//!   per-module counts, tests, files, transitive importers) ──> PATHS filter ──> concise | json
+//!   per-module counts, tests, files, transitive importers) ──> PATHS filter ──> text | llm | json
 //! ```
 //!
 //! Rows carry the least sure edge on the path back to the symbol: `[possible]` means at least
@@ -13,12 +13,13 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use pymapper_core::analysis::testfiles;
 use pymapper_core::index::NodeId;
 use pymapper_core::query::{Impact, Query, Scratch};
 use pymapper_core::timing;
 
 use super::query::hops::{self, RowCounts, Side};
-use super::query::{QueryFlags, Session, WalkFlags, Writer, finish, import_site};
+use super::query::{QueryFlags, Session, WalkFlags, Writer, finish, import_site, llm};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -41,6 +42,10 @@ pub struct Args {
 /// Most affected modules named in the concise summary line.
 const TOP_MODULES: usize = 3;
 
+/// Importing modules named in llm output (the rest are counted): a change to a function
+/// rarely concerns every transitive importer of its module (ISSUES F9).
+const TOP_IMPORTERS: usize = 10;
+
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let s = Session::open("impact", args.flags, args.paths)?;
     let q = s.query();
@@ -55,6 +60,12 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let limit = s.row_limit;
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
+    if w.llm {
+        let c = timing::time("output", || write_llm(&s, &q, &mut w, target, &imp, &args.symbol));
+        finish(w)?;
+        s.report_stats(&q, &[("reached", imp.walk.hops.len() as u64), ("importers", imp.importers.len() as u64), ("shown", c.rows.shown as u64)]);
+        return Ok(ExitCode::SUCCESS);
+    }
     let counts = timing::time("output", || {
         if w.json {
             w.json_header("impact");
@@ -208,4 +219,120 @@ fn summary_line(w: &mut Writer<'_>, target: u32, imp: &Impact, rows: &RowCounts,
     };
     hops::filter_note(w, &both);
     w.end_line();
+}
+
+/// The llm rendering (ISSUES O4): affected symbols first, grouped by file; the importing
+/// modules collapsed to a count and the first [`TOP_IMPORTERS`] (direct importers first).
+fn write_llm(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, target: NodeId, imp: &Impact, arg: &str) -> hops::WalkCounts {
+    let ix = q.index();
+    let c = hops::walk_counts(s, &imp.walk, s.row_limit, true);
+    // The target's modules (a def: its own module): their importers are direct.
+    let modules = match (ix.kind(target).is_def(), ix.file(target)) {
+        (true, Some(f)) => ix.file_node(f)..ix.file_node(f) + 1,
+        (true, None) => target..target,
+        (false, _) => ix.subtree(target),
+    };
+    let mut importers: Vec<(bool, usize)> = Vec::new();
+    let mut outside = 0;
+    let mut in_tests = 0;
+    for (i, (&m, via)) in imp.importers.iter().zip(&imp.importer_via).enumerate() {
+        if !s.node_in_scope(m) {
+            outside += 1;
+            continue;
+        }
+        in_tests += usize::from(ix.file(m).is_some_and(|f| testfiles::is_test_file(ix, f)));
+        importers.push((!modules.contains(via), i));
+    }
+    let direct = importers.iter().filter(|x| !x.0).count();
+    llm::header(w, "impact", arg);
+    llm::target(w, target);
+    llm::sep(w);
+    llm::root(w, s);
+    w.end_line();
+    w.str("Affected: ");
+    w.num(c.rows.matched as u64);
+    w.str(" (");
+    llm::count(w, u64::from(imp.symbols), "symbol", "symbols");
+    w.str(", ");
+    w.num(u64::from(imp.module_scopes));
+    w.str(" module level) in ");
+    llm::count(w, u64::from(imp.files), "file", "files");
+    w.str(", ");
+    w.num(u64::from(imp.tests));
+    w.str(" in tests, ");
+    w.num(c.possible as u64);
+    w.str(" only through a possible edge · importing modules: ");
+    w.num(importers.len() as u64);
+    w.str(" (");
+    w.num(direct as u64);
+    w.str(" direct, ");
+    w.num(in_tests as u64);
+    w.str(" in tests)");
+    w.end_line();
+    w.str("Tags are the least sure edge on the path back to the target.");
+    w.end_line();
+    llm::call_blind_spots(w, s);
+    if c.rows.matched > 0 {
+        w.end_line();
+        w.str("Affected symbols, grouped by file (closest first):");
+        w.end_line();
+        hops::write_llm_rows(s, q, w, &imp.walk, Side::Callers, s.row_limit, true);
+    }
+    if !importers.is_empty() {
+        // Direct importers first, then in breadth-first order.
+        importers.sort_by_key(|&(indirect, i)| (indirect, i));
+        let top = importers.len().min(TOP_IMPORTERS).min(s.row_limit);
+        w.end_line();
+        w.str("## Importing modules (");
+        w.num(importers.len() as u64);
+        if top < importers.len() {
+            w.str("; first ");
+            w.num(top as u64);
+            w.str(" shown, direct first");
+        }
+        w.str("): import the target's module, so a removed or renamed name breaks them; most do not call it");
+        w.end_line();
+        for &(indirect, i) in &importers[..top] {
+            let m = imp.importers[i];
+            w.qid(m);
+            w.str(" (");
+            let site = import_site(q, m, imp.importer_via[i]);
+            match site {
+                Some((f, line, _)) => {
+                    w.file(f);
+                    w.str(":");
+                    w.num(u64::from(line));
+                }
+                None => w.def_at(m),
+            }
+            if indirect {
+                w.str(", via ");
+                w.qid(imp.importer_via[i]);
+            }
+            w.str(")");
+            w.end_line();
+        }
+        if top < importers.len() {
+            w.num((importers.len() - top) as u64);
+            w.str(" more importing modules not displayed (use --output-format json for all).");
+            w.end_line();
+        }
+    }
+    if !imp.modules.is_empty() {
+        w.end_line();
+        w.str("Most affected modules: ");
+        for (i, &(m, n)) in imp.modules.iter().take(TOP_MODULES).enumerate() {
+            if i > 0 {
+                w.str(", ");
+            }
+            w.qid(m);
+            w.str(" ");
+            w.num(u64::from(n));
+        }
+        w.end_line();
+    }
+    llm::trailer(w, c.rows.matched, c.rows.shown, c.rows.outside + outside, "affected symbols");
+    let id = llm::qid_arg(w, target);
+    llm::next(w, &format!("`pymapper callers {id}` for the direct call sites · `pymapper explain {id}` for findings on it"));
+    c
 }

@@ -46,8 +46,8 @@ covering the project root filters nothing. A path that does not exist is a usage
 |------|---------|
 | `--score` | add the scorecard columns (JSON: a `scorecard` object per distribution) |
 | `--all` | list every distribution, not only those first-party code imports or calls |
-| `--format concise\|json` | output format (`--output-format`, config `output-format`); `sarif` and `github` are usage errors |
-| `--check` | run the dependency-hygiene rules PM601-PM604 instead of listing ([Hygiene](#hygiene---check)); all four formats |
+| `--format human\|llm\|concise\|json`, `--llm` | output format (`--output-format`, config `output-format`; `--llm` = `--output-format llm`); `sarif` and `github` are usage errors |
+| `--check` | run the dependency-hygiene rules PM601-PM604 instead of listing ([Hygiene](#hygiene---check)); every format |
 | `--baseline FILE`, `--save-baseline FILE` | with `--check`: as for `check` |
 | `--stats` | phase timings (`deps.usage`, `deps.score`, ...), counters and peak RSS on stderr |
 | configuration flags | as for `check` (`--venv`, `--cache-dir`, `--no-cache`, `-j`, `--set`, `--config`, ...) |
@@ -160,7 +160,7 @@ are imports of distributions that a workspace member pulls in, which `--extend-s
 reports as transitive instead.)
 
 `--check` runs the PM6xx rules ([`rules.md`](rules.md#dependencies)) with everything `check`
-has: the formats (`concise`, `json`, `sarif`, `github`), the rule selection (`select`,
+has: the formats (`human`, `llm` / `--llm`, `concise`, `json`, `sarif`, `github`), the rule selection (`select`,
 `--select PM604`, ...), `per-file-ignores`, inline suppressions, the confidence gate,
 `--baseline` / `--save-baseline` / `baseline`, `--stats` and the exit codes (0 clean, 1
 findings at or above the gate, 2 usage or fatal error). Only the PM6xx rules run: selecting

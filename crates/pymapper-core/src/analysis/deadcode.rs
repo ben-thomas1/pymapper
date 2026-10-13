@@ -95,6 +95,9 @@
 //! ([`crate::rules::dead_code::reason`]: `no-references`, `only-used-by-unused-code`,
 //! `name-elsewhere`, `possible-call-only`, `module-dynamic-access`, ...), and the message
 //! names the strongest one: "is never used" only when nothing refers to the node at all.
+//! A PM401-PM403 finding that is only used by unused code also carries one *referrer* (the
+//! smallest calling node, else the importing module, else a subclass) as an extra argument, so
+//! the llm output can show a dead chain as one decision ("root X; also dead if X goes: A, B").
 //!
 //! So, at the default gate, a def is reported when nothing reaches it, or when only a
 //! library-mode public name keeps it (confidence 80). A function reached only through a
@@ -238,7 +241,8 @@ use crate::config::{EntrypointMatcher, Mode};
 use crate::extract::config::ConfigEvidence;
 use crate::extract::facts::{DefKind, def_flags, evidence_hash};
 use crate::index::{FileId, Index, NONE, NodeId, NodeKind};
-use crate::reach::{BitSet, FileModes, RootOptions, RootSet, is_library, root_kind, roots};
+use crate::intern::FxHashMap;
+use crate::reach::{FileModes, RootOptions, RootSet, is_library, root_kind, roots};
 use crate::roots::{FileStatus, Origin, ProjectUnits};
 use crate::resolve::{Confidence, Imports, ResolvedCalls};
 use crate::rules::codes::{UNUSED_CLASS, UNUSED_FUNCTION, UNUSED_IMPORT, UNUSED_METHOD, UNUSED_MODULE};
@@ -887,20 +891,27 @@ fn unit_flags_of(ix: &Index, roots: &RootSet, modes: &FileModes, included: &[boo
 
 /// Defs below [`level::LIVE`] that something refers to, live or not: a `certain` / `likely`
 /// call or decorator edge from another def, an import of an included file, or a loaded
-/// subclass. Their findings say "only used by unused code" rather than "never used". O(nodes +
-/// call edges + import rows + class bases); one bit per node.
-fn referenced_defs(ix: &Index, imp: &Imports, g: &DefGraph<'_>, level: &[u8], included: &[bool]) -> BitSet {
+/// subclass. Their findings say "only used by unused code" rather than "never used". Each maps
+/// to one referrer (for dead-chain grouping in the output): the smallest calling node, else the
+/// importing module, else the subclass. O(nodes + call edges + import rows + class bases); one
+/// map entry per referenced def below [`level::LIVE`].
+fn referenced_defs(ix: &Index, imp: &Imports, g: &DefGraph<'_>, level: &[u8], included: &[bool]) -> FxHashMap<NodeId, NodeId> {
     let n = ix.node_count();
-    let mut out = BitSet::new(n);
+    let mut out: FxHashMap<NodeId, NodeId> = FxHashMap::default();
     let rev = g.calls.reverse();
     for v in 0..n {
         if level[v as usize] == level::LIVE || !ix.kind(v).is_def() {
             continue;
         }
         let labels = rev.neighbour_labels(v);
-        let sure = |(i, &w): (usize, &u32)| w != v && labels.get(i).is_none_or(|&l| l <= Confidence::Likely as u8);
-        if rev.neighbours(v).iter().enumerate().any(sure) {
-            out.insert(v);
+        let mut first = NONE;
+        for (i, &w) in rev.neighbours(v).iter().enumerate() {
+            if w != v && labels.get(i).is_none_or(|&l| l <= Confidence::Likely as u8) && w < first {
+                first = w;
+            }
+        }
+        if first != NONE {
+            out.insert(v, first);
         }
     }
     for f in 0..ix.file_count() {
@@ -909,17 +920,21 @@ fn referenced_defs(ix: &Index, imp: &Imports, g: &DefGraph<'_>, level: &[u8], in
         }
         for row in ix.file_facts(f).imports.range() {
             if let Some(t) = imp.target(row)
+                && level[t as usize] != level::LIVE
                 && ix.kind(t).is_def()
                 && ix.file(t) != Some(f)
             {
-                out.insert(t);
+                out.entry(t).or_insert(ix.file_node(f));
             }
         }
     }
     let cl = g.classes;
     for c in 0..cl.len() {
         for &b in cl.bases(c) {
-            out.insert(cl.node(b));
+            let base = cl.node(b);
+            if level[base as usize] != level::LIVE {
+                out.entry(base).or_insert(cl.node(c as _));
+            }
         }
     }
     out
@@ -1072,7 +1087,7 @@ fn module_phrase(dc: &DeadCode, m: NodeId) -> (u32, u32) {
 fn findings(
     ix: &Index,
     info: &seeds::FileInfo,
-    referenced: &BitSet,
+    referenced: &FxHashMap<NodeId, NodeId>,
     cov: Option<&Coverage>,
     dc: &mut DeadCode,
     emit: Emit,
@@ -1121,8 +1136,12 @@ fn findings(
             if on {
                 stack.push((ix.subtree(v).end, conf));
                 let at = Location::new(file, defs.name_line[row], defs.name_col[row] + 1);
-                let (phrase, reasons) = def_wording(dc, v, referenced.contains(v), not_executed(v));
-                out.push_with_reasons(rule, at, SymbolId(v), conf, &[Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)], reasons);
+                let by = referenced.get(&v).copied();
+                let (phrase, reasons) = def_wording(dc, v, by.is_some(), not_executed(v));
+                let args = [Arg::Symbol(SymbolId(v)), Arg::Phrase(phrase)];
+                // Extra: the referrer of a def only used by unused code (dead-chain grouping).
+                let extra = by.map(|w| [Arg::Symbol(SymbolId(w))]);
+                out.push_full(rule, at, 0, SymbolId(v), conf, reasons, &args, extra.as_ref().map_or(&[][..], |e| &e[..]));
                 dc.stats.findings[slot] += 1;
             }
         }

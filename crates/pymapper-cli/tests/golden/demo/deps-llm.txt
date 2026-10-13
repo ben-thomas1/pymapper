@@ -1,0 +1,5 @@
+# pymapper deps
+root: . · 0 of 0 distributions used by first-party code (23 first-party files) · listed: 0
+Usage counts static imports and resolved calls from first-party code; dynamic imports, CLI tools, plugins and unresolved calls are not seen. Scorecards are information, never findings (exit 0).
+
+Next: `pymapper deps --score --llm` for scorecards · `pymapper deps --check --llm` for undeclared and unused dependencies

@@ -5,9 +5,9 @@
 ::error file=pkg/alpha.py,line=3,col=1,title=PM303 forbidden-import::`pkg.alpha` imports forbidden module `we"ird%0Aname` (contract `core-layers`)
 ::warning file=pkg/alpha.py,line=3,col=1,title=PM405 unused-import::`os.path` is imported but never used (confidence 90)
 ::warning file=pkg/alpha.py,line=3,col=1,title=PM405 unused-import::`yaml` is imported but never used (confidence 90)
-::notice file=pkg/alpha.py,line=20,col=5,title=PM106 low-maintainability::`pkg.alpha:Big.run` has a low maintainability index (12.2 < 20.0)
+::notice file=pkg/alpha.py,line=20,col=5,endLine=25,title=PM106 low-maintainability::`pkg.alpha:Big.run` has a low maintainability index (12.2 < 20.0)
 ::error file=pkg/café/�.py,line=2,title=PM601 undeclared-dependency::`yaml` is provided by `PyYAML`, which is not a declared dependency
-::warning file=pkg/zeta.py,line=12,col=5,title=PM101 complex-function::`pkg.zeta:handle` is too complex (McCabe 14 > 10)
-::notice file=pkg/zeta.py,line=14,col=9,title=PM501 duplicate-code::8 lines duplicated in pkg/alpha.py:40 (confidence 96)
+::warning file=pkg/zeta.py,line=12,col=5,endLine=30,title=PM101 complex-function::`pkg.zeta:handle` is too complex (McCabe 14 > 10)
+::notice file=pkg/zeta.py,line=14,col=9,endLine=21,title=PM501 duplicate-code::8 lines duplicated in pkg/alpha.py:40 (confidence 96)
 Found 11 findings in 5 files (1 below min-confidence 80; 42 files checked).
 Not shown: 1 suppressed, 3 ignored by per-file-ignores, 1 below min-confidence.

@@ -1,0 +1,65 @@
+Architecture  2
+  models/order.py
+     2:29  imports forbidden repo.order_repo (contract: models are independent of repo)   PM303-e6ff
+  repo/order_repo.py
+     1:26  import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo   PM301-e35f
+
+Complexity  1 function
+  services/pricing.py
+     6:5   calculate_price  McCabe 14>10 · cognitive 32>15 · nesting 5>4 · params 8>7  PM101-312c +PM102,PM103,PM105
+
+Duplication  1 pair
+  services/invoice.py:1  invoice_lines  ↔  services/pricing.py:39  receipt_lines  (12 lines) (confidence 98)  PM501-f258
+
+Dead code  28
+  app.py
+    13:5   function  list_users             has no resolved callers (an unknown decorator may register it) (confidence 40: unknown-decorator)  PM401-e889
+    19:5   function  health_check           has no resolved callers (an unknown decorator may register it) (confidence 40: unknown-decorator)  PM401-a442
+    35:5   function  dead_endpoint          never used                                    PM401-e3b2
+  middleware/pipeline.py
+    21:5   function  format_receipt         never used                                    PM401-61ec
+  models/base.py
+     2:9   method    BaseModel.validate     only used by unused code (confidence 50: only-used-by-unused-code, possible-call-only)  PM403-6ccd
+     9:9   method    BaseModel.to_dict      only used by unused code (confidence 50: only-used-by-unused-code, possible-call-only)  PM403-524e
+    12:9   method    BaseModel.save         never used                                    PM403-7339
+    17:9   method    BaseModel.serialize    has only possible callers (unique method name, unresolved receiver) (confidence 50: possible-call-only)  PM403-565b
+    20:9   method    BaseModel.is_valid     has only possible callers (unique method name, unresolved receiver) (confidence 50: possible-call-only)  PM403-bb65
+  models/order.py
+    12:9   method    Order.total            has only possible callers (unique method name, unresolved receiver) (confidence 50: possible-call-only)  PM403-0917
+    15:9   method    Order.archive          never used                                    PM403-d26a
+  models/product.py
+     4:7   class     Product                only used by unused code (confidence 30: only-used-by-unused-code, exported)  PM402-efd7
+    10:9   method    Product.display_price  never used                                    PM403-5d6b
+  models/user.py
+    10:9   method    User.display_name      never used                                    PM403-0ad5
+  repo/product_repo.py
+     1:1   module    repo.product_repo      never imported                                PM404-d26e
+  repo/user_repo.py
+     9:5   function  delete_user            never used                                    PM401-5619
+  services/auth.py
+     2:9   function  require_auth.wrapper   has no resolved callers (name appears in its own file) (confidence 10: name-in-same-file)  PM401-428a
+    11:5   function  make_validator         never used                                    PM401-5dad
+    29:5   function  classify_token         never used                                    PM401-974d
+    34:5   function  create_authenticator   never used                                    PM401-f0b1
+  services/pricing.py
+    53:5   function  legacy_discount        never used                                    PM401-145e
+    57:7   class     PromoEngine            never used                                    PM402-d424
+  services/user_service.py
+    22:5   function  get_user_display       never used                                    PM401-f4f8
+  utils/decorators.py
+     3:9   function  log_calls.wrapper      has no resolved callers (name appears in its own file) (confidence 10: name-in-same-file)  PM401-226f
+  utils/formatting.py
+     5:5   function  format_currency        only used by unused code                      PM401-5fdd
+     9:5   function  format_percentage      never used                                    PM401-04b6
+  utils/legacy_helpers.py
+     1:1   module    utils.legacy_helpers   never imported                                PM404-c008
+  utils/validation.py
+    15:5   function  validate_range         never used                                    PM401-c422
+
+Unused imports  2
+  middleware/pipeline.py
+     6:25  User                                                                           PM405-f95d
+  services/pricing.py
+     1:8   json                                                                           PM405-4ed8
+
+38 findings in 17 files (23 files checked) · architecture 2 · complexity 1 function · duplication 1 pair · dead code 28 · unused imports 2

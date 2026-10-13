@@ -27,6 +27,7 @@ little is left), so runs of overloads are not reported. Duplicates must be kept 
 and drift apart.\n\n\
 Fix: extract the shared code into a function or base class.\n\n\
 Off unless `analysis.dupes = true` (token-window hashing across all first-party files).",
+    fix: "extract the {0} shared lines into one function (or base class) used by both copies",
     severity: Severity::Info,
     default_enabled: true,
     cost: CostClass::Expensive,

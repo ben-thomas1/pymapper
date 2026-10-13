@@ -1,0 +1,11 @@
+# pymapper cycles --calls --symbol cycles:ping
+target: cycles:ping (function, cycles.py:1) · root: . · 1 call cycle
+A call cycle is direct or mutual recursion; tags are the edge confidence.
+Not call edges (results may be incomplete): functions passed as values (callbacks, registries), getattr/string dispatch, calls from C extensions and notebooks, and unresolved calls (52.8% of call sites).
+
+## Cycle 1: 2 functions
+cycles:ping -> cycles:pong -> cycles:ping
+ping -> pong [certain] at cycles.py:2:5
+pong -> ping [certain] at cycles.py:6:5
+
+Next: `pymapper callers <member>` to see who enters the recursion

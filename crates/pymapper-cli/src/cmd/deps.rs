@@ -5,14 +5,15 @@
 //!   config (include-deps forced on) ──> roots ──> walk ──> index (cache) ──> imports
 //!     ──> calls ──> usage (importers, API used, LOC reached)  from first-party files in PATHS
 //!     ──> --score: scorecards (cached per distribution in `scores.pmc`, computed when missing)
-//!     ──> report (concise | json) ──> exit 0
+//!     ──> report (text | llm | json) ──> exit 0
 //! ```
 //!
 //! Scorecards are information, never findings: the exit code is 0 whatever the grades, 2 only
 //! for usage and fatal errors (as `check`). `--check` runs the dependency-hygiene rules instead
 //! (PM601-PM604, see [`hygiene`]), with the findings, formats and exit codes of `check`.
 
-use std::io;
+use std::fmt::Write as _;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -27,6 +28,7 @@ use pymapper_core::timing;
 
 mod hygiene;
 
+use super::check::RelPath;
 use super::config::ConfigArgs;
 use crate::pipeline::{self, warn};
 
@@ -68,6 +70,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     }
     let explicit = !args.paths.is_empty();
     let no_deps = args.config.no_deps;
+    let explicit_limit = args.config.limit;
     let mut loaded = timing::time("config", || args.config.load(args.paths))?;
     let config_file = loaded.project.config_file.as_ref().map(|(p, _)| p.as_path());
     pipeline::require_paths(&loaded.scope, true, None)?;
@@ -83,8 +86,8 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     }
     loaded.config.include_deps = true;
     let config = &loaded.config;
+    let llm = config.output_format == OutputFormat::Llm;
     let json = match config.output_format {
-        // Text renderings; the human and llm layouts for deps are not built yet.
         OutputFormat::Human | OutputFormat::Llm | OutputFormat::Concise => false,
         OutputFormat::Json => true,
         other => anyhow::bail!("`pymapper deps` writes the human, llm, concise and json formats, not `{}`", other.as_str()),
@@ -139,7 +142,19 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let opts = ReportOptions { score: args.score, all: args.all, json };
     let mut out = io::stdout().lock();
     // A closed pipe (`pymapper deps | head`) is not an error.
-    timing::time("output", || report.write(&opts, &mut out)).context("cannot write to stdout")?;
+    if llm {
+        let cwd = std::env::current_dir().context("cannot determine the working directory")?;
+        let limit = match explicit_limit.unwrap_or(config.limit) {
+            0 => usize::MAX,
+            n => n as usize,
+        };
+        let text = write_llm(&report, &opts, &RelPath(root, &cwd).to_string(), limit);
+        timing::time("output", || out.write_all(text.as_bytes()).and_then(|()| out.flush()))
+            .or_else(|e| if e.kind() == io::ErrorKind::BrokenPipe { Ok(()) } else { Err(e) })
+            .context("cannot write to stdout")?;
+    } else {
+        timing::time("output", || report.write(&opts, &mut out)).context("cannot write to stdout")?;
+    }
 
     if args.stats {
         let s = ix.stats();
@@ -162,4 +177,83 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         crate::stats::report(t0.elapsed(), &counters);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The llm rendering of the listing and `--score` (ISSUES O4): a header, what usage does not
+/// see, then one line per distribution, most used first, at most `limit`:
+/// `requests 2.32.3: grade B (78.2) · importers 3 · names used 14 (public api 152) · loc
+/// reached 1203/5301 (23%)`. "names used" counts every class and function first-party code
+/// imports or calls, private ones included, so it is not a share of the public API.
+fn write_llm(report: &DepsReport<'_>, opts: &ReportOptions, root: &str, limit: usize) -> String {
+    let mut out = String::new();
+    let rows: Vec<_> = {
+        let mut v: Vec<_> = report.rows().iter().filter(|r| opts.all || r.usage.is_used()).collect();
+        v.sort_by(|a, b| {
+            (b.usage.importers, b.usage.loc_reached, b.usage.call_sites)
+                .cmp(&(a.usage.importers, a.usage.loc_reached, a.usage.call_sites))
+                .then_with(|| a.key.cmp(b.key))
+        });
+        v
+    };
+    let total = report.rows().len();
+    let _ = writeln!(out, "# pymapper deps{}", if opts.score { " --score" } else { "" });
+    let _ = writeln!(
+        out,
+        "root: {root} · {} of {total} distributions used by first-party code ({} first-party files) · listed: {}{}",
+        report.used(),
+        report.first_party_files,
+        rows.len(),
+        if opts.all { " (--all)" } else { "" }
+    );
+    out.push_str("Usage counts static imports and resolved calls from first-party code; dynamic imports, CLI tools, plugins and unresolved calls are not seen. Scorecards are information, never findings (exit 0).\n");
+    if opts.score {
+        out.push_str("Grade A-F from the 0-100 score (complexity, hotspots, maintainability, coupling; formula in docs/deps.md).\n");
+    }
+    if !rows.is_empty() {
+        out.push('\n');
+    }
+    let s = |n: u32| if n == 1 { "" } else { "s" };
+    for r in rows.iter().take(limit) {
+        let u = &r.usage;
+        let name = String::from_utf8_lossy(r.name);
+        let version = if r.version.is_empty() { "-".into() } else { String::from_utf8_lossy(r.version) };
+        let _ = write!(out, "{name} {version}:");
+        if opts.score {
+            match r.score.as_ref().and_then(|sc| sc.grade().map(|g| (g, sc.score))) {
+                Some((g, score)) => {
+                    let _ = write!(out, " grade {} ({:.1}) ·", g.as_str(), score);
+                }
+                None if r.loaded => out.push_str(" grade - (no functions) ·"),
+                None => out.push_str(" grade - (code not loaded) ·"),
+            }
+        }
+        let _ = write!(out, " importers {}", u.importers);
+        if u.importers == 0 && u.call_sites > 0 {
+            out.push_str(" (reached only through calls)");
+        }
+        if r.loaded {
+            let _ = write!(out, " · names used {}", u.api_used);
+            if let Some(sc) = r.score.as_ref().filter(|_| opts.score) {
+                let _ = write!(out, " (public api {})", sc.public_api);
+            }
+            let pct = if u.loc == 0 { 0 } else { (u64::from(u.loc_reached) * 100 + u64::from(u.loc) / 2) / u64::from(u.loc) };
+            let _ = write!(out, " · loc reached {}/{} ({pct}%)", u.loc_reached, u.loc);
+        } else {
+            let _ = write!(out, " · {} import row{} · code not loaded", u.import_rows, s(u.import_rows));
+        }
+        out.push('\n');
+    }
+    if rows.len() > limit {
+        let _ = writeln!(out, "\n{} more distributions not displayed. Use --limit 0 to show all.", rows.len() - limit);
+    }
+    if !opts.all && rows.len() < total {
+        let n = total - rows.len();
+        let _ = writeln!(out, "\n{n} unused distribution{} not listed (--all lists every one).", if n == 1 { "" } else { "s" });
+    }
+    out.push_str(if opts.score {
+        "\nNext: `pymapper deps --check --llm` for undeclared and unused dependencies · `pymapper imports <module>` for where one is used\n"
+    } else {
+        "\nNext: `pymapper deps --score --llm` for scorecards · `pymapper deps --check --llm` for undeclared and unused dependencies\n"
+    });
+    out
 }

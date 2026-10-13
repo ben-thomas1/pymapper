@@ -209,7 +209,7 @@ fn watch_survives_a_broken_config_and_recovers() {
 fn watch_exits_when_stdout_closes() {
     let p = demo();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pymapper"))
-        .args(["check", "--watch", "--no-cache"])
+        .args(["check", "--watch", "--no-cache", "--output-format", "concise"])
         .current_dir(&p.dir)
         .env_remove("VIRTUAL_ENV")
         .stdout(Stdio::piped())

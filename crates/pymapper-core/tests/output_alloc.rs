@@ -6,7 +6,7 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pymapper_core::config::OutputFormat;
+use pymapper_core::config::{GroupBy, OutputFormat};
 use pymapper_core::output::{Baseline, Context, Options, Outcome, Report, Summary};
 use pymapper_core::rules::codes::{COMPLEX_FUNCTION, UNUSED_IMPORT};
 use pymapper_core::rules::{Arg, ArgResolver, FileId, Findings, Location, SymbolId};
@@ -117,9 +117,23 @@ fn allocations_do_not_grow_with_findings() {
             let opts = Options::new(format);
             let (res, a) = count(|| report.write(&opts, &Summary::default(), &mut io::sink()));
             assert_eq!(res.expect("write"), Outcome::Written);
-            assert!(a <= 12, "{format:?}: {a} allocations for {n} findings");
+            // Json: the finding ids (a presized table, the id order) on top.
+            assert!(a <= 20, "{format:?}: {a} allocations for {n} findings");
             writes.push(a);
         }
+        // Human: per run, the line index (findings and items), the ids (whose hash map grows
+        // by doubling, so logarithmic in the findings) and a few scratch buffers.
+        for group_by in [GroupBy::Category, GroupBy::File] {
+            let opts = Options { group_by, color: true, ..Options::new(OutputFormat::Human) };
+            let (res, a) = count(|| report.write(&opts, &Summary::default(), &mut io::sink()));
+            assert_eq!(res.expect("write"), Outcome::Written);
+            assert!(a <= 60, "human {group_by:?}: {a} allocations for {n} findings");
+        }
+        // Llm: ids, presized grouping tables and the reused line buffers; never per finding.
+        let opts = Options { limit: 0, ..Options::new(OutputFormat::Llm) };
+        let (res, a) = count(|| report.write(&opts, &Summary::default(), &mut io::sink()));
+        assert_eq!(res.expect("write"), Outcome::Written);
+        assert!(a <= 40, "Llm: {a} allocations for {n} findings");
         let (res, a) = count(|| report.write_baseline(&mut io::sink()));
         assert_eq!(res.expect("write"), Outcome::Written);
         // The baseline map grows by doubling: logarithmic in the number of keys.

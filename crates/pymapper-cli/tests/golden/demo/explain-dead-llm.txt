@@ -1,0 +1,36 @@
+# pymapper explain PM401-145e
+
+PM401-145e · Dead code · unused-function: function services.pricing:legacy_discount is never used
+at services/pricing.py:53:5 · services.pricing:legacy_discount (function) · confidence 100 (no-references)
+
+## Source services/pricing.py:53-54
+53 > def legacy_discount(total):  # PM401: never called
+54 |     return total * 0.9
+
+## Evidence
+no-references: nothing refers to it at all
+liveness level 0/100 (confidence = 100 - level), from: no path from any root
+call sites: none (no resolved call, decorator or override edge reaches it)
+name `legacy_discount`: appears nowhere else in the analysed Python files
+decorators: none
+mode: .: application ([project.scripts] in pyproject.toml)
+roots checked: __main__ 1, scripts 2 (e.g. app, app:main)
+
+## Effect of deleting it
+no other code becomes unused (nothing it calls is used only by unused code)
+no import statement names it
+
+## Blind spots
+not scanned in this repository: 0 notebooks (.ipynb), 0 compiled extensions (.so/.pyd); callbacks passed as values, getattr/string dispatch and calls from C are not edges
+
+## Verify
+grep -rnw legacy_discount . --exclude-dir=.venv --exclude-dir=.git --exclude-dir=.pymapper_cache
+pymapper callers services.pricing:legacy_discount
+
+## Fix
+delete services.pricing:legacy_discount if nothing uses it by name, or declare how it is used ([entrypoints], a preset, __all__)
+
+## Suppress
+add `# pymapper: ignore[PM401]` at the end of services/pricing.py:53
+
+Next: run the Verify command, then delete it with what Effect lists · `pymapper callers services.pricing:legacy_discount` to double-check

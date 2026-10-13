@@ -162,3 +162,111 @@ pub fn json_counts(w: &mut Writer<'_>, c: &RowCounts) {
     w.key_num("outside_paths", c.outside as u64);
     w.key_bool("truncated", c.shown < c.matched);
 }
+
+/// Counts of a walk for the llm header: the rows ([`RowCounts`], capped by `limit`), and how
+/// many of the rows under the positional paths hang on a `possible` edge or a dispatch-only
+/// edge, and in how many files they lie.
+#[derive(Clone, Copy, Default)]
+pub struct WalkCounts {
+    pub rows: RowCounts,
+    pub possible: usize,
+    pub dispatch: usize,
+    pub files: usize,
+}
+
+/// [`WalkCounts`] of `walk` (`path_conf`: count the least sure edge on the path, as `impact`
+/// tags its rows).
+pub fn walk_counts(s: &Session, walk: &Walk, limit: usize, path_conf: bool) -> WalkCounts {
+    let ix = &s.project.index;
+    let mut c = WalkCounts::default();
+    let mut files: Vec<u32> = Vec::new();
+    for h in &walk.hops {
+        if !s.node_in_scope(h.node) {
+            c.rows.outside += 1;
+            continue;
+        }
+        c.rows.matched += 1;
+        let conf = if path_conf { h.worst } else { h.conf };
+        c.possible += usize::from(conf == pymapper_core::resolve::Confidence::Possible);
+        c.dispatch += usize::from(h.dispatch);
+        files.extend(ix.file(h.node));
+    }
+    files.sort_unstable();
+    files.dedup();
+    c.files = files.len();
+    c.rows.shown = c.rows.matched.min(limit);
+    c
+}
+
+/// The llm rows of `walk`: the first `limit` rows under the positional paths (closest
+/// first), grouped by the file of the reached node (`## path (module)`, files in path order),
+/// one row per node: `name [conf] at line:col +N sites depth D via pkg.mod:g`; `callees`
+/// rows also give the definition line (`name:12`). A site outside the group's file shows its
+/// path.
+pub fn write_llm_rows(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, walk: &Walk, side: Side, limit: usize, path_conf: bool) {
+    let ix = q.index();
+    let shown: Vec<&Hop> = walk.hops.iter().filter(|h| s.node_in_scope(h.node)).take(limit).collect();
+    let pairs: Vec<Pair> = shown
+        .iter()
+        .map(|h| match side {
+            Side::Callers => Pair { src: h.node, dst: h.via, dispatch: h.dispatch },
+            Side::Callees => Pair { src: h.via, dst: h.node, dispatch: h.dispatch },
+        })
+        .collect();
+    let sites = pymapper_core::timing::time("output.sites", || locate(q, &pairs));
+    // Group by file path (display order), then closest first, then by site.
+    let mut order: Vec<usize> = (0..shown.len()).collect();
+    let file_of = |i: usize| ix.file(shown[i].node);
+    order.sort_by(|&a, &b| {
+        let pa = file_of(a).map(|f| ix.file_path(f));
+        let pb = file_of(b).map(|f| ix.file_path(f));
+        let la = sites[a].first.map(|x| (x.line, x.col));
+        let lb = sites[b].first.map(|x| (x.line, x.col));
+        (pa, shown[a].depth, la, a).cmp(&(pb, shown[b].depth, lb, b))
+    });
+    let mut current: Option<Option<u32>> = None;
+    for i in order {
+        let h = shown[i];
+        let file = file_of(i);
+        if current != Some(file) {
+            super::llm::group(w, file);
+            current = Some(file);
+        }
+        if ix.kind(h.node).is_def() {
+            w.short(h.node);
+        } else {
+            w.str("(module level)");
+        }
+        if side == Side::Callees {
+            let d = SymbolLoc::of(ix, h.node);
+            if d.line > 0 {
+                w.str(":");
+                w.num(u64::from(d.line));
+            }
+        }
+        w.conf_tag(if path_conf { h.worst } else { h.conf }, h.dispatch);
+        let st = &sites[i];
+        if let Some(site) = st.first {
+            w.str(if h.dispatch { " overrides at " } else { " at " });
+            if Some(site.file) != file {
+                w.file(site.file);
+                w.str(":");
+            }
+            w.num(u64::from(site.line));
+            w.str(":");
+            w.num(u64::from(site.col));
+            if st.count > 1 {
+                w.str(" +");
+                w.num(u64::from(st.count - 1));
+                w.str(if st.count == 2 { " site" } else { " sites" });
+            }
+        }
+        if h.depth > 1 {
+            w.str(" depth ");
+            w.num(u64::from(h.depth));
+            w.str(" via ");
+            w.qid(h.via);
+        }
+        w.end_line();
+    }
+}

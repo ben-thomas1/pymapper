@@ -33,6 +33,13 @@ pub trait Context: ArgResolver {
     fn write_root_path(&self, file: FileId, out: &mut Vec<u8>) {
         self.write_path(file, out);
     }
+    /// Appends the absolute project root (empty when unknown; JSON `root`, the llm header).
+    fn write_root_dir(&self, _out: &mut Vec<u8>) {}
+    /// The node containing `sym` (a def's class, function or module; a module's package), or
+    /// [`SymbolId::NONE`] (unknown or top). Used to attribute dead-code chains (llm format).
+    fn parent_symbol(&self, _sym: SymbolId) -> SymbolId {
+        SymbolId::NONE
+    }
     /// Appends the stable qualified id of `sym` (`pkg.mod:Class.method`), as used by baselines.
     fn write_symbol_id(&self, sym: SymbolId, out: &mut Vec<u8>);
     /// Last line of `sym`'s definition when it is a class or function, else 0 (for the JSON
@@ -142,12 +149,23 @@ impl Context for IndexContext<'_> {
         }
     }
 
+    fn write_root_dir(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.root);
+    }
+
     fn write_symbol_id(&self, sym: SymbolId, out: &mut Vec<u8>) {
         if self.valid_node(sym) {
             self.index.qid(sym.0, out);
         } else {
             out.push(b'?');
         }
+    }
+
+    fn parent_symbol(&self, sym: SymbolId) -> SymbolId {
+        if !self.valid_node(sym) {
+            return SymbolId::NONE;
+        }
+        self.index.parent(sym.0).map_or(SymbolId::NONE, SymbolId)
     }
 
     fn def_end_line(&self, sym: SymbolId) -> u32 {

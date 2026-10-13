@@ -29,6 +29,7 @@ pub(super) const RULES: &[RuleDef] = &[
 (at any scope, `if TYPE_CHECKING:` imports excluded). A module that depends on many others breaks \
 whenever any of them changes and is hard to test in isolation.\n\n\
 Fix: move unrelated responsibilities into separate modules, or depend on a narrower facade.",
+        fix: "move unrelated responsibilities of `{0}` into separate modules, or depend on a narrower facade, to import at most {2} first-party modules (now {1})",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -54,6 +55,7 @@ ripples); near `A = 1, I = 1` the zone of uselessness (abstractions nobody uses)
 mean little. The rule is a ranking aid, which is why it is off by default.\n\n\
 Fix: in the zone of pain, put an abstract interface between the module and its dependants; in \
 the zone of uselessness, remove or merge unused abstractions.",
+        fix: "if `{0}` is concrete and widely used (abstractness {3}, instability {4}), put an abstract interface between it and its dependants; if it is an unused abstraction, remove or merge it",
         severity: Severity::Info,
         default_enabled: false,
         cost: CostClass::Graph,
@@ -75,6 +77,7 @@ exceeds `max-module-coupling`. Such a module gathers many responsibilities and s
 of the import graph, so most changes touch it and it touches most of the code base.\n\n\
 Fix: split the module along its responsibilities so that each dependant imports only the part it \
 needs.",
+        fix: "split `{0}` along its responsibilities so that each dependant imports only the part it needs",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,
@@ -97,6 +100,7 @@ functions are not counted). A class above both `max-class-wmc` and `max-class-fa
 centralises behaviour and reaches into many collaborators instead of delegating to them.\n\n\
 Fix: move behaviour next to the data it uses (into the collaborating classes), and split the \
 class along groups of methods that share state.",
+        fix: "move behaviour of `{0}` next to the data it uses (into the classes it calls), and split it along groups of methods that share state",
         severity: Severity::Warning,
         default_enabled: true,
         cost: CostClass::Graph,

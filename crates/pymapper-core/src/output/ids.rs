@@ -84,7 +84,7 @@ impl FindingIds {
     pub(super) fn build(r: &Report<'_>) -> FindingIds {
         let mut keys = KeyBuf::new();
         // Occurrences of each (code, key hash) so far, to tell equal keys apart.
-        let mut seen: FxHashMap<(u16, u64), u32> = FxHashMap::default();
+        let mut seen: FxHashMap<(u16, u64), u32> = FxHashMap::with_capacity_and_hasher(r.len(), Default::default());
         let mut ids = Vec::with_capacity(r.len());
         let mut scratch = Vec::with_capacity(super::SCRATCH);
         for f in r.iter() {

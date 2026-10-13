@@ -2209,7 +2209,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pymapper-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "pymapper-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "rayon",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "pymapper-gui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "egui",
@@ -4007,7 +4007,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",

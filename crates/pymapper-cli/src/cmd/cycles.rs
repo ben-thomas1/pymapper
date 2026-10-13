@@ -6,7 +6,7 @@
 //!                               │  graph (first-party runtime imports, as PM301)
 //!                               ├─ --symbol: the components holding its modules
 //!                               └─ --symbol --calls: the call SCC through it
-//!   ──> PATHS filter (a cycle with a member under PATHS) ──> concise | json ──> exit 0
+//!   ──> PATHS filter (a cycle with a member under PATHS) ──> text | llm | json ──> exit 0
 //! ```
 //!
 //! Every cycle is one line at the import (call) that starts its witness: a shortest cycle,
@@ -24,7 +24,7 @@ use pymapper_core::roots::Origin;
 use pymapper_core::timing;
 
 use super::query::hops::{self, RowCounts};
-use super::query::{Pair, QueryFlags, Session, WalkFlags, Writer, finish, import_site, locate};
+use super::query::{Pair, QueryFlags, Session, WalkFlags, Writer, finish, import_site, llm, locate};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -78,7 +78,12 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     counts.shown = hits.len().min(s.row_limit);
     let mut stdout = io::stdout().lock();
     let mut w = s.writer(&mut stdout);
-    timing::time("output", || write(&q, &mut w, &kind, target, &hits, &counts, &walk));
+    if w.llm {
+        let arg = cmd_args(&args.symbol, args.calls);
+        timing::time("output", || write_llm(&s, &q, &mut w, &kind, target, &hits, &counts, &walk, &arg));
+    } else {
+        timing::time("output", || write(&q, &mut w, &kind, target, &hits, &counts, &walk));
+    }
     finish(w)?;
     s.report_stats(&q, &[("cycles", counts.matched as u64)]);
     Ok(ExitCode::SUCCESS)
@@ -233,4 +238,183 @@ fn write(q: &Query<'_>, w: &mut Writer<'_>, kind: &Kind, target: Option<NodeId>,
     }
     hops::filter_note(w, counts);
     w.end_line();
+}
+
+/// One import statement from a module of a cycle to another member.
+#[derive(Clone, Copy)]
+pub struct CycleRow {
+    pub src: NodeId,
+    pub dst: NodeId,
+    pub file: u32,
+    pub line: u32,
+    /// The row's [`res_flags`](pymapper_core::resolve::res_flags).
+    pub flags: u8,
+    /// Import row (store-absolute), for the imported names.
+    pub row: usize,
+}
+
+/// Every import statement between two members of a cycle, by importing member (in `members`
+/// order) then line. O(import rows of the members' files * log members).
+pub fn cycle_rows(q: &Query<'_>, members: &[NodeId]) -> Vec<CycleRow> {
+    let ix = q.index();
+    let imp = q.imports();
+    let st = &ix.facts().imports;
+    let mut sorted = members.to_vec();
+    sorted.sort_unstable();
+    let mut out = Vec::new();
+    for &m in members {
+        let Some(f) = ix.file(m) else { continue };
+        for row in ix.file_facts(f).imports.range() {
+            let d = imp.module_node(row);
+            if d != m && sorted.binary_search(&d).is_ok() {
+                out.push(CycleRow { src: m, dst: d, file: f, line: st.line[row], flags: imp.flags(row), row });
+            }
+        }
+    }
+    out
+}
+
+/// Flags of the module edge `src -> dst` ([`res_flags::EDGE_ALL`] flags shared by every row:
+/// none of the deferring ones means some row runs on import).
+pub fn edge_flags(q: &Query<'_>, src: NodeId, dst: NodeId) -> u8 {
+    let ix = q.index();
+    let Some(f) = ix.file(src) else { return 0 };
+    let edges = q.imports().module_edges(f);
+    edges.binary_search_by_key(&dst, |e| e.dst).map_or(0, |i| edges[i].flags)
+}
+
+/// Whether import flags defer or guard an import (it does not run on import, or only for
+/// type checkers).
+pub fn deferred(flags: u8) -> bool {
+    use pymapper_core::resolve::res_flags;
+    flags & (res_flags::TYPE_ONLY | res_flags::CONDITIONAL | res_flags::TRY | res_flags::LAZY) != 0
+}
+
+/// The arguments echoed in the llm header.
+fn cmd_args(symbol: &Option<String>, calls: bool) -> String {
+    match (symbol, calls) {
+        (Some(sym), true) => format!("--calls --symbol {sym}"),
+        (Some(sym), false) => format!("--symbol {sym}"),
+        (None, _) => String::new(),
+    }
+}
+
+/// The llm rendering: one section per cycle with its witness and every witness edge at its
+/// import (call) site with its kind (top-level / inside a function / TYPE_CHECKING / try /
+/// conditional) or confidence; import cycles also count the other edges between members.
+#[allow(clippy::too_many_arguments)]
+fn write_llm(s: &Session, q: &Query<'_>, w: &mut Writer<'_>, kind: &Kind, target: Option<NodeId>, hits: &[CycleHit], counts: &RowCounts, walk: &WalkOptions, arg: &str) {
+    let calls = matches!(kind, Kind::Calls);
+    llm::header(w, "cycles", arg);
+    if let Some(t) = target {
+        llm::target(w, t);
+        llm::sep(w);
+    }
+    llm::root(w, s);
+    llm::sep(w);
+    let largest = hits.iter().map(|h| h.members.len()).max().unwrap_or(0);
+    llm::count(w, counts.matched as u64, if calls { "call cycle" } else { "import cycle" }, if calls { "call cycles" } else { "import cycles" });
+    if counts.matched > 1 {
+        w.str(" (largest: ");
+        w.num(largest as u64);
+        w.str(")");
+    }
+    w.end_line();
+    if calls {
+        w.str("A call cycle is direct or mutual recursion; tags are the edge confidence.");
+        w.end_line();
+        llm::call_blind_spots(w, s);
+    } else {
+        w.str("Graph: first-party imports");
+        if s.config.analysis.type_checking_cycles {
+            w.str(" (TYPE_CHECKING imports included)");
+        } else {
+            w.str(", TYPE_CHECKING imports excluded");
+        }
+        w.str(", as PM301. Kinds: top-level runs on import; inside a function, try and conditional imports are deferred or guarded, so a cycle closed only by them is usually harmless.");
+        w.end_line();
+        llm::import_blind_spots(w);
+    }
+    for (i, h) in hits[..counts.shown].iter().enumerate() {
+        let wit = &h.witness;
+        let n = wit.len();
+        w.end_line();
+        w.str("## Cycle ");
+        w.num(i as u64 + 1);
+        w.str(": ");
+        llm::count(w, h.members.len() as u64, if calls { "function" } else { "module" }, if calls { "functions" } else { "modules" });
+        let flags: Vec<u8> = if calls { Vec::new() } else { (0..n).map(|k| edge_flags(q, wit[k], wit[(k + 1) % n])).collect() };
+        if !calls && n > 0 {
+            w.str(if flags.iter().all(|&f| !deferred(f)) { ", eager (every edge runs on import)" } else { ", deferred (an edge does not run on import)" });
+        }
+        w.end_line();
+        for &m in wit {
+            w.qid(m);
+            w.str(" -> ");
+        }
+        if let Some(&first) = wit.first() {
+            w.qid(first);
+        }
+        w.end_line();
+        if calls {
+            let edges = witness_edges(q, wit, walk);
+            let pairs: Vec<Pair> = (0..n).map(|k| Pair { src: wit[k], dst: wit[(k + 1) % n], dispatch: edges[k].1 }).collect();
+            let sites = locate(q, &pairs);
+            for (k, p) in pairs.iter().enumerate() {
+                w.short(p.src);
+                w.str(" -> ");
+                w.short(p.dst);
+                w.conf_tag(edges[k].0, edges[k].1);
+                if let Some(site) = sites[k].first {
+                    w.str(" at ");
+                    w.loc_plain(site.file, site.line, site.col);
+                }
+                w.end_line();
+            }
+            continue;
+        }
+        for k in 0..n {
+            let (a, b) = (wit[k], wit[(k + 1) % n]);
+            w.qid(a);
+            w.str(" -> ");
+            w.qid(b);
+            w.str(" (");
+            w.import_kind(flags[k]);
+            w.str(")");
+            if let Some((f, line, col)) = import_site(q, a, b) {
+                w.str(" at ");
+                w.loc_plain(f, line, col);
+            }
+            w.end_line();
+        }
+        if h.members.len() > n {
+            w.str("Also in the cycle: ");
+            for (k, &m) in h.members.iter().filter(|m| !wit.contains(m)).enumerate() {
+                if k > 0 {
+                    w.str(", ");
+                }
+                w.qid(m);
+            }
+            w.end_line();
+        }
+        let rows = cycle_rows(q, &h.members);
+        let mut pairs: Vec<(NodeId, NodeId)> = rows.iter().map(|r| (r.src, r.dst)).collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        let other = pairs.len().saturating_sub(n);
+        if other > 0 {
+            llm::count(w, other as u64, "other import edge", "other import edges");
+            w.str(" between members (`pymapper explain` on the PM301 id lists every one).");
+            w.end_line();
+        }
+    }
+    llm::trailer(w, counts.matched, counts.shown, counts.outside, "cycles");
+    let next = if calls {
+        "`pymapper callers <member>` to see who enters the recursion".to_owned()
+    } else if counts.matched == 0 {
+        "nothing to do; `pymapper cycles --calls --symbol <f>` finds recursion".to_owned()
+    } else {
+        "break an edge by moving a top-level import into the function that uses it, or move the shared names to a module both can import · `pymapper check --select PM301 --llm` for the finding ids".to_owned()
+    };
+    llm::next(w, &next);
 }

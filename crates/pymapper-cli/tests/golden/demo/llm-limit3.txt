@@ -1,0 +1,18 @@
+# pymapper check · root <root> (reached as .) · paths relative to the working directory
+Dead-code mode: application ([project.scripts] in pyproject.toml)
+26 findings in 15 files, 19 items, showing 3 · 10 below confidence 80 not shown (--min-confidence 0 shows them) · exit 1 = findings, not an error
+Not analysed: notebooks, C extensions, names used only via getattr or strings. Verify dead code before deleting it.
+Rules not run: PM501: needs `analysis.dupes = true`; PM601-PM603: run by `pymapper deps --check`
+
+## Architecture (2)
+PM303-e6ff models/order.py:2 models.order imports forbidden module repo.order_repo (contract "models are independent of repo")
+  fix: remove the import of repo.order_repo from models.order, or move the code that needs it out of models.order (contract "models are independent of repo") · verify: pymapper explain PM303-e6ff
+PM301-e35f repo/order_repo.py:1 import cycle (2 modules): repo.order_repo -> models.order -> repo.order_repo
+  fix: break one import of the cycle: import inside the function that needs it, or move the shared code into a lower-level module both can import · verify: pymapper explain PM301-e35f
+
+## Complexity (1 function)
+PM101-312c services/pricing.py:6-36 calculate_price: McCabe 14>10, cognitive 32>15, nesting 5>4, params 8>7 (PM101,PM102,PM103,PM105)
+  fix: flatten calculate_price with guard clauses and extract nested blocks, to bring cognitive complexity from 32 to 15 or less · verify: pymapper callers services.pricing:calculate_price
+
+20 more findings not displayed (in 14 files). Use --limit 0 to show all, or --select <code> to narrow.
+Next: pymapper explain <id> for evidence and source · suppress with # pymapper: ignore[PMxxx] on the reported line
